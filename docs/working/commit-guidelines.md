@@ -40,8 +40,8 @@ behavioral gap, or maintenance benefit that would not be obvious from the
 subject alone.
 
 Do not create subject-only commits. When committing manually, prefer writing the
-message to a temporary file and using `git commit --file <path>` so the body is
-not accidentally skipped.
+message to a file in `tmp/` at the project root (gitignored) and using
+`git commit --file tmp/<name>.txt` so the body is not accidentally skipped.
 
 ## Forbidden Content
 
