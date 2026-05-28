@@ -64,9 +64,13 @@ When implementing any feature or fix:
    beyond unit tests. If it touches subprocess, GitHub API, or filesystem — write
    those tests too.
 5. Repeat steps 1-4 for each requirement within the task autonomously.
-6. Self-review the diff (`git diff main...HEAD`) as if presenting to a principal engineer:
-   check for missing edge cases, naming clarity, unnecessary complexity, security issues,
-   and test coverage gaps. Fix any findings.
+   For doc/spec/plan-only changes, skip steps 1-5 and go directly to step 6.
+6. Self-review the diff (`git diff main...HEAD`) as if presenting to a principal engineer.
+   For code changes: check for missing edge cases, naming clarity, unnecessary complexity,
+   security issues, and test coverage gaps.
+   For doc/spec/plan changes: verify the content is complete, ordered correctly, executable
+   by an implementer without follow-up questions, and consistent with existing working docs
+   and current code. Fix any findings before presenting.
 7. Only present to the user when the full task is complete, reviewed, and ready to commit.
 
 Never write implementation code without first having a failing test.
