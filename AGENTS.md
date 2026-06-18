@@ -27,6 +27,7 @@ If both files apply:
 - When raising a PR manually, read `docs/working/pr-guidelines.md` and follow its required PR body structure
 - When picking up an issue, reviewing a PR, or revising after review, follow the workflow-label and AI-review-posting rules in `docs/working/pr-guidelines.md`
 - When reviewing a PR, issue, implementation proposal, design proposal, or plan, review the full change scope against the current live repo and adjacent contracts. Do not limit the review to newly edited lines, previously requested fixes, or the author's stated intent.
+- Treat proposal and documentation reviews with the same completeness standard as code reviews: verify that the content is executable, ordered correctly, and consistent with current code, tests, runtime contracts, and workflow docs.
 - Report the complete set of blocker and major findings you can identify in the current pass. Do not hold back issues to keep the comment short, and do not stop after finding the first valid blocker. The goal is to avoid repeated cycles where one issue is fixed only for the reviewer to surface another issue that was already discoverable.
 - GitHub workflow operations requested by the user or required by repo workflow are pre-authorized when they are non-destructive: creating issues, creating PRs, posting issue/PR/review comments, and updating workflow labels. Do not ask for per-item confirmation before running the matching `gh` command. This does not authorize destructive remote actions such as closing issues/PRs, deleting branches, merging, or force-pushing someone else's branch.
 - When preparing GitHub body text (issue bodies, PR bodies, review bodies, comments, or review replies), write body files to `tmp/` at the project root (gitignored, inside the sandbox write allowlist). Run `mkdir -p tmp` first.
@@ -35,7 +36,7 @@ If both files apply:
 
 - Use test-first development for implementation work
 - Do not write implementation code before a failing test exists
-- Keep changes minimal, verify locally, and review the diff before presenting work
+- Keep changes minimal, verify locally, and review the diff thoroughly before presenting work — apply principal-engineer standards whether the change is code or documentation
 - Preserve existing user changes and do not revert unrelated modifications
 
 ## Commit Rules
