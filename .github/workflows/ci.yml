@@ -35,6 +35,37 @@ jobs:
       - name: Install test runner
         run: python -m pip install --disable-pip-version-check pytest
 
+      # The tick's startup probe requires `gh`, `git` and `codex` to be present
+      # before it will run at all, and exits 3 when any is missing. Runners ship
+      # git and gh but never codex, so without this every test that reaches a
+      # dispatch path fails for a reason that has nothing to do with the change
+      # under review.
+      #
+      # A stub is the right shape here, not a real install. The probe only calls
+      # shutil.which -- it never executes the binary -- and the suite already
+      # mocks every actual codex invocation, so installing the real CLI would
+      # buy no additional coverage: it cannot authenticate and must not make
+      # paid calls from CI. The `--version` line is here so anything that shells
+      # out for a version check sees a string above the pinned minimum.
+      #
+      # This is the same PATH-interception seam the process-level smoke harness
+      # is designed around: `codex` is resolved by name, so a script earlier on
+      # PATH intercepts it with no production-code change.
+      - name: Stub external CLIs the startup probe requires
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\necho "codex-cli 0.142.5"\n' > "$RUNNER_TEMP/bin/codex"
+          chmod +x "$RUNNER_TEMP/bin/codex"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the probe's binaries resolve
+        shell: bash
+        run: |
+          for binary in gh git codex; do
+            command -v "$binary" || { echo "missing: $binary" >&2; exit 1; }
+          done
+
       - name: Test
         run: python -m pytest skills/ -q
 
