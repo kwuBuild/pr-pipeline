@@ -1,0 +1,13 @@
+# Operator configuration for the PR-pipeline control plane.
+#
+# [policy] governs the reviewer admission gate. A PR whose diff edits files
+# that steer the reviewer (CLAUDE.md, AGENTS.md, the review checklists) is
+# normally escalated to a human instead of auto-reviewed — the reviewer runs on
+# the PR's own worktree, so it would review under instructions the PR itself
+# supplied. Set allow_touching = true to accept that trust boundary and
+# auto-review such PRs anyway. The human merge gate after ai:ready-for-human
+# still stands.
+#
+# A missing or malformed config.toml keeps the conservative gate (fail closed).
+[policy]
+allow_touching = true

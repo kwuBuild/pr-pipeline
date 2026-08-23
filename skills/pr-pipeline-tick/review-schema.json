@@ -1,0 +1,35 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "findings"],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["ready_for_human", "changes_requested"],
+      "description": "ready_for_human when the diff has no blocker/major issues; changes_requested otherwise."
+    },
+    "findings": {
+      "type": "array",
+      "description": "One entry per issue found. Empty array for a clean review.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["severity", "file", "summary"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["blocker", "major", "minor"]
+          },
+          "file": {
+            "type": "string",
+            "description": "Repo-relative path the finding applies to."
+          },
+          "summary": {
+            "type": "string",
+            "description": "One-line description of the issue and the fix."
+          }
+        }
+      }
+    }
+  }
+}

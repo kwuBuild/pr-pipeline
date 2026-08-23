@@ -1,0 +1,4996 @@
+"""Tests for the PR-pipeline review-stage helper logic.
+
+Co-located with ``pipeline.py`` so the whole ``pr-pipeline-tick/lib`` directory lifts
+out cleanly when the tool is extracted from Sworn. Run with::
+
+    uv run pytest .claude/skills/pr-pipeline-tick/lib/test_pipeline.py
+"""
+
+from __future__ import annotations
+
+import inspect
+import io
+import json
+import os
+from pathlib import Path
+
+import pipeline
+import pytest
+
+# Slack for the fixer comment's own framing — marker, headline, outcome lines,
+# and the details/fence wrapper — on top of the bounded engine excerpt. The
+# bound itself is read from ``pipeline`` rather than restated, so a change to
+# the publish budget moves these assertions with it instead of either breaking
+# them (budget raised past a hardcoded ceiling) or hollowing them out (budget
+# lowered, leaving a ceiling nothing could reach).
+_FIX_COMMENT_FRAMING = 500
+
+
+# --- decide_loop_cadence ---
+
+
+def test_loop_cadence_in_flight_sleeps_until_nearest_deadline_when_soon() -> None:
+    sleep_seconds, stop = pipeline.decide_loop_cadence(
+        in_flight_count=1,
+        nearest_engine_deadline=1090.0,
+        actionable_queue=False,
+        at_cap=False,
+        quiescent=False,
+        consecutive_quiescent=0,
+        now=1000.0,
+    )
+
+    assert sleep_seconds == 90
+    assert stop is False
+
+
+def test_loop_cadence_actionable_queue_uses_cache_warm_band() -> None:
+    sleep_seconds, stop = pipeline.decide_loop_cadence(
+        in_flight_count=0,
+        nearest_engine_deadline=None,
+        actionable_queue=True,
+        at_cap=False,
+        quiescent=False,
+        consecutive_quiescent=0,
+        now=1000.0,
+    )
+
+    assert sleep_seconds == 270
+    assert stop is False
+
+
+def test_loop_cadence_in_flight_clamps_to_cache_warm_band() -> None:
+    sleep_seconds, stop = pipeline.decide_loop_cadence(
+        in_flight_count=1,
+        nearest_engine_deadline=1500.0,
+        actionable_queue=False,
+        at_cap=False,
+        quiescent=False,
+        consecutive_quiescent=0,
+        now=1000.0,
+    )
+
+    assert sleep_seconds == 270
+    assert stop is False
+
+
+def test_loop_cadence_quiescent_uses_heartbeat_and_stops_after_limit() -> None:
+    sleep_seconds, stop = pipeline.decide_loop_cadence(
+        in_flight_count=0,
+        nearest_engine_deadline=None,
+        actionable_queue=False,
+        at_cap=False,
+        quiescent=True,
+        consecutive_quiescent=3,
+        now=1000.0,
+    )
+
+    assert sleep_seconds == 1800
+    assert stop is True
+
+
+# --- validate_review ---
+
+
+def test_validate_review_accepts_ready_for_human_with_empty_findings() -> None:
+    assert (
+        pipeline.validate_review({"verdict": "ready_for_human", "findings": []})
+        == "ready_for_human"
+    )
+
+
+def test_validate_review_rejects_missing_findings() -> None:
+    # ``findings`` is required by review-schema.json; a payload missing it did not
+    # go through the schema-constrained reviewer path, so the promote-safety guard
+    # must reject it (the caller then applies the conservative changes_requested
+    # default) rather than promote on malformed/truncated output.
+    assert pipeline.validate_review({"verdict": "ready_for_human"}) is None
+
+
+def test_validate_review_accepts_changes_requested_with_findings() -> None:
+    obj = {
+        "verdict": "changes_requested",
+        "findings": [
+            {"severity": "blocker", "file": "app/x.py", "summary": "SQL injection"},
+        ],
+    }
+    assert pipeline.validate_review(obj) == "changes_requested"
+
+
+def test_validate_review_rejects_unknown_verdict() -> None:
+    assert pipeline.validate_review({"verdict": "lgtm"}) is None
+
+
+def test_validate_review_rejects_missing_verdict() -> None:
+    assert pipeline.validate_review({"findings": []}) is None
+
+
+def test_validate_review_rejects_non_object() -> None:
+    assert pipeline.validate_review(["ready_for_human"]) is None
+    assert pipeline.validate_review(None) is None
+
+
+def test_validate_review_rejects_malformed_findings() -> None:
+    # findings present but not a list
+    assert pipeline.validate_review({"verdict": "changes_requested", "findings": {}}) is None
+    # a finding missing required keys
+    bad = {"verdict": "changes_requested", "findings": [{"severity": "blocker"}]}
+    assert pipeline.validate_review(bad) is None
+    # a finding with an unknown severity
+    bad_sev = {
+        "verdict": "changes_requested",
+        "findings": [{"severity": "nit", "file": "a", "summary": "b"}],
+    }
+    assert pipeline.validate_review(bad_sev) is None
+
+
+def test_validate_review_rejects_unhashable_verdict() -> None:
+    """A list/dict verdict must return None, never crash with TypeError."""
+    assert pipeline.validate_review({"verdict": ["ready_for_human"], "findings": []}) is None
+    assert pipeline.validate_review({"verdict": {}, "findings": []}) is None
+
+
+def test_validate_review_rejects_unhashable_severity() -> None:
+    """A list/dict severity must return None, never crash with TypeError."""
+    obj = {
+        "verdict": "changes_requested",
+        "findings": [{"severity": ["blocker"], "file": "a.py", "summary": "b"}],
+    }
+    assert pipeline.validate_review(obj) is None
+
+
+# --- has_blocking_findings ---
+
+
+def test_has_blocking_findings_true_for_blocker() -> None:
+    assert pipeline.has_blocking_findings([{"severity": "blocker", "file": "a", "summary": "b"}])
+
+
+def test_has_blocking_findings_true_for_major() -> None:
+    assert pipeline.has_blocking_findings([{"severity": "major", "file": "a", "summary": "b"}])
+
+
+def test_has_blocking_findings_false_for_minor_only() -> None:
+    assert not pipeline.has_blocking_findings([{"severity": "minor", "file": "a", "summary": "b"}])
+
+
+def test_has_blocking_findings_false_for_empty() -> None:
+    assert not pipeline.has_blocking_findings([])
+
+
+def test_has_blocking_findings_tolerates_malformed_entries() -> None:
+    # A non-dict entry must not crash the gate; it simply is not a blocking finding.
+    mixed = ["oops", {"severity": "minor", "file": "", "summary": ""}]
+    assert not pipeline.has_blocking_findings(mixed)
+
+
+# --- head_advanced ---
+
+
+def test_head_unchanged_is_not_advanced() -> None:
+    assert pipeline.head_advanced("h1", "h1") is False
+
+
+def test_head_moved_is_advanced() -> None:
+    assert pipeline.head_advanced("h1", "h2") is True
+
+
+def test_head_advanced_treats_unresolved_current_as_moved() -> None:
+    # A head we pinned but can no longer resolve must be treated as drift.
+    assert pipeline.head_advanced("h1", "") is True
+
+
+def test_head_advanced_skips_when_no_head_pinned() -> None:
+    # With no pinned head (unit-test convenience; production always pins) the gate
+    # cannot assert drift, so it returns False rather than fabricating a discard.
+    assert pipeline.head_advanced("", "") is False
+    assert pipeline.head_advanced("", "h2") is False
+
+
+# --- review_already_posted ---
+
+
+def test_review_already_posted_true_when_round_token_present() -> None:
+    body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[],
+        base_sha="b1",
+        head_sha="h1",
+    )
+    assert pipeline.review_already_posted([{"body": body}], "b1", "h1") is True
+
+
+def test_review_already_posted_false_for_different_head() -> None:
+    body = pipeline.render_review_comment(
+        verdict="changes_requested", findings=[], base_sha="b1", head_sha="h1"
+    )
+    assert pipeline.review_already_posted([{"body": body}], "b1", "h2") is False
+
+
+def test_review_already_posted_false_for_same_head_different_base() -> None:
+    # A base that advanced under an unchanged head is a new round, not a replay.
+    body = pipeline.render_review_comment(
+        verdict="changes_requested", findings=[], base_sha="b1", head_sha="h1"
+    )
+    assert pipeline.review_already_posted([{"body": body}], "b2", "h1") is False
+
+
+def test_review_already_posted_false_when_no_marked_comments() -> None:
+    assert pipeline.review_already_posted([{"body": "just a human note"}], "b1", "h1") is False
+
+
+# --- count_review_rounds ---
+
+
+def test_count_review_rounds_counts_only_marked_comments() -> None:
+    comments = [
+        {"body": "random human comment"},
+        {"body": f"{pipeline.REVIEW_MARKER}\n\nround 1 findings"},
+        {"body": "another human note"},
+        {"body": f"{pipeline.REVIEW_MARKER}\n\nround 2 findings"},
+    ]
+    assert pipeline.count_review_rounds(comments, pipeline.REVIEW_MARKER) == 2
+
+
+def test_count_review_rounds_zero_when_no_marked_comments() -> None:
+    assert pipeline.count_review_rounds([{"body": "hi"}], pipeline.REVIEW_MARKER) == 0
+
+
+def test_count_review_rounds_tolerates_missing_or_nonstring_body() -> None:
+    comments = [{}, {"body": None}, {"body": pipeline.REVIEW_MARKER}]
+    assert pipeline.count_review_rounds(comments, pipeline.REVIEW_MARKER) == 1
+
+
+def test_at_max_iterations_routes_to_max_iterations_label() -> None:
+    # Default threshold is 5: the 5th completed round is the cap.
+    assert pipeline.at_max_iterations(4) is False
+    assert pipeline.at_max_iterations(5) is True
+    assert pipeline.at_max_iterations(6) is True
+
+
+# --- base_advanced ---
+
+
+def test_base_unchanged_is_not_advanced() -> None:
+    assert pipeline.base_advanced("abc123", "abc123") is False
+
+
+def test_base_moved_is_advanced() -> None:
+    assert pipeline.base_advanced("abc123", "def456") is True
+
+
+def test_base_advanced_treats_unknown_tip_as_moved() -> None:
+    # A tip we could not resolve must be treated as drift, never as "safe".
+    assert pipeline.base_advanced("abc123", "") is True
+
+
+# --- classify_dispatch ---
+
+
+def test_classify_stale_when_bare_result_without_envelope() -> None:
+    """A result file without a valid envelope is not trustworthy — treat as stale."""
+    assert classify(now=100, deadline=50, alive=False, result=True) == "stale"
+
+
+def test_classify_live_when_result_but_pid_alive() -> None:
+    # A result file alongside a still-running PID means codex may be mid-write — wait
+    # for the engine to exit rather than harvest a partially written review.json.
+    assert classify(now=10, deadline=50, alive=True, result=True) == "live"
+
+
+def test_classify_launching_lease_is_not_stale() -> None:
+    # A `launching` lease (marker written pre-spawn, no PID published yet) must NOT
+    # read as stale — that would re-dispatch a live reviewer. With no result it stays
+    # `launching` so reconcile can escalate instead of silently re-queueing.
+    assert (
+        pipeline.classify_dispatch(
+            now=10, deadline=50, pid_alive=False, result_exists=False, state="launching"
+        )
+        == "launching"
+    )
+
+
+def test_classify_launching_with_bare_result_is_still_launching() -> None:
+    # A bare result without a valid envelope does not prove completion.
+    assert (
+        pipeline.classify_dispatch(
+            now=10, deadline=50, pid_alive=False, result_exists=True, state="launching"
+        )
+        == "launching"
+    )
+
+
+def test_classify_launching_with_envelope_is_complete() -> None:
+    # A valid envelope proves the wrapper confirmed exit+schema.
+    assert (
+        pipeline.classify_dispatch(
+            now=10, deadline=50, pid_alive=False, result_exists=True,
+            state="launching", envelope_valid=True,
+        )
+        == "complete"
+    )
+
+
+def test_classify_live_when_running_within_deadline() -> None:
+    assert classify(now=10, deadline=50, alive=True, result=False) == "live"
+
+
+def test_classify_stale_when_dead_with_no_result() -> None:
+    assert classify(now=10, deadline=50, alive=False, result=False) == "stale"
+
+
+def test_classify_failed_when_dead_with_bound_failure_envelope() -> None:
+    """A wrapper-confirmed reviewer failure is terminal, not stale/requeueable."""
+    assert (
+        pipeline.classify_dispatch(
+            now=10,
+            deadline=50,
+            pid_alive=False,
+            result_exists=False,
+            failure_envelope_valid=True,
+        )
+        == "failed"
+    )
+
+
+def test_classify_hung_when_alive_past_deadline() -> None:
+    assert classify(now=99, deadline=50, alive=True, result=False) == "hung"
+
+
+# --- atomic_write ---
+
+
+def test_atomic_write_writes_content(tmp_path: Path) -> None:
+    target = tmp_path / "dispatch.json"
+    pipeline.atomic_write(str(target), json.dumps({"pid": 42}))
+    assert json.loads(target.read_text()) == {"pid": 42}
+
+
+def test_atomic_write_leaves_no_temp_files(tmp_path: Path) -> None:
+    target = tmp_path / "dispatch.json"
+    pipeline.atomic_write(str(target), "x")
+    # Only the final file should remain — no orphaned temp alongside it.
+    assert [p.name for p in tmp_path.iterdir()] == ["dispatch.json"]
+
+
+def test_atomic_write_overwrites_existing(tmp_path: Path) -> None:
+    target = tmp_path / "iter.txt"
+    pipeline.atomic_write(str(target), "1")
+    pipeline.atomic_write(str(target), "2")
+    assert target.read_text() == "2"
+
+
+# --- render_review_comment ---
+
+
+def test_render_review_comment_embeds_marker_and_base_sha() -> None:
+    body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "blocker", "file": "app/x.py", "summary": "leak"}],
+        base_sha="abc123",
+        head_sha="head789",
+    )
+    assert body.startswith(pipeline.REVIEW_MARKER)
+    assert "abc123" in body
+    assert "head789" in body
+    assert "app/x.py" in body
+    assert "leak" in body
+    assert "blocker" in body.lower()
+    # The marker must be present so count_review_rounds tallies this round.
+    assert pipeline.count_review_rounds([{"body": body}]) == 1
+    # The round token must be present so re-runs are idempotent.
+    assert pipeline.review_already_posted([{"body": body}], "abc123", "head789") is True
+
+
+def test_render_review_comment_handles_clean_review() -> None:
+    body = pipeline.render_review_comment(
+        verdict="ready_for_human", findings=[], base_sha="abc123", head_sha="head789"
+    )
+    assert body.startswith(pipeline.REVIEW_MARKER)
+    assert "abc123" in body
+    assert pipeline.count_review_rounds([{"body": body}]) == 1
+
+
+def test_render_review_comment_embeds_diff_base_and_freshness_tip() -> None:
+    # The two-SHA model: base_sha is the merge-base the diff was actually anchored
+    # to; base_tip_sha is the base tip snapshot the freshness guard compared. The
+    # audit record must carry both honestly — claiming the tip was "the reviewed
+    # range" when Codex diffed from the merge-base misstates what was reviewed.
+    body = pipeline.render_review_comment(
+        verdict="ready_for_human",
+        findings=[],
+        base_sha="mergebase111",
+        base_tip_sha="basetip222",
+        head_sha="head333",
+    )
+    assert "diff base `mergebase111`" in body
+    assert "base tip `basetip222`" in body
+    assert "head `head333`" in body
+
+
+def test_review_already_posted_keys_on_diff_base_tip_and_head() -> None:
+    # The hidden idempotency token covers the full (diff base, base tip, head)
+    # triple: a re-dispatch that changes ANY of the three is a new round.
+    body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+    )
+    comments = [{"body": body}]
+    assert pipeline.review_already_posted(
+        comments, "mb1", "h1", base_tip_sha="tip1",
+    ) is True
+    assert pipeline.review_already_posted(
+        comments, "mb2", "h1", base_tip_sha="tip1",
+    ) is False
+    assert pipeline.review_already_posted(
+        comments, "mb1", "h1", base_tip_sha="tip2",
+    ) is False
+    assert pipeline.review_already_posted(
+        comments, "mb1", "h2", base_tip_sha="tip1",
+    ) is False
+
+
+def test_review_already_posted_keys_on_base_ref() -> None:
+    # The base branch *name* is part of review identity (a retarget discards
+    # even when every SHA is unchanged), so it must be part of the replay
+    # token too: base A and base B can point to the same commit, and a
+    # comment posted under A must not suppress the fresh review under B.
+    body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+        base_ref="main",
+    )
+    comments = [{"body": body}]
+    assert pipeline.review_already_posted(
+        comments, "mb1", "h1", base_tip_sha="tip1", base_ref="main",
+    ) is True
+    assert pipeline.review_already_posted(
+        comments, "mb1", "h1", base_tip_sha="tip1", base_ref="develop",
+    ) is False
+
+
+def test_review_already_posted_base_ref_legacy_fallback() -> None:
+    # Comments posted before the base-ref key carry the three-part token.
+    # An empty ref keeps the legacy format so legacy lookups still match,
+    # and the two formats never match each other (a cross-format replay
+    # re-posts once — the accepted one-time upgrade edge).
+    legacy_body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+    )
+    ref_body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+        base_ref="main",
+    )
+    assert pipeline.review_already_posted(
+        [{"body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
+    ) is True
+    assert pipeline.review_already_posted(
+        [{"body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
+        base_ref="main",
+    ) is False
+    assert pipeline.review_already_posted(
+        [{"body": ref_body}], "mb1", "h1", base_tip_sha="tip1",
+    ) is False
+
+
+# --- decide_review_harvest (composition) ---
+
+
+def test_decide_posts_fresh_review_when_same_shas_new_base_ref() -> None:
+    # Regression (review finding): PR retargeted from feat-1 to main where
+    # both point at the same commit — identical (diff base, base tip, head)
+    # triple. The old round's comment must NOT suppress the fresh round's
+    # comment: post_comment stays True so the new findings become the posted
+    # handoff the next fixer reads, instead of the stale feat-1 review.
+    old_comment = pipeline.render_review_comment(
+        verdict="ready_for_human",
+        findings=[],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+        base_ref="feat-1",
+    )
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(),
+        comments=[{"body": old_comment}],
+        pinned_base="tip1",
+        current_base="tip1",
+        pinned_head="h1",
+        current_head="h1",
+        diff_base_sha="mb1",
+        pinned_base_ref="main",
+        current_base_ref="main",
+    )
+    assert d["action"] == "request_changes"
+    assert d["label"] == "ai:changes-requested"
+    assert d["post_comment"] is True
+    body = d["comment_body"]
+    assert isinstance(body, str) and "boom" in body
+    # The fresh comment carries the new base-ref identity, so a crash-window
+    # replay of THIS round is still recognised as already posted.
+    assert pipeline.review_already_posted(
+        [{"body": old_comment}, {"body": body}],
+        "mb1", "h1", base_tip_sha="tip1", base_ref="main",
+    ) is True
+
+
+def test_decide_replay_suppressed_for_same_base_ref() -> None:
+    # Same identity including the ref: an interrupted tick re-reading the
+    # same result must not re-post or double-count the round.
+    posted = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "blocker", "file": "a.py", "summary": "boom"}],
+        base_sha="mb1",
+        base_tip_sha="tip1",
+        head_sha="h1",
+        base_ref="main",
+    )
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(),
+        comments=[{"body": posted}],
+        pinned_base="tip1",
+        current_base="tip1",
+        pinned_head="h1",
+        current_head="h1",
+        diff_base_sha="mb1",
+        pinned_base_ref="main",
+        current_base_ref="main",
+    )
+    assert d["post_comment"] is False
+
+
+def test_decide_promotes_clean_review() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b1"
+    )
+    assert d["action"] == "promote"
+    assert d["label"] == "ai:ready-for-human"
+    assert d["post_comment"] is True
+    assert d["base_drift"] is False
+
+
+def test_decide_requests_changes() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(), comments=[], pinned_base="b1", current_base="b1"
+    )
+    assert d["action"] == "request_changes"
+    assert d["label"] == "ai:changes-requested"
+    assert d["post_comment"] is True
+
+
+def test_decide_discards_when_base_drifted() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b2"
+    )
+    assert d["action"] == "discard"
+    assert d["label"] == "ai:implemented"  # reverted for re-dispatch
+    assert d["post_comment"] is False
+    assert d["base_drift"] is True
+
+
+def test_decide_invalid_review_escalates_not_fix_loop() -> None:
+    # Invalid reviewer output (verdict=None) is an infra/output failure, not a real
+    # changes_requested verdict: escalate to a human rather than spend fix rounds on
+    # an empty review.
+    d = pipeline.decide_review_harvest(
+        review_obj={"verdict": "??"}, comments=[], pinned_base="b1", current_base="b1"
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["verdict"] is None
+    assert d["post_comment"] is False
+
+
+def test_decide_routes_to_max_iterations_at_cap() -> None:
+    # Four prior rounds already recorded; this changes_requested round is the 5th.
+    prior = [{"body": pipeline.REVIEW_MARKER}] * 4
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(), comments=prior, pinned_base="b1", current_base="b1"
+    )
+    assert d["action"] == "max_iterations"
+    assert d["label"] == "ai:max-iterations"
+    assert d["post_comment"] is True
+
+
+def test_decide_discard_reverts_to_pre_label() -> None:
+    # An ai:revised PR that drifts must revert to ai:revised, not ai:implemented.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b2",
+        pre_label="ai:revised",
+    )
+    assert d["action"] == "discard"
+    assert d["label"] == "ai:revised"
+
+
+def test_decide_discard_defaults_pre_label_to_implemented() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b2"
+    )
+    assert d["label"] == "ai:implemented"
+
+
+def test_decide_clean_review_at_cap_still_promotes() -> None:
+    # The cap only stops further fix loops; a clean verdict still promotes.
+    prior = [{"body": pipeline.REVIEW_MARKER}] * 9
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(), comments=prior, pinned_base="b1", current_base="b1"
+    )
+    assert d["action"] == "promote"
+
+
+# --- decide_review_harvest: head drift (finding 2) ---
+
+
+def test_decide_discards_when_head_drifted() -> None:
+    # A clean review against a head that has since been force-pushed must NOT
+    # promote the new, unreviewed head — it is discarded and re-dispatched.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h2",
+    )
+    assert d["action"] == "discard"
+    assert d["head_drift"] is True
+    assert d["post_comment"] is False
+    assert d["label"] == "ai:implemented"
+
+
+def test_decide_promotes_when_head_steady() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "promote"
+    assert d["head_drift"] is False
+
+
+# --- decide_review_harvest: base retarget ---
+
+
+def test_decide_discards_when_base_retargeted() -> None:
+    # A PR retargeted from main to develop while the review ran: the old
+    # base's tip and the head are both unchanged, so the SHA drift checks
+    # alone would promote a review anchored to the wrong target.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+        pinned_base_ref="main",
+        current_base_ref="develop",
+    )
+    assert d["action"] == "discard"
+    assert d["label"] == "ai:implemented"
+    assert d["base_retarget"] is True
+    assert d["post_comment"] is False
+
+
+def test_decide_retarget_reverts_to_pre_label() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pre_label="ai:revised",
+        pinned_base_ref="main",
+        current_base_ref="develop",
+    )
+    assert d["action"] == "discard"
+    assert d["label"] == "ai:revised"
+
+
+def test_decide_retarget_discards_without_base_tip_resolution() -> None:
+    # When the base was retargeted the old ref may be deleted, so the tick
+    # cannot resolve its tip; an empty current_base must not mask the discard.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="",
+        pinned_head="h1",
+        current_head="h1",
+        pinned_base_ref="main",
+        current_base_ref="develop",
+    )
+    assert d["action"] == "discard"
+    assert d["base_retarget"] is True
+
+
+def test_decide_same_base_ref_promotes() -> None:
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+        pinned_base_ref="main",
+        current_base_ref="main",
+    )
+    assert d["action"] == "promote"
+    assert d["base_retarget"] is False
+
+
+def test_decide_retarget_check_inactive_when_refs_absent() -> None:
+    # Backward compatibility: callers that predate the retarget guard omit
+    # both refs and keep the SHA-only drift behavior.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+    )
+    assert d["action"] == "promote"
+    assert d["base_retarget"] is False
+
+
+# --- decide_review_harvest: verdict/findings consistency (finding 4) ---
+
+
+def test_decide_does_not_promote_ready_verdict_with_blocker_findings() -> None:
+    # A reviewer that emits ready_for_human while reporting a blocker contradicts
+    # the schema's own definition; the promote gate must refuse to promote it.
+    contradictory = {
+        "verdict": "ready_for_human",
+        "findings": [{"severity": "blocker", "file": "a.py", "summary": "leak"}],
+    }
+    d = pipeline.decide_review_harvest(
+        review_obj=contradictory,
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "request_changes"
+    assert d["label"] == "ai:changes-requested"
+    # The posted comment must reflect changes-requested, not a clean promotion.
+    assert "🔧" in d["comment_body"]
+
+
+def test_decide_promotes_ready_verdict_with_minor_findings() -> None:
+    # ready_for_human means "no blocker/major"; minor findings are compatible.
+    ready_minor = {
+        "verdict": "ready_for_human",
+        "findings": [{"severity": "minor", "file": "a.py", "summary": "nit"}],
+    }
+    d = pipeline.decide_review_harvest(
+        review_obj=ready_minor,
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "promote"
+
+
+# --- decide_review_harvest: idempotency (finding 3) ---
+
+
+def test_decide_skips_comment_when_already_posted_for_head() -> None:
+    # A prior tick posted the comment but its label edit failed; the re-run must
+    # not post a duplicate (which would inflate the iteration count) — it only
+    # re-applies the label.
+    prior_body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "blocker", "file": "a.py", "summary": "boom"}],
+        base_sha="b1",
+        head_sha="h1",
+    )
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(),
+        comments=[{"body": prior_body}],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "request_changes"
+    assert d["post_comment"] is False
+    assert d["label"] == "ai:changes-requested"
+
+
+def test_decide_posts_re_review_when_base_moved_under_same_head() -> None:
+    # A prior round reviewed head h1 against base b1 and posted its comment. The base
+    # then advanced to b2 and the PR was re-dispatched against the SAME head. The new
+    # review (same head, new base) is a legitimate fresh round and must post its
+    # findings — keying idempotency on the head alone would suppress it and leave the
+    # next fixer with no current review to act on.
+    prior_body = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "blocker", "file": "a.py", "summary": "old finding"}],
+        base_sha="b1",
+        head_sha="h1",
+    )
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(),
+        comments=[{"body": prior_body}],
+        pinned_base="b2",
+        current_base="b2",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["post_comment"] is True
+    assert d["action"] == "request_changes"
+
+
+def test_decide_audits_diff_base_separately_from_freshness_tip() -> None:
+    # Dispatch pins base_sha = merge-base (the Codex diff anchor) and
+    # base_tip_sha = base tip (the freshness snapshot). The posted audit record
+    # must attribute each SHA to its real role: drift is compared on the tip,
+    # while the comment/token carry the true diff anchor plus the tip.
+    d = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[],
+        pinned_base="tip1",
+        current_base="tip1",
+        pinned_head="h1",
+        current_head="h1",
+        diff_base_sha="mb1",
+    )
+    assert d["action"] == "promote"
+    body = str(d["comment_body"])
+    assert "diff base `mb1`" in body
+    assert "base tip `tip1`" in body
+
+    # Idempotency: a replay with the same triple must not re-post.
+    d2 = pipeline.decide_review_harvest(
+        review_obj=clean_review(),
+        comments=[{"body": body}],
+        pinned_base="tip1",
+        current_base="tip1",
+        pinned_head="h1",
+        current_head="h1",
+        diff_base_sha="mb1",
+    )
+    assert d2["post_comment"] is False
+
+
+def test_decide_idempotent_replay_does_not_inflate_iteration_cap() -> None:
+    # Four prior distinct rounds, and THIS round's comment was already posted by an
+    # interrupted earlier attempt (5 markers total). A naive rounds+1 would jump to
+    # 6 and trip the cap on a duplicate; idempotent counting keeps it at the real 5.
+    prior = [{"body": pipeline.REVIEW_MARKER}] * 4
+    this_round = pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "blocker", "file": "a.py", "summary": "boom"}],
+        base_sha="b1",
+        head_sha="h1",
+    )
+    d = pipeline.decide_review_harvest(
+        review_obj=changes_review(),
+        comments=prior + [{"body": this_round}],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    # 5 completed rounds → cap reached, but on a replay we still must not re-post.
+    assert d["action"] == "max_iterations"
+    assert d["post_comment"] is False
+
+
+# --- touches_review_policy (candidate-controlled review policy) ---
+
+
+def test_touches_review_policy_false_for_ordinary_code() -> None:
+    assert pipeline.touches_review_policy(["app/foo.py", "frontend/x.ts"]) is False
+
+
+def test_touches_review_policy_true_for_root_claude_md() -> None:
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+
+
+def test_touches_review_policy_true_for_nested_claude_or_agents_md() -> None:
+    # codex loads the nearest AGENTS.md/CLAUDE.md up the tree, so a nested one
+    # still governs the reviewer.
+    assert pipeline.touches_review_policy(["frontend/AGENTS.md"]) is True
+    assert pipeline.touches_review_policy(["app/sub/CLAUDE.md"]) is True
+
+
+def test_touches_review_policy_true_for_review_checklist() -> None:
+    assert (
+        pipeline.touches_review_policy([".claude/hooks/sworn-review-checklist.md"]) is True
+    )
+
+
+def test_touches_review_policy_true_for_gate_config() -> None:
+    """The gate's own config.toml is review policy: a PR that flips
+    allow_touching to true would otherwise be auto-reviewed, then silently
+    disable the gate for every future policy-editing PR after a human merge."""
+    assert (
+        pipeline.touches_review_policy(
+            [".claude/skills/pr-pipeline-tick/config.toml"]
+        )
+        is True
+    )
+
+
+def test_touches_review_policy_true_for_gate_implementation() -> None:
+    """The gate's implementation files are review policy too: a PR that
+    rewrites _policy_touching_allowed to always return True (or removes the
+    tick.py:9007 call) is the same silent-disable vector as a config flip."""
+    assert (
+        pipeline.touches_review_policy(
+            [".claude/skills/pr-pipeline-tick/lib/pipeline.py"]
+        )
+        is True
+    )
+    assert (
+        pipeline.touches_review_policy(
+            [".claude/skills/pr-pipeline-tick/lib/tick.py"]
+        )
+        is True
+    )
+
+
+def test_touches_review_policy_false_for_unrelated_dotclaude_files() -> None:
+    # A change to some other skill under .claude/ does not steer the reviewer's
+    # governing instructions, so it must not block auto-review.
+    assert pipeline.touches_review_policy([".claude/skills/other/SKILL.md"]) is False
+
+
+def test_touches_review_policy_ignores_blank_lines() -> None:
+    assert pipeline.touches_review_policy(["", "app/foo.py", ""]) is False
+
+
+def test_touches_review_policy_config_allow_touching_true(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """config.toml [policy] allow_touching = true must let a PR that edits
+    reviewer policy files flow to auto-review — the operator has explicitly
+    accepted the trust boundary (the reviewer runs on the PR's own worktree)."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[policy]\nallow_touching = true\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is False
+    assert pipeline.touches_review_policy(["app/AGENTS.md"]) is False
+    assert (
+        pipeline.touches_review_policy([".claude/hooks/sworn-review-checklist.md"])
+        is False
+    )
+    assert pipeline.touches_review_policy(["app/foo.py"]) is False
+
+
+def test_touches_review_policy_config_conservative_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Missing, false, or malformed config must keep the conservative gate."""
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", tmp_path / "nope.toml")
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[policy]\nallow_touching = false\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+    cfg.write_text("not toml [", encoding="utf-8")
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+    # A valid-but-wrong-shape [policy] value must not crash the gate — it
+    # fails closed like every other non-true value.
+    cfg.write_text('policy = "allow"\n', encoding="utf-8")
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+    # Invalid UTF-8 bytes raise UnicodeDecodeError (not TOMLDecodeError) from
+    # tomllib.load — the gate must fail closed, never crash the tick.
+    cfg.write_bytes(b"\xff\xfe[policy]\nallow_touching = true\n")
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+
+
+# --- trusted_review_candidate (credential exposure boundary) ---
+
+
+def test_trusted_review_candidate_accepts_owner_authored_same_repo_pr() -> None:
+    metadata = {
+        "author": {"login": "kwuBuild"},
+        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "isCrossRepository": False,
+    }
+
+    assert pipeline.trusted_review_candidate(
+        metadata,
+        trusted_author="kwuBuild",
+        trusted_repo="kwuBuild/sworn",
+    )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {
+            "author": {"login": "contributor"},
+            "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+            "isCrossRepository": False,
+        },
+        {
+            "author": {"login": "kwuBuild"},
+            "headRepository": {"nameWithOwner": "fork/sworn"},
+            "isCrossRepository": True,
+        },
+        {
+            "author": {"login": "kwuBuild"},
+            "headRepository": {"nameWithOwner": "kwuBuild/other"},
+            "isCrossRepository": False,
+        },
+        {"author": {"login": "kwuBuild"}, "isCrossRepository": False},
+        None,
+    ],
+)
+def test_trusted_review_candidate_rejects_untrusted_or_malformed_metadata(
+    metadata: object,
+) -> None:
+    assert not pipeline.trusted_review_candidate(
+        metadata,
+        trusted_author="kwuBuild",
+        trusted_repo="kwuBuild/sworn",
+    )
+
+
+# --- reconcile_dispatch (label-driven in-flight reconciliation) ---
+
+
+def test_reconcile_noops_on_markerless_in_flight_label() -> None:
+    # ai:reviewing with no local marker proves nothing: another machine's tick
+    # can never see this machine's markers, and a human may have claimed the
+    # label by hand. Absence of a local file is not evidence of an orphan, so
+    # the only safe decision is to do nothing (issue #592).
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "noop"
+    assert d["kill"] is False
+    assert d["label"] == ""
+
+
+def test_reconcile_noop_when_no_marker_and_not_in_flight() -> None:
+    # No marker and the PR is not parked at an in-flight label: nothing of ours.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:implemented",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "noop"
+
+
+def test_reconcile_harvests_completed_at_reviewing_label() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="complete",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "harvest"
+
+
+def test_reconcile_harvests_completed_when_label_edit_failed() -> None:
+    # Finding: dispatch wrote the marker and the engine finished, but the
+    # post-dispatch label edit failed so the PR is still at its pre-dispatch
+    # label. The completed result is still in our custody and must be harvested,
+    # not re-dispatched into a second reviewer.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:revised",
+        marker_valid=True,
+        classify_state="complete",
+        pre_label="ai:revised",
+    )
+    assert d["action"] == "harvest"
+
+
+def test_reconcile_cleans_up_completed_when_human_took_over() -> None:
+    # A human moved the PR out of our custody while the engine ran: do not act on
+    # the stale result, just drop the scratch.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:ready-for-human",
+        marker_valid=True,
+        classify_state="complete",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "cleanup"
+
+
+def test_reconcile_leaves_live_engine() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="live",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "leave"
+
+
+def test_reconcile_reverts_stale_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:revised",
+    )
+    assert d["action"] == "revert"
+    assert d["label"] == "ai:revised"
+
+
+def test_reconcile_routes_bound_failure_to_terminal_failure_action() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="failed",
+        pre_label="ai:implemented",
+    )
+    assert d == {"action": "fail", "kill": False, "label": "ai:needs-human-decision"}
+
+
+def test_reconcile_cleans_up_stale_when_human_took_over() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:changes-requested",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "cleanup"
+
+
+def test_reconcile_kills_and_escalates_hung_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="hung",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "kill_escalate"
+    assert d["kill"] is True
+    assert d["label"] == "ai:needs-human-decision"
+
+
+def test_reconcile_kills_and_cleans_up_hung_out_of_custody() -> None:
+    # Even when a human moved the label, a hung process must still be killed so it
+    # cannot pin the cadence at "busy"; we just do not clobber the human's label.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:ready-for-human",
+        marker_valid=True,
+        classify_state="hung",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "kill_cleanup"
+    assert d["kill"] is True
+
+
+# --- CLI ---
+
+
+def test_cli_harvest_review_emits_decision_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(changes_review()))
+    comments = tmp_path / "comments.json"
+    comments.write_text(json.dumps([]))
+
+    rc = pipeline.main(
+        [
+            "harvest-review",
+            "--review",
+            str(review),
+            "--comments",
+            str(comments),
+            "--pinned-base",
+            "b1",
+            "--current-base",
+            "b1",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "request_changes"
+    assert out["label"] == "ai:changes-requested"
+    assert out["post_comment"] is True
+
+
+def test_cli_harvest_review_unwraps_gh_comments_object(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `gh pr view --json comments` writes {"comments": [...]}, not a bare list.
+    # The helper must unwrap it, or the iteration count is silently always zero.
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(changes_review()))
+    comments = tmp_path / "comments.json"
+    comments.write_text(json.dumps({"comments": [{"body": pipeline.REVIEW_MARKER}] * 4}))
+    rc = pipeline.main(
+        [
+            "harvest-review",
+            "--review",
+            str(review),
+            "--comments",
+            str(comments),
+            "--pinned-base",
+            "b1",
+            "--current-base",
+            "b1",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    # 4 prior rounds + this one = 5 → cap reached.
+    assert out["action"] == "max_iterations"
+    assert out["rounds"] == 4
+
+
+def test_cli_harvest_review_passes_pre_label(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(clean_review()))
+    comments = tmp_path / "comments.json"
+    comments.write_text(json.dumps([]))
+    rc = pipeline.main(
+        [
+            "harvest-review",
+            "--review",
+            str(review),
+            "--comments",
+            str(comments),
+            "--pinned-base",
+            "b1",
+            "--current-base",
+            "b2",  # drifted
+            "--pre-label",
+            "ai:revised",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "discard"
+    assert out["label"] == "ai:revised"
+
+
+def test_cli_harvest_review_missing_file_escalates(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A missing/unreadable review.json is an infra failure, not a verdict: escalate
+    # to a human conservatively rather than crash or enter the paid fix loop.
+    comments = tmp_path / "comments.json"
+    comments.write_text(json.dumps([]))
+    rc = pipeline.main(
+        [
+            "harvest-review",
+            "--review",
+            str(tmp_path / "nope.json"),
+            "--comments",
+            str(comments),
+            "--pinned-base",
+            "b1",
+            "--current-base",
+            "b1",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "escalate"
+    assert out["label"] == "ai:needs-human-decision"
+    assert out["verdict"] is None
+
+
+def test_cli_harvest_review_discards_on_head_drift(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(clean_review()))
+    comments = tmp_path / "comments.json"
+    comments.write_text(json.dumps([]))
+    rc = pipeline.main(
+        [
+            "harvest-review",
+            "--review",
+            str(review),
+            "--comments",
+            str(comments),
+            "--pinned-base",
+            "b1",
+            "--current-base",
+            "b1",
+            "--pinned-head",
+            "h1",
+            "--current-head",
+            "h2",  # force-pushed under the review
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "discard"
+    assert out["head_drift"] is True
+
+
+def test_cli_classify_dispatch(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps({"pid": 1, "deadline": 50}))
+    rc = pipeline.main(
+        [
+            "classify-dispatch",
+            "--dispatch",
+            str(dispatch),
+            "--now",
+            "10",
+            "--pid-alive",
+            "0",
+            "--result-exists",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "stale"
+
+
+def test_cli_classify_dispatch_corrupt_deadline_is_conservative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A non-numeric deadline must not crash classify, and must fail CLOSED for
+    # admission: a live engine with a corrupt deadline counts as in-flight (`live`),
+    # never `hung` — classifying it hung would free its slot and let the cap admit an
+    # extra reviewer over a still-running, money-spending one.
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps({"pid": 1, "deadline": "soon"}))
+    rc = pipeline.main(
+        [
+            "classify-dispatch",
+            "--dispatch",
+            str(dispatch),
+            "--now",
+            "10",
+            "--pid-alive",
+            "1",
+            "--result-exists",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "live"
+
+
+def test_cli_classify_dispatch_bool_deadline_is_conservative(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A boolean deadline (True/False) must not bypass the fail-closed coercion.
+    # float(True) == 1.0, which would classify a live engine as `hung` (since
+    # now > 1.0), freeing its slot. The fix coerces bools to +inf → `live`.
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps({"pid": 1, "deadline": True}))
+    rc = pipeline.main(
+        [
+            "classify-dispatch",
+            "--dispatch",
+            str(dispatch),
+            "--now",
+            "10",
+            "--pid-alive",
+            "1",
+            "--result-exists",
+            "0",
+        ]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "live"
+
+
+def test_cli_atomic_write_reads_stdin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    target = tmp_path / "dispatch.json"
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"pid": 7}'))
+    rc = pipeline.main(["atomic-write", "--path", str(target)])
+    assert rc == 0
+    assert json.loads(target.read_text()) == {"pid": 7}
+
+
+def test_cli_validate_review_ok(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps(clean_review()))
+    rc = pipeline.main(["validate-review", "--review", str(review)])
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "ready_for_human"
+
+
+def test_cli_validate_review_invalid_exits_nonzero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    review = tmp_path / "review.json"
+    review.write_text(json.dumps({"verdict": "??"}))
+    rc = pipeline.main(["validate-review", "--review", str(review)])
+    assert rc == 1
+    assert "INVALID" in capsys.readouterr().out
+
+
+def test_cli_touches_review_policy_reads_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("app/foo.py\nCLAUDE.md\n"))
+    rc = pipeline.main(["touches-review-policy"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["touches_policy"] is True
+
+
+def test_cli_touches_review_policy_false_exit_zero(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr("sys.stdin", io.StringIO("app/foo.py\n"))
+    rc = pipeline.main(["touches-review-policy"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["touches_policy"] is False
+
+
+def test_cli_validate_review_candidate_reads_stdin(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    metadata = {
+        "author": {"login": "kwuBuild"},
+        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "isCrossRepository": False,
+    }
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(metadata)))
+
+    rc = pipeline.main(
+        [
+            "validate-review-candidate",
+            "--trusted-author",
+            "kwuBuild",
+            "--trusted-repo",
+            "kwuBuild/sworn",
+        ]
+    )
+
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out) == {"trusted": True}
+
+
+def test_no_helper_answers_admission_from_shared_labels() -> None:
+    """Only one admission contract may exist, and it is marker-only.
+
+    ``in_flight_prs``/``dispatch_admission`` were the older PR-number-only
+    model that unioned authoritative ``ai:reviewing`` labels with local
+    markers. Once :func:`pipeline.in_flight_refs` stopped counting labels,
+    those two answered a question nothing in the system asks any more — and
+    answered it with the opposite verdict for the same repo state. A second
+    admission surface is how an operator reasons from a contract production
+    abandoned, so the sibling is removed rather than left to disagree.
+    """
+    assert not hasattr(pipeline, "in_flight_prs")
+    assert not hasattr(pipeline, "dispatch_admission")
+
+
+def test_no_admission_claimant_can_ignore_process_liveness() -> None:
+    """Every symbol claiming to answer admission must be able to see liveness.
+
+    The guard above names two retired symbols, so it can only catch helpers
+    someone already thought to remove. This asserts the property instead: a
+    signature that cannot represent a live process group cannot answer "is this
+    slot spent", because ``complete``-with-a-live-child is exactly the marker
+    where the two answers diverge. A helper that takes bare classify states and
+    still advertises itself as the admission count is the same competing
+    contract that justified deleting ``in_flight_prs``.
+    """
+    live_child = ("pr", 42, pipeline.LABEL_REVIEWING, "complete", True)
+    assert len(pipeline.in_flight_refs([live_child])) == 1
+
+    offenders: list[str] = []
+    for name, obj in vars(pipeline).items():
+        if name.startswith("_") or name == "in_flight_refs":
+            continue
+        if not inspect.isfunction(obj):
+            continue
+        doc = (obj.__doc__ or "").lower()
+        if "admission count" not in doc and "occupy a concurrency slot" not in doc:
+            continue
+        # A bare classify-state list is the signature that cannot carry
+        # liveness. ``can_dispatch`` claims the count in prose but takes an
+        # int, so it compares a total rather than deriving one.
+        takes_bare_states = any(
+            "list[str]" in str(param.annotation)
+            for param in inspect.signature(obj).parameters.values()
+        )
+        if takes_bare_states:
+            offenders.append(name)
+
+    assert not offenders, (
+        f"{offenders} advertise themselves as the admission count but take "
+        "classify states alone, so they cannot represent a live process "
+        "group; in_flight_refs is the only admission contract"
+    )
+
+
+def test_cli_exposes_no_label_union_admission_subcommand(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The operator CLI must not offer the retired union calculator."""
+    with pytest.raises(SystemExit):
+        pipeline.main(["dispatch-admission", "--max", "3"])
+
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_cli_reconcile_dispatch_emits_action(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps(marker(pr_number=7, pre_label="ai:revised")))
+    rc = pipeline.main(
+        [
+            "reconcile-dispatch",
+            "--dispatch",
+            str(dispatch),
+            "--pr",
+            "7",
+            "--current-label",
+            "ai:reviewing",
+            "--classify-state",
+            "stale",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "revert"
+    assert out["label"] == "ai:revised"
+
+
+def test_cli_reconcile_dispatch_missing_marker_is_non_destructive(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # An ai:reviewing PR whose marker file is absent must not crash — and must
+    # not act, since a missing marker proves nothing about custody.
+    rc = pipeline.main(
+        [
+            "reconcile-dispatch",
+            "--dispatch",
+            str(tmp_path / "nope.json"),
+            "--current-label",
+            "ai:reviewing",
+            "--classify-state",
+            "",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "noop"
+    assert out["label"] == ""
+
+
+# --- review-revision hardening (consolidated review pass) ---
+
+
+def test_reconcile_escalates_launching_in_custody() -> None:
+    # A launching lease observed on a later tick means the spawn crashed
+    # mid-flight. Unlike a markerless item this is proven custody — our own
+    # marker — and we cannot prove whether a paid engine is live, so never
+    # re-dispatch (that would double-spend). Money may be burning, which is a
+    # genuine call for the operator.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="launching",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == pipeline.LABEL_NEEDS_HUMAN
+
+
+def test_reconcile_cleans_up_launching_when_human_took_over() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:ready-for-human",
+        marker_valid=True,
+        classify_state="launching",
+        pre_label="ai:implemented",
+    )
+    assert d["action"] == "cleanup"
+
+
+def test_reconcile_reverts_stale_under_attempt_cap() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:implemented",
+        dispatch_attempts=1,
+        attempt_threshold=3,
+    )
+    assert d["action"] == "revert"
+
+
+def test_reconcile_escalates_stale_at_attempt_cap() -> None:
+    # A repeatable resultless failure (codex/API crash that never posts a comment) must
+    # not re-dispatch forever — the comment-based round cap never counts it. Once the
+    # durable attempt count would reach the cap, escalate instead of reverting.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:implemented",
+        dispatch_attempts=2,
+        attempt_threshold=3,
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+
+
+def test_decide_escalates_on_malformed_review() -> None:
+    # Invalid reviewer output (verdict=None) must not be routed into the paid fix loop
+    # as changes_requested with no findings — escalate to a human instead.
+    d = pipeline.decide_review_harvest(
+        review_obj={"garbage": True},
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["post_comment"] is False
+
+
+def test_decide_escalates_changes_requested_with_no_blocking_findings() -> None:
+    # changes_requested with only minor (or empty) findings contradicts the repo rule
+    # that nits alone do not warrant changes — escalate rather than dispatch a fixer
+    # with nothing actionable to fix.
+    review = {"verdict": "changes_requested", "findings": [
+        {"severity": "minor", "file": "a.py", "summary": "nit"}
+    ]}
+    d = pipeline.decide_review_harvest(
+        review_obj=review,
+        comments=[],
+        pinned_base="b1",
+        current_base="b1",
+        pinned_head="h1",
+        current_head="h1",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["post_comment"] is False
+
+
+def test_in_flight_refs_preserves_kind_and_stage_identity() -> None:
+    """Admission dedupes only the same dispatch identity."""
+    markers = [
+        ("issue", 42, "ai:implementing", "live", True),
+        ("pr", 42, "ai:reviewing", "hung", True),
+        ("pr", 42, "ai:fixing", "live", True),
+    ]
+
+    refs = pipeline.in_flight_refs(markers)
+
+    assert refs == {
+        ("issue", 42, "ai:implementing"),
+        ("pr", 42, "ai:reviewing"),
+        ("pr", 42, "ai:fixing"),
+    }
+
+
+def test_in_flight_refs_ignores_items_with_no_local_marker() -> None:
+    """Occupancy comes from markers alone — a label cannot add a slot.
+
+    ``ai:implementing`` is a shared workflow state contributors set by hand,
+    so counting it as a paid engine let stale manual pickups starve dispatch
+    permanently (#534, and again on 2026-08-20).
+    """
+    assert pipeline.in_flight_refs([]) == set()
+
+
+def test_in_flight_refs_counts_a_finished_marker_whose_group_still_lives() -> None:
+    """A live group occupies a slot whatever the classify state says.
+
+    A wrapper that published its envelope while a child still runs
+    classifies ``complete`` — outside ENGINE_OCCUPIED_STATES — but is still
+    spending and still owes the pipeline an archive or a kill.
+    """
+    refs = pipeline.in_flight_refs([("pr", 42, "ai:reviewing", "complete", True)])
+
+    assert refs == {("pr", 42, "ai:reviewing")}
+
+
+def test_in_flight_refs_ignores_a_finished_marker_whose_group_is_dead() -> None:
+    """A finished, dead engine spends nothing and holds no slot."""
+    assert pipeline.in_flight_refs(
+        [("pr", 42, "ai:reviewing", "complete", False)]
+    ) == set()
+
+
+def test_cadence_names_human_custody_when_wedged_at_the_admission_cap() -> None:
+    """A loop that cannot dispatch must say why, not just when it wakes.
+
+    Every occupied slot held by a human is discounted from ``in_flight_count``,
+    so this tick looks like an ordinary warm poll: 0 in flight, queue non-empty.
+    Admission is in fact saturated and no tick can dispatch until the operator
+    acts, and the reason line is the only thing the one-shot ``/loop`` path
+    reports.
+    """
+    decision = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+        held_items=("pr #41 (ai:needs-human-decision)", "pr #42 (ai:blocked)"),
+    )
+
+    assert decision.stop is False
+    assert decision.reason == (
+        "actionable queue non-empty → wake 270s"
+        "; awaiting human decision: pr #41 (ai:needs-human-decision), "
+        "pr #42 (ai:blocked)"
+    )
+
+
+def test_cadence_omits_custody_suffix_when_nothing_is_held() -> None:
+    """The suffix is evidence, not decoration — no holds, no suffix."""
+    decision = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+
+    assert decision.reason == "actionable queue non-empty → wake 270s"
+
+
+def test_can_dispatch_respects_cap() -> None:
+    assert pipeline.can_dispatch(in_flight=2, max_in_flight=3) is True
+    assert pipeline.can_dispatch(in_flight=3, max_in_flight=3) is False
+    assert pipeline.can_dispatch(in_flight=4, max_in_flight=3) is False
+
+
+def test_valid_marker_rejects_empty_and_partial() -> None:
+    assert pipeline.valid_marker({}) is False
+    assert pipeline.valid_marker({"stage": "review"}) is False
+    assert pipeline.valid_marker("not a dict") is False
+
+
+def test_valid_marker_accepts_full_and_launching_lease() -> None:
+    assert pipeline.valid_marker(marker()) is True
+    assert pipeline.valid_marker(lease()) is True
+
+
+def test_valid_marker_rejects_wrong_field_types() -> None:
+    # bool is an int subclass; a boolean pr_number/pid must not pass the int check.
+    assert pipeline.valid_marker(marker(pr_number=True)) is False
+    assert pipeline.valid_marker(marker(pid=True)) is False
+    # A string pid (or any non-int) is not a handle kill -0 can use.
+    assert pipeline.valid_marker(marker(pid="5")) is False
+    # A non-positive pid is never a real process handle.
+    assert pipeline.valid_marker(marker(pid=0)) is False
+    # A non-numeric deadline crashes classify-dispatch downstream — reject it here.
+    assert pipeline.valid_marker(marker(deadline="soon")) is False
+
+
+def test_valid_marker_rejects_unknown_stage_and_state() -> None:
+    # An unknown stage is not a marker this pipeline ever writes.
+    assert pipeline.valid_marker(marker(stage="bogus")) is False
+    # A lease must carry the one known lease state, not arbitrary text.
+    assert pipeline.valid_marker(lease(state="anything")) is False
+
+
+def test_valid_marker_rejects_unknown_engine() -> None:
+    assert pipeline.valid_marker(marker(engine="unknown-provider")) is False
+
+
+def test_valid_marker_rejects_non_finite_deadline() -> None:
+    # json.loads accepts NaN/Infinity, and both pass a naive isinstance(float) check.
+    # A NaN deadline makes `now > deadline` always False, so a live engine could never
+    # time out (never `hung`); an infinite deadline is equally untrustworthy. Reject.
+    assert pipeline.valid_marker(marker(deadline=float("nan"))) is False
+    assert pipeline.valid_marker(marker(deadline=float("inf"))) is False
+
+
+def test_valid_marker_requires_exactly_one_ownership_signal() -> None:
+    # A published marker carries a pid and NO state; a lease carries state and NO pid.
+    # A marker with BOTH is corrupt: classify would read `launching` (from state) and
+    # reconcile would escalate WITHOUT killing the live pid, leaking a paid process.
+    assert pipeline.valid_marker(marker(state="launching")) is False
+    # A pid present alongside an INVALID state must not be masked by the valid pid.
+    assert pipeline.valid_marker(marker(state="bogus")) is False
+    # Neither signal present → not an in-flight dispatch.
+    bare = marker()
+    del bare["pid"]
+    assert pipeline.valid_marker(bare) is False
+
+
+def test_valid_marker_cross_checks_pr_and_stage() -> None:
+    m = marker(pr_number=2)
+    # Matching identity passes.
+    assert pipeline.valid_marker(m, expected_pr=2, expected_stage="review") is True
+    # A marker for a different PR must never be trusted for this directory's PR.
+    assert pipeline.valid_marker(m, expected_pr=3, expected_stage="review") is False
+    # A marker for a different stage must not drive this stage's reconciliation.
+    assert pipeline.valid_marker(m, expected_pr=2, expected_stage="fix") is False
+
+
+def test_valid_marker_rejects_arbitrary_pre_label() -> None:
+    # The marker's pre_label flows straight into reconciliation as the stale-revert
+    # target. A corrupt marker naming a terminal label (here ai:ready-for-human) would
+    # otherwise let a dead, resultless dispatch silently "promote" the PR. Only the two
+    # real pre-dispatch labels are trusted.
+    assert pipeline.valid_marker(marker(pre_label="ai:ready-for-human")) is False
+    assert pipeline.valid_marker(marker(pre_label="ai:implemented")) is True
+    assert pipeline.valid_marker(marker(pre_label="ai:revised")) is True
+
+
+def test_valid_marker_requires_full_provenance_field_set() -> None:
+    # A published marker must carry the full identity + provenance set recovery acts on;
+    # a marker missing any of them is not a trustworthy dispatch record. Each omission
+    # has a concrete failure mode (a missing head_sha disables the head-drift guard, a
+    # missing deadline misclassifies a live engine as hung, a missing pre_label has no
+    # revert target), so all are required, not optional.
+    for field in ("engine", "stage", "pr_number", "deadline", "base_ref", "base_sha",
+                  "head_sha", "pre_label"):
+        m = marker()
+        del m[field]
+        assert pipeline.valid_marker(m) is False, f"missing {field} must fail closed"
+
+
+def test_valid_marker_rejects_unknown_fields() -> None:
+    # A marker carrying a field this pipeline never writes did not come from its writer;
+    # do not partially trust it.
+    assert pipeline.valid_marker(marker(surprise="x")) is False
+
+
+def test_valid_marker_validates_base_tip_sha_as_provenance() -> None:
+    # base_tip_sha is the anti-stale-promotion freshness anchor: if present it must be
+    # a canonical full commit OID, not merely allowlisted. A mistyped/malformed value
+    # would make harvest silently fall back to base_sha (the merge-base), gutting the
+    # drift guard precisely at the field added to strengthen it.
+    good_oid = "a" * 40
+    assert pipeline.valid_marker(marker(base_tip_sha=good_oid)) is True
+    assert pipeline.valid_marker(marker(base_tip_sha=7)) is False
+    assert pipeline.valid_marker(marker(base_tip_sha="")) is False
+    assert pipeline.valid_marker(marker(base_tip_sha="not-a-sha")) is False
+    assert pipeline.valid_marker(marker(base_tip_sha="A" * 40)) is False
+    assert pipeline.valid_marker(marker(base_tip_sha="a" * 39)) is False
+
+
+def test_valid_marker_rejects_base_tip_sha_on_non_review_stages() -> None:
+    # Only reviewer dispatch writes base_tip_sha; an implement/fix marker carrying it
+    # did not come from this pipeline's writer for that stage.
+    good_oid = "b" * 40
+    assert pipeline.valid_marker(impl_marker(base_tip_sha=good_oid)) is False
+    assert pipeline.valid_marker(fix_marker(base_tip_sha=good_oid)) is False
+
+
+def test_valid_marker_validates_pr_body_revision_provenance() -> None:
+    # The fixer's PR-body revision is gated on this block: the digest decides
+    # whether the live body still matches what dispatch handed the engine, the
+    # closure fields decide whether a replacement kept the issues merging will
+    # close, and the truncation flag decides whether the engine saw enough of
+    # the body to replace it at all. A mistyped digest reads as "somebody edited
+    # the body" and disables the replacement silently; a mistyped closure set
+    # rejects every candidate. The block is optional (markers predating the path
+    # omit it) and fully typed when present.
+    assert pipeline.valid_marker(fix_marker(pr_body=body_provenance())) is True
+    assert pipeline.valid_marker(
+        fix_marker(pr_body=body_provenance(closes=[])),
+    ) is True
+    for bad in [
+        {"digest": ""},
+        {"digest": "a" * 63},
+        {"digest": "A" * 64},
+        {"digest": 7},
+        {"summary_closes": 0},
+        {"summary_closes": True},
+        {"summary_closes": "7"},
+        {"closes": 7},
+        {"closes": [7]},
+        {"closes": [""]},
+        {"truncated": "no"},
+        {"truncated": 0},
+    ]:
+        assert pipeline.valid_marker(
+            fix_marker(pr_body=body_provenance(**bad)),
+        ) is False, f"a marker with {bad} in its pr_body block was trusted"
+    assert pipeline.valid_marker(fix_marker(pr_body="a" * 64)) is False
+    assert pipeline.valid_marker(fix_marker(pr_body=None)) is False
+
+
+def test_valid_marker_rejects_a_partial_pr_body_provenance_block() -> None:
+    # Dispatch writes all four fields together, so a block missing one is
+    # corruption rather than a marker from before the revision path — and the
+    # difference matters: a legacy marker is trusted for everything else it
+    # carries, while a corrupt one must not be. Accepting a partial block would
+    # let the harvest judge a candidate against half a contract, publish an
+    # irreversible body edit, relabel, and then clean the only evidence.
+    for missing in ("digest", "summary_closes", "closes", "truncated"):
+        partial = body_provenance()
+        del partial[missing]
+        assert pipeline.valid_marker(fix_marker(pr_body=partial)) is False, (
+            f"a pr_body block missing {missing!r} was trusted as complete"
+        )
+    surplus = body_provenance()
+    surplus["closing_issues"] = [7]
+    assert pipeline.valid_marker(fix_marker(pr_body=surplus)) is False
+
+
+def test_valid_marker_rejects_body_revision_fields_on_non_fix_stages() -> None:
+    # Only fixer dispatch reads a PR body and writes this. A review or
+    # implement marker carrying it did not come from this pipeline's writer
+    # for that stage.
+    assert pipeline.valid_marker(marker(pr_body=body_provenance())) is False
+    assert pipeline.valid_marker(impl_marker(pr_body=body_provenance())) is False
+
+
+def test_valid_marker_requires_string_refs_and_shas() -> None:
+    assert pipeline.valid_marker(marker(base_ref=123)) is False
+    assert pipeline.valid_marker(marker(base_sha="")) is False
+    assert pipeline.valid_marker(marker(head_sha=None)) is False
+    assert pipeline.valid_marker(marker(engine="")) is False
+
+
+def test_cli_reconcile_dispatch_ignores_an_arbitrary_pre_label(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # End-to-end of the demonstrated probe: a stale dispatch whose marker carries a
+    # bogus pre_label must NOT return label=ai:ready-for-human. The strengthened
+    # valid_marker rejects the marker, so the forged label is never applied — the
+    # decision falls through to the markerless branch, which acts on nothing.
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(
+        json.dumps(
+            {
+                "engine": "codex",
+                "stage": "review",
+                "pr_number": 7,
+                "pid": 1,
+                "deadline": 50,
+                "base_ref": "main",
+                "base_sha": "b1",
+                "head_sha": "h1",
+                "pre_label": "ai:ready-for-human",
+            }
+        )
+    )
+    rc = pipeline.main(
+        [
+            "reconcile-dispatch",
+            "--dispatch",
+            str(dispatch),
+            "--pr",
+            "7",
+            "--current-label",
+            "ai:reviewing",
+            "--classify-state",
+            "stale",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "noop"
+    assert out["label"] != "ai:ready-for-human"
+
+
+def test_cli_validate_marker_reports_validity(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps(marker(pr_number=9)))
+    rc = pipeline.main(
+        ["validate-marker", "--dispatch", str(dispatch), "--pr", "9", "--stage", "review"]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+
+
+def test_cli_validate_marker_fails_closed_on_pr_mismatch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps(marker(pr_number=9)))
+    rc = pipeline.main(
+        ["validate-marker", "--dispatch", str(dispatch), "--pr", "10", "--stage", "review"]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+# --- CLI: harvest-implementation ---
+
+
+def test_cli_harvest_implementation_emits_create_pr(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(impl_complete_result()))
+    rc = pipeline.main(
+        ["harvest-implementation", "--result", str(result), "--pre-label", "ai:available"]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "create_pr"
+    assert out["sentinel"] == "IMPLEMENTATION_COMPLETE"
+
+
+def test_cli_harvest_implementation_escalates_on_needs_human(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(impl_needs_human_result()))
+    rc = pipeline.main(
+        ["harvest-implementation", "--result", str(result), "--pre-label", "ai:available"]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "escalate"
+    assert out["label"] == "ai:needs-human-decision"
+
+
+def test_cli_harvest_implementation_escalates_on_missing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = pipeline.main(
+        [
+            "harvest-implementation",
+            "--result",
+            str(tmp_path / "nope.json"),
+            "--pre-label",
+            "ai:available",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "escalate"
+    assert out["sentinel"] is None
+
+
+def test_cli_validate_marker_fails_closed_on_missing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = pipeline.main(
+        ["validate-marker", "--dispatch", str(tmp_path / "nope.json"), "--pr", "1"]
+    )
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+# --- parse_implementation_result ---
+
+
+def test_parse_implementation_result_extracts_complete_sentinel() -> None:
+    result = {"result": "All done. IMPLEMENTATION_COMPLETE", "is_error": False}
+    assert pipeline.parse_implementation_result(result) == "IMPLEMENTATION_COMPLETE"
+
+
+def test_parse_implementation_result_extracts_needs_human_sentinel() -> None:
+    result = {"result": "Blocked on design. NEEDS_HUMAN_DECISION", "is_error": False}
+    assert pipeline.parse_implementation_result(result) == "NEEDS_HUMAN_DECISION"
+
+
+def test_parse_implementation_result_returns_none_when_no_sentinel() -> None:
+    result = {"result": "I did some stuff but forgot the sentinel.", "is_error": False}
+    assert pipeline.parse_implementation_result(result) is None
+
+
+def test_parse_implementation_result_returns_none_for_non_dict() -> None:
+    assert pipeline.parse_implementation_result("not a dict") is None
+    assert pipeline.parse_implementation_result(None) is None
+
+
+def test_parse_implementation_result_returns_none_for_missing_result_key() -> None:
+    assert pipeline.parse_implementation_result({"output": "IMPLEMENTATION_COMPLETE"}) is None
+
+
+def test_parse_implementation_result_returns_none_for_non_string_result() -> None:
+    assert pipeline.parse_implementation_result({"result": 42}) is None
+
+
+def test_parse_implementation_result_prefers_last_sentinel_on_multiple() -> None:
+    result = {
+        "result": "NEEDS_HUMAN_DECISION ... actually fixed it. IMPLEMENTATION_COMPLETE",
+        "is_error": False,
+    }
+    assert pipeline.parse_implementation_result(result) == "IMPLEMENTATION_COMPLETE"
+
+
+# --- valid_marker: implement stage ---
+
+
+def test_valid_marker_accepts_implement_stage_marker() -> None:
+    m = impl_marker()
+    assert pipeline.valid_marker(m) is True
+
+
+def test_valid_marker_accepts_implement_stage_lease() -> None:
+    m = impl_lease()
+    assert pipeline.valid_marker(m) is True
+
+
+def test_valid_marker_rejects_implement_marker_with_review_pre_label() -> None:
+    m = impl_marker(pre_label="ai:implemented")
+    assert pipeline.valid_marker(m) is False
+
+
+def test_valid_marker_rejects_review_marker_with_implement_pre_label() -> None:
+    m = marker(pre_label="ai:available")
+    assert pipeline.valid_marker(m) is False
+
+
+def test_valid_marker_cross_checks_implement_stage() -> None:
+    m = impl_marker(pr_number=5)
+    assert pipeline.valid_marker(m, expected_pr=5, expected_stage="implement") is True
+    assert pipeline.valid_marker(m, expected_stage="review") is False
+
+
+def test_valid_marker_accepts_implement_marker_with_claude_ds_engine() -> None:
+    """``claude-ds`` is a valid engine value for implement-stage markers."""
+    assert pipeline.valid_marker(impl_marker(engine="claude-ds"),
+                                 expected_stage="implement") is True
+
+
+def test_valid_marker_accepts_implement_lease_with_claude_ds_engine() -> None:
+    """``claude-ds`` is a valid engine value for implement-stage leases."""
+    assert pipeline.valid_marker(impl_lease(engine="claude-ds"),
+                                 expected_stage="implement") is True
+
+
+# --- reconcile_dispatch: implement stage ---
+
+
+def test_reconcile_leaves_manually_claimed_implementing_issue_alone() -> None:
+    # CLAUDE.md tells contributors to set ai:implementing by hand before
+    # writing code. A tick that cannot see a marker for it must leave it be.
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:implementing",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:available",
+        in_flight_label="ai:implementing",
+    )
+    assert d["action"] == "noop"
+    assert d["label"] == ""
+
+
+def test_reconcile_noops_on_markerless_implementing_issue() -> None:
+    # The documented manual pickup puts an issue here by hand; a missing
+    # marker must never move it (issue #592).
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:implementing",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:available",
+        in_flight_label="ai:implementing",
+    )
+    assert d["action"] == "noop"
+    assert d["label"] == ""
+
+
+def test_reconcile_harvests_completed_implement_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:implementing",
+        marker_valid=True,
+        classify_state="complete",
+        pre_label="ai:available",
+        in_flight_label="ai:implementing",
+    )
+    assert d["action"] == "harvest"
+
+
+def test_reconcile_reverts_stale_implement_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:implementing",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:available",
+        in_flight_label="ai:implementing",
+    )
+    assert d["action"] == "revert"
+    assert d["label"] == "ai:available"
+
+
+# --- decide_implementation_harvest ---
+
+
+def test_decide_implementation_harvest_creates_pr_on_complete() -> None:
+    d = pipeline.decide_implementation_harvest(
+        result_obj=impl_complete_result(),
+        pre_label="ai:available",
+    )
+    assert d["action"] == "create_pr"
+    assert d["sentinel"] == "IMPLEMENTATION_COMPLETE"
+
+
+def test_decide_implementation_harvest_escalates_on_needs_human() -> None:
+    d = pipeline.decide_implementation_harvest(
+        result_obj=impl_needs_human_result(),
+        pre_label="ai:available",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] == "NEEDS_HUMAN_DECISION"
+
+
+def test_decide_implementation_harvest_retries_session_limit() -> None:
+    d = pipeline.decide_implementation_harvest(
+        result_obj={
+            "result": "You've hit your session limit · resets 2:40am Europe/London",
+        },
+        pre_label="ai:available",
+    )
+
+    assert d == {
+        "action": "retry",
+        "label": "ai:available",
+        "sentinel": None,
+        "failure_class": "quota_or_limit",
+    }
+
+
+def test_decide_implementation_harvest_sentinel_precedes_transient_fields() -> None:
+    """A completed implementation is not requeued for surrounding limit prose."""
+    d = pipeline.decide_implementation_harvest(
+        result_obj={
+            "result": "IMPLEMENTATION_COMPLETE\nHandled rate limit exceeded errors.",
+            "api_error_status": 429,
+        },
+        pre_label="ai:available",
+    )
+
+    assert d["action"] == "create_pr"
+    assert d["sentinel"] == "IMPLEMENTATION_COMPLETE"
+
+
+def test_classify_engine_result_failure_recognizes_status_429() -> None:
+    assert pipeline.classify_engine_result_failure(
+        {"result": "request failed", "api_error_status": 429},
+    ) == "quota_or_limit"
+
+
+def test_classify_engine_result_failure_does_not_use_is_error_alone() -> None:
+    assert pipeline.classify_engine_result_failure(
+        {"result": "provider request failed", "is_error": True},
+    ) is None
+
+
+@pytest.mark.parametrize(
+    "subtype",
+    ["rate_limit_error", "quota_exceeded", "usage_limit_error"],
+)
+def test_classify_engine_result_failure_recognizes_limit_subtype(
+    subtype: str,
+) -> None:
+    assert pipeline.classify_engine_result_failure(
+        {"result": "request failed", "subtype": subtype},
+    ) == "quota_or_limit"
+
+
+def test_classify_engine_result_failure_recognizes_quota_phrase() -> None:
+    assert pipeline.classify_engine_result_failure(
+        {"result": "API quota exceeded for this billing period"},
+    ) == "quota_or_limit"
+
+
+@pytest.mark.parametrize(
+    "result_text",
+    ["Usage limit reached", "Rate limit exceeded; retry later"],
+)
+def test_classify_engine_result_failure_recognizes_limit_phrase_variants(
+    result_text: str,
+) -> None:
+    assert pipeline.classify_engine_result_failure(
+        {"result": result_text},
+    ) == "quota_or_limit"
+
+
+def test_decide_implementation_harvest_escalates_on_missing_sentinel() -> None:
+    d = pipeline.decide_implementation_harvest(
+        result_obj={"result": "no sentinel here"},
+        pre_label="ai:available",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] is None
+
+
+def test_decide_implementation_harvest_escalates_on_unparseable_result() -> None:
+    d = pipeline.decide_implementation_harvest(
+        result_obj=None,
+        pre_label="ai:available",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] is None
+
+
+# --- validate_completion_envelope ---
+
+
+def test_validate_envelope_accepts_valid_success() -> None:
+    assert pipeline.validate_completion_envelope(envelope()) is True
+
+
+def test_validate_envelope_rejects_non_zero_exit() -> None:
+    assert pipeline.validate_completion_envelope(envelope(exit_status=1)) is False
+
+
+def test_validate_failure_envelope_accepts_bound_nonzero_invalid_result() -> None:
+    assert pipeline.validate_failure_envelope(
+        envelope(
+            dispatch_id="d1",
+            exit_status=1,
+            result_valid=False,
+            error_class="EngineExitError",
+        ),
+        expected_dispatch_id="d1",
+    ) is True
+
+
+@pytest.mark.parametrize(
+    "overrides,remove_field",
+    [
+        ({"dispatch_id": "other", "exit_status": 1, "result_valid": False,
+          "error_class": "EngineExitError"}, None),
+        ({"dispatch_id": "d1", "exit_status": 0, "result_valid": False,
+          "error_class": "EngineExitError"}, None),
+        ({"dispatch_id": "d1", "exit_status": 1, "result_valid": True,
+          "error_class": "EngineExitError"}, None),
+        ({"dispatch_id": "d1", "exit_status": 1, "result_valid": False,
+          "error_class": "EngineExitError"}, "wrapper_pid"),
+        ({"dispatch_id": "d1", "exit_status": 1, "result_valid": False}, None),
+        ({"dispatch_id": "d1", "exit_status": 1, "result_valid": False,
+          "error_class": ""}, None),
+    ],
+)
+def test_validate_failure_envelope_rejects_mismatched_or_malformed(
+    overrides: dict[str, object],
+    remove_field: str | None,
+) -> None:
+    failure_envelope = envelope(**overrides)
+    if remove_field is not None:
+        del failure_envelope[remove_field]
+    assert pipeline.validate_failure_envelope(
+        failure_envelope,
+        expected_dispatch_id="d1",
+    ) is False
+
+
+def test_success_envelope_rejects_failure_error_class() -> None:
+    assert pipeline.validate_completion_envelope(
+        envelope(error_class="EngineExitError"),
+    ) is False
+
+
+def test_validate_envelope_rejects_missing_fields() -> None:
+    for field in ("dispatch_id", "exit_status", "wrapper_pid", "start_time"):
+        e = envelope()
+        del e[field]
+        assert pipeline.validate_completion_envelope(e) is False, f"missing {field}"
+
+
+def test_validate_envelope_rejects_wrong_dispatch_id() -> None:
+    assert pipeline.validate_completion_envelope(
+        envelope(), expected_dispatch_id="other-id"
+    ) is False
+
+
+def test_validate_envelope_accepts_matching_dispatch_id() -> None:
+    assert pipeline.validate_completion_envelope(
+        envelope(dispatch_id="d1"), expected_dispatch_id="d1"
+    ) is True
+
+
+def test_validate_envelope_rejects_exit_zero_with_invalid_result() -> None:
+    """An envelope with exit_status=0 but result_valid=False must not validate."""
+    assert pipeline.validate_completion_envelope(envelope(result_valid=False)) is False
+
+
+def test_validate_envelope_rejects_missing_result_valid() -> None:
+    """An envelope missing the result_valid field is structurally incomplete."""
+    e = envelope()
+    del e["result_valid"]
+    assert pipeline.validate_completion_envelope(e) is False
+
+
+def test_validate_envelope_rejects_non_dict() -> None:
+    assert pipeline.validate_completion_envelope("not a dict") is False
+    assert pipeline.validate_completion_envelope(None) is False
+
+
+def test_validate_envelope_rejects_bool_exit_status() -> None:
+    """False == 0 in Python, so a bool exit_status must be rejected explicitly."""
+    assert pipeline.validate_completion_envelope(envelope(exit_status=False)) is False
+    assert pipeline.validate_completion_envelope(envelope(exit_status=True)) is False
+
+
+def test_validate_envelope_rejects_bool_wrapper_pid() -> None:
+    """A boolean wrapper_pid is not a real process handle."""
+    assert pipeline.validate_completion_envelope(envelope(wrapper_pid=False)) is False
+    assert pipeline.validate_completion_envelope(envelope(wrapper_pid=True)) is False
+
+
+def test_validate_envelope_rejects_non_positive_wrapper_pid() -> None:
+    assert pipeline.validate_completion_envelope(envelope(wrapper_pid=0)) is False
+    assert pipeline.validate_completion_envelope(envelope(wrapper_pid=-1)) is False
+    assert pipeline.validate_completion_envelope(envelope(wrapper_pid="5")) is False
+
+
+def test_validate_envelope_rejects_non_numeric_start_time() -> None:
+    assert pipeline.validate_completion_envelope(envelope(start_time="not-a-time")) is False
+    assert pipeline.validate_completion_envelope(envelope(start_time=False)) is False
+    assert pipeline.validate_completion_envelope(envelope(start_time=True)) is False
+
+
+def test_validate_envelope_rejects_non_finite_start_time() -> None:
+    assert pipeline.validate_completion_envelope(envelope(start_time=float("nan"))) is False
+    assert pipeline.validate_completion_envelope(envelope(start_time=float("inf"))) is False
+
+
+def test_validate_envelope_rejects_unknown_keys() -> None:
+    e = envelope(surprise="x")
+    assert pipeline.validate_completion_envelope(e) is False
+
+
+# --- verify_process_identity ---
+
+
+def test_verify_identity_matches_same_start_time() -> None:
+    assert pipeline.verify_process_identity(1000.5, 1000.5) == "matched"
+
+
+def test_verify_identity_rejects_pid_reuse() -> None:
+    assert pipeline.verify_process_identity(1000.5, 2000.0) == "mismatched"
+
+
+def test_verify_identity_returns_unknown_for_none_live_start() -> None:
+    assert pipeline.verify_process_identity(1000.5, None) == "unknown"
+
+
+def test_verify_identity_tolerates_small_clock_skew() -> None:
+    assert pipeline.verify_process_identity(1000.5, 1001.0, tolerance=2.0) == "matched"
+    assert pipeline.verify_process_identity(1000.5, 1003.0, tolerance=2.0) == "mismatched"
+
+
+# --- valid_marker: dispatch_id + process identity ---
+
+
+def test_valid_marker_accepts_owned_marker_with_identity() -> None:
+    assert pipeline.valid_marker(owned_marker()) is True
+
+
+def test_valid_marker_accepts_owned_lease_with_dispatch_id() -> None:
+    assert pipeline.valid_marker(owned_lease()) is True
+
+
+def test_valid_marker_requires_dispatch_id() -> None:
+    m = owned_marker()
+    del m["dispatch_id"]
+    assert pipeline.valid_marker(m) is False
+
+
+def test_valid_marker_rejects_empty_dispatch_id() -> None:
+    assert pipeline.valid_marker(owned_marker(dispatch_id="")) is False
+
+
+def test_valid_marker_requires_start_time_with_pid() -> None:
+    m = owned_marker()
+    del m["start_time"]
+    assert pipeline.valid_marker(m) is False
+
+
+def test_valid_marker_requires_pgid_with_pid() -> None:
+    m = owned_marker()
+    del m["pgid"]
+    assert pipeline.valid_marker(m) is False
+
+
+def test_valid_marker_rejects_start_time_on_lease() -> None:
+    assert pipeline.valid_marker(owned_lease(start_time=1000.0)) is False
+
+
+def test_valid_marker_rejects_pgid_on_lease() -> None:
+    assert pipeline.valid_marker(owned_lease(pgid=5)) is False
+
+
+def test_valid_marker_rejects_non_finite_start_time() -> None:
+    assert pipeline.valid_marker(owned_marker(start_time=float("nan"))) is False
+    assert pipeline.valid_marker(owned_marker(start_time=float("inf"))) is False
+
+
+def test_valid_marker_rejects_non_positive_pgid() -> None:
+    assert pipeline.valid_marker(owned_marker(pgid=0)) is False
+    assert pipeline.valid_marker(owned_marker(pgid=-1)) is False
+
+
+def test_valid_marker_rejects_bool_pgid() -> None:
+    assert pipeline.valid_marker(owned_marker(pgid=True)) is False
+
+
+# --- CLI: validate-envelope ---
+
+
+def test_cli_validate_envelope_reports_valid(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = tmp_path / "completion.json"
+    env_file.write_text(json.dumps(envelope()))
+    rc = pipeline.main(["validate-envelope", "--envelope", str(env_file)])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is True
+
+
+def test_cli_validate_envelope_checks_dispatch_id(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env_file = tmp_path / "completion.json"
+    env_file.write_text(json.dumps(envelope(dispatch_id="d1")))
+    rc = pipeline.main([
+        "validate-envelope", "--envelope", str(env_file), "--dispatch-id", "d2"
+    ])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+def test_cli_validate_envelope_missing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = pipeline.main(["validate-envelope", "--envelope", str(tmp_path / "nope.json")])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["valid"] is False
+
+
+# --- CLI: verify-identity ---
+
+
+def test_cli_verify_identity_matching(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = pipeline.main([
+        "verify-identity", "--recorded-start", "1000.0", "--live-start", "1000.0"
+    ])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["identity"] == "matched"
+
+
+def test_cli_verify_identity_reused_pid(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = pipeline.main([
+        "verify-identity", "--recorded-start", "1000.0", "--live-start", "2000.0"
+    ])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["identity"] == "mismatched"
+
+
+def test_cli_verify_identity_missing_process(capsys: pytest.CaptureFixture[str]) -> None:
+    rc = pipeline.main([
+        "verify-identity", "--recorded-start", "1000.0", "--live-start", "-1"
+    ])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["identity"] == "unknown"
+
+
+# --- CLI: classify-dispatch with envelope ---
+
+
+def test_cli_classify_dispatch_with_envelope_and_result(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dispatch = tmp_path / "dispatch.json"
+    dispatch.write_text(json.dumps({"pid": 1, "deadline": 50}))
+    rc = pipeline.main([
+        "classify-dispatch",
+        "--dispatch", str(dispatch),
+        "--now", "10",
+        "--pid-alive", "1",
+        "--result-exists", "1",
+        "--envelope-valid", "1",
+    ])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["state"] == "complete"
+
+
+# --- classify_dispatch with envelope ---
+
+
+def test_classify_not_complete_when_envelope_valid_but_result_missing() -> None:
+    """A valid envelope without the result file is not harvestable — treat as stale."""
+    assert pipeline.classify_dispatch(
+        now=10, deadline=50, pid_alive=False,
+        result_exists=False, envelope_valid=True,
+    ) == "stale"
+
+
+def test_classify_complete_on_envelope_with_result() -> None:
+    assert pipeline.classify_dispatch(
+        now=10, deadline=50, pid_alive=True,
+        result_exists=True, envelope_valid=True,
+    ) == "complete"
+
+
+def test_classify_complete_on_envelope_even_if_pid_alive() -> None:
+    assert pipeline.classify_dispatch(
+        now=10, deadline=50, pid_alive=True,
+        result_exists=True, envelope_valid=True,
+    ) == "complete"
+
+
+# --- parse_fix_result ---
+
+
+def test_parse_fix_result_extracts_fixes_pushed_sentinel() -> None:
+    result = {"result": "All fixes applied. FIXES_PUSHED_RECHECK_NEEDED", "is_error": False}
+    assert pipeline.parse_fix_result(result) == "FIXES_PUSHED_RECHECK_NEEDED"
+
+
+def test_parse_fix_result_extracts_needs_human_sentinel() -> None:
+    result = {"result": "Finding out of scope. NEEDS_HUMAN_DECISION", "is_error": False}
+    assert pipeline.parse_fix_result(result) == "NEEDS_HUMAN_DECISION"
+
+
+def test_parse_fix_result_returns_none_when_no_sentinel() -> None:
+    result = {"result": "I did some work but forgot the sentinel.", "is_error": False}
+    assert pipeline.parse_fix_result(result) is None
+
+
+def test_parse_fix_result_returns_none_for_non_dict() -> None:
+    assert pipeline.parse_fix_result("not a dict") is None
+    assert pipeline.parse_fix_result(None) is None
+
+
+def test_parse_fix_result_returns_none_for_missing_result_key() -> None:
+    assert pipeline.parse_fix_result({"output": "FIXES_PUSHED_RECHECK_NEEDED"}) is None
+
+
+def test_parse_fix_result_prefers_last_sentinel_on_multiple() -> None:
+    result = {
+        "result": "NEEDS_HUMAN_DECISION ... actually fixed it. FIXES_PUSHED_RECHECK_NEEDED",
+        "is_error": False,
+    }
+    assert pipeline.parse_fix_result(result) == "FIXES_PUSHED_RECHECK_NEEDED"
+
+
+def test_parse_fix_result_does_not_recognise_implementer_sentinel() -> None:
+    result = {"result": "All done. IMPLEMENTATION_COMPLETE", "is_error": False}
+    assert pipeline.parse_fix_result(result) is None
+
+
+# --- decide_fix_harvest ---
+
+
+def test_decide_fix_harvest_rechecks_on_fixes_pushed() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+    )
+    assert d["action"] == "recheck"
+    assert d["label"] == "ai:revised"
+    assert d["sentinel"] == "FIXES_PUSHED_RECHECK_NEEDED"
+
+
+def test_decide_fix_harvest_escalates_on_needs_human() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_needs_human_result(),
+        pre_label="ai:changes-requested",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] == "NEEDS_HUMAN_DECISION"
+
+
+def test_decide_fix_harvest_retries_session_limit() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "You've hit your session limit"},
+        pre_label="ai:changes-requested",
+    )
+
+    assert d == {
+        "action": "retry",
+        "label": "ai:changes-requested",
+        "sentinel": None,
+        "failure_class": "quota_or_limit",
+    }
+
+
+def test_decide_fix_harvest_sentinel_precedes_transient_fields() -> None:
+    """A completed fix remains authoritative over transient-looking metadata."""
+    d = pipeline.decide_fix_harvest(
+        result_obj={
+            "result": "FIXES_PUSHED_RECHECK_NEEDED\nHandled quota exceeded errors.",
+            "subtype": "rate_limit_error",
+        },
+        pre_label="ai:changes-requested",
+    )
+
+    assert d["action"] == "recheck"
+    assert d["sentinel"] == "FIXES_PUSHED_RECHECK_NEEDED"
+
+
+def test_decide_fix_harvest_escalates_on_missing_sentinel() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "no sentinel here"},
+        pre_label="ai:changes-requested",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] is None
+
+
+def test_decide_fix_harvest_escalates_on_unparseable_result() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj=None,
+        pre_label="ai:changes-requested",
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] is None
+
+
+def test_decide_fix_harvest_escalates_when_head_unchanged() -> None:
+    """FIXES_PUSHED with an unchanged live head is contradictory output.
+
+    A fast-forward push always advances the head and force-push is not
+    permitted, so a fixer claiming success while the head equals the
+    dispatch-pinned head cannot have pushed. Trusting the sentinel would
+    relabel to ai:revised and re-enter an identical review round whose
+    comment is replay-suppressed — freezing the comment-derived iteration
+    count below MAX_ITERATIONS and looping spend forever.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="a" * 40,
+    )
+    assert d["action"] == "escalate"
+    assert d["label"] == "ai:needs-human-decision"
+    assert d["sentinel"] == "FIXES_PUSHED_RECHECK_NEEDED"
+    assert d["head_advanced"] is False
+
+
+def test_decide_fix_harvest_rechecks_when_head_advanced() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+    assert d["action"] == "recheck"
+    assert d["label"] == "ai:revised"
+
+
+def test_decide_fix_harvest_head_check_disabled_without_refs() -> None:
+    """Empty pinned or current head disables the push check (legacy markers)."""
+    for pinned, current in (("", "b" * 40), ("a" * 40, ""), ("", "")):
+        d = pipeline.decide_fix_harvest(
+            result_obj=fix_pushed_result(),
+            pre_label="ai:changes-requested",
+            pinned_head=pinned,
+            current_head=current,
+        )
+        assert d["action"] == "recheck", (pinned, current)
+
+
+def test_decide_fix_harvest_head_check_ignores_needs_human() -> None:
+    """The push check gates only the FIXES_PUSHED claim, not other sentinels."""
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_needs_human_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="a" * 40,
+    )
+    assert d["action"] == "escalate"
+    assert d["sentinel"] == "NEEDS_HUMAN_DECISION"
+    assert "head_advanced" not in d
+
+
+def test_decide_fix_harvest_reports_a_published_pr_body_revision() -> None:
+    """A recheck that carried a publishable revision says so in its comment."""
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+        body_revision="ready",
+    )
+
+    assert "- PR body: replaced with the fixer's revision" in str(
+        d["comment_body"],
+    )
+
+
+def test_decide_fix_harvest_withholds_a_revision_from_a_non_recheck() -> None:
+    """A ready revision on any non-recheck outcome reports as not applied.
+
+    The caller publishes the body only on ``recheck``, so a comment that said
+    "replaced" on an escalation would describe a write that never happened —
+    and the escalation is precisely the outcome where the head the replacement
+    describes may not exist.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_needs_human_result(),
+        pre_label="ai:changes-requested",
+        body_revision="ready",
+    )
+
+    assert d["action"] == "escalate"
+    body = str(d["comment_body"])
+    assert "- PR body: left unchanged — the fixer offered a revision" in body
+    assert "replaced with the fixer's revision" not in body
+
+
+@pytest.mark.parametrize("state", ["conflict", "invalid", "unstamped", "unavailable"])
+def test_decide_fix_harvest_states_why_a_revision_was_not_published(
+    state: str,
+) -> None:
+    """Every refusal names a reason a reviewer can act on.
+
+    A body silently left alone is indistinguishable from a pipeline that never
+    looked at it, which is the whole defect this path exists to close.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+        body_revision=state,
+    )
+
+    body = str(d["comment_body"])
+    assert "- PR body: left unchanged — " in body, (
+        f"the {state} outcome published no reason: {body}"
+    )
+    assert "replaced with the fixer's revision" not in body
+
+
+def test_decide_fix_harvest_says_nothing_when_no_revision_was_offered() -> None:
+    """The common run keeps the comment it had before this path existed."""
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    assert "PR body" not in str(d["comment_body"])
+
+
+# --- fixer harvest comment ---
+
+
+def test_decide_fix_harvest_recheck_comment_names_both_heads() -> None:
+    """The recheck comment is self-describing about the push it recorded."""
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "FIXES_PUSHED_RECHECK_NEEDED\nRewired the guard."},
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    assert d["post_comment"] is True
+    body = str(d["comment_body"])
+    assert body.startswith(pipeline.FIX_MARKER)
+    assert f"head `{'a' * 40}` → `{'b' * 40}`" in body
+    assert "`recheck` → `ai:revised`" in body
+    assert "`FIXES_PUSHED_RECHECK_NEEDED`" in body
+
+
+def test_decide_fix_harvest_recheck_comment_states_what_was_fixed() -> None:
+    """A recheck must say what was fixed, not just that a head moved.
+
+    The PR comment is the only surviving record of a successful fixer run: the
+    recheck path does not archive harvest evidence, and its scratch — holding
+    ``result.json`` — is deleted on cleanup. Publishing the bounded engine
+    report here is what makes the run auditable from GitHub at all.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "FIXES_PUSHED_RECHECK_NEEDED\nRewired the guard."},
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    body = str(d["comment_body"])
+    assert "Engine report" in body
+    assert "Rewired the guard." in body
+
+
+@pytest.mark.parametrize(
+    ("stage", "result_obj", "expected"),
+    [
+        (
+            "review",
+            {"verdict": "ready_for_human", "findings": []},
+            "ready_for_human",
+        ),
+        (
+            "implement",
+            {"result": "IMPLEMENTATION_COMPLETE\nCreated PR #42."},
+            "IMPLEMENTATION_COMPLETE",
+        ),
+        (
+            "fix",
+            {"result": "FIXES_PUSHED_RECHECK_NEEDED\nUpdated the guard."},
+            "FIXES_PUSHED_RECHECK_NEEDED",
+        ),
+        ("review", {"verdict": "ready_for_human"}, "unrecognized"),
+        ("fix", {"result": "finished without a sentinel"}, "unrecognized"),
+    ],
+)
+def test_held_completion_outcome_uses_each_stages_validated_protocol(
+    stage: str,
+    result_obj: object,
+    expected: str,
+) -> None:
+    """Held completions name only outcomes trusted by that stage's parser."""
+    assert pipeline.held_completion_outcome(stage, result_obj) == expected
+
+
+def test_held_completion_outcome_refuses_a_stage_with_no_parser() -> None:
+    """An unmapped stage has no validated vocabulary to publish from."""
+    with pytest.raises(ValueError, match="unknown pipeline stage"):
+        pipeline.held_completion_outcome("plan", {"result": "anything"})
+
+
+def test_render_held_completion_comment_names_the_unharvested_outcome() -> None:
+    """The remote record names the result without inventing hold provenance."""
+    body = pipeline.render_held_completion_comment(
+        stage="fix",
+        outcome=pipeline.SENTINEL_FIXES_PUSHED,
+    )
+
+    assert body.startswith(pipeline.ESCALATION_MARKER)
+    assert "workflow hold remains authoritative" in body
+    assert "human" not in body.lower()
+    assert "completed result is not being harvested" in body
+    assert "- Engine outcome: `FIXES_PUSHED_RECHECK_NEEDED`" in body
+    assert "harvest-evidence archive" in body
+
+
+def test_render_held_completion_comment_rejects_cross_stage_outcomes() -> None:
+    """A renderer cannot publish an implementer sentinel as a fixer outcome."""
+    with pytest.raises(ValueError, match="unknown held completion outcome"):
+        pipeline.render_held_completion_comment(
+            stage="fix",
+            outcome=pipeline.SENTINEL_IMPL_COMPLETE,
+        )
+
+
+def test_render_transient_escalation_comment_distinguishes_its_two_causes() -> None:
+    """Each transient terminal transition names the cause that produced it.
+
+    A label that turned red because the engine's quota ran out and one that
+    turned red because the controller could not write its own counter demand
+    different operator responses, so the comment cannot flatten them into one
+    "escalated" line. Only the exhaustion path archives locally, so only it
+    points at the archive.
+    """
+    exhausted = pipeline.render_transient_escalation_comment(
+        stage="fix",
+        outcome=pipeline.OUTCOME_TRANSIENT_EXHAUSTED,
+        failure_class="quota_or_limit",
+        attempts=3,
+        evidence_archived=True,
+    )
+    unwritable = pipeline.render_transient_escalation_comment(
+        stage="implement",
+        outcome=pipeline.OUTCOME_ATTEMPT_STATE_ERROR,
+        failure_class="quota_or_limit",
+    )
+
+    assert exhausted.startswith(pipeline.ESCALATION_MARKER)
+    assert "transient failure on every attempt" in exhausted
+    assert "- Attempts: 3 (budget exhausted)" in exhausted
+    assert "harvest-evidence archive" in exhausted
+    assert f"`{pipeline.LABEL_NEEDS_HUMAN}`" in exhausted
+
+    assert "attempt counter could not be written" in unwritable
+    # No retry budget was tracked and nothing was archived, so the comment
+    # promises neither.
+    assert "Attempts:" not in unwritable
+    assert "harvest-evidence archive" not in unwritable
+
+
+def test_render_dispatch_escalation_comment_distinguishes_its_two_causes() -> None:
+    """Each dispatch escalation names what did and did not survive it.
+
+    The two paths differ in the one fact an operator needs before touching the
+    item: a setup failure removed its scratch and ran nothing, while an
+    ambiguous marker means a *possibly live* engine's scratch is still on the
+    operator's disk. Flattening both into "escalated" would invite deleting the
+    one directory that is evidence.
+    """
+    setup_failed = pipeline.render_dispatch_escalation_comment(
+        stage="implement",
+        outcome=pipeline.OUTCOME_DISPATCH_SETUP_FAILED,
+        reason="failed to create implementer worktree",
+        engine="claude",
+    )
+    ambiguous = pipeline.render_dispatch_escalation_comment(
+        stage="review",
+        outcome=pipeline.OUTCOME_AMBIGUOUS_MARKER,
+        reason="dispatch marker unreadable",
+    )
+
+    assert setup_failed.startswith(pipeline.ESCALATION_MARKER)
+    assert "`implement` dispatch" in setup_failed
+    assert "no engine output exists" in setup_failed
+    assert "- Reason: failed to create implementer worktree" in setup_failed
+    assert "- Engine: `claude` (never launched)" in setup_failed
+    assert f"`{pipeline.LABEL_NEEDS_HUMAN}`" in setup_failed
+
+    assert "retained locally for inspection" in ambiguous
+    # No engine was resolved on this path, so the comment claims none.
+    assert "Engine:" not in ambiguous
+
+
+def test_render_dispatch_escalation_comment_rejects_an_unknown_outcome() -> None:
+    """An outcome slug with no explanation is a bug, not a comment to publish."""
+    with pytest.raises(ValueError, match="unknown dispatch escalation outcome"):
+        pipeline.render_dispatch_escalation_comment(
+            stage="fix", outcome="mystery", reason="whatever",
+        )
+
+
+def test_render_dispatch_escalation_comment_neutralises_markers_in_the_reason() -> None:
+    """The reason carries GitHub-supplied text, so it cannot ship raw markers.
+
+    One reason interpolates the PR's base ref, which is author-controlled: a
+    branch named after :data:`pipeline.REVIEW_MARKER` would smuggle that marker
+    into a comment body, and ``count_review_rounds`` matches the raw substring —
+    inflating the iteration count and tripping the runaway-spend valve early.
+    """
+    body = pipeline.render_dispatch_escalation_comment(
+        stage="review",
+        outcome=pipeline.OUTCOME_DISPATCH_SETUP_FAILED,
+        reason=f"failed to fetch base ref '{pipeline.REVIEW_MARKER}'",
+        engine="codex",
+    )
+
+    assert pipeline.REVIEW_MARKER not in body
+    assert body.count(pipeline.ESCALATION_MARKER) == 1
+
+
+def test_render_transient_escalation_comment_rejects_an_unknown_outcome() -> None:
+    """An outcome slug with no explanation is a bug, not a comment to publish."""
+    with pytest.raises(ValueError, match="unknown transient escalation outcome"):
+        pipeline.render_transient_escalation_comment(
+            stage="fix", outcome="mystery", failure_class="quota_or_limit",
+        )
+
+
+def test_decide_fix_harvest_recheck_comment_flags_a_sentinel_only_report() -> None:
+    """A sentinel-only result must not be dressed up as a summary of the fixes.
+
+    The fixer prompt asks for a change summary, but a bare
+    ``FIXES_PUSHED_RECHECK_NEEDED`` is a protocol-valid result. Echoing that
+    token back under an "Engine report" heading would look like the comment
+    answered "what was fixed" when it did not. The comment says so instead, and
+    points at the head range a reader can diff.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "FIXES_PUSHED_RECHECK_NEEDED"},
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    body = str(d["comment_body"])
+    assert "<details><summary>Engine report</summary>" not in body
+    assert "no change summary" in body
+    assert f"{'a' * 40}..{'b' * 40}" in body
+
+
+def test_decide_fix_harvest_recheck_comment_sanitizes_and_bounds_report() -> None:
+    """The recheck report gets the same neutralisation the escalation gets."""
+    d = pipeline.decide_fix_harvest(
+        result_obj={
+            "result": (
+                "FIXES_PUSHED_RECHECK_NEEDED\n"
+                f"Quoting {pipeline.REVIEW_MARKER} back at you.\n" + "x" * 50_000
+            ),
+        },
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    body = str(d["comment_body"])
+    assert pipeline.count_review_rounds([{"body": body}]) == 0
+    assert "… (truncated)" in body
+    assert len(body) < pipeline._FIX_REPORT_LIMIT + _FIX_COMMENT_FRAMING
+
+
+def test_decide_fix_harvest_escalation_comment_states_reason() -> None:
+    """Each escalation cause gets its own stated reason on the PR."""
+    blocked = pipeline.decide_fix_harvest(
+        result_obj=fix_needs_human_result(),
+        pre_label="ai:changes-requested",
+    )
+    assert blocked["post_comment"] is True
+    assert "blocked" in str(blocked["comment_body"])
+
+    unpushed = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="a" * 40,
+    )
+    assert "the PR head did not advance" in str(unpushed["comment_body"])
+
+    silent = pipeline.decide_fix_harvest(
+        result_obj={"result": "no sentinel here"},
+        pre_label="ai:changes-requested",
+    )
+    body = str(silent["comment_body"])
+    assert "no recognised completion sentinel" in body
+    assert "_none emitted_" in body
+
+
+def test_decide_fix_harvest_retry_posts_no_comment() -> None:
+    """A transient failure has no outcome to record — it reverts and re-dispatches."""
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "You've hit your session limit"},
+        pre_label="ai:changes-requested",
+    )
+    assert d.get("post_comment") is not True
+    assert not d.get("comment_body")
+
+
+def test_fix_comment_neutralises_pipeline_markers_in_engine_text() -> None:
+    """Engine-quoted reviewer markers must not inflate the round count.
+
+    ``count_review_rounds`` tallies the iteration cap by matching the raw
+    marker substring in a comment body, so a fixer that quotes a reviewer
+    comment back at us would otherwise add a phantom round.
+    """
+    d = pipeline.decide_fix_harvest(
+        result_obj={
+            "result": (
+                f"{pipeline.SENTINEL_NEEDS_HUMAN_DECISION}\n"
+                f"Stuck on {pipeline.REVIEW_MARKER} from the reviewer.\n"
+                "```\nfenced\n```\n</details>"
+            ),
+        },
+        pre_label="ai:changes-requested",
+    )
+
+    body = str(d["comment_body"])
+    assert pipeline.count_review_rounds([{"body": body}]) == 0
+    assert body.count("```") == 2, "only the harness fence may remain"
+    assert body.count("</details>") == 1
+
+
+def test_fix_comment_truncates_unbounded_engine_output() -> None:
+    """A PR comment is a shared record, not a transcript dump."""
+    d = pipeline.decide_fix_harvest(
+        result_obj={
+            "result": f"{pipeline.SENTINEL_NEEDS_HUMAN_DECISION}\n" + "x" * 50_000,
+        },
+        pre_label="ai:changes-requested",
+    )
+
+    body = str(d["comment_body"])
+    assert "… (truncated)" in body
+    assert len(body) < pipeline._FIX_REPORT_LIMIT + _FIX_COMMENT_FRAMING
+
+
+def test_fix_comment_publishes_a_budget_sized_summary_untruncated() -> None:
+    """The size the fixer is told to write to must be a size the PR can carry.
+
+    The prompt's budget and this excerpt limit are two ends of one contract: a
+    fixer that obeys its stated budget and still gets cut publishes a rationale
+    that reads as complete and is not. Equal numbers would guarantee that — the
+    completion sentinel rides in the same ``result`` text — so the limit carries
+    headroom, and this is the assertion that keeps it there.
+    """
+    summary = "D" * pipeline.FIX_SUMMARY_BUDGET
+    d = pipeline.decide_fix_harvest(
+        result_obj={
+            "result": f"{summary}\n\n{pipeline.SENTINEL_FIXES_PUSHED}",
+        },
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="b" * 40,
+    )
+
+    body = str(d["comment_body"])
+    assert "… (truncated)" not in body, (
+        "a summary written to the budget the fixer prompt states was truncated "
+        "by the harvest that publishes it"
+    )
+    assert summary in body
+
+
+def test_fix_comment_omits_report_section_when_result_text_absent() -> None:
+    d = pipeline.decide_fix_harvest(
+        result_obj={"result": "", "subtype": "success"},
+        pre_label="ai:changes-requested",
+    )
+
+    body = str(d["comment_body"])
+    assert "Engine report" not in body
+    assert "`escalate` → `ai:needs-human-decision`" in body
+
+
+def test_fix_comment_renders_unknown_heads_without_marker_provenance() -> None:
+    """A marker predating head pinning still yields a readable record."""
+    d = pipeline.decide_fix_harvest(
+        result_obj=fix_pushed_result(),
+        pre_label="ai:changes-requested",
+    )
+
+    assert "head `unknown` → `unknown`" in str(d["comment_body"])
+
+
+# --- valid_marker: fix stage ---
+
+
+def test_valid_marker_accepts_fix_stage_marker() -> None:
+    assert pipeline.valid_marker(fix_marker()) is True
+
+
+def test_valid_marker_accepts_fix_stage_lease() -> None:
+    assert pipeline.valid_marker(fix_lease()) is True
+
+
+def test_valid_marker_rejects_fix_marker_with_review_pre_label() -> None:
+    assert pipeline.valid_marker(fix_marker(pre_label="ai:implemented")) is False
+
+
+def test_valid_marker_rejects_fix_marker_with_implement_pre_label() -> None:
+    assert pipeline.valid_marker(fix_marker(pre_label="ai:available")) is False
+
+
+def test_valid_marker_cross_checks_fix_stage() -> None:
+    m = fix_marker(pr_number=5)
+    assert pipeline.valid_marker(m, expected_pr=5, expected_stage="fix") is True
+    assert pipeline.valid_marker(m, expected_stage="review") is False
+    assert pipeline.valid_marker(m, expected_stage="implement") is False
+
+
+# --- reconcile_dispatch: fix stage ---
+
+
+def test_reconcile_leaves_markerless_fixing_pr_alone() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:fixing",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:changes-requested",
+        in_flight_label="ai:fixing",
+    )
+    assert d["action"] == "noop"
+    assert d["label"] == ""
+
+
+def test_reconcile_noops_on_markerless_fixing_pr() -> None:
+    # Same rule at the fix stage: a missing marker is not evidence of anything
+    # (issue #592).
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:fixing",
+        marker_valid=False,
+        classify_state="",
+        pre_label="ai:changes-requested",
+        in_flight_label="ai:fixing",
+    )
+    assert d["action"] == "noop"
+    assert d["label"] == ""
+
+
+def test_reconcile_harvests_completed_fix_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:fixing",
+        marker_valid=True,
+        classify_state="complete",
+        pre_label="ai:changes-requested",
+        in_flight_label="ai:fixing",
+    )
+    assert d["action"] == "harvest"
+
+
+def test_reconcile_reverts_stale_fix_in_custody() -> None:
+    d = pipeline.reconcile_dispatch(
+        current_label="ai:fixing",
+        marker_valid=True,
+        classify_state="stale",
+        pre_label="ai:changes-requested",
+        in_flight_label="ai:fixing",
+    )
+    assert d["action"] == "revert"
+    assert d["label"] == "ai:changes-requested"
+
+
+# --- CLI: harvest-fix ---
+
+
+def test_cli_harvest_fix_emits_recheck(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(fix_pushed_result()))
+    rc = pipeline.main(
+        ["harvest-fix", "--result", str(result), "--pre-label", "ai:changes-requested"]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "recheck"
+    assert out["label"] == "ai:revised"
+    assert out["sentinel"] == "FIXES_PUSHED_RECHECK_NEEDED"
+
+
+def test_cli_harvest_fix_escalates_on_needs_human(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(fix_needs_human_result()))
+    rc = pipeline.main(
+        ["harvest-fix", "--result", str(result), "--pre-label", "ai:changes-requested"]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "escalate"
+    assert out["label"] == "ai:needs-human-decision"
+
+
+def test_cli_harvest_fix_escalates_on_missing_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rc = pipeline.main(
+        [
+            "harvest-fix",
+            "--result",
+            str(tmp_path / "nope.json"),
+            "--pre-label",
+            "ai:changes-requested",
+        ]
+    )
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["action"] == "escalate"
+    assert out["sentinel"] is None
+
+
+def test_cli_harvest_fix_reproduces_the_tick_pr_body_line(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI must be able to reproduce any comment the tick renders.
+
+    This subcommand exists so an operator can replay a harvest decision without
+    running the tick. A revision state the CLI cannot express would make its
+    ``comment_body`` differ from the one the PR actually carries, which is the
+    one thing this surface has to be trusted for.
+    """
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(fix_pushed_result()))
+
+    rc = pipeline.main([
+        "harvest-fix", "--result", str(result),
+        "--pre-label", "ai:changes-requested",
+        "--pinned-head", "a" * 40, "--current-head", "b" * 40,
+        "--body-revision", "conflict",
+    ])
+
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert "- PR body: left unchanged — it was edited while the fixer ran" in (
+        out["comment_body"]
+    )
+
+
+def test_cli_harvest_fix_rejects_an_unknown_body_revision_state(
+    tmp_path: Path,
+) -> None:
+    """An unrecognised state must fail loudly, not render a silent no-line.
+
+    The states are a closed set the tick and the renderer share. A typo that
+    parsed would print a comment claiming nothing happened to the body — the
+    exact silence the reason lines exist to remove.
+    """
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(fix_pushed_result()))
+
+    with pytest.raises(SystemExit):
+        pipeline.main([
+            "harvest-fix", "--result", str(result),
+            "--body-revision", "applied",
+        ])
+
+
+def test_cli_harvest_fix_rejects_the_derived_not_applied_state(
+    tmp_path: Path,
+) -> None:
+    """``not-applied`` is an output of this module, never an input to it.
+
+    It is derived from a ``ready`` revision on a non-``recheck`` outcome, so the
+    tick never passes it. Accepting it would let a caller render "this run did
+    not reach re-review" onto a ``recheck`` comment — a sentence the tick cannot
+    produce, from the one surface whose job is reproducing what the tick renders.
+    """
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps(fix_pushed_result()))
+
+    with pytest.raises(SystemExit):
+        pipeline.main([
+            "harvest-fix", "--result", str(result),
+            "--body-revision", "not-applied",
+        ])
+
+    assert "not-applied" not in pipeline._BODY_REVISION_INPUTS
+    assert "not-applied" in pipeline._BODY_REVISION_NOTES, (
+        "the derived state still has to render a reason line"
+    )
+
+
+def test_every_body_revision_state_the_tick_returns_renders_a_reason() -> None:
+    """The tick's states and the renderer's notes are one closed set.
+
+    A state added to ``tick._fixer_body_revision`` without a note here renders
+    no ``- PR body:`` line at all, which is the silence this whole path exists
+    to remove: the reviewer cannot tell a body the pipeline declined to touch
+    from one it never looked at. Pinned as a literal so adding a state on either
+    side has to come here and state its reason.
+    """
+    assert set(pipeline._BODY_REVISION_INPUTS) == {
+        "ready", "conflict", "invalid", "unstamped", "unavailable",
+        "truncated", "stale-head", "closure-drift", "unreadable", "oversized",
+    }
+    assert all(
+        pipeline._BODY_REVISION_NOTES[state].strip()
+        for state in pipeline._BODY_REVISION_INPUTS
+    )
+
+
+# --- tick log ---
+
+
+def test_prune_tick_logs_returns_zero_when_dir_missing(tmp_path: Path) -> None:
+    pruned = pipeline.prune_tick_logs(str(tmp_path / "nonexistent"), keep_n=50)
+    assert pruned == 0
+
+
+def test_prune_tick_logs_keeps_most_recent_n(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    for i in range(10):
+        (log_dir / f"tick-2024010{i:01d}T000000-{i}.jsonl").write_text("")
+    pruned = pipeline.prune_tick_logs(str(log_dir), keep_n=5)
+    assert pruned == 5
+    remaining = sorted(log_dir.glob("tick-*.jsonl"))
+    assert len(remaining) == 5
+    # The 5 newest (highest index) must survive.
+    assert remaining[0].name == "tick-20240105T000000-5.jsonl"
+
+
+def test_prune_tick_logs_no_op_when_under_limit(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    for i in range(3):
+        (log_dir / f"tick-202401{i:02d}T000000-{i}.jsonl").write_text("")
+    pruned = pipeline.prune_tick_logs(str(log_dir), keep_n=5)
+    assert pruned == 0
+    assert len(list(log_dir.glob("tick-*.jsonl"))) == 3
+
+
+def test_open_tick_log_creates_file_and_returns_path(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    path = pipeline.open_tick_log(str(log_dir))
+    assert os.path.isfile(path)
+    assert path.startswith(str(log_dir))
+    assert os.path.basename(path).startswith("tick-")
+    assert path.endswith(".jsonl")
+
+
+def test_open_tick_log_creates_directory_if_missing(tmp_path: Path) -> None:
+    log_dir = tmp_path / "new" / "tick-log"
+    path = pipeline.open_tick_log(str(log_dir))
+    assert os.path.isdir(str(log_dir))
+    assert os.path.isfile(path)
+
+
+def test_open_tick_log_creates_unique_files_within_same_second(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    log_dir = tmp_path / "tick-log"
+    monkeypatch.setattr(pipeline.time, "time", lambda: 1_700_000_000.42)
+
+    first = pipeline.open_tick_log(str(log_dir))
+    second = pipeline.open_tick_log(str(log_dir))
+
+    assert first != second
+    assert os.path.isfile(first)
+    assert os.path.isfile(second)
+
+
+def test_open_tick_log_prunes_old_files(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    for i in range(52):
+        (log_dir / f"tick-202401{i:02d}T000000-{i}.jsonl").write_text("")
+    pipeline.open_tick_log(str(log_dir), keep_n=50)
+    remaining = list(log_dir.glob("tick-*.jsonl"))
+    # prune runs before the new file is created: 52 old → prune to 50 → add 1 new = 51 total
+    assert len(remaining) == 51
+
+
+def test_append_tick_entry_writes_json_line(tmp_path: Path) -> None:
+    log_path = str(tmp_path / "tick-20240101T000000-0.jsonl")
+    entry = {"ts": 1.0, "pr": 123, "phase": "harvest", "stage": "review", "action": "revert"}
+    pipeline.append_tick_entry(log_path, entry)
+    lines = Path(log_path).read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == entry
+
+
+def test_append_tick_entry_appends_multiple_entries(tmp_path: Path) -> None:
+    log_path = str(tmp_path / "tick-20240101T000000-0.jsonl")
+    e1 = {"ts": 1.0, "pr": 1, "phase": "harvest", "stage": "review", "action": "leave"}
+    e2 = {"ts": 2.0, "pr": 2, "phase": "dispatch", "stage": "implement", "action": "skip_dedup"}
+    pipeline.append_tick_entry(log_path, e1)
+    pipeline.append_tick_entry(log_path, e2)
+    lines = Path(log_path).read_text().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == e1
+    assert json.loads(lines[1]) == e2
+
+
+def test_read_latest_tick_log_returns_entries_from_newest_file(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    old_log = str(log_dir / "tick-20240101T000000-1.jsonl")
+    new_log = str(log_dir / "tick-20240102T000000-2.jsonl")
+    with open(old_log, "w") as f:
+        f.write('{"ts": 1.0, "pr": 1, "action": "leave"}\n')
+    e = {"ts": 2.0, "pr": 2, "action": "harvest"}
+    with open(new_log, "w") as f:
+        f.write(json.dumps(e) + "\n")
+    entries = pipeline.read_latest_tick_log(str(log_dir))
+    assert entries == [e]
+
+
+def test_read_latest_tick_log_returns_empty_list_when_no_logs(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    assert pipeline.read_latest_tick_log(str(log_dir)) == []
+
+
+def test_read_latest_tick_log_returns_empty_list_when_dir_missing(tmp_path: Path) -> None:
+    assert pipeline.read_latest_tick_log(str(tmp_path / "nonexistent")) == []
+
+
+def test_read_latest_tick_log_skips_non_dict_json_lines(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    log_path = str(log_dir / "tick-20240101T000000-1.jsonl")
+    with open(log_path, "w") as f:
+        f.write('{"ts": 1.0, "action": "leave"}\n')
+        f.write("[1, 2, 3]\n")
+        f.write('"just a string"\n')
+        f.write("42\n")
+        f.write('{"ts": 2.0, "action": "harvest"}\n')
+    entries = pipeline.read_latest_tick_log(str(log_dir))
+    assert len(entries) == 2
+    assert entries[0] == {"ts": 1.0, "action": "leave"}
+    assert entries[1] == {"ts": 2.0, "action": "harvest"}
+
+
+def test_read_latest_tick_log_skips_malformed_lines(tmp_path: Path) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    log_path = str(log_dir / "tick-20240101T000000-1.jsonl")
+    with open(log_path, "w") as f:
+        f.write('{"ts": 1.0, "action": "leave"}\n')
+        f.write("not-json\n")
+        f.write('{"ts": 2.0, "action": "harvest"}\n')
+    entries = pipeline.read_latest_tick_log(str(log_dir))
+    assert len(entries) == 2
+    assert entries[0] == {"ts": 1.0, "action": "leave"}
+    assert entries[1] == {"ts": 2.0, "action": "harvest"}
+
+
+def test_cli_tick_log_open_prints_path(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    log_dir = tmp_path / "tick-log"
+    rc = pipeline.main(["tick-log-open", "--log-dir", str(log_dir)])
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out.startswith(str(log_dir))
+    assert out.endswith(".jsonl")
+    assert os.path.isfile(out)
+
+
+def test_cli_tick_log_write_appends_entry(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_path = str(tmp_path / "tick-20240101T000000-0.jsonl")
+    entry = {"ts": 1.0, "pr": 42, "phase": "harvest", "stage": "review", "action": "leave"}
+    rc = pipeline.main(["tick-log-write", "--log-path", log_path, "--entry", json.dumps(entry)])
+    assert rc == 0
+    lines = Path(log_path).read_text().splitlines()
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == entry
+
+
+def test_cli_tick_log_write_rejects_invalid_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_path = str(tmp_path / "tick-20240101T000000-0.jsonl")
+    rc = pipeline.main(["tick-log-write", "--log-path", log_path, "--entry", "not-json{"])
+    assert rc == 1
+    assert "invalid JSON" in capsys.readouterr().err
+
+
+def test_cli_tick_log_write_rejects_non_dict_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_path = str(tmp_path / "tick-20240101T000000-0.jsonl")
+    rc = pipeline.main(["tick-log-write", "--log-path", log_path, "--entry", "[1,2,3]"])
+    assert rc == 1
+    assert "must be a JSON object" in capsys.readouterr().err
+
+
+def test_cli_tick_log_tail_returns_entries_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    log_path = str(log_dir / "tick-20240101T000000-1.jsonl")
+    e1 = {"ts": 1.0, "pr": 1, "action": "leave"}
+    e2 = {"ts": 2.0, "pr": 2, "action": "harvest"}
+    with open(log_path, "w") as f:
+        f.write(json.dumps(e1) + "\n")
+        f.write(json.dumps(e2) + "\n")
+    rc = pipeline.main(["tick-log-tail", "--log-dir", str(log_dir)])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out == [e1, e2]
+
+
+# --- Helpers ---
+
+
+def classify(*, now: float, deadline: float, alive: bool, result: bool) -> str:
+    """Thin wrapper over classify_dispatch to keep assertion lines readable."""
+    return pipeline.classify_dispatch(
+        now=now, deadline=deadline, pid_alive=alive, result_exists=result
+    )
+
+
+def marker(**overrides: object) -> dict[str, object]:
+    """A complete, valid *published* review dispatch marker.
+
+    Override one field to exercise a single rejection reason; pass a field already
+    present to corrupt it, or use ``del`` on the returned dict to test an omission.
+    """
+    base: dict[str, object] = {
+        "engine": "codex",
+        "stage": "review",
+        "pr_number": 1,
+        "deadline": 50,
+        "base_ref": "main",
+        "base_sha": "b1",
+        "head_sha": "h1",
+        "pre_label": "ai:implemented",
+        "dispatch_id": "d-test-001",
+        "pid": 5,
+        "start_time": 1000.0,
+        "pgid": 5,
+    }
+    base.update(overrides)
+    return base
+
+
+def lease(**overrides: object) -> dict[str, object]:
+    """A complete, valid pre-spawn *launching* lease marker (state, no pid)."""
+    base = marker()
+    del base["pid"]
+    del base["start_time"]
+    del base["pgid"]
+    base["state"] = "launching"
+    base.update(overrides)
+    return base
+
+
+def clean_review() -> dict[str, object]:
+    """A review.json body with a clean verdict and no findings."""
+    return {"verdict": "ready_for_human", "findings": []}
+
+
+def changes_review() -> dict[str, object]:
+    """A review.json body requesting changes with one blocker finding."""
+    return {
+        "verdict": "changes_requested",
+        "findings": [{"severity": "blocker", "file": "a.py", "summary": "boom"}],
+    }
+
+
+def impl_marker(**overrides: object) -> dict[str, object]:
+    """A complete, valid *published* implement-stage dispatch marker."""
+    base: dict[str, object] = {
+        "engine": "claude",
+        "stage": "implement",
+        "pr_number": 1,
+        "deadline": 50,
+        "base_ref": "main",
+        "base_sha": "b1",
+        "head_sha": "h1",
+        "pre_label": "ai:available",
+        "dispatch_id": "d-impl-001",
+        "pid": 5,
+        "start_time": 1000.0,
+        "pgid": 5,
+    }
+    base.update(overrides)
+    return base
+
+
+def impl_lease(**overrides: object) -> dict[str, object]:
+    """A complete, valid implement-stage launching lease marker."""
+    base = impl_marker()
+    del base["pid"]
+    del base["start_time"]
+    del base["pgid"]
+    base["state"] = "launching"
+    base.update(overrides)
+    return base
+
+
+def impl_complete_result() -> dict[str, object]:
+    """A claude -p result.json with the IMPLEMENTATION_COMPLETE sentinel."""
+    return {"result": "All tests pass. IMPLEMENTATION_COMPLETE", "is_error": False}
+
+
+def impl_needs_human_result() -> dict[str, object]:
+    """A claude -p result.json with the NEEDS_HUMAN_DECISION sentinel."""
+    return {"result": "Blocked on design question. NEEDS_HUMAN_DECISION", "is_error": False}
+
+
+def owned_marker(**overrides: object) -> dict[str, object]:
+    """A valid published marker with full process identity (dispatch_id + start_time + pgid)."""
+    base: dict[str, object] = {
+        "engine": "codex",
+        "stage": "review",
+        "pr_number": 1,
+        "deadline": 50,
+        "base_ref": "main",
+        "base_sha": "b1",
+        "head_sha": "h1",
+        "pre_label": "ai:implemented",
+        "dispatch_id": "d-test-001",
+        "pid": 5,
+        "start_time": 1000.0,
+        "pgid": 5,
+    }
+    base.update(overrides)
+    return base
+
+
+def owned_lease(**overrides: object) -> dict[str, object]:
+    """A valid launching lease with dispatch_id but no process identity."""
+    base = owned_marker()
+    del base["pid"]
+    del base["start_time"]
+    del base["pgid"]
+    base["state"] = "launching"
+    base.update(overrides)
+    return base
+
+
+def envelope(**overrides: object) -> dict[str, object]:
+    """A valid completion envelope from the engine wrapper."""
+    base: dict[str, object] = {
+        "dispatch_id": "d-test-001",
+        "exit_status": 0,
+        "wrapper_pid": 100,
+        "start_time": 1000.0,
+        "result_valid": True,
+    }
+    base.update(overrides)
+    return base
+
+
+def fix_marker(**overrides: object) -> dict[str, object]:
+    """A complete, valid *published* fix-stage dispatch marker."""
+    base: dict[str, object] = {
+        "engine": "claude",
+        "stage": "fix",
+        "pr_number": 1,
+        "deadline": 50,
+        "base_ref": "main",
+        "base_sha": "b1",
+        "head_sha": "h1",
+        "pre_label": "ai:changes-requested",
+        "dispatch_id": "d-fix-001",
+        "pid": 5,
+        "start_time": 1000.0,
+        "pgid": 5,
+    }
+    base.update(overrides)
+    return base
+
+
+def body_provenance(**overrides: object) -> dict[str, object]:
+    """A complete, valid ``pr_body`` provenance block for a fix marker."""
+    base: dict[str, object] = {
+        "digest": "a" * 64,
+        "summary_closes": 7,
+        "closes": ["#7"],
+        "truncated": False,
+    }
+    base.update(overrides)
+    return base
+
+
+def fix_lease(**overrides: object) -> dict[str, object]:
+    """A complete, valid fix-stage launching lease marker."""
+    base = fix_marker()
+    del base["pid"]
+    del base["start_time"]
+    del base["pgid"]
+    base["state"] = "launching"
+    base.update(overrides)
+    return base
+
+
+def fix_pushed_result() -> dict[str, object]:
+    """A claude -p result.json with the FIXES_PUSHED_RECHECK_NEEDED sentinel."""
+    return {
+        "result": "All fixes applied. FIXES_PUSHED_RECHECK_NEEDED",
+        "is_error": False,
+    }
+
+
+def fix_needs_human_result() -> dict[str, object]:
+    """A claude -p result.json with the NEEDS_HUMAN_DECISION sentinel for fix."""
+    return {"result": "Finding out of scope. NEEDS_HUMAN_DECISION", "is_error": False}
+
+
+# --- TypedDicts and dataclasses ---
+
+
+def test_harvest_result_typeddict_is_importable() -> None:
+    """HarvestResult TypedDict exists and has required fields."""
+    from pipeline import HarvestResult  # type: ignore[attr-defined]
+
+    result: HarvestResult = {
+        "action": "promote",
+        "label": "ai:ready-for-human",
+    }
+    assert result["action"] == "promote"
+    assert result["label"] == "ai:ready-for-human"
+
+
+def test_classify_result_typeddict_is_importable() -> None:
+    """ClassifyResult TypedDict exists and has required fields."""
+    from pipeline import ClassifyResult  # type: ignore[attr-defined]
+
+    result: ClassifyResult = {
+        "state": "live",
+        "identity": "matched",
+    }
+    assert result["state"] == "live"
+    assert result["identity"] == "matched"
+
+
+def test_reconcile_result_typeddict_is_importable() -> None:
+    """ReconcileResult TypedDict exists and has required fields."""
+    from pipeline import ReconcileResult  # type: ignore[attr-defined]
+
+    result: ReconcileResult = {
+        "action": "noop",
+        "label": "",
+        "kill": False,
+    }
+    assert result["action"] == "noop"
+    assert not result["kill"]
+
+
+def test_admission_result_dataclass_is_importable() -> None:
+    """AdmissionResult frozen dataclass exists and has required fields."""
+    from pipeline import AdmissionResult  # type: ignore[attr-defined]
+
+    result = AdmissionResult(
+        can_dispatch=True,
+        reason="",
+        in_flight_count=1,
+        max_in_flight=3,
+    )
+    assert result.can_dispatch is True
+    assert result.in_flight_count == 1
+
+
+def test_in_flight_ref_dataclass_is_importable() -> None:
+    """InFlightRef frozen dataclass exists and has required fields."""
+    from pipeline import InFlightRef  # type: ignore[attr-defined]
+
+    ref = InFlightRef(kind="pr", number=42, label="ai:reviewing")
+    assert ref.kind == "pr"
+    assert ref.number == 42
+
+
+def test_stage_config_dataclass_is_importable() -> None:
+    """StageConfig frozen dataclass exists and has required fields."""
+    from pipeline import StageConfig  # type: ignore[attr-defined]
+
+    config = StageConfig(
+        stage="review",
+        worktree_prefix="pr",
+        attempts_key_prefix="",
+        result_file="review.json",
+        in_flight_label="ai:reviewing",
+        pre_label="ai:implemented",
+        strict_dual_label=True,
+        tick_abort_on_enum_failure=True,
+    )
+    assert config.stage == "review"
+    assert config.strict_dual_label is True
+
+
+def test_candidate_metadata_typeddict_is_importable() -> None:
+    """CandidateMetadata TypedDict exists and has required fields."""
+    from pipeline import CandidateMetadata  # type: ignore[attr-defined]
+
+    meta: CandidateMetadata = {
+        "author": {"login": "test"},
+        "headRepository": {"nameWithOwner": "test/repo"},
+        "isCrossRepository": False,
+    }
+    assert meta["author"]["login"] == "test"
+
+
+# --- Public function exports (Step 2 — importability) ---
+
+
+def test_harvest_review_public_function_is_importable() -> None:
+    """harvest_review() is importable and callable with keyword-only args."""
+    from pipeline import harvest_review  # type: ignore[attr-defined]
+
+    result = harvest_review(
+        review='{"verdict":"ready_for_human","findings":[]}',
+        comments="[]",
+        pinned_base="abc123",
+        current_base="abc123",
+    )
+    assert result["action"] in (
+        "promote", "request_changes", "max_iterations", "discard", "escalate",
+    )
+
+
+def test_validate_review_candidate_public_function_is_importable() -> None:
+    """validate_review_candidate() is importable and accepts raw PR metadata."""
+    from pipeline import validate_review_candidate  # type: ignore[attr-defined]
+
+    result = validate_review_candidate(
+        candidate={
+            "author": {"login": "kwuBuild"},
+            "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+            "isCrossRepository": False,
+        },
+        trusted_author="kwuBuild",
+        trusted_repo="kwuBuild/sworn",
+    )
+    assert result is True
+
+
+def test_validate_marker_public_function_is_importable() -> None:
+    """validate_marker() is importable and delegates to valid_marker()."""
+    from pipeline import validate_marker  # type: ignore[attr-defined]
+
+    result = validate_marker(dispatch={})
+    assert result is False
+
+
+def test_harvest_implementation_public_function_is_importable() -> None:
+    """harvest_implementation() is importable with keyword-only args."""
+    from pipeline import harvest_implementation  # type: ignore[attr-defined]
+
+    result = harvest_implementation(
+        result='{"result":"IMPLEMENTATION_COMPLETE"}',
+    )
+    assert result["action"] in ("create_pr", "escalate")
+
+
+def test_harvest_fix_public_function_is_importable() -> None:
+    """harvest_fix() is importable with keyword-only args."""
+    from pipeline import harvest_fix  # type: ignore[attr-defined]
+
+    result = harvest_fix(
+        result='{"result":"FIXES_PUSHED_RECHECK_NEEDED"}',
+    )
+    assert result["action"] in ("recheck", "escalate")
+
+
+def test_harvest_fix_threads_head_shas_to_decision() -> None:
+    """harvest_fix() passes the pinned/current heads through to the push check."""
+    result = pipeline.harvest_fix(
+        result='{"result":"FIXES_PUSHED_RECHECK_NEEDED"}',
+        pre_label="ai:changes-requested",
+        pinned_head="a" * 40,
+        current_head="a" * 40,
+    )
+    assert result["action"] == "escalate"
+    assert result["head_advanced"] is False
+
+
+def test_validate_envelope_public_function_is_importable() -> None:
+    """validate_envelope() is importable and delegates to validate_completion_envelope()."""
+    from pipeline import validate_envelope  # type: ignore[attr-defined]
+
+    result = validate_envelope(envelope={})
+    assert result is False
+
+
+def test_verify_identity_public_function_is_importable() -> None:
+    """verify_identity() is importable and delegates to verify_process_identity()."""
+    from pipeline import verify_identity  # type: ignore[attr-defined]
+
+    result = verify_identity(recorded_start=100.0, live_start=100.5)
+    assert result in ("matched", "mismatched", "unknown")
+
+
+def test_tick_log_open_public_function_is_importable(tmp_path: Path) -> None:
+    """tick_log_open() is importable and returns a path string."""
+    from pipeline import tick_log_open  # type: ignore[attr-defined]
+
+    result = tick_log_open(log_dir=str(tmp_path))
+    assert isinstance(result, str)
+
+
+def test_tick_log_write_public_function_is_importable(tmp_path: Path) -> None:
+    """tick_log_write() is importable and accepts entry dict."""
+    from pipeline import tick_log_open, tick_log_write  # type: ignore[attr-defined]
+
+    log_path = tick_log_open(log_dir=str(tmp_path))
+    tick_log_write(
+        log_path=log_path,
+        entry={
+            "ts": 100, "pr": None, "phase": "harvest", "stage": "review",
+            "action": "noop", "reason": "test", "engine": "",
+        },
+    )
+
+
+def test_tick_log_tail_public_function_is_importable() -> None:
+    """tick_log_tail() is importable and returns a list."""
+    from pipeline import tick_log_tail  # type: ignore[attr-defined]
+
+    result = tick_log_tail(log_dir="/nonexistent-dir")
+    assert isinstance(result, list)
+
+
+# --- process_control.py public API verification (Step 3) ---
+
+
+def test_process_control_public_api_is_importable() -> None:
+    """The three public functions tick.py needs are importable."""
+    from process_control import (  # type: ignore[import-untyped]
+        get_process_start_time,
+        terminate_process,
+        terminate_process_group,
+    )
+
+    assert callable(get_process_start_time)
+    assert callable(terminate_process)
+    assert callable(terminate_process_group)
+
+
+# --- Parity tests (Step 4) — direct-call output ≡ CLI round-trip ---
+
+
+def test_harvest_review_direct_equals_cli(tmp_path: Path) -> None:
+    """harvest_review() direct call matches CLI output for the same inputs."""
+    review_path = tmp_path / "review.json"
+    comments_path = tmp_path / "comments.json"
+    review_path.write_text('{"verdict":"ready_for_human","findings":[]}')
+    comments_path.write_text("[]")
+
+    direct = pipeline.harvest_review(
+        review='{"verdict":"ready_for_human","findings":[]}',
+        comments="[]",
+        pinned_base="abc",
+        current_base="abc",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "harvest-review",
+                f"--review={review_path}",
+                f"--comments={comments_path}",
+                "--pinned-base=abc",
+                "--current-base=abc",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == direct
+
+
+def test_validate_review_candidate_direct_equals_cli() -> None:
+    """validate_review_candidate() direct call matches CLI output."""
+    candidate = {
+        "author": {"login": "kwuBuild"},
+        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "isCrossRepository": False,
+    }
+    direct = pipeline.validate_review_candidate(
+        candidate=candidate,
+        trusted_author="kwuBuild",
+        trusted_repo="kwuBuild/sworn",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_in = _sys.stdin
+    old_out = _sys.stdout
+    _sys.stdin = StringIO(json.dumps(candidate))
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "validate-review-candidate",
+                "--trusted-author=kwuBuild",
+                "--trusted-repo=kwuBuild/sworn",
+            ]
+        )
+    finally:
+        _sys.stdin = old_in
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"trusted": direct}
+
+
+def test_verify_identity_direct_equals_cli() -> None:
+    """verify_identity() direct call matches CLI output."""
+    direct = pipeline.verify_identity(
+        recorded_start=100.0, live_start=100.5, tolerance=1.0,
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "verify-identity",
+                "--recorded-start=100.0",
+                "--live-start=100.5",
+                "--tolerance=1.0",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"identity": direct}
+
+
+def test_validate_envelope_direct_equals_cli(tmp_path: Path) -> None:
+    """validate_envelope() direct call matches CLI output."""
+    envelope_path = tmp_path / "completion.json"
+    envelope_path.write_text(
+        '{"dispatch_id":"d1","exit_status":0,"wrapper_pid":1,"start_time":1.0,"result_valid":true}'
+    )
+
+    direct = pipeline.validate_envelope(
+        envelope={
+            "dispatch_id": "d1",
+            "exit_status": 0,
+            "wrapper_pid": 1,
+            "start_time": 1.0,
+            "result_valid": True,
+        },
+        dispatch_id="d1",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "validate-envelope",
+                f"--envelope={envelope_path}",
+                "--dispatch-id=d1",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"valid": direct}
+
+
+def test_tick_log_round_trip(tmp_path: Path) -> None:
+    """tick_log_open + tick_log_write + tick_log_tail round-trip works."""
+    log_path = pipeline.tick_log_open(log_dir=str(tmp_path))
+    assert os.path.exists(log_path)
+
+    entry = {
+        "ts": 1234567890,
+        "pr": 42,
+        "phase": "harvest",
+        "stage": "review",
+        "action": "promote",
+        "reason": "no blockers",
+        "engine": "",
+    }
+    pipeline.tick_log_write(log_path=log_path, entry=entry)
+
+    entries = pipeline.tick_log_tail(log_dir=str(tmp_path))
+    assert len(entries) >= 1
+    last = entries[-1]
+    assert last["ts"] == 1234567890
+    assert last["pr"] == 42
+    assert last["action"] == "promote"
+
+
+def test_validate_review_direct_equals_cli(tmp_path: Path) -> None:
+    """validate_review() direct call matches CLI output."""
+    review_path = tmp_path / "review.json"
+    review_path.write_text(
+        '{"verdict":"ready_for_human","findings":[]}'
+    )
+
+    direct = pipeline.validate_review(
+        {"verdict": "ready_for_human", "findings": []}
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            ["validate-review", f"--review={review_path}"]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    assert io.getvalue().strip() == direct
+
+
+def test_classify_dispatch_direct_equals_cli(tmp_path: Path) -> None:
+    """classify_dispatch() direct call matches CLI output."""
+    dispatch_path = tmp_path / "dispatch.json"
+    dispatch_path.write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 1,
+        "deadline": 9999999999.0, "base_ref": "main",
+        "base_sha": "b1", "head_sha": "h1",
+        "pre_label": "ai:implemented", "dispatch_id": "d-1",
+        "pid": 99999, "start_time": 999999.0, "pgid": 99999,
+    }))
+
+    direct_state = pipeline.classify_dispatch(
+        now=1000.0, deadline=9999999999.0,
+        pid_alive=True, result_exists=False,
+        state="", envelope_valid=False,
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "classify-dispatch",
+                f"--dispatch={dispatch_path}",
+                "--now=1000.0", "--pid-alive=1",
+                "--result-exists=0", "--envelope-valid=0",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"state": direct_state}
+
+
+def test_touches_review_policy_direct_equals_cli() -> None:
+    """touches_review_policy() direct call matches CLI output."""
+    direct = pipeline.touches_review_policy(
+        changed_paths=["CLAUDE.md", "src/main.py"]
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_in = _sys.stdin
+    old_out = _sys.stdout
+    _sys.stdin = StringIO("CLAUDE.md\nsrc/main.py\n")
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(["touches-review-policy"])
+    finally:
+        _sys.stdin = old_in
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"touches_policy": direct}
+
+
+def test_validate_marker_direct_equals_cli(tmp_path: Path) -> None:
+    """validate_marker() direct call matches CLI output."""
+    dispatch_path = tmp_path / "dispatch.json"
+    dispatch_path.write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 1,
+        "deadline": 9999999999.0, "base_ref": "main",
+        "base_sha": "b1", "head_sha": "h1",
+        "pre_label": "ai:implemented", "dispatch_id": "d-1",
+        "pid": 99999, "start_time": 999999.0, "pgid": 99999,
+    }))
+
+    from pathlib import Path as _Path
+    with open(_Path(dispatch_path)) as fh:
+        dispatch_obj = json.load(fh)
+    direct = pipeline.validate_marker(
+        dispatch=dispatch_obj, pr=1, stage="review",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "validate-marker",
+                f"--dispatch={dispatch_path}",
+                "--pr=1", "--stage=review",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == {"valid": direct}
+
+
+def test_harvest_implementation_direct_equals_cli(tmp_path: Path) -> None:
+    """harvest_implementation() direct call matches CLI output."""
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        '{"result": "IMPLEMENTATION_COMPLETE", "exit_status": 0}'
+    )
+
+    direct = pipeline.harvest_implementation(
+        result='{"result": "IMPLEMENTATION_COMPLETE", "exit_status": 0}',
+        pre_label="ai:available",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "harvest-implementation",
+                f"--result={result_path}",
+                "--pre-label=ai:available",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == direct
+
+
+def test_harvest_fix_direct_equals_cli(tmp_path: Path) -> None:
+    """harvest_fix() direct call matches CLI output."""
+    result_path = tmp_path / "result.json"
+    result_path.write_text(
+        '{"result": "FIXES_PUSHED_RECHECK_NEEDED", "exit_status": 0}'
+    )
+
+    direct = pipeline.harvest_fix(
+        result='{"result": "FIXES_PUSHED_RECHECK_NEEDED", "exit_status": 0}',
+        pre_label="ai:changes-requested",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "harvest-fix",
+                f"--result={result_path}",
+                "--pre-label=ai:changes-requested",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == direct
+
+
+def test_reconcile_dispatch_direct_equals_cli(tmp_path: Path) -> None:
+    """reconcile_dispatch() direct call matches CLI output."""
+    dispatch_path = tmp_path / "dispatch.json"
+    dispatch_path.write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 1,
+        "deadline": 9999999999.0, "base_ref": "main",
+        "base_sha": "b1", "head_sha": "h1",
+        "pre_label": "ai:implemented", "dispatch_id": "d-1",
+        "pid": 99999, "start_time": 999999.0, "pgid": 99999,
+    }))
+
+    direct = pipeline.reconcile_dispatch(
+        current_label="ai:reviewing", marker_valid=True,
+        classify_state="live", pre_label="ai:implemented",
+        in_flight_label="ai:reviewing",
+    )
+
+    import sys as _sys
+    from io import StringIO
+
+    old_out = _sys.stdout
+    _sys.stdout = io = StringIO()
+    try:
+        ret = pipeline.main(
+            [
+                "reconcile-dispatch",
+                f"--dispatch={dispatch_path}",
+                "--current-label=ai:reviewing",
+                "--classify-state=live",
+                "--in-flight-label=ai:reviewing",
+            ]
+        )
+    finally:
+        _sys.stdout = old_out
+
+    assert ret == 0
+    cli_result = json.loads(io.getvalue())
+    assert cli_result == direct
+
+
+# --- derive_tick_state ---
+
+
+def test_derive_tick_state_ok_with_in_flight_and_queue() -> None:
+    """Healthy tick with 2 in-flight engines and an actionable queue."""
+    state = pipeline.derive_tick_state(
+        status="ok",
+        in_flight_count=2,
+        has_actionable_queue=True,
+    )
+    assert state.status == "ok"
+    assert state.in_flight == "2"
+    assert state.queue == "true"
+    assert state.quiescent == "false"
+
+
+def test_derive_tick_state_quiescent() -> None:
+    """All items terminal, no in-flight, no queue → quiescent."""
+    state = pipeline.derive_tick_state(
+        status="ok",
+        in_flight_count=0,
+        has_actionable_queue=False,
+    )
+    assert state.status == "ok"
+    assert state.in_flight == "0"
+    assert state.queue == "false"
+    assert state.quiescent == "true"
+
+
+def test_derive_tick_state_not_quiescent_when_in_flight() -> None:
+    """In-flight engines prevent quiescence even with empty queue."""
+    state = pipeline.derive_tick_state(
+        status="ok",
+        in_flight_count=1,
+        has_actionable_queue=False,
+    )
+    assert state.quiescent == "false"
+
+
+def test_derive_tick_state_not_quiescent_when_queue_nonempty() -> None:
+    """Actionable queue prevents quiescence even with zero in-flight."""
+    state = pipeline.derive_tick_state(
+        status="ok",
+        in_flight_count=0,
+        has_actionable_queue=True,
+    )
+    assert state.quiescent == "false"
+
+
+def test_derive_tick_state_failed_uses_unknown() -> None:
+    """FAILED status with no computed state → all fields unknown."""
+    state = pipeline.derive_tick_state(status="FAILED")
+    assert state.status == "FAILED"
+    assert state.in_flight == "unknown"
+    assert state.queue == "unknown"
+    assert state.quiescent == "unknown"
+
+
+def test_derive_tick_state_partial_with_partial_info() -> None:
+    """PARTIAL status where in-flight is known but queue is not."""
+    state = pipeline.derive_tick_state(
+        status="PARTIAL",
+        in_flight_count=1,
+    )
+    assert state.status == "PARTIAL"
+    assert state.in_flight == "1"
+    assert state.queue == "unknown"
+    assert state.quiescent == "unknown"
+
+
+def test_tick_state_format_line() -> None:
+    """format_line produces the parseable tick-state: line."""
+    state = pipeline.TickState(
+        status="ok", in_flight="2", queue="true", quiescent="false",
+        held="1",
+    )
+    assert state.format_line() == (
+        "tick-state: status=ok in_flight=2 queue=true quiescent=false held=1"
+    )
+
+
+# --- compute_next_wake (cadence) ---
+
+
+def test_next_wake_in_flight_uses_min_of_deadline_and_270() -> None:
+    """≥1 engine in-flight with a known deadline → min(deadline, 270s)."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=120.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 120
+    assert d.stop is False
+
+
+def test_next_wake_in_flight_clamps_deadline_to_270() -> None:
+    """Deadline beyond 270s is clamped to stay cache-warm."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=2,
+        nearest_deadline_s=500.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+
+
+def test_next_wake_in_flight_no_deadline_defaults_to_270() -> None:
+    """In-flight without a known deadline → 270s (cache-warm default)."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+
+
+def test_next_wake_actionable_queue_returns_270() -> None:
+    """No in-flight but actionable queue → ~270s to poll promptly."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+
+
+def test_next_wake_at_capacity_returns_270() -> None:
+    """At MAX_IN_FLIGHT → ~270s to harvest and free a slot."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=3,
+        nearest_deadline_s=500.0,
+        has_actionable_queue=False,
+        at_capacity=True,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+
+
+def test_next_wake_quiescent_heartbeat_returns_1800() -> None:
+    """Quiescent → ~1800s heartbeat, amortizing the cache miss."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=True,
+        consecutive_quiescent_ticks=0,
+    )
+    assert d.next_wake_seconds == 1800
+    assert d.stop is False
+
+
+def test_next_wake_quiescent_stops_after_n_heartbeats() -> None:
+    """N consecutive quiescent heartbeats → stop + notify developer."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=True,
+        consecutive_quiescent_ticks=2,
+        quiescent_stop_after=3,
+    )
+    assert d.next_wake_seconds == 1800
+    assert d.stop is True
+
+
+def test_next_wake_quiescent_stop_default_threshold() -> None:
+    """With default stop_after=3, the 3rd heartbeat (index 2) stops."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=True,
+        consecutive_quiescent_ticks=1,
+    )
+    assert d.stop is False
+
+    d2 = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=True,
+        consecutive_quiescent_ticks=2,
+    )
+    assert d2.stop is True
+
+
+def test_next_wake_never_returns_300() -> None:
+    """The 300s TTL cliff must never be the output — nudge to 270."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=300.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds != 300
+
+
+def test_next_wake_non_quiescent_resets_counter() -> None:
+    """A non-quiescent tick resets quiescence — stop is always False."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+        consecutive_quiescent_ticks=5,
+    )
+    assert d.stop is False
+    assert d.next_wake_seconds == 270
+
+
+def test_next_wake_in_flight_beats_actionable_queue() -> None:
+    """In-flight engines take priority over actionable queue."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=2,
+        nearest_deadline_s=60.0,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 60  # deadline-driven, not 270
+
+
+def test_next_wake_in_flight_beats_at_capacity_flag() -> None:
+    """In-flight with deadline beats the at_capacity 270s default."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=3,
+        nearest_deadline_s=90.0,
+        has_actionable_queue=True,
+        at_capacity=True,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 90  # deadline, not 270
+
+
+def test_next_wake_quiescent_beats_everything() -> None:
+    """Quiescence is checked after in-flight/queue/capacity — it's the
+    fallback when nothing is happening."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=True,
+    )
+    assert d.next_wake_seconds == 1800
+    assert d.stop is False
+
+
+def test_next_wake_reason_is_descriptive() -> None:
+    """Every decision carries a human-readable reason string."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=120.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert isinstance(d.reason, str)
+    assert len(d.reason) > 0
+
+
+def test_cadence_decision_dataclass_is_importable() -> None:
+    """CadenceDecision frozen dataclass exists with required fields."""
+    from pipeline import CadenceDecision  # type: ignore[attr-defined]
+
+    d = CadenceDecision(next_wake_seconds=270, stop=False, reason="test")
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+    assert d.reason == "test"
+
+
+def test_next_wake_actionable_queue_with_in_flight_zero() -> None:
+    """Edge: exactly zero in-flight with an actionable queue is not quiescent."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=0,
+        nearest_deadline_s=None,
+        has_actionable_queue=True,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 270
+    assert d.stop is False
+
+
+def test_next_wake_overdue_deadline_triggers_immediate_retry() -> None:
+    """An overdue engine (deadline_s <= 0) must not sleep 270s; wake in 1s."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=-30.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 1
+    assert d.stop is False
+
+
+def test_next_wake_zero_deadline_triggers_immediate_retry() -> None:
+    """A deadline of exactly 0s (just expired) must also wake immediately."""
+    d = pipeline.compute_next_wake(
+        in_flight_count=1,
+        nearest_deadline_s=0.0,
+        has_actionable_queue=False,
+        at_capacity=False,
+        is_quiescent=False,
+    )
+    assert d.next_wake_seconds == 1
+    assert d.stop is False
+
+
+def test_cadence_decision_format_line() -> None:
+    """format_line produces the parseable tick-cadence: line."""
+    d = pipeline.CadenceDecision(
+        next_wake_seconds=270, stop=False, reason="in-flight → wake 270s",
+    )
+    assert d.format_line() == (
+        'tick-cadence: next_wake=270 stop=false reason="in-flight → wake 270s"'
+    )
+
+
+def test_cadence_decision_format_line_stop_true() -> None:
+    """Stop line is parseable and includes the reason."""
+    d = pipeline.CadenceDecision(
+        next_wake_seconds=1800, stop=True,
+        reason="quiescent (heartbeat 3/3) → stop",
+    )
+    line = d.format_line()
+    assert "stop=true" in line
+    assert "next_wake=1800" in line
+
+
+# --- resolve_pickup_eligibility ---
+
+
+@pytest.mark.parametrize(
+    ("stage", "entity", "labels", "expected"),
+    [
+        ("implement", "issue", [pipeline.LABEL_AVAILABLE], pipeline.LABEL_AVAILABLE),
+        ("review", "pr", [pipeline.LABEL_IMPLEMENTED], pipeline.LABEL_IMPLEMENTED),
+        ("review", "pr", [pipeline.LABEL_REVISED], pipeline.LABEL_REVISED),
+        (
+            "fix", "pr", [pipeline.LABEL_CHANGES_REQUESTED],
+            pipeline.LABEL_CHANGES_REQUESTED,
+        ),
+    ],
+)
+def test_pickup_eligibility_admits_a_single_stage_label(
+    stage: str, entity: str, labels: list[str], expected: str,
+) -> None:
+    """The ordinary case: one pickup label, no hold, no in-flight label."""
+    verdict = pipeline.resolve_pickup_eligibility(labels, entity=entity, stage=stage)
+
+    assert verdict.label == expected
+    assert verdict.reason == ""
+
+
+def test_pickup_eligibility_rejects_cross_stage_pickup_labels() -> None:
+    """Two pickup labels from *different* stages are ambiguous everywhere.
+
+    A PR carrying ``ai:implemented`` next to ``ai:changes-requested`` used to
+    satisfy the review stage and the fix stage independently, because each
+    counted only its own labels: two engines could take the same PR, and the
+    second would meet the first's live marker under a lagging label read.
+    Exactly-one is therefore counted across every stage for the entity.
+    """
+    labels = [pipeline.LABEL_IMPLEMENTED, pipeline.LABEL_CHANGES_REQUESTED]
+
+    for stage in ("review", "fix"):
+        verdict = pipeline.resolve_pickup_eligibility(labels, entity="pr", stage=stage)
+        assert verdict.label == ""
+        assert "single pickup label" in verdict.reason
+        assert verdict.blocking == (
+            pipeline.LABEL_CHANGES_REQUESTED, pipeline.LABEL_IMPLEMENTED,
+        )
+
+
+def test_pickup_eligibility_rejects_ambiguous_same_stage_labels() -> None:
+    """``ai:implemented`` + ``ai:revised`` guesses at the stale-revert target."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_IMPLEMENTED, pipeline.LABEL_REVISED],
+        entity="pr", stage="review",
+    )
+
+    assert verdict.label == ""
+    assert "single pickup label" in verdict.reason
+
+
+def test_pickup_eligibility_rejects_an_in_flight_label() -> None:
+    """An in-flight label is some machine's claim; the local marker scan
+    cannot disprove it, so the label set is the only usable proof."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_REVISED, pipeline.LABEL_REVIEWING],
+        entity="pr", stage="review",
+    )
+
+    assert verdict.label == ""
+    assert "in-flight label" in verdict.reason
+    assert verdict.blocking == (pipeline.LABEL_REVIEWING,)
+
+
+@pytest.mark.parametrize(
+    "hold", [pipeline.LABEL_BLOCKED, pipeline.LABEL_NEEDS_HUMAN],
+)
+def test_pickup_eligibility_rejects_a_human_hold(hold: str) -> None:
+    """A hold coexisting with a pickup label is human-set and outranks it."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_AVAILABLE, hold], entity="issue", stage="implement",
+    )
+
+    assert verdict.label == ""
+    assert "hold label" in verdict.reason
+    assert verdict.blocking == (hold,)
+
+
+def test_pickup_eligibility_rejects_a_label_owned_by_another_stage() -> None:
+    """The label may move between the queue listing and the point-read."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_CHANGES_REQUESTED], entity="pr", stage="review",
+    )
+
+    assert verdict.label == ""
+    assert "another stage" in verdict.reason
+    assert verdict.blocking == (pipeline.LABEL_CHANGES_REQUESTED,)
+
+
+def test_pickup_eligibility_without_a_stage_answers_for_any_stage() -> None:
+    """Cadence asks "can *some* stage dispatch this?", not "can review?".
+
+    Both questions must apply the identical rule, or a permanently
+    undispatchable item counts as an actionable queue and holds the loop
+    short of its quiescent stop forever.
+    """
+    dispatchable = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_CHANGES_REQUESTED], entity="pr",
+    )
+    ambiguous = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_IMPLEMENTED, pipeline.LABEL_REVISED], entity="pr",
+    )
+
+    assert dispatchable.label == pipeline.LABEL_CHANGES_REQUESTED
+    assert ambiguous.label == ""
+
+
+def test_pickup_eligibility_ignores_the_other_entitys_labels() -> None:
+    """A PR label stranded on an issue is not one of the issue's pickups."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_AVAILABLE, pipeline.LABEL_IMPLEMENTED],
+        entity="issue", stage="implement",
+    )
+
+    assert verdict.label == pipeline.LABEL_AVAILABLE
+
+
+def test_pickup_eligibility_rejects_an_unknown_entity() -> None:
+    """Fail closed: an entity with no pickup vocabulary is never dispatchable."""
+    verdict = pipeline.resolve_pickup_eligibility(
+        [pipeline.LABEL_AVAILABLE], entity="discussion",
+    )
+
+    assert verdict.label == ""
+
+
+def test_stage_pickup_labels_cover_every_in_flight_stage() -> None:
+    """Both stage tables must name the same stages, or a stage can be added
+    to one and forgotten in the other."""
+    assert set(pipeline.STAGE_PICKUP_LABELS) == set(pipeline.STAGE_IN_FLIGHT_LABELS)
+    assert set(pipeline.STAGE_ENTITIES) == set(pipeline.STAGE_IN_FLIGHT_LABELS)

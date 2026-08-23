@@ -1,0 +1,1682 @@
+"""Executable contract checks for the PR-pipeline skill.
+
+Tests are categorized by verification strategy per the extraction design doc:
+
+- **Category A — ordering invariants:** mock + assert_has_calls on subprocess
+- **Category B — behavioral invariants:** standard unit tests with mocked returns
+- **Category C — structural invariants:** subprocess call args ARE the invariant
+- **Category D — documentation invariants:** design/skill doc content checks
+"""
+
+from __future__ import annotations
+
+import ast
+import os
+import re
+import subprocess
+from pathlib import Path
+from typing import NamedTuple
+from unittest import mock
+
+import pytest
+
+REPO_ROOT = (Path(__file__).parent.parent / "../../..").resolve()
+SKILL = Path(__file__).parent.parent / "SKILL.md"
+README = Path(__file__).parent.parent / "README.md"
+DEBUG = Path(__file__).parent.parent / "DEBUG.md"
+LIB_README = Path(__file__).parent / "README.md"
+PREFLIGHT = Path(__file__).parent.parent / "preflight.sh"
+STATUS_SKILL = (
+    Path(__file__).parent.parent.parent / "pr-pipeline-status" / "SKILL.md"
+)
+PROMPTS = Path(__file__).parent / "prompts"
+GUIDELINES = (Path(__file__).parent.parent / "../../../docs/working/pr-guidelines.md").resolve()
+DESIGN = (
+    Path(__file__).parent.parent / "../../../docs/planning/designs/pr-pipeline-tick.md"
+).resolve()
+INTERNALS = (
+    Path(__file__).parent.parent / "../../../docs/working/pr-pipeline-internals.md"
+).resolve()
+EXTRACTION_DESIGN = (
+    Path(__file__).parent.parent
+    / "../../../docs/planning/designs/pr-pipeline-tick-python-extraction.md"
+).resolve()
+
+# The scope the credentialed engine prompts must state verbatim. Ambient `gh`
+# credentials reach every item in the repository, not just the one the engine was
+# dispatched on, so a stage-scoped wording ("on this PR") leaves sibling items
+# inside the prompt's allowed scope.
+_ENGINE_LABEL_PROHIBITION = (
+    "Do not add, remove, or change any `ai:` label on any issue or pull request"
+)
+
+# Per-engine clauses that ride alongside the shared prohibition. The implementer
+# is also barred from `gh pr create`: the harvest opens the PR from the engine's
+# pr-body file and labels it, so an engine that opens its own PR labels it too —
+# the same escape the label rule closes, one step earlier.
+_ENGINE_EXTRA_CLAUSES: dict[str, list[str]] = {
+    "implementer": ["Do not run `gh pr create`"],
+    "fixer": [],
+}
+
+# Placeholder values that render each credentialed prompt through the production
+# loader. Only the label-authority clause is asserted, so the values need to be
+# well-formed, not realistic.
+_PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
+    "implementer": {
+        "issue_number": 1,
+        "issue_title": "contract render",
+        "issue_body": "body",
+        "branch_name": "worktree-i1",
+        "pr_body_source_file": "pr-body.md",
+    },
+    "fixer": {
+        "pr_number": 2,
+        "review_body": "findings",
+        "pr_body": "## Summary",
+        "issue_contract": "### Issue #1 — contract render",
+        "head_ref": "worktree-i1",
+        "revision_hygiene_skill_doc": "some/skill/SKILL.md",
+        "summary_budget": 1,
+        "pr_body_revision_file": "pr-body-revision.md",
+        "pr_body_revision_stamp": "pr-body-revision: fix-2-1",
+        "pr_body_revision_head_stamp": "pr-body-revision-head:",
+    },
+}
+
+# The carve-out's first and last words in both root agent docs. Assertions are
+# scoped between them because the clauses they pin — `gh pr create`, label
+# commands — also appear elsewhere in the same files as *instructions to follow*.
+# A whole-file substring check would pass on those occurrences and prove nothing.
+_CARVE_OUT_OPENER = "If you were dispatched by `pr-pipeline-tick`"
+_CARVE_OUT_CLOSER = "#pipeline-label-authority)"
+
+# Carve-out clauses that only one root agent doc owes. `CLAUDE.md` reaches the
+# dispatched implementer and separately instructs `gh pr create` (skill routing
+# and PR Workflow), which the implementer prompt now forbids — the harvest opens
+# the PR from the engine's pr-body file. `AGENTS.md` owes no equivalent: the
+# reviewer is the only AGENTS.md-native dispatched engine and it creates no PRs.
+_AGENT_DOC_EXTRA_CARVE_OUTS: dict[str, list[str]] = {
+    "CLAUDE.md": ["`gh pr create`"],
+    "AGENTS.md": [],
+}
+
+# The scope the publish-before-relabel gate actually holds on: a transition that
+# reports an engine outcome, or one that fires before any engine was launched.
+# What the two clauses leave out is the middle — an engine was launched and the
+# tick cannot read a result from it — which is the whole of what stays silent.
+_ORDERING_SCOPE = "reports an engine result, or fires before one was launched"
+
+# The tick's entire publishing surface. Only these two functions may run
+# `gh <entity> comment`: the reviewer harvest posts its verdict directly and
+# gates the relabel on it, and everything else goes through the receipted helper
+# under one of the kinds below. Every other route to a terminal label is silent.
+_PUBLISH_HELPER = "_post_harvest_comment"
+_COMMENT_POSTING_FUNCTIONS = frozenset({"_harvest_one_reviewer", _PUBLISH_HELPER})
+_PUBLISHED_COMMENT_KINDS = frozenset({
+    "_FIX_COMMENT_KIND",  # fixer recheck/escalate
+    "_CAP_COMMENT_KIND",  # attempt cap
+    "_ESCALATION_COMMENT_KIND",  # transient exhaustion, counter-write failure
+    "_DISPATCH_COMMENT_KIND",  # every pre-launch dispatch escalation
+})
+
+# The helpers that move an item's pipeline label. `relabel` is the raw edit,
+# `_relabel_with_context` adds the terminal notification, and
+# `_converge_pipeline_labels` reconciles a whole label set — a census that read
+# only one of them would miss escalations spelled with the others.
+_RELABEL_HELPERS = frozenset({
+    "relabel", "_relabel_with_context", "_converge_pipeline_labels",
+})
+
+# Every function that can move an item to `ai:needs-human-decision`, and how many
+# such relabel sites it owns. This is the census the publish-before-relabel rule
+# is argued against, so it is pinned rather than described: a new route to the
+# hold label is a decision about whether that item's red label explains itself,
+# and the way to force the decision is to fail here until someone records it.
+#
+# "Can" is load-bearing. `needs_human_relabel_sites` fails closed, so a site that
+# passes a *computed* label counts even when it usually resolves to something
+# else. Recognising only `pipeline.LABEL_NEEDS_HUMAN` would have missed the two
+# reconcile paths outright — one passes the bare string, the other a variable
+# proven equal by an enclosing guard — and those are exactly the shape a new
+# silent escalation gets written in. A false positive costs one line here; a
+# false negative is the accumulating silence this census exists to stop.
+#
+# Entries divide into sites that provably name the hold label and sites that
+# pass a computed one. Only the first group is an escalation; the second is the
+# cost of failing closed, and is grouped separately so a count change is read
+# against the right expectation.
+#
+# The dispatch phase is the half this pins hardest. Every *pre-launch* escalation
+# is funnelled through `_escalate_dispatch_setup_failure` or `escalate_ambiguous`,
+# both of which publish first; the one *provable* site left in each
+# `_dispatch_one_*` is the post-launch guard, which fires when the in-flight
+# relabel failed and the engine could not be killed. That one stays silent by
+# design — a live engine still owns the marker, and its harvest owns the
+# explanation — so a second provable site there means a new silent pre-launch
+# path.
+_NEEDS_HUMAN_TRANSITIONS = {
+    # --- Provably the hold label ---
+    # Reconcile — no engine result the tick can read. Both silent, and both
+    # invisible to an attribute-only census: `_reconcile_one` passes the bare
+    # string, `_execute_reconcile_actions` a guard-proven variable (the latter
+    # counts twice: the guarded escalate/kill_escalate branch and its revert).
+    "_reconcile_one": 1,
+    "_execute_reconcile_actions": 2,
+    # Harvest — an engine result exists, and `.harvest-evidence/` holds it.
+    "_harvest_failed_reviewer": 1,      # silent; belongs with #618
+    "_handle_transient_engine_result": 2,  # transient: publishes, gated+bounded
+    # Dispatch, pre-launch — no engine ran; both publish before the label moves.
+    "_escalate_dispatch_setup_failure": 1,
+    "escalate_ambiguous": 1,
+    # Dispatch, post-launch — the in-flight relabel failed *and* the kill failed.
+    "_dispatch_one_reviewer": 1,
+    "_dispatch_one_implementer": 1,
+    "_dispatch_one_fixer": 1,
+    # --- Computed label: counted because the walk cannot rule the hold out ---
+    # The helper every other site relabels through; its `to_label` is its
+    # caller's.
+    "_relabel_with_context": 2,
+    # The one remote mutation every terminal transition — the attempt cap,
+    # transient exhaustion, and the fixer's `escalate` — is landed through, on a
+    # `target_label` its caller computed. Each caller publishes before it lands,
+    # except the cap, whose post is the documented best-effort one.
+    "_land_terminal_transition": 1,
+    # Terminal harvest transitions, normally `ai:reviewed` / `ai:revised` / a
+    # pre-label revert. `_harvest_one_implementer` owns none: its only converge
+    # passes `""`, which the walk can prove is not the hold label.
+    "_harvest_one_reviewer": 1,
+    "_harvest_one_fixer": 1,
+    # A revert to the pre-dispatch label after a confirmed-dead engine — the
+    # opposite of an escalation.
+    "_publish_marker_or_revert": 1,
+}
+
+# The rule each ordering surface must state, and the shape it must state it in.
+# The silent set is defined as the *complement* of the publishing set, never
+# enumerated: enumerating it is what failed three times running — first counted
+# as four transitions, then as six, then as a hand-named list of four that was
+# still short by the reviewer wrapper-failure and reconcile escalation families.
+# The publishing set is a handful of constants the source itself declares, so
+# stating the rule this way round closes it by construction.
+_SILENT_SET_RULE = "every other terminal transition publishes nothing"
+
+# The ordering surfaces spell the publishing bound out in words rather than
+# digits, so the AST-derived size is mapped through this rather than formatted.
+# A count with no entry here fails loudly: widening the publishing surface is
+# the moment every document that states the bound has to be revisited.
+_CARDINALITY_WORDS = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}
+
+class _OrderingSurface(NamedTuple):
+    """One document that states the publication-ordering rule.
+
+    Attributes:
+        name: Display name used in assertion messages.
+        path: The document.
+        section_start: Raw-text literal that opens its publication-ordering
+            section. The member check reads that section rather than the whole
+            file — `_harvest_one_reviewer` and `_post_harvest_comment` are named
+            elsewhere in these documents for unrelated reasons, and a whole-file
+            scan reads those mentions as the ordering surface naming its
+            publishing set.
+        section_end: Raw-text literal that closes it.
+        names_members: Whether the section names the posting functions or only
+            states their count. Declared rather than inferred: inferring it from
+            what a surface happens to name is what let a rename of *every*
+            posting function pass while all three documents kept the old names.
+    """
+
+    name: str
+    path: Path
+    section_start: str
+    section_end: str
+    names_members: bool
+
+
+# The documents that state the publication-ordering rule, and where each states
+# it. Each surface stated the rule independently, which is how they drifted
+# apart: correcting one leaves the other two teaching the superseded version.
+# They live in one table so the whole-file checks and the section slice cannot
+# disagree about which documents are ordering surfaces. The operator README
+# states the bound without symbol names on purpose — its reader is an operator,
+# not someone reading `tick.py`.
+_ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
+    _OrderingSurface(
+        name="README.md",
+        path=README,
+        section_start="### Silent transitions",
+        section_end="observability surfaces",
+        names_members=False,
+    ),
+    _OrderingSurface(
+        name="design doc",
+        path=DESIGN,
+        section_start="**Silent escalations, stated by complement.**",
+        section_end="**Publication durability.**",
+        names_members=True,
+    ),
+    _OrderingSurface(
+        name="pr-pipeline-internals.md",
+        path=INTERNALS,
+        section_start="Publication ordering:",
+        section_end="Receipt custody:",
+        names_members=True,
+    ),
+)
+
+
+# --- Category D — documentation invariants ---
+
+
+def test_skill_md_references_tick_py_invocation() -> None:
+    """SKILL.md must reference the new Python orchestrator entry point."""
+    text = SKILL.read_text()
+    assert "uv run python .claude/skills/pr-pipeline-tick/lib/tick.py" in text
+
+
+def test_skill_md_is_lean_operator_sop() -> None:
+    """SKILL.md must stay lean because it is injected on every skill invocation."""
+    text = SKILL.read_text()
+    assert len(text.splitlines()) <= 80
+    for heading in [
+        "## Run Procedure",
+        "## Outcome Check",
+        "## Exit Codes",
+        "## Stop or Escalate",
+        "## Running Under /loop",
+    ]:
+        assert heading in text, f"SOP heading not found: {heading}"
+
+
+def test_skill_md_loop_section_has_paste_ready_iteration_prompt() -> None:
+    """Loop supervision must schedule the compact tick contract, not reinvoke the skill."""
+    text = SKILL.read_text()
+    assert "Paste this prompt into /loop" in text
+    assert "Do not invoke /pr-pipeline-tick" in text
+    assert "dangerouslyDisableSandbox: true" in text
+    assert "uv run python .claude/skills/pr-pipeline-tick/lib/tick.py" in text
+    assert ".claude/worktrees/.tick-log" in text
+    assert "tick-cadence:" in text
+    assert "ScheduleWakeup" in text
+    assert "stop=true" in text
+    assert "notify the developer" in text
+    assert "Stop and notify the developer if `corrupt_marker_escalate` appears." in text
+
+
+def test_skill_md_cross_links_to_debug_md() -> None:
+    """SOP must point operators to DEBUG.md by section name for key references."""
+    text = SKILL.read_text()
+    assert "DEBUG.md" in text
+    assert 'DEBUG.md "Startup failure diagnostics"' in text or \
+           'DEBUG.md "Debugging pointers"' in text
+    assert 'DEBUG.md' in text.split("dangerouslyDisableSandbox")[0] or \
+           'DEBUG.md' in text.split("dangerouslyDisableSandbox")[1]
+
+
+def test_debug_md_retains_the_invariants_moved_out_of_the_sop() -> None:
+    """DEBUG.md must still carry every invariant the lean SOP handed it.
+
+    This is a floor, not a total: DEBUG.md has grown invariants of its own since
+    the split, and asserting a count would make each new one a test edit. What
+    must not happen is one of the migrated invariants disappearing when the SOP
+    no longer states it either.
+    """
+    text = DEBUG.read_text()
+    invariants = [
+        "HARVEST then DISPATCH",
+        "Fail closed on every external read",
+        "Lease-before-label",
+        "Kill only on proven identity",
+        "can_dispatch_now fails CLOSED",
+        "Scratch deletion gated on label edit",
+        "Admission counts this machine's engines",
+        "gh` exits 0 on empty results",
+    ]
+    for inv in invariants:
+        assert inv in text, f"Invariant not found: {inv}"
+
+
+# Every doc that teaches how occupancy is counted. A reader reaches the design
+# docs and the internals note from the same question the operator docs answer,
+# so a retired ceiling surviving in any one of them is a second contract.
+_ADMISSION_DOCS = (
+    DEBUG, SKILL, README, LIB_README, DESIGN, EXTRACTION_DESIGN, INTERNALS,
+)
+
+
+def test_no_operator_doc_still_claims_the_label_union_ceiling() -> None:
+    """The retired union contract must not survive in operator-facing docs.
+
+    The floor test above is satisfied by *presence*, so it cannot notice a
+    replaced invariant still being asserted a few lines down, or in a sibling
+    doc an operator reads first. Admission has exactly one contract now; this
+    is the assertion that fails if a second one grows back.
+    """
+    for doc in _ADMISSION_DOCS:
+        text = doc.read_text()
+        assert "Authoritative in-flight labels count globally" not in text, doc
+        # Admission-specific: HARVEST legitimately unions markers with the
+        # label query to build its reconcile set, so the bare verb is not the
+        # thing being banned here — pairing it with the label set is.
+        assert "unions local markers with authoritative labels" not in text, doc
+        assert "local-markers ∪ authoritative-labels" not in text, doc
+
+
+def test_no_doc_pairs_a_union_with_the_in_flight_count() -> None:
+    """No doc may describe in-flight occupancy as a union outside HARVEST.
+
+    The assertion above bans three exact strings, so it only catches wordings
+    someone already thought to ban — and the retired ceiling survived a full
+    sweep in ``pr-pipeline-tick.md`` precisely because its end-to-end
+    walkthrough phrased it differently. This asserts the shape instead: a
+    paragraph pairing a union with the in-flight count is describing
+    admission, and admission does not union anything any more.
+
+    HARVEST is the one place a union is still real — it builds its reconcile
+    set from the label query *and* local markers — so naming ``reconcile`` or
+    ``HARVEST`` in the same paragraph is the carve-out, and the only one.
+    """
+    for doc in _ADMISSION_DOCS:
+        for paragraph in doc.read_text().split("\n\n"):
+            lowered = paragraph.lower()
+            if "union" not in lowered and "∪" not in lowered:
+                continue
+            if "in-flight" not in lowered:
+                continue
+            assert "reconcile" in lowered or "harvest" in lowered, (
+                f"{doc} describes in-flight occupancy as a union outside "
+                f"HARVEST's reconcile set:\n{paragraph}"
+            )
+
+
+def test_every_admission_doc_credits_the_marker_with_the_slot() -> None:
+    """Each doc that teaches occupancy must positively name what pays.
+
+    The guard below is a blocklist in shape: it fails on a wrong sentence
+    someone wrote. It cannot fail on a *missing* right one, so a sweep that
+    deletes the contradiction and stops there leaves a doc that teaches
+    occupancy while naming no payer at all — and the next author fills that
+    silence with the label, which is how the retired ceiling grew back in the
+    design doc's walkthrough after the first sweep.
+
+    This is the mirror assertion, built from the same primitives so the two
+    cannot drift: somewhere in every admission doc, a marker must be the
+    subject of a slot the pipeline spends.
+    """
+    missing: list[str] = []
+    for doc in _ADMISSION_DOCS:
+        credited = False
+        for paragraph in doc.read_text().split("\n\n"):
+            flat = " ".join(paragraph.split()).lower()
+            for sentence in re.split(r"(?<=[.;])\s+", flat):
+                positive = sentence.replace("markerless", "").replace(
+                    "no marker", ""
+                )
+                if "marker" not in positive:
+                    continue
+                if not any(term in sentence for term in _SLOT_TERMS):
+                    continue
+                if not any(verb in sentence for verb in _CONSUMPTION_VERBS):
+                    continue
+                credited = True
+                break
+            if credited:
+                break
+        if not credited:
+            missing.append(str(doc.resolve().relative_to(REPO_ROOT)))
+
+    assert not missing, (
+        "these docs teach occupancy without ever naming the dispatch marker "
+        "as the thing that holds a slot:\n\n" + "\n".join(missing)
+    )
+
+
+# Every surface a reader can learn the occupancy rule from. The two guards above
+# read docs only, but a docstring and a comment teach the contract to the next
+# implementer just as hard — and `pr-guidelines.md` teaches it to contributors,
+# who are the ones hand-setting the labels this cap must not count.
+_SLOT_ATTRIBUTION_SURFACES = _ADMISSION_DOCS + (
+    GUIDELINES,
+    Path(__file__).parent / "tick.py",
+    Path(__file__).parent / "pipeline.py",
+)
+
+# A label being named as the thing that holds, costs, or frees a slot.
+_LABEL_TERMS = (
+    "in-flight label", "in-flight labels", "in-flight read", "in-flight reads",
+    "ai:implementing", "ai:reviewing", "ai:fixing", "authoritative label",
+    "authoritative labels", "pipeline label", "dispatch label",
+    # The act of moving a label is the same attribution without the noun:
+    # "relabel when the queue needs the slot" evaded the first version of this
+    # guard entirely because no listed label *noun* appeared in the sentence.
+    "relabel",
+)
+_SLOT_TERMS = (
+    "admission slot", "concurrency slot", "dispatch slot", "admission account",
+    "max_in_flight", "admission count", "against the cap", "spend cap",
+    # Bare references. Prose reaches for these once the named term has been
+    # established a sentence earlier, which is exactly where the attribution
+    # stops being visible to a term list built from the named forms.
+    "the slot", "a slot",
+)
+_CONSUMPTION_VERBS = (
+    "count", "consum", "burn", "pin", "free", "occup", "participat", "spend",
+    # "cost" and "release" are the two verbs the live violations actually
+    # used; "need" is how the README asked for a slot without naming a payer.
+    "cost", "releas", "need",
+)
+
+# Clause separators. A sentence can name the marker in one clause and still
+# hand the slot to a label in the next, which is how DEBUG.md's held-slot
+# sentence passed a carve-out that scanned the whole sentence for "marker".
+_CLAUSE_SPLIT = re.compile(r"\s*(?:—|,\s+(?:and|so|but|which|then)\s+)\s*")
+
+# Wordings that deny the attribution rather than assert it.
+_CLAIM_NEGATIONS = (
+    "never", "no longer", "cannot", "does not", "do not", "nothing",
+)
+
+
+def _attributes_slot_to_label(fragment: str) -> bool:
+    """Return whether one sentence or clause hands a slot to a label.
+
+    Naming the marker is the carve-out, but only a *positive* mention:
+    ``markerless`` and ``no marker`` name its absence, which is exactly the
+    state these passages wrongly say costs a slot.
+
+    Args:
+        fragment: A lowercased sentence or clause.
+
+    Returns:
+        ``True`` when the fragment names a label, names a slot or the cap, and
+        joins them with a verb of consumption without crediting the marker.
+    """
+    positive = fragment.replace("markerless", "").replace("no marker", "")
+    if "marker" in positive:
+        return False
+    # Denying the attribution is the other way a passage can be correct, and
+    # the contract's own statement of itself takes that form ("a shared `ai:`
+    # in-flight label never occupies a slot"). Known blind spot: a wrong
+    # sentence that negates some *other* clause is excused too. The positive
+    # section binding below, not this tripwire, is what pins the real claim.
+    if any(neg in fragment for neg in _CLAIM_NEGATIONS):
+        return False
+    return (
+        any(term in fragment for term in _LABEL_TERMS)
+        and any(term in fragment for term in _SLOT_TERMS)
+        and any(verb in fragment for verb in _CONSUMPTION_VERBS)
+    )
+
+
+def test_no_surface_attributes_an_admission_slot_to_a_label() -> None:
+    """No doc, docstring, or comment may make a label the thing that pays.
+
+    The two guards above match on *wording* — three exact strings, or the
+    literal token ``union``. Codex's re-review found nine live passages that
+    teach the retired ceiling without using any of them, in files one of those
+    guards does not even open. This asserts the *claim* instead: a passage that
+    names a label, names a slot or the cap, and joins them with a verb of
+    consumption is asserting the thing this pipeline stopped doing.
+
+    The carve-out is deliberately a positive obligation rather than an
+    exemption list: a sentence that puts a label next to a slot must name the
+    marker, because the marker is what pays. That cannot be satisfied by
+    rewording around a banned phrase — which is exactly how
+    ``pr-pipeline-tick.md``'s walkthrough survived the last sweep. It is scoped
+    to the sentence rather than the paragraph so a correct neighbouring
+    sentence cannot vouch for a wrong one.
+    """
+    violations: list[str] = []
+    for surface in _SLOT_ATTRIBUTION_SURFACES:
+        for paragraph in surface.read_text().split("\n\n"):
+            # Normalise before splitting into sentences: a wrapped docstring or
+            # comment puts "in-flight" and "label" on different source lines,
+            # and splitting on the newline hides the claim from every term
+            # below. This is why the tick.py docstrings survived the last pass.
+            flat = " ".join(paragraph.split())
+            # Not split on ":" — a colon joins the claim to the attribution
+            # that qualifies it, and severing them hides the correction.
+            for sentence in re.split(r"(?<=[.;])\s+", flat):
+                lowered = sentence.lower()
+                # Both scopes, because neither subsumes the other: a sentence
+                # that splits the label from the slot across clauses is only
+                # visible whole, and a sentence that credits the marker in one
+                # clause while handing the slot to a label in the next is only
+                # visible per clause.
+                if not (
+                    _attributes_slot_to_label(lowered)
+                    or any(
+                        _attributes_slot_to_label(clause)
+                        for clause in _CLAUSE_SPLIT.split(lowered)
+                    )
+                ):
+                    continue
+                rel = surface.resolve().relative_to(REPO_ROOT)
+                violations.append(f"{rel}: {sentence[:220]}")
+
+    assert not violations, (
+        "these passages make an `ai:` label the thing that holds or frees an "
+        "admission slot; the cap counts local dispatch markers:\n\n"
+        + "\n\n".join(violations)
+    )
+
+
+def test_debug_md_has_required_sections() -> None:
+    """DEBUG.md must have all the debugging/recovery sections."""
+    text = DEBUG.read_text()
+    for heading in [
+        "## Operational invariants",
+        "## Why `dangerouslyDisableSandbox: true`",
+        "## Reviewer sandbox posture",
+        "## Startup failure diagnostics",
+        "## Debugging pointers",
+        "## Constants and boundaries",
+    ]:
+        assert heading in text, f"DEBUG.md heading not found: {heading}"
+
+
+def test_skill_md_references_preflight() -> None:
+    """SKILL.md must still require preflight.sh before first reviewer dispatch."""
+    text = SKILL.read_text()
+    assert "preflight.sh" in text
+
+
+def test_design_doc_marks_fixer_as_shipped_not_manual() -> None:
+    """The design doc shipped-slice language must match the runnable fixer stage."""
+    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    text = design.read_text()
+    assert "shipped review-only slice" not in text
+    assert "shipped implement/review/fix slice" in text
+
+
+def test_readme_documents_transient_engine_result_contract() -> None:
+    """Operator docs must expose quota retry state, bounds, and audit actions."""
+    text = README.read_text()
+    for contract_text in [
+        "### Transient quota and limit results",
+        ".engine-cooldowns/",
+        "`transient_revert`",
+        "`cooldown_skip`",
+        "`transient_exhausted`",
+        "`MAX_DISPATCH_ATTEMPTS = 3`",
+        ".harvest-evidence/",
+    ]:
+        assert contract_text in text, f"Transient-result contract missing: {contract_text}"
+
+
+@pytest.mark.parametrize("prompt_name", ["implementer", "fixer"])
+def test_credentialed_engine_prompts_forbid_pipeline_label_mutation(
+    prompt_name: str,
+) -> None:
+    """Engines that inherit the operator's `gh` credentials must be told the
+    pipeline owns every ``ai:`` label transition, on every work item.
+
+    The implementer and fixer run under the full parent environment, so they can
+    reach ``gh pr edit`` and set a pipeline label on *any* work item, not only
+    their own. A label set mid-run is an un-retractable opinion published into a
+    channel with final-state semantics: reconcile reads it as a hold and
+    escalates over the engine's own completion sentinel. The result envelope is
+    the only outcome channel these prompts may use.
+
+    The assertion runs against the rendered production prompt — the exact string
+    handed to the engine — rather than the template file, and it pins the full
+    scope sentence. A per-stage narrowing ("on this PR") would satisfy a
+    prefix-only check while leaving sibling items inside the allowed scope.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    text: str = tick.load_prompt_template(
+        prompt_name, _PROMPT_RENDER_VARIABLES[prompt_name],
+    )
+    for contract_text in [
+        _ENGINE_LABEL_PROHIBITION,
+        "completion sentinel",
+        *_ENGINE_EXTRA_CLAUSES[prompt_name],
+    ]:
+        assert contract_text in text, (
+            f"rendered {prompt_name} prompt is missing the label-ownership "
+            f"contract: {contract_text}"
+        )
+
+
+def test_the_fixer_binds_a_skill_that_exists_and_a_tool_the_engine_carries() -> None:
+    """The binding must be reachable at both ends, or dispatch never runs.
+
+    Two ways this becomes a no-op that no other test would notice. If the doc
+    the constant names is renamed or deleted, the dispatch-time probe escalates
+    every fixer instead of launching one — the fail-closed behaviour is correct
+    and the pipeline is still stopped. And if the prompt asked the engine to
+    *invoke* a skill, the bounded allowlist would deny it: engines get ``Read``
+    and no ``Skill`` tool, which is why the binding is a doc path rather than a
+    tool call. Both ends are pinned here so neither can drift silently.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    doc = REPO_ROOT / tick.skill_doc_path(tick.REVISION_HYGIENE_SKILL)
+    assert doc.is_file(), (
+        f"the fixer prompt binds {doc}, which does not exist — every fixer "
+        f"dispatch escalates on the pre-launch skill probe until it does"
+    )
+    assert "Read" in tick._ENGINE_ALLOWED_TOOLS_BASE.split(), (
+        "the engine allowlist no longer carries Read, so a dispatched fixer "
+        "cannot open the skill doc its prompt names"
+    )
+
+
+def test_no_dispatched_engine_can_reach_gh() -> None:
+    """GitHub mutation stays on the controller, for every engine and stage.
+
+    The fixer can now correct a stale PR body, and the reason it does so through
+    a file the harvest validates — rather than through ``gh pr edit`` of its own
+    — is this boundary. An engine-side write has no validation gate, no receipt,
+    and no way to be retracted if the run it describes then fails, so widening
+    the allowlist would silently undo the controller-owned design the write path
+    was built as.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    allowlist = tick._engine_allowed_tools(
+        tick._fixer_push_permission("agent/issue-1"),
+    )
+    assert "gh" not in allowlist.replace("(", " ").replace(")", " ").split(), (
+        f"a dispatched engine can now run gh: {allowlist}"
+    )
+
+
+def test_engine_authored_pr_metadata_files_are_gitignored() -> None:
+    """Both prompts say "do not commit"; the repo has to mean it.
+
+    Engines run with ``Bash(git add *)``, so one ``git add -A`` puts the file in
+    the PR head. For the fixer that is not cosmetic: its worktree is a detached
+    checkout of that head, so a committed revision file arrives before the
+    engine writes anything and would read as a candidate replacement body. The
+    dispatch stamp catches it, but the ignore rule is what stops it happening.
+    Pinned against the constants so a rename cannot silently drop the rule.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    ignored = (REPO_ROOT / ".gitignore").read_text().splitlines()
+    for name in (tick._PR_BODY_SOURCE_FILE, tick._PR_BODY_REVISION_FILE):
+        assert name in ignored, (
+            f"{name} is not gitignored, so an engine's `git add -A` can commit "
+            "the metadata file its own prompt forbids committing"
+        )
+
+
+def test_operator_grep_lists_carry_the_unresolved_skill_event() -> None:
+    """A binding that fails closed must be findable in the log it writes to.
+
+    ``skill_unresolved`` is the only entry that distinguishes "the prompt names
+    a doc this worktree does not have" from the generic setup-failure escalate
+    that follows it. Absent from the grep list, an operator sees a PR sitting on
+    ``ai:needs-human-decision`` with no stated cause.
+
+    The loop prompt is asserted separately from the fast-check command: they are
+    two different reader paths, and past drift landed in exactly one of them.
+    """
+    text = SKILL.read_text()
+    fast_check, loop_prompt = text.split("Paste this prompt into /loop")
+
+    assert "skill_unresolved" in fast_check, (
+        "the Outcome Check grep list does not surface skill_unresolved"
+    )
+    assert "skill_unresolved" in loop_prompt, (
+        "the /loop iteration prompt does not tell the supervisor to grep for "
+        "skill_unresolved"
+    )
+
+
+def test_reviewer_prompt_keeps_its_no_credentials_label_boundary() -> None:
+    """The reviewer needs no label-ownership clause because it cannot mutate labels.
+
+    ``_dispatch_one_reviewer`` builds a scrubbed allowlist env with no GitHub
+    token and launches codex under ``-s read-only``, so the reviewer is
+    structurally incapable of editing labels. This pins the standing instruction
+    that carries that boundary into the prompt, so the engine-type asymmetry
+    stays deliberate rather than becoming an oversight.
+    """
+    text = (PROMPTS / "reviewer.txt").read_text()
+    assert "do not attempt gh commands" in text
+
+
+def test_operator_docs_define_dispatched_engine_label_authority() -> None:
+    """Operator docs must name who may move a pipeline label, and who may not.
+
+    The engine-facing contract lives in the repo docs that dispatched engines
+    read alongside their prompt. Without the dispatched-vs-interactive split,
+    an engine follows the interactive-agent label workflow and mutates labels
+    the tick owns.
+    """
+    guidelines = GUIDELINES.read_text()
+    for contract_text in [
+        "## Pipeline label authority",
+        "dispatched engine",
+        "completion sentinel",
+    ]:
+        assert contract_text in guidelines, (
+            f"pr-guidelines.md is missing the label-authority contract: "
+            f"{contract_text}"
+        )
+
+
+def test_operator_docs_preserve_the_human_emergency_hold_override() -> None:
+    """The authority contract must keep a human's mid-run hold legitimate.
+
+    Dispatch skips a candidate carrying a hold before it spends anything, and
+    ``_reconcile_one`` lets a hold outrank a completed marker. #618 keeps that
+    human-set route deliberately alive — it only removes the silence around it.
+    A contract that granted humans authority solely over marker-free items would
+    tell an operator they may not stop a bad active run while the live control
+    plane treats exactly that intervention as authoritative.
+    """
+    guidelines = GUIDELINES.read_text()
+    for contract_text in [
+        "A human may stop a dispatched run at any time",
+        "`ai:needs-human-decision` or `ai:blocked`",
+        "the hold wins",
+    ]:
+        assert contract_text in guidelines, (
+            f"pr-guidelines.md dropped the human emergency-hold override: "
+            f"{contract_text}"
+        )
+
+
+def test_state_machine_and_design_docs_treat_hold_provenance_as_unprovable() -> None:
+    """No source of truth may claim a hold beside custody *is* human-set.
+
+    ``pipeline.py`` owns the hold-label set, ``tick.py`` acts on it in
+    ``_reconcile_one`` and ``_resolve_dispatchable_pickup_label``, and both
+    design docs describe reconcile's precedence rule — the canonical one and the
+    extraction
+    doc that restates the dual-label decision step. Engines share the tick's
+    GitHub token, so a `labeled` timeline event names the same account either way
+    and no provenance signal exists. Leaving any of the four asserting proven
+    provenance invites a future recovery change to branch on it.
+    """
+    pipeline_source = (Path(__file__).parent / "pipeline.py").read_text()
+    tick_source = (Path(__file__).parent / "tick.py").read_text()
+    design = DESIGN.read_text()
+    surfaces = (
+        ("pipeline.py", pipeline_source),
+        ("tick.py", tick_source),
+        ("design doc", design),
+        ("extraction design doc", EXTRACTION_DESIGN.read_text()),
+    )
+    for name, text in surfaces:
+        assert "treated as human-set" in text, (
+            f"{name} still asserts proven hold provenance"
+        )
+        assert "fail closed toward the human" in text, (
+            f"{name} does not state the fail-closed trade"
+        )
+
+
+def test_publication_ordering_docs_state_the_scope_the_gate_holds_on() -> None:
+    """The publish-before-relabel rule must state the scope it actually holds on.
+
+    The gate governs transitions that report an *engine result*, and those that
+    fire *before an engine was launched*. It does not govern the middle — an
+    engine launched, no result the tick can read — where the relabel still goes
+    through ``_relabel_with_context`` and posts nothing. Stating the rule
+    unscoped turned a true invariant into a false one, and an unscoped claim is
+    what let the silent paths go undocumented, so each surface must carry the
+    scoping phrase rather than an unqualified "every terminal transition".
+
+    The scope widens when a family of silent transitions is closed, which is a
+    moment all three surfaces have to be rewritten together — the failure this
+    check exists to force.
+    """
+    for name, text in ordering_surfaces():
+        assert _ORDERING_SCOPE in text, (
+            f"{name} states the publication gate without the scope it holds on"
+        )
+
+
+def test_publication_ordering_docs_define_the_silent_set_by_complement() -> None:
+    """The docs must bound what publishes, and call everything else silent.
+
+    Enumerating the silent transitions failed three times: counted as four, then
+    as six, then hand-named as four — each time an undercount, because the set is
+    large, spread across reconcile, harvest, and dispatch, and maintained by hand
+    in three documents at once. The publishing set is a handful of comment kinds
+    behind one helper, so the docs state that side and define the silent set as
+    its complement. Then a new silent path cannot make the docs wrong; only a new
+    *publishing* path can, and
+    :func:`test_tick_publishes_only_the_documented_comment_kinds` fails when one
+    appears.
+
+    Only #618 is required now. #625 closed the dispatch-side family, and a
+    surface still pointing at it would send an operator to an issue that no
+    longer describes the code — which is the same staleness this file exists to
+    prevent, in the opposite direction.
+
+    ``forced transitions`` — the undefined term the original counts were
+    expressed in — must not come back with it.
+    """
+    for name, text in ordering_surfaces():
+        assert "#618" in text, f"{name} does not track #618"
+        assert _SILENT_SET_RULE in text, (
+            f"{name} does not define the silent set as the complement of the "
+            f"publishing set"
+        )
+        assert "forced transitions" not in text, (
+            f"{name} reintroduced a hand-counted total"
+        )
+
+
+def test_tick_publishes_from_only_two_places() -> None:
+    """``gh <entity> comment`` may only be reached from the two documented sites.
+
+    This is the executable half of
+    :func:`test_publication_ordering_docs_define_the_silent_set_by_complement`.
+    The docs say "these publish, everything else is silent", and that claim is
+    only as good as the bound on what publishes. Asserting the *helper's* comment
+    kinds alone is not that bound — the reviewer verdict posts directly, without
+    a receipt, and was missed by exactly that narrower check. So the raw `gh`
+    call is what is pinned, wherever it appears.
+
+    A new publishing site fails here, which is the signal to revisit all three
+    ordering surfaces rather than let them go quietly stale.
+    """
+    posting_functions = comment_posting_functions()
+
+    assert posting_functions == _COMMENT_POSTING_FUNCTIONS, (
+        f"the set of functions that post comments changed: "
+        f"{sorted(posting_functions)} != {sorted(_COMMENT_POSTING_FUNCTIONS)}. "
+        f"Update the ordering surfaces before updating this test."
+    )
+
+
+def test_publication_ordering_docs_state_the_ast_derived_publishing_bound() -> None:
+    """The cardinality the surfaces state must come from ``tick.py``, not a count.
+
+    The complement rule is only worth what its bound is worth, and each surface
+    spells that bound out in prose ("exactly two functions run ``gh … comment``").
+    Nothing tied that number to the source. Growing the publishing set fails
+    :func:`test_tick_publishes_from_only_two_places`, whose fix is to widen
+    ``_COMMENT_POSTING_FUNCTIONS`` — and once widened, all three surfaces go
+    green again while still claiming a bound the source no longer has. So the
+    phrase is derived from the AST here, and a widened bound cannot be resolved
+    without restating it everywhere it is published.
+
+    The member names are checked the same way, against the extracted ordering
+    section rather than the whole document — these documents name the posting
+    functions elsewhere for unrelated reasons, and a whole-file scan reads those
+    mentions as the ordering surface naming its publishing set.
+
+    Which surfaces carry the names is declared, not inferred. The design doc and
+    internals reference the symbols; the operator README states the bound without
+    them. Inferring it from what a surface happens to name is what let a rename of
+    *every* posting function pass: the docs named none of the new symbols, so a
+    "names none" surface was read as a surface that never names them. Declaring
+    the bearers makes the stale document the failure it is.
+    """
+    posting_functions = comment_posting_functions()
+    word = _CARDINALITY_WORDS.get(len(posting_functions))
+    assert word is not None, (
+        f"no cardinality word for {len(posting_functions)} publishing functions; "
+        f"extend _CARDINALITY_WORDS and restate the bound on every ordering surface"
+    )
+    phrase = f"exactly {word} functions"
+
+    for surface, text in publication_ordering_sections():
+        assert phrase in text, (
+            f"{surface.name} does not state the publishing bound as {phrase!r}, "
+            f"the cardinality tick.py actually has"
+        )
+        named = {fn for fn in posting_functions if fn in text}
+        if surface.names_members:
+            assert named == posting_functions, (
+                f"{surface.name} names {sorted(named)} in its publication-"
+                f"ordering section but tick.py publishes from "
+                f"{sorted(posting_functions)}"
+            )
+        else:
+            assert not named, (
+                f"{surface.name} states the bound without symbol names by "
+                f"contract, but its publication-ordering section names "
+                f"{sorted(named)}; either drop them or set names_members=True so "
+                f"the full member set is required there"
+            )
+
+
+def test_tick_publishes_only_the_documented_comment_kinds() -> None:
+    """Every receipted post must carry one of the three documented kinds.
+
+    The receipt key is what makes a post idempotent across harvest retries, so a
+    call with a non-constant or undocumented kind is both an unbounded publishing
+    surface and an unbounded receipt namespace.
+    """
+    tree = ast.parse((Path(__file__).parent / "tick.py").read_text())
+    kinds: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        if not isinstance(node.func, ast.Name) or node.func.id != _PUBLISH_HELPER:
+            continue
+        kind = next(
+            (kw.value for kw in node.keywords if kw.arg == "kind"), None,
+        )
+        assert isinstance(kind, ast.Name), (
+            f"{_PUBLISH_HELPER} called with a non-constant comment kind; the "
+            f"publishing surface is no longer statically bounded"
+        )
+        kinds.add(kind.id)
+
+    assert kinds == _PUBLISHED_COMMENT_KINDS, (
+        f"the published comment kinds changed: {sorted(kinds)} != "
+        f"{sorted(_PUBLISHED_COMMENT_KINDS)}. Update the ordering surfaces "
+        f"before updating this test."
+    )
+
+
+def test_every_needs_human_transition_is_a_recorded_decision() -> None:
+    """No function may escalate to the terminal label without being enumerated.
+
+    The publication rule is an argument about a set of transitions, and the set
+    is the part that moves. A new escalation site is exactly the moment someone
+    has to answer "does this one explain itself?", and nothing in the source
+    asks the question — the previous silent paths accumulated by being added and
+    never revisited.
+
+    Pinning the census asks it. A new site fails here, and the fix is either to
+    route it through a publishing helper or to record it as deliberately silent
+    with the reason, which is the enumeration the ordering surfaces argue from.
+    """
+    sites = needs_human_relabel_sites()
+
+    assert sites == _NEEDS_HUMAN_TRANSITIONS, (
+        f"the set of transitions to ai:needs-human-decision changed: {sites} != "
+        f"{_NEEDS_HUMAN_TRANSITIONS}. A new site must either publish before it "
+        f"relabels or be recorded here as deliberately silent, with the reason."
+    )
+
+
+@pytest.mark.parametrize("agent_doc", ["CLAUDE.md", "AGENTS.md"])
+def test_repo_agent_docs_exempt_dispatched_engines_from_label_workflow(
+    agent_doc: str,
+) -> None:
+    """Both root agent docs must carve dispatched engines out of the label workflow.
+
+    ``CLAUDE.md`` is loaded into a dispatched implementer's or fixer's context
+    automatically, and its Task Coordination and force-push sections instruct the
+    reader to move ``ai:`` labels. Those instructions are what an engine follows
+    when it labels its own work item mid-run. ``AGENTS.md`` carries the same
+    instruction for AGENTS.md-native engines and declares itself *authoritative*
+    for workflow over ``CLAUDE.md``, so a carve-out in one file and not the other
+    leaves the higher-priority doc teaching the behaviour this contract forbids.
+    These are the surfaces that actually reach the engine, so both are pinned
+    here rather than left to review.
+
+    The carve-out must cover *every* label instruction in its file, not a counted
+    subset. ``AGENTS.md`` originally scoped itself to "the two label instructions
+    below" while carrying four: two workflow bullets, a blanket pre-authorization
+    for "updating workflow labels", and a review-posting flow that runs
+    ``gh pr edit``. An engine that counts to two applies the carve-out to the
+    first pair and reads the rest as a standing grant, so the count is asserted
+    against — an unbounded scope is the only version that closes the hole.
+    """
+    text = (SKILL.parent / f"../../../{agent_doc}").resolve().read_text()
+    assert _CARVE_OUT_OPENER in text, (
+        f"{agent_doc} has no dispatched-engine carve-out at all"
+    )
+    block = carve_out_block(text)
+    for contract_text in [
+        "every label instruction",
+        "completion sentinel",
+        *_AGENT_DOC_EXTRA_CARVE_OUTS[agent_doc],
+    ]:
+        assert contract_text in block, (
+            f"{agent_doc} is missing the dispatched-engine carve-out: "
+            f"{contract_text}"
+        )
+
+
+def test_operator_docs_define_targeted_issue_and_pr_scope() -> None:
+    """Target syntax must describe the stage-specific runtime scope exactly."""
+    skill = SKILL.read_text()
+    readme = README.read_text()
+    for text in (skill, readme):
+        for token in ("#N", "issue `N`", "zero or one", "open closing PR",
+                      "reviewer", "fixer", "`pr:N`", "direct PR scope"):
+            assert token in text
+
+
+def test_operator_docs_never_treat_dashboard_absence_as_custody_proof() -> None:
+    """The runbook must not re-teach the inference the runtime removed.
+
+    ``status.sh`` reads shared GitHub labels plus only *this* machine's marker
+    root, so an in-flight label with no engine row reads identically for
+    another machine's healthy dispatch, a manual pickup, and a dead engine.
+    Every doc that shows the operator that pairing must say so, or following it
+    steals live work exactly as the old automation did.
+    """
+    for doc in (README, SKILL, STATUS_SKILL):
+        text = doc.read_text()
+        assert "machine" in text, doc
+        assert "custody proof" in text, doc
+
+    readme = README.read_text()
+    for token in ("out of band", "confirm", "late result", "pickup label"):
+        assert token.lower() in readme.lower(), token
+
+
+def test_operator_docs_define_target_resolution_fail_closed_boundary() -> None:
+    """Target uncertainty may audit, but cannot mutate workflow or scratch state."""
+    skill = SKILL.read_text()
+    readme = README.read_text()
+    for text in (skill, readme):
+        for token in ("ambiguous", "malformed", "GitHub read failure",
+                      "scratch/worktree", "GitHub workflow mutation",
+                      "audit log", "tick lock", "excepted"):
+            assert token in text
+        assert "before any local or GitHub mutation" not in text
+
+
+def test_operator_docs_locate_engine_stderr() -> None:
+    """Troubleshooting docs must distinguish sanitized reviewer diagnostics."""
+    for text in (README.read_text(), DEBUG.read_text()):
+        for token in ("`stderr.log`", "reviewer", "bounded", "sanitized",
+                      "startup error class", "`EngineExitError`",
+                      "implementer/fixer", "engine stderr"):
+            assert token in text
+        assert "raw reviewer engine stderr" not in text
+
+
+def test_operator_docs_define_failed_reviewer_terminal_custody() -> None:
+    """Reviewer wrapper failures must not be documented as redispatchable work."""
+    skill = SKILL.read_text()
+    debug = DEBUG.read_text()
+    for text in (skill, debug):
+        for token in ("dispatch-bound", "failed reviewer", "completion",
+                      "`ai:needs-human-decision`", "redispatch", "archive failure",
+                      "relabel failure", "scratch"):
+            assert token in text
+
+
+def test_design_doc_distinguishes_reviewer_and_wrapperless_completion() -> None:
+    """The canonical design must not require reviewer envelopes from Claude stages."""
+    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    text = design.read_text()
+    assert "Reviewer completion authority" in text
+    assert "Wrapperless implementer/fixer completion authority" in text
+
+
+def test_design_doc_defines_failed_reviewer_envelope_and_custody() -> None:
+    """Canonical design must distinguish terminal wrapper failure from staleness."""
+    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    text = design.read_text()
+    for token in (
+        "`error_class`",
+        "dispatch-bound",
+        "non-zero",
+        "`result_valid=False`",
+        "classifies as `failed`",
+        "archive before relabel",
+        "`ai:needs-human-decision`",
+        "relabel failure",
+        "final archive",
+        "retains scratch",
+    ):
+        assert token in text, f"Failed-reviewer design contract missing: {token}"
+
+
+def test_design_doc_defines_reviewer_output_suppression() -> None:
+    """Canonical design must not promise candidate-controlled reviewer output."""
+    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    text = design.read_text()
+    for token in ("JSONL stdout", "stderr", "bounded", "sanitized",
+                  "review-observation.json", "explicit invocation",
+                  "startup error class", "`EngineExitError`",
+                  "implementer/fixer", "engine stderr"):
+        assert token in text
+    assert "stdout and stderr are both\nredirected to `DEVNULL`" not in text
+    assert "raw reviewer engine stderr" not in text
+
+
+def test_preflight_scopes_model_report_as_unverified_signal() -> None:
+    """Preflight must label the sandbox denial signal as UNVERIFIED."""
+    text = PREFLIGHT.read_text()
+    assert "UNVERIFIED" in text
+
+
+# --- Category B — behavioral invariants (mock subprocess on tick.py functions) ---
+
+
+def test_read_authoritative_in_flight_labels_queries_three_label_sets() -> None:
+    """read_authoritative_in_flight_labels queries all three in-flight label sets."""
+    from tick import read_authoritative_in_flight_labels  # type: ignore[import-untyped]
+
+    with mock.patch("tick.gh_json") as gh_json:
+        gh_json.side_effect = [
+            [{"number": 1}],
+            [{"number": 2}],
+            [{"number": 3}],
+        ]
+        refs = read_authoritative_in_flight_labels()
+
+    labels = {r.label for r in refs}
+    assert labels == {"ai:implementing", "ai:reviewing", "ai:fixing"}
+
+
+def test_can_dispatch_now_fail_closed_on_corrupt_marker() -> None:
+    """Admission must fail closed — one bad marker blocks all dispatch."""
+    from tick import can_dispatch_now  # type: ignore[import-untyped]
+
+    with mock.patch("tick._scan_marker_identities") as scan:
+        scan.side_effect = RuntimeError("corrupt")
+        result = can_dispatch_now(max_in_flight=3)
+
+    assert result.can_dispatch is False
+    assert result.reason == "admission_error"
+
+
+def test_can_dispatch_now_ignores_markerless_in_flight_labels() -> None:
+    """A markerless in-flight label consumes no admission slot.
+
+    The cap bounds the engines this machine launched. ``ai:implementing`` is
+    also the documented manual pickup label, so counting it as a paid engine
+    let stale hand-set labels starve every dispatch until an operator
+    stripped them (#534, recurring 2026-08-20).
+    """
+    from tick import can_dispatch_now  # type: ignore[import-untyped]
+
+    with mock.patch("tick._scan_marker_identities") as scan:
+        scan.return_value = []
+        result = can_dispatch_now(max_in_flight=1)
+
+    assert result.can_dispatch is True
+    assert result.in_flight_count == 0
+
+
+@pytest.mark.real_gh_helper
+def test_relabel_uses_a_single_add_remove_mutation() -> None:
+    """relabel() moves a label in one gh edit, never add-then-remove.
+
+    Two mutations would leave a dual-label window that HARVEST reads as a
+    partially applied transition.
+    """
+    from tick import relabel  # type: ignore[import-untyped]
+
+    with mock.patch("subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=[], returncode=0, stdout="", stderr="",
+        )
+        relabel("pr", 42, "ai:reviewing", "ai:ready-for-human")
+
+    assert run.call_count == 1
+    call_args = run.call_args[0][0]
+    assert "--add-label" in call_args
+    assert "--remove-label" in call_args
+    assert "ai:ready-for-human" in call_args
+
+
+def test_dispatch_writes_the_lease_before_it_relabels(tmp_path: Path) -> None:
+    """Dispatch writes the local lease marker before applying the label.
+
+    A label applied first is a custody claim with no local liveness record, so
+    a crash between the two strands the item at an in-flight label with
+    nothing to harvest.
+
+    The engine launch is recorded too, so the asserted order is the real one
+    rather than the one the docs would like. The launching lease lands before
+    the engine spends — that half is sound — but the *label* lands after it.
+    That residual window (another machine can select the same item between the
+    spawn and the relabel) is pre-existing and out of scope here; asserting the
+    true order keeps it visible instead of letting a docstring imply the
+    label is acquired first.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    order: list[str] = []
+    fake_proc = mock.MagicMock()
+    fake_proc.pid = 12345
+
+    def record_write(path: str, data: str) -> None:
+        if os.path.basename(path) == "dispatch.json":
+            order.append("lease")
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_text(data)
+
+    def record_gh(*args: str, **kwargs: object) -> object:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+
+    def record_relabel(*args: object, **kwargs: object) -> None:
+        order.append("relabel")
+
+    def record_launch(*args: object, **kwargs: object) -> object:
+        order.append("launch")
+        return fake_proc
+
+    def fake_git(*args: str, **kwargs: object) -> str:
+        return "deadbeef" if "rev-parse" in args else ""
+
+    with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "sk-test"}, clear=True):
+        with mock.patch.object(tick, "WT_ROOT", str(tmp_path)):
+            with mock.patch.object(tick, "git", side_effect=fake_git):
+                with mock.patch.object(
+                    tick.pipeline, "atomic_write", side_effect=record_write,
+                ):
+                    with mock.patch.object(tick, "gh", side_effect=record_gh):
+                        with mock.patch.object(
+                            tick, "relabel", side_effect=record_relabel,
+                        ):
+                            with mock.patch.object(
+                                tick, "_publish_marker_or_revert",
+                                return_value=True,
+                            ):
+                                with mock.patch.object(
+                                    tick, "_resolve_engine",
+                                    return_value=("claude", {}),
+                                ):
+                                    with mock.patch.object(
+                                        tick, "_launch_claude_engine",
+                                        side_effect=record_launch,
+                                    ):
+                                        tick._dispatch_one_implementer(
+                                            issue_number=77,
+                                            issue_title="Test",
+                                            issue_body="Body",
+                                        )
+
+    assert order == ["lease", "launch", "relabel"]
+
+
+def test_verify_codex_bin_prevents_below_minimum_reviewer_launch() -> None:
+    """Dispatch must reject codex versions below the minimum floor."""
+    import shutil as _shutil
+
+    from tick import verify_codex_bin  # type: ignore[import-untyped]
+
+    with mock.patch.object(_shutil, "which", return_value="/usr/local/bin/codex"):
+        with mock.patch("subprocess.run") as run:
+            run.return_value = subprocess.CompletedProcess(
+                args=["/usr/local/bin/codex", "--version"],
+                returncode=0, stdout="codex-cli 0.140.0\n", stderr="",
+            )
+            with pytest.raises(RuntimeError, match="below minimum"):
+                verify_codex_bin(min_version="codex-cli 0.141.0")
+
+
+def test_reconcile_engine_kill_gated_on_matched_identity() -> None:
+    """Kill only fires when identity is 'matched'."""
+    from pipeline import StageConfig  # type: ignore[attr-defined]
+    from tick import reconcile_engine  # type: ignore[import-untyped]
+
+    config = StageConfig(
+        stage="review", worktree_prefix="pr", attempts_key_prefix="",
+        result_file="review.json", in_flight_label="ai:reviewing",
+        pre_label="ai:implemented", strict_dual_label=True,
+        tick_abort_on_enum_failure=True,
+    )
+
+    with mock.patch("tick.gh_text") as gh_text:
+        gh_text.return_value = ""  # empty reconcile set
+        with mock.patch("os.listdir") as listdir:
+            listdir.return_value = []
+            decisions, ok = reconcile_engine(config, tick_log=None, target=None,
+                                             wt_root="/tmp")
+
+    # Empty reconcile set = no kill decisions
+    assert len(decisions) == 0
+    assert ok is True
+
+
+def test_main_honors_harvest_ordering() -> None:
+    """main() runs HARVEST phases in the correct order (review → implement → fix).
+
+    DISPATCH follows HARVEST and is gated on reconcile_ok.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    call_order: list[str] = []
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = "/tmp"
+        with mock.patch("tick.harvest_reviewers") as hr:
+            hr.side_effect = lambda *a, **kw: call_order.append("harvest_reviewers") or True
+            with mock.patch("tick.harvest_implementers") as hi:
+                hi.side_effect = lambda *a, **kw: call_order.append("harvest_implementers") or True
+                with mock.patch("tick.harvest_fixers") as hf:
+                    hf.side_effect = lambda *a, **kw: call_order.append("harvest_fixers") or True
+                    main()
+
+    assert call_order == [
+        "harvest_reviewers", "harvest_implementers", "harvest_fixers",
+    ], f"Expected harvest ordering, got: {call_order}"
+
+
+# --- Category C — structural invariants (subprocess call args) ---
+
+
+def test_dispatch_implementers_uses_comma_separated_json_fields() -> None:
+    """dispatch_implementers must query gh issue list --json number,title (comma-separated).
+
+    The gh CLI treats ``--json number title`` as two separate positional arguments
+    and rejects the call.  The correct form is ``--json number,title``.
+    """
+    from tick import dispatch_implementers  # type: ignore[import-untyped]
+
+    with mock.patch("tick.gh_json") as gh_json:
+        gh_json.return_value = []  # empty list → loop body never runs
+        dispatch_implementers(authoritative_in_flight=[])
+
+    # Find the issue list call and verify comma-separated fields.
+    found_call = False
+    for call in gh_json.call_args_list:
+        args: tuple[str, ...] = call[0]
+        if len(args) >= 2 and args[0] == "issue" and args[1] == "list":
+            found_call = True
+            for i, a in enumerate(args):
+                if a == "--json" and i + 1 < len(args):
+                    assert args[i + 1] == "number,title", (
+                        f"Expected '--json number,title' (single comma-separated string), "
+                        f"got '--json {args[i + 1]}'"
+                    )
+    assert found_call, "dispatch_implementers did not call gh_json for issue list"
+
+
+@pytest.mark.real_gh_helper
+def test_gh_helper_always_uses_utf8_errors_replace() -> None:
+    """gh() must use encoding='utf-8', errors='replace'."""
+    from tick import gh  # type: ignore[import-untyped]
+
+    with mock.patch("subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=["gh", "pr", "list"], returncode=0, stdout="", stderr="",
+        )
+        gh("pr", "list")
+        call_kwargs = run.call_args[1]
+        assert call_kwargs["encoding"] == "utf-8"
+        assert call_kwargs["errors"] == "replace"
+
+
+def test_git_helper_always_uses_utf8_errors_replace() -> None:
+    """git() must use encoding='utf-8', errors='replace'."""
+    from tick import git  # type: ignore[import-untyped]
+
+    with mock.patch("subprocess.run") as run:
+        run.return_value = subprocess.CompletedProcess(
+            args=["git", "rev-parse"], returncode=0, stdout="/repo\n", stderr="",
+        )
+        git("rev-parse", "--show-toplevel")
+        call_kwargs = run.call_args[1]
+        assert call_kwargs["encoding"] == "utf-8"
+        assert call_kwargs["errors"] == "replace"
+
+
+def test_tick_log_entry_has_ts_as_integer() -> None:
+    """TickLog entries must emit ts as an integer (epoch seconds)."""
+    import json as _json
+    import tempfile
+
+    from tick import TickLog  # type: ignore[import-untyped]
+
+    tmp = tempfile.mkdtemp()
+    try:
+        log = TickLog.open(tmp)
+        log.log(pr=42, phase="harvest", stage="review", action="promote",
+                reason="no blockers")
+        with open(log.path) as fh:
+            entry = _json.loads(fh.readline())
+        assert isinstance(entry["ts"], int)
+    finally:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --- Category A — ordering invariants (mock + assert_has_calls) ---
+
+
+def test_main_harvest_phases_called_in_order() -> None:
+    """HARVEST phases must execute in order: reviewers, implementers, fixers."""
+    from tick import main  # type: ignore[import-untyped]
+
+    manager = mock.MagicMock()
+    manager.attach_mock(mock.MagicMock(return_value=True), "harvest_reviewers")
+    manager.attach_mock(mock.MagicMock(return_value=True), "harvest_implementers")
+    manager.attach_mock(mock.MagicMock(return_value=True), "harvest_fixers")
+
+    with mock.patch("tick.git", return_value="/tmp"):
+        with mock.patch("tick.harvest_reviewers", manager.harvest_reviewers):
+            with mock.patch("tick.harvest_implementers", manager.harvest_implementers):
+                with mock.patch("tick.harvest_fixers", manager.harvest_fixers):
+                    with mock.patch("tick.read_authoritative_in_flight_labels", return_value=[]):
+                        with mock.patch("tick.dispatch_reviewers"):
+                            with mock.patch("tick.dispatch_implementers"):
+                                with mock.patch("tick.dispatch_fixers"):
+                                    main()
+
+    harvest_calls = [c[0] for c in manager.mock_calls if "harvest" in str(c)]
+    assert len(harvest_calls) == 3
+    assert "harvest_reviewers" in str(harvest_calls[0])
+    assert "harvest_implementers" in str(harvest_calls[1])
+    assert "harvest_fixers" in str(harvest_calls[2])
+
+
+# --- Helpers ---
+
+
+def ordering_surfaces() -> tuple[tuple[str, str], ...]:
+    """Return the whole contents of each doc stating the publication-ordering rule.
+
+    Each surface stated the rule independently, which is how they drifted apart:
+    correcting one leaves the other two teaching the superseded version. Pinning
+    them together is what makes a partial fix fail.
+
+    Whole-file scope is right for *existence* checks — a required phrase may move
+    between sections and still be stated. It is wrong for checking which symbols a
+    surface names, because these documents name them elsewhere too; use
+    :func:`publication_ordering_sections` for that.
+
+    Returns:
+        ``(display name, normalized contents)`` per ordering surface. See
+        :func:`normalize_prose` for why the contents are normalized.
+    """
+    return tuple(
+        (surface.name, normalize_prose(surface.path.read_text()))
+        for surface in _ORDERING_SURFACES
+    )
+
+
+def publication_ordering_sections() -> tuple[tuple[_OrderingSurface, str], ...]:
+    """Return just the publication-ordering section of each ordering surface.
+
+    Slices each document between its declared anchors, so a check on what the
+    surface *names* reads only the prose that states the bound. Both anchors are
+    required: a surface that renamed or dropped its section fails here rather
+    than degrading into a whole-file scan, or into an empty slice that passes
+    everything.
+
+    Returns:
+        ``(surface, normalized section)`` per ordering surface.
+    """
+    sections: list[tuple[_OrderingSurface, str]] = []
+    for surface in _ORDERING_SURFACES:
+        raw = surface.path.read_text()
+        start = raw.find(surface.section_start)
+        assert start != -1, (
+            f"{surface.name} no longer opens its publication-ordering section "
+            f"with {surface.section_start!r}; re-anchor it in _ORDERING_SURFACES "
+            f"rather than letting the member check widen to the whole file"
+        )
+        end = raw.find(surface.section_end, start + len(surface.section_start))
+        assert end != -1, (
+            f"{surface.name}'s publication-ordering section is no longer "
+            f"terminated by {surface.section_end!r}; re-anchor it in "
+            f"_ORDERING_SURFACES"
+        )
+        sections.append((surface, normalize_prose(raw[start:end])))
+    return tuple(sections)
+
+
+def comment_posting_functions() -> frozenset[str]:
+    """Return the ``tick.py`` functions that reach ``gh <entity> comment``.
+
+    The raw ``gh`` call is what is inspected, not the receipted helper: the
+    reviewer verdict posts directly and would be invisible to a helper-scoped
+    check. Two contracts read this — the bound itself, and the cardinality the
+    ordering surfaces publish — so they cannot disagree about what the source
+    says.
+
+    Returns:
+        The names of the enclosing functions containing a ``gh`` call with a
+        literal ``"comment"`` argument.
+    """
+    tree = ast.parse((Path(__file__).parent / "tick.py").read_text())
+    posting: set[str] = set()
+    for enclosing, node in walk_calls_with_enclosing_function(tree):
+        if not isinstance(node.func, ast.Name) or node.func.id != "gh":
+            continue
+        if any(
+            isinstance(arg, ast.Constant) and arg.value == "comment"
+            for arg in node.args
+        ):
+            posting.add(enclosing)
+    return frozenset(posting)
+
+
+def reaches_hold_label(argument: ast.expr) -> bool:
+    """Return whether one relabel argument may carry the hold label.
+
+    Fails closed, for the same reason :func:`conftest.is_mutating_gh` does:
+    a census that only recognised ``pipeline.LABEL_NEEDS_HUMAN`` would miss the
+    two spellings the reconcile paths already use — a bare
+    ``"ai:needs-human-decision"`` string (``_reconcile_one``) and a variable
+    proven equal to the constant by an enclosing guard
+    (``_execute_reconcile_actions``). Those are exactly the style a new silent
+    escalation would be written in, so recognising only the attribute form
+    would leave the hole this census exists to close.
+
+    Anything the walk cannot resolve to a *different* label therefore counts.
+    A name, a call, a subscript — all indeterminate, all enumerated, and the
+    cost of a false positive is one recorded line in
+    :data:`_NEEDS_HUMAN_TRANSITIONS` rather than a missed escalation.
+
+    Args:
+        argument: One positional or keyword argument of a relabel call.
+
+    Returns:
+        ``True`` unless the argument is provably some other label.
+    """
+    import pipeline  # type: ignore[import-untyped]
+
+    if isinstance(argument, ast.Attribute):
+        return argument.attr == "LABEL_NEEDS_HUMAN"
+    if isinstance(argument, ast.Constant):
+        return argument.value == pipeline.LABEL_NEEDS_HUMAN
+    return True
+
+
+def needs_human_relabel_sites() -> dict[str, int]:
+    """Return each ``tick.py`` function that relabels an item to the hold label.
+
+    Keyed by the *enclosing* function so a nested escalation helper reports its
+    own name, and valued by count so a function that owns one deliberate silent
+    transition cannot quietly grow a second.
+
+    Only the *target* label position is classified, which is where each helper
+    actually puts it: ``relabel``/``_relabel_with_context`` take
+    ``(entity, number, from_label, to_label)``, and ``_converge_pipeline_labels``
+    takes ``(entity, number, to_label)``. Reading every argument from the third
+    on would fold ``from_label`` in, and since that is usually a variable the
+    fail-closed classifier would count ordinary in-flight relabels as hold-label
+    sites — making the census a superset that no longer means what it says.
+
+    Returns:
+        ``{function name: number of transitions to the hold label}``.
+    """
+    tree = ast.parse((Path(__file__).parent / "tick.py").read_text())
+    sites: dict[str, int] = {}
+    for enclosing, node in walk_calls_with_enclosing_function(tree):
+        if not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id not in _RELABEL_HELPERS:
+            continue
+        target_index = 2 if node.func.id == "_converge_pipeline_labels" else 3
+        label_args = [
+            *node.args[target_index:target_index + 1],
+            # Both spellings: `relabel`/`_relabel_with_context` name the
+            # parameter `to_label`, `_converge_pipeline_labels` names it
+            # `target_label`. Matching one would leave the other invisible the
+            # first time a call site passes it by keyword.
+            *(
+                kw.value for kw in node.keywords
+                if kw.arg in ("to_label", "target_label")
+            ),
+        ]
+        if any(reaches_hold_label(arg) for arg in label_args):
+            sites[enclosing] = sites.get(enclosing, 0) + 1
+    return sites
+
+
+def walk_calls_with_enclosing_function(
+    tree: ast.Module,
+) -> list[tuple[str, ast.Call]]:
+    """Yield every call in a module paired with the function that contains it.
+
+    ``ast.walk`` loses the enclosing scope, and the publishing bound is a claim
+    about *where* a call appears, not just that it exists. Nested functions
+    report their own name rather than the outer one, which is what a reader
+    checking the source would name too.
+
+    Args:
+        tree: A parsed module.
+
+    Returns:
+        ``(enclosing function name, call node)`` pairs. Calls at module scope
+        report ``"<module>"``.
+    """
+    pairs: list[tuple[str, ast.Call]] = []
+
+    def visit(node: ast.AST, enclosing: str) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.Call):
+                pairs.append((enclosing, child))
+            if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                visit(child, child.name)
+            else:
+                visit(child, enclosing)
+
+    visit(tree, "<module>")
+    return pairs
+
+
+def carve_out_block(text: str) -> str:
+    """Return just the dispatched-engine carve-out from a root agent doc.
+
+    Both ``CLAUDE.md`` and ``AGENTS.md`` open the carve-out with the same
+    sentence and close it with the same link to the label-authority section, so
+    the block is delimited without depending on either file's paragraph shape.
+
+    Args:
+        text: Raw contents of ``CLAUDE.md`` or ``AGENTS.md``.
+
+    Returns:
+        The carve-out text, or the remainder of the file if the closing link is
+        missing — an absent closer should surface as the specific clause
+        assertion that fails, not as a silently empty block that passes nothing.
+    """
+    start = text.index(_CARVE_OUT_OPENER)
+    end = text.find(_CARVE_OUT_CLOSER, start)
+    return text[start:] if end == -1 else text[start : end + len(_CARVE_OUT_CLOSER)]
+
+
+def normalize_prose(text: str) -> str:
+    """Flatten markdown prose so phrase assertions survive editing.
+
+    These are hand-wrapped documents. A named path is asserted because it states
+    a contract, not because it is typeset a particular way — so reflowing a
+    paragraph, bolding a term, or starting a sentence with it must not fail the
+    assertion, while dropping the path entirely must. Lowercases, strips ``*``
+    and backtick emphasis, and collapses whitespace runs (including the line
+    wraps that split a phrase in two).
+
+    Args:
+        text: Raw markdown file contents.
+
+    Returns:
+        The text lowercased, stripped of emphasis markers, and whitespace-collapsed.
+    """
+    stripped = text.lower().replace("*", "").replace("`", "")
+    return " ".join(stripped.split())
