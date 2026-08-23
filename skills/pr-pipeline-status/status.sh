@@ -6,9 +6,9 @@
 #   watch -n 5 'bash .claude/skills/pr-pipeline-status/status.sh'
 #
 # It makes no writes to pipeline state: it never edits labels, dispatches
-# engines, or touches markers. (The two `uv run` calls below can sync the
-# project venv — that is uv's own state, not the pipeline's, and neither call
-# takes the tick lock.) It only *reads* the two state sources the pipeline
+# engines, or touches markers. (The two Python calls below invoke a resolved
+# interpreter directly and take no tick lock.) It only *reads* the two state
+# sources the pipeline
 # externalizes, so it cannot interfere with a running tick/loop:
 #
 #   1. GitHub labels      = pipeline stage   (queue / reviewing / done)
@@ -36,8 +36,41 @@ REPO="${PIPELINE_REPO:-kwuBuild/sworn}"
 COMMON_DIR="$(git rev-parse --git-common-dir)"
 ROOT="$(cd "$(dirname "$COMMON_DIR")" && pwd)"
 WT_ROOT="$ROOT/.claude/worktrees"
-TICK_LIB="$ROOT/.claude/skills/pr-pipeline-tick/lib"
+# Pipeline CODE is resolved relative to this script, not to the target repo:
+# under a plugin install the skills live outside the repo entirely. Pipeline
+# STATE (WT_ROOT, TICK_LOG_DIR) stays repo-relative — it belongs to the repo
+# being operated on. Conflating the two is what makes a moved dashboard report
+# a busy pipeline as idle.
+SKILL_DIR="$(cd "$(dirname "$0")" && pwd)"
+TICK_LIB="$SKILL_DIR/../pr-pipeline-tick/lib"
 NOW=$(date +%s)
+
+# Resolve an interpreter that can actually run the lib. Bare `python3` is NOT a
+# safe substitute for `uv run python`: tick.py/pipeline.py need 3.11+ for
+# `tomllib`, and the ambient `python3` is whatever PATH resolves (3.9 on a stock
+# macOS box, and on Anaconda installs). This is about PRECEDENCE, not
+# availability: a box can have 3.13 installed and still resolve `python3` to a
+# 3.9. Set PR_PIPELINE_PYTHON to pin one explicitly. A too-old interpreter would
+# fail every render into `?` — a dashboard reporting false idle, which is exactly
+# the signal an operator uses to decide the pipeline is safe to touch.
+resolve_python() {
+  local candidate
+  for candidate in ${PR_PIPELINE_PYTHON:+"$PR_PIPELINE_PYTHON"} \
+                   python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+        >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+PY="$(resolve_python || true)"
+if [[ -z "$PY" ]]; then
+  echo "WARN: no Python >= 3.11 on PATH (needed for tomllib);" >&2
+  echo "      engine-progress and tick-log columns will render as '?'." >&2
+fi
 
 # Progress verdicts, one `name<TAB>label` line per marker, from the same code
 # the loop's stall watcher runs. A stall is "quiet past the threshold" *and*
@@ -48,14 +81,12 @@ NOW=$(date +%s)
 # distrust both surfaces, so the verdict is computed once, in Python.
 #
 # Takes no pipeline lock and makes no pipeline state transition, so it is safe
-# against a live tick. Not the same claim as "touches nothing": `uv run` may
-# sync and lock the *project venv*, which is why the invocation is not plain
-# `python3` even though tick.py is stdlib-only — tick.py needs 3.11+ for
-# `tomllib`, and the ambient `python3` is whatever the operator's PATH resolves
-# (3.9 on a stock macOS box), which would fail every render into `?`. If the
-# call cannot be made at all the column reads `?` (see below) rather than
-# guessing.
-PROGRESS_VERDICTS=$(uv run python "$TICK_LIB/tick.py" engine-progress \
+# against a live tick. The interpreter is the one resolved above, not bare
+# `python3`: tick.py is stdlib-only but needs 3.11+ for `tomllib`, and the
+# ambient `python3` is whatever the operator's PATH resolves (3.9 on a stock
+# macOS box), which would fail every render into `?`. If the call cannot be
+# made at all the column reads `?` (see below) rather than guessing.
+PROGRESS_VERDICTS=$("$PY" "$TICK_LIB/tick.py" engine-progress \
                       --wt-root "$WT_ROOT" 2>/dev/null || true)
 
 echo "PR PIPELINE  ·  $(date '+%Y-%m-%d %H:%M:%S')  ·  repo $REPO"
@@ -136,9 +167,9 @@ gh issue list --repo "$REPO" --state open --json number,title,labels --limit 100
 # --- LAST TICK LOG SUMMARY ------------------------------------------------------
 echo
 echo "LAST TICK AUDIT LOG"
-PIPELINE="$ROOT/.claude/skills/pr-pipeline-tick/lib/pipeline.py"
+PIPELINE="$SKILL_DIR/../pr-pipeline-tick/lib/pipeline.py"
 TICK_LOG_DIR="$ROOT/.claude/worktrees/.tick-log"
-if entries=$(uv run python "$PIPELINE" tick-log-tail --log-dir "$TICK_LOG_DIR" 2>/dev/null) \
+if entries=$("$PY" "$PIPELINE" tick-log-tail --log-dir "$TICK_LOG_DIR" 2>/dev/null) \
    && [ "$(printf '%s' "$entries" | jq 'length' 2>/dev/null)" -gt 0 ]; then
   printf '%s' "$entries" \
     | jq -r '.[] | "\(.ts|tonumber|strftime("%H:%M:%S"))  PR#\(.pr // "-")\t\(.phase)\t\(.stage)\t\(.action)\t\(.dispatch_id // "")\t\((.reason // "")[0:30])\t\(.engine // "")"' \

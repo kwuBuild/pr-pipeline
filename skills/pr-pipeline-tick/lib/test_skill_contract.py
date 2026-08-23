@@ -20,7 +20,23 @@ from unittest import mock
 
 import pytest
 
-REPO_ROOT = (Path(__file__).parent.parent / "../../..").resolve()
+def _repo_root() -> Path:
+    """Locate the repository root by walking up to the enclosing ``.git``.
+
+    Never count directory levels from ``__file__``: a fixed ``../../..`` walk
+    encodes how deeply the skill happens to sit inside the repo, which differs
+    between an in-repo install (``.claude/skills/...``) and this repository's
+    own ``skills/...`` layout. A hardcoded depth resolves silently to the wrong
+    directory rather than failing, so every doc-contract assertion below would
+    read a file that is not the one it names.
+    """
+    for candidate in Path(__file__).resolve().parents:
+        if (candidate / ".git").exists():
+            return candidate
+    raise RuntimeError(f"no enclosing git repository above {__file__}")
+
+
+REPO_ROOT = _repo_root()
 SKILL = Path(__file__).parent.parent / "SKILL.md"
 README = Path(__file__).parent.parent / "README.md"
 DEBUG = Path(__file__).parent.parent / "DEBUG.md"

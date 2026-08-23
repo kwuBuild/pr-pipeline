@@ -22,6 +22,35 @@ PROBE_SCHEMA="$SKILL_DIR/preflight-probe-schema.json"
 LIB="$SKILL_DIR/lib/pipeline.py"
 MIN_VERSION="codex-cli 0.142.5"
 
+# Resolve an interpreter that can actually run the lib. `uv run python` is not
+# available outside a uv project, and bare `python3` is NOT a safe substitute:
+# tick.py/pipeline.py need 3.11+ for `tomllib`, while the ambient `python3` is
+# whatever PATH resolves (3.9 on a stock macOS box, and on Anaconda installs).
+# Note this is about PRECEDENCE, not availability: a box can have 3.13 installed
+# and still resolve `python3` to a 3.9 (Anaconda, pyenv shim, system Python).
+# Set PR_PIPELINE_PYTHON to pin an interpreter explicitly; otherwise probe
+# explicit minors first, then verify whatever `python3` resolves to. Fail loudly
+# rather than letting a 3.9 produce a confusing ImportError inside a probe.
+resolve_python() {
+  local candidate
+  for candidate in ${PR_PIPELINE_PYTHON:+"$PR_PIPELINE_PYTHON"} \
+                   python3.14 python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1 \
+      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+        >/dev/null 2>&1; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+if ! PY="$(resolve_python)"; then
+  echo "FAIL: no Python >= 3.11 found on PATH (needed for tomllib)." >&2
+  echo "      Tried: python3.14 python3.13 python3.12 python3.11 python3" >&2
+  exit 1
+fi
+
 # Resolve the binary by the SAME path dispatch uses (`command -v codex`), then bind
 # every probe below to that absolute path. Preflight and dispatch must verify and launch
 # the identical build, or the sandbox/schema guarantees this gate proves do not transfer
@@ -108,7 +137,7 @@ if ! bound "$CODEX_BIN" exec -C "$work" --skip-git-repo-check -s read-only \
   exit 1
 fi
 
-if ! verdict="$(uv run python "$LIB" validate-review --review "$out")"; then
+if ! verdict="$("$PY" "$LIB" validate-review --review "$out")"; then
   echo "FAIL(b): codex output did not validate against review-schema.json"
   echo "  produced:"; sed 's/^/  /' "$out" 2>/dev/null || echo "  (no output file written)"
   exit 1
@@ -144,8 +173,8 @@ bound "$CODEX_BIN" exec -C "$work" --skip-git-repo-check -s read-only \
   "Attempt to create a file named WRITE_TEST.txt containing the word blocked in the current working directory by running a shell command. Then report, conforming exactly to the output schema: set write_attempted=true ONLY if you actually executed a command that tried to create the file, and write_blocked=true if that command was denied by the sandbox (e.g. 'operation not permitted'). Never report write_attempted=true unless you really ran the command." \
   > /dev/null 2> "$work/stderr-c.log" || true
 
-attempted="$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("write_attempted"))' "$probe_out" 2>/dev/null || echo None)"
-blocked="$(uv run python -c 'import json,sys; print(json.load(open(sys.argv[1])).get("write_blocked"))' "$probe_out" 2>/dev/null || echo None)"
+attempted="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("write_attempted"))' "$probe_out" 2>/dev/null || echo None)"
+blocked="$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("write_blocked"))' "$probe_out" 2>/dev/null || echo None)"
 
 if [[ -f "$work/WRITE_TEST.txt" ]]; then
   echo "FAIL(c): -s read-only did NOT block the write (WRITE_TEST.txt was created)."
