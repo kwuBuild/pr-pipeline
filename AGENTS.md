@@ -19,6 +19,18 @@ If both files apply:
 
 ## Working Rules
 
+**If you were dispatched by `pr-pipeline-tick`, every label instruction in this
+file and in `pr-guidelines.md` is not for you** — not the workflow bullets
+below, not the blanket pre-authorization for updating workflow labels, and not
+the review-posting flow that runs `gh pr edit`. The scope is unbounded on
+purpose: it covers every label instruction in this file, present and future, not
+a counted subset you can read past. The tick owns both ends of your stage's
+label transitions. Do not add, remove, or change any `ai:` label on any issue or
+PR; report your outcome through the completion sentinel named in your prompt and
+let the harvest do the relabel. A label you set mid-run cannot be retracted and
+will be read as a human hold that overrides the sentinel you finish with. See
+[Pipeline label authority](docs/working/pr-guidelines.md#pipeline-label-authority).
+
 - Start with the smallest relevant context instead of loading large project documents wholesale
 - Use `CLAUDE.md` as the routing map for project architecture and planning documents
 - Prefer focused reads by section or line range when a referenced document is large

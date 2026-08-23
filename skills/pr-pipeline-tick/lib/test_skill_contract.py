@@ -46,17 +46,10 @@ STATUS_SKILL = (
     Path(__file__).parent.parent.parent / "pr-pipeline-status" / "SKILL.md"
 )
 PROMPTS = Path(__file__).parent / "prompts"
-GUIDELINES = (Path(__file__).parent.parent / "../../../docs/working/pr-guidelines.md").resolve()
-DESIGN = (
-    Path(__file__).parent.parent / "../../../docs/planning/designs/pr-pipeline-tick.md"
-).resolve()
-INTERNALS = (
-    Path(__file__).parent.parent / "../../../docs/working/pr-pipeline-internals.md"
-).resolve()
-EXTRACTION_DESIGN = (
-    Path(__file__).parent.parent
-    / "../../../docs/planning/designs/pr-pipeline-tick-python-extraction.md"
-).resolve()
+GUIDELINES = REPO_ROOT / "docs/working/pr-guidelines.md"
+DESIGN = REPO_ROOT / "docs/planning/designs/pr-pipeline-tick.md"
+INTERNALS = REPO_ROOT / "docs/working/pr-pipeline-internals.md"
+EXTRACTION_DESIGN = REPO_ROOT / "docs/planning/designs/pr-pipeline-tick-python-extraction.md"
 
 # The scope the credentialed engine prompts must state verbatim. Ambient `gh`
 # credentials reach every item in the repository, not just the one the engine was
@@ -599,7 +592,7 @@ def test_skill_md_references_preflight() -> None:
 
 def test_design_doc_marks_fixer_as_shipped_not_manual() -> None:
     """The design doc shipped-slice language must match the runnable fixer stage."""
-    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    design = DESIGN
     text = design.read_text()
     assert "shipped review-only slice" not in text
     assert "shipped implement/review/fix slice" in text
@@ -1032,7 +1025,7 @@ def test_repo_agent_docs_exempt_dispatched_engines_from_label_workflow(
     first pair and reads the rest as a standing grant, so the count is asserted
     against — an unbounded scope is the only version that closes the hole.
     """
-    text = (SKILL.parent / f"../../../{agent_doc}").resolve().read_text()
+    text = (REPO_ROOT / agent_doc).read_text()
     assert _CARVE_OUT_OPENER in text, (
         f"{agent_doc} has no dispatched-engine carve-out at all"
     )
@@ -1112,7 +1105,7 @@ def test_operator_docs_define_failed_reviewer_terminal_custody() -> None:
 
 def test_design_doc_distinguishes_reviewer_and_wrapperless_completion() -> None:
     """The canonical design must not require reviewer envelopes from Claude stages."""
-    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    design = DESIGN
     text = design.read_text()
     assert "Reviewer completion authority" in text
     assert "Wrapperless implementer/fixer completion authority" in text
@@ -1120,7 +1113,7 @@ def test_design_doc_distinguishes_reviewer_and_wrapperless_completion() -> None:
 
 def test_design_doc_defines_failed_reviewer_envelope_and_custody() -> None:
     """Canonical design must distinguish terminal wrapper failure from staleness."""
-    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    design = DESIGN
     text = design.read_text()
     for token in (
         "`error_class`",
@@ -1139,7 +1132,7 @@ def test_design_doc_defines_failed_reviewer_envelope_and_custody() -> None:
 
 def test_design_doc_defines_reviewer_output_suppression() -> None:
     """Canonical design must not promise candidate-controlled reviewer output."""
-    design = (SKILL.parent / "../../../docs/planning/designs/pr-pipeline-tick.md").resolve()
+    design = DESIGN
     text = design.read_text()
     for token in ("JSONL stdout", "stderr", "bounded", "sanitized",
                   "review-observation.json", "explicit invocation",

@@ -26,6 +26,18 @@ Two layers of agency. The **orchestrator agent** (a Claude Code session running 
 
 Tasks are tracked as GitHub Issues and PRs with workflow labels. The full label set and transition rules live in `docs/working/pr-guidelines.md` under [Workflow labels](docs/working/pr-guidelines.md#workflow-labels) — read that doc before picking up, raising, reviewing, or revising any work.
 
+**If you were dispatched by `pr-pipeline-tick`, every label instruction in this
+file and in `pr-guidelines.md` is not for you.** The tick owns both ends of your
+stage's label transitions. Do not add, remove, or change any `ai:` label on any
+issue or PR; report your outcome through the completion sentinel named in your
+prompt and let the harvest do the relabel. A label you set mid-run cannot be
+retracted and will be read as a human hold that overrides the sentinel you
+finish with. For the same reason, do not run `gh pr create` — the instructions
+elsewhere in this file that tell you to raise the PR yourself are for
+interactive agents. The harvest opens your PR from the `pr-body` file your
+prompt names, and labels it. See
+[Pipeline label authority](docs/working/pr-guidelines.md#pipeline-label-authority).
+
 ### Workflow labels
 
 Issue states:
