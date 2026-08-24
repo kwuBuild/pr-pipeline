@@ -2895,6 +2895,35 @@ def test_touches_review_policy_catches_frontend_checklist() -> None:
     assert touches_review_policy(["README.md"]) is False
 
 
+def test_touches_review_policy_guards_the_gate_at_any_install_depth() -> None:
+    """A PR editing the gate's own files must escalate wherever the skill lives.
+
+    The gate protects itself: a PR that flips ``allow_touching`` or rewrites
+    ``_policy_touching_allowed`` would otherwise disable the escalation for
+    every future policy-editing PR, so those paths escalate to a human. That
+    self-protection was pinned to ``.claude/skills/...`` — the depth of an
+    in-repo install — which silently exempts exactly the same edit in the
+    pipeline's own repository, where the skills live at ``skills/``, and in any
+    plugin layout. Matching the path suffix keeps one rule for every depth.
+    """
+    from pipeline import touches_review_policy  # type: ignore[import-untyped]
+
+    for prefix in ("", ".claude/", "vendor/pr-pipeline/"):
+        for tail in (
+            "skills/pr-pipeline-tick/config.toml",
+            "skills/pr-pipeline-tick/lib/pipeline.py",
+            "skills/pr-pipeline-tick/lib/tick.py",
+        ):
+            assert touches_review_policy([prefix + tail]) is True, (
+                f"gate self-protection missed {prefix + tail}"
+            )
+
+    # The suffix must stay a path-segment match, not a substring one.
+    assert touches_review_policy(["docs/skills/pr-pipeline-tick/config.toml"]) is True
+    assert touches_review_policy(["other-skills/pr-pipeline-tick/config.toml"]) is False
+    assert touches_review_policy(["skills/pr-pipeline-tick/lib/README.md"]) is False
+
+
 # --- Adversarial review: reviewer codex exec argv ---
 
 

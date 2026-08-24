@@ -14,6 +14,7 @@ import ast
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import NamedTuple
 from unittest import mock
@@ -46,6 +47,10 @@ STATUS_SKILL = (
     Path(__file__).parent.parent.parent / "pr-pipeline-status" / "SKILL.md"
 )
 PROMPTS = Path(__file__).parent / "prompts"
+STATUS_SCRIPT = (
+    Path(__file__).parent.parent.parent / "pr-pipeline-status" / "status.sh"
+)
+POLICY_CONFIG = Path(__file__).parent.parent / "config.toml"
 GUIDELINES = REPO_ROOT / "docs/working/pr-guidelines.md"
 DESIGN = REPO_ROOT / "docs/planning/designs/pr-pipeline-tick.md"
 INTERNALS = REPO_ROOT / "docs/working/pr-pipeline-internals.md"
@@ -280,7 +285,7 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
 def test_skill_md_references_tick_py_invocation() -> None:
     """SKILL.md must reference the new Python orchestrator entry point."""
     text = SKILL.read_text()
-    assert "uv run python .claude/skills/pr-pipeline-tick/lib/tick.py" in text
+    assert "uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py" in text
 
 
 def test_skill_md_is_lean_operator_sop() -> None:
@@ -303,7 +308,7 @@ def test_skill_md_loop_section_has_paste_ready_iteration_prompt() -> None:
     assert "Paste this prompt into /loop" in text
     assert "Do not invoke /pr-pipeline-tick" in text
     assert "dangerouslyDisableSandbox: true" in text
-    assert "uv run python .claude/skills/pr-pipeline-tick/lib/tick.py" in text
+    assert "uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py" in text
     assert ".claude/worktrees/.tick-log" in text
     assert "tick-cadence:" in text
     assert "ScheduleWakeup" in text
@@ -1463,7 +1468,220 @@ def test_main_harvest_phases_called_in_order() -> None:
     assert "harvest_fixers" in str(harvest_calls[2])
 
 
+# --- Category E — install-portability and identity invariants ---
+
+# Docs that must stay correct wherever the pipeline is installed: the operator
+# entry points plus the internals reference an operator follows into the source.
+# `docs/planning/designs/` is deliberately absent — those records describe the
+# in-repo incubation accurately, as history, and rewriting them would falsify it.
+_INSTALL_PORTABLE_DOCS = (
+    SKILL, README, DEBUG, LIB_README, PREFLIGHT, STATUS_SKILL, STATUS_SCRIPT,
+    INTERNALS,
+)
+
+# A pipeline path as a doc can legitimately write one: repo-relative in prose and
+# links, or install-root-anchored in a runnable command. The optional `.claude/`
+# alternative is matched only so the stale in-repo layout is reported as the
+# specific defect it is rather than as a generic missing file.
+_PIPELINE_PATH_RE = re.compile(
+    r"(?:\$PR_PIPELINE_HOME/|\.claude/)?skills/pr-pipeline-[\w./-]*\w"
+)
+
+# Tokens that bind a shipped, paste-ready prompt to one machine or one target.
+_OPERATOR_SPECIFIC_TOKENS = ("/Users/", "/home/", "sworn")
+
+# A backticked repo path in a root agent doc: at least one `/`, so a backticked
+# bare term (`pr-pipeline`, `gh`) is not mistaken for a file that must exist.
+_BACKTICKED_PATH_RE = re.compile(r"`([A-Za-z][\w.-]*(?:/[\w.-]*)+)`")
+
+# Paths the docs name that are created at runtime and gitignored by design, so
+# their absence from a clean checkout is correct rather than a broken reference.
+_RUNTIME_CREATED_PATHS = frozenset({"tmp"})
+
+# Any `ai:` label named in prose. The trailing character class stops at the
+# closing backtick, so the bare namespace ("the `ai:` namespace") never matches.
+_AI_LABEL_RE = re.compile(r"ai:[a-z][a-z-]*")
+
+
+def test_shipped_config_ships_the_conservative_reviewer_policy_gate() -> None:
+    """The committed ``config.toml`` must not opt out of the policy gate.
+
+    A candidate branch that edits ``CLAUDE.md``/``AGENTS.md`` supplies the very
+    instructions the reviewer deciding its promotion runs under. The gate that
+    escalates such a PR to a human is the only thing standing between an adopter
+    and that inversion, and ``config.toml`` is *copied into every install* — so
+    a shipped ``allow_touching = true`` silently opts every adopter out of it on
+    day one. An operator who accepts that trust boundary edits their own copy;
+    the default that ships cannot make the choice for them.
+    """
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    allow_touching = config.get("policy", {}).get("allow_touching")
+
+    assert allow_touching is not True, (
+        "config.toml ships with the reviewer-policy admission gate disabled; "
+        "every adopter inherits the opt-out without choosing it"
+    )
+
+
+def test_no_operator_doc_names_a_pipeline_path_that_does_not_exist() -> None:
+    """Every pipeline path an operator doc names must resolve in this repo.
+
+    The skills were incubated at ``.claude/skills/pr-pipeline-*`` inside their
+    host repo, where every documented command happened to be correct by accident
+    of location. They ship from ``skills/`` here and from a plugin root once
+    installed, so a path written for the old depth is not merely untidy — the
+    documented preflight and tick commands exit 127 and 2 respectively, and the
+    source links in the internals doc resolve above the repository.
+
+    Pipeline *code* is therefore named relative to the install root
+    (``$PR_PIPELINE_HOME``) in runnable commands and repo-relative in prose,
+    never relative to the repository the tick operates on. Pipeline *state*
+    (``.claude/worktrees/``) stays target-repo-relative and is untouched by this
+    guard.
+    """
+    unresolved: list[str] = []
+    for doc in _INSTALL_PORTABLE_DOCS:
+        text = doc.read_text()
+        label = str(doc.resolve().relative_to(REPO_ROOT))
+        for match in _PIPELINE_PATH_RE.finditer(text):
+            named = match.group(0)
+            if named.startswith(".claude/"):
+                unresolved.append(f"{label}: {named} (stale in-repo skill layout)")
+                continue
+            relative = named.removeprefix("$PR_PIPELINE_HOME/")
+            if not (REPO_ROOT / relative).exists():
+                unresolved.append(f"{label}: {named}")
+
+    assert not unresolved, (
+        "these docs name pipeline paths that do not exist at this layout:\n\n"
+        + "\n".join(sorted(set(unresolved)))
+    )
+
+
+def test_loop_prompt_is_not_bound_to_one_operators_checkout() -> None:
+    """The paste-ready loop prompt must not hardcode a single target repo.
+
+    ``SKILL.md`` ships to every install, and its loop prompt is copied verbatim
+    into ``/loop`` by whoever runs it. An absolute path to the author's own
+    checkout does not fail loudly for an adopter — it points a live control
+    plane that dispatches paid engines and mutates labels at *someone else's
+    repository*, and the prompt's own wording tells the operator that is
+    correct.
+    """
+    prompt = loop_prompt_block(SKILL.read_text())
+
+    assert prompt, "SKILL.md no longer contains a fenced loop prompt"
+    offenders = [
+        token
+        for token in _OPERATOR_SPECIFIC_TOKENS
+        if token.lower() in prompt.lower()
+    ]
+
+    assert not offenders, (
+        f"the loop prompt is bound to one operator's checkout: {offenders}"
+    )
+
+
+@pytest.mark.parametrize("agent_doc", ["CLAUDE.md", "AGENTS.md"])
+def test_root_agent_docs_route_only_to_documents_that_exist(agent_doc: str) -> None:
+    """The authoritative guides must not route an agent to a missing document.
+
+    ``CLAUDE.md`` and ``AGENTS.md`` are the first thing a dispatched engine and a
+    new maintainer read, and both declare themselves the routing map for
+    everything else. A doc map naming files that were never landed does not
+    degrade gracefully: the reader either stops, or reconstructs the
+    architecture from a description of a system that does not exist.
+    """
+    text = (REPO_ROOT / agent_doc).read_text()
+
+    missing = sorted({
+        named
+        for named in _BACKTICKED_PATH_RE.findall(text)
+        if named.rstrip("/") not in _RUNTIME_CREATED_PATHS
+        and not (REPO_ROOT / named.rstrip("/")).exists()
+    })
+
+    assert not missing, (
+        f"{agent_doc} routes to documents that do not exist: {missing}"
+    )
+
+
+@pytest.mark.parametrize(
+    "workflow_doc", ["CLAUDE.md", "AGENTS.md", "docs/working/pr-guidelines.md"]
+)
+def test_workflow_docs_use_the_label_vocabulary_the_tick_implements(
+    workflow_doc: str,
+) -> None:
+    """No workflow doc may teach an ``ai:`` label the pipeline does not know.
+
+    Labels are the pipeline's only source of truth, and ``pipeline.py`` owns the
+    vocabulary. A doc teaching a label the tick never reads is worse than a typo:
+    an interactive agent that follows it moves a real PR to a label no dispatch
+    query selects, and the item goes dark in the queue with nothing to signal it.
+    ``ai:recheck`` was exactly that — the shipped re-review label is
+    ``ai:revised``.
+    """
+    text = (REPO_ROOT / workflow_doc).read_text()
+
+    unknown = sorted({
+        label
+        for label in _AI_LABEL_RE.findall(text)
+        if label not in implemented_labels()
+    })
+
+    assert not unknown, (
+        f"{workflow_doc} teaches ai: labels the pipeline does not implement: "
+        f"{unknown}"
+    )
+
+
 # --- Helpers ---
+
+
+def implemented_labels() -> frozenset[str]:
+    """Return every ``ai:`` label the shipped pipeline actually implements.
+
+    Read from ``pipeline.py``'s ``LABEL_*`` constants rather than restated here,
+    so adding a label to the runtime cannot leave this guard rejecting it and
+    removing one cannot leave the docs teaching it.
+
+    Returns:
+        The label strings the tick reads or writes.
+    """
+    import pipeline  # type: ignore[import-untyped]
+
+    return frozenset(
+        value
+        for name, value in vars(pipeline).items()
+        if name.startswith("LABEL_") and isinstance(value, str)
+    )
+
+
+def loop_prompt_block(text: str) -> str:
+    """Return the fenced prompt ``SKILL.md`` tells the operator to paste into /loop.
+
+    Only the fenced block is returned: the surrounding section explains the loop
+    contract in prose that may legitimately name the host repository, while the
+    block itself is copied verbatim into a live control plane.
+
+    Args:
+        text: Raw contents of ``SKILL.md``.
+
+    Returns:
+        The prompt body, or the empty string if the section or its fence is gone.
+    """
+    marker = "Paste this prompt into /loop"
+    start = text.find(marker)
+    if start == -1:
+        return ""
+    fence_open = text.find("```", start)
+    if fence_open == -1:
+        return ""
+    body_start = text.index("\n", fence_open) + 1
+    fence_close = text.find("```", body_start)
+    return text[body_start:fence_close] if fence_close != -1 else ""
 
 
 def ordering_surfaces() -> tuple[tuple[str, str], ...]:

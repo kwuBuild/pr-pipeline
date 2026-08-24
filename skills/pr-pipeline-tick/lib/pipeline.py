@@ -138,19 +138,30 @@ _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 _POLICY_PATHS = frozenset({
     ".claude/hooks/sworn-review-checklist.md",
     ".claude/hooks/sworn-review-checklist-frontend.md",
-    # The file that toggles the gate is itself review policy: a PR flipping
-    # allow_touching to true must be escalated to a human, not auto-reviewed —
-    # otherwise a merged flip would silently disable the gate for every future
-    # policy-editing PR.
-    ".claude/skills/pr-pipeline-tick/config.toml",
-    # The gate's own implementation is the same vector: a PR that rewrites
-    # _policy_touching_allowed to return True unconditionally (pipeline.py), or
-    # removes the gate call from the reviewer dispatch (tick.py), would disable
-    # the gate exactly like a config flip. Pipeline-code PRs therefore escalate
-    # to a human while the gate is enabled.
-    ".claude/skills/pr-pipeline-tick/lib/pipeline.py",
-    ".claude/skills/pr-pipeline-tick/lib/tick.py",
 })
+
+# The pipeline's own files are review policy too, matched by path *suffix* rather
+# than exact path. The file that toggles the gate is policy: a PR flipping
+# allow_touching to true must be escalated to a human, not auto-reviewed —
+# otherwise a merged flip would silently disable the gate for every future
+# policy-editing PR. The gate's implementation is the same vector: a PR that
+# rewrites _policy_touching_allowed to return True unconditionally (pipeline.py),
+# or removes the gate call from the reviewer dispatch (tick.py), disables the
+# gate exactly like a config flip.
+#
+# The suffix is what makes that hold. An exact path encodes one install depth
+# (`.claude/skills/...`, where the skills were incubated) and silently exempts
+# the identical edit in the pipeline's own repository, where they live at
+# `skills/`, and under any plugin layout. Matching is per path segment, so
+# `other-skills/pr-pipeline-tick/config.toml` is not a hit.
+_POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
+    tuple(suffix.split("/"))
+    for suffix in (
+        "skills/pr-pipeline-tick/config.toml",
+        "skills/pr-pipeline-tick/lib/pipeline.py",
+        "skills/pr-pipeline-tick/lib/tick.py",
+    )
+)
 
 # Operator config for admission gates, read at call time so a config change
 # takes effect on the next tick without a redeploy. Resolved via __file__ so it
@@ -1540,6 +1551,24 @@ def _policy_touching_allowed() -> bool:
     return isinstance(section, dict) and section.get("allow_touching") is True
 
 
+def _ends_with_policy_suffix(path: str) -> bool:
+    """Return whether ``path`` ends in one of the pipeline's own gate files.
+
+    Compares whole path segments so the match cannot straddle a segment
+    boundary: ``other-skills/pr-pipeline-tick/config.toml`` is not a hit, while
+    ``.claude/skills/...``, ``skills/...`` and any plugin prefix all are.
+
+    Args:
+        path: A repo-relative path from ``git diff --name-only``.
+
+    Returns:
+        ``True`` when the path's trailing segments match a suffix in
+        :data:`_POLICY_PATH_SUFFIXES`.
+    """
+    segments = tuple(path.split("/"))
+    return any(segments[-len(s):] == s for s in _POLICY_PATH_SUFFIXES)
+
+
 def touches_review_policy(changed_paths: list[str]) -> bool:
     """Return whether a diff modifies any file that governs the reviewer.
 
@@ -1550,6 +1579,10 @@ def touches_review_policy(changed_paths: list[str]) -> bool:
     this and routes such PRs to a human instead of auto-reviewing them under
     instructions the PR itself supplies. Files are matched at any directory level
     because codex loads the nearest governing file up the tree.
+
+    The pipeline's own gate files (``config.toml``, ``pipeline.py``, ``tick.py``)
+    match by path suffix instead, so the self-protection holds at every install
+    depth rather than only where the skills were incubated.
 
     The operator may opt out via ``config.toml`` ``[policy] allow_touching``
     (see :func:`_policy_touching_allowed`) when they accept that the review
@@ -1570,6 +1603,8 @@ def touches_review_policy(changed_paths: list[str]) -> bool:
         if not path:
             continue
         if path in _POLICY_PATHS or os.path.basename(path) in _POLICY_BASENAMES:
+            return True
+        if _ends_with_policy_suffix(path):
             return True
     return False
 

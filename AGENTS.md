@@ -6,7 +6,7 @@ Before doing substantive work in this repository:
 
 1. Read `AGENTS.md`
 2. Read `CLAUDE.md`
-3. Read the relevant spec/plan section in `docs/specs/` and `docs/plans/`
+3. Read the relevant section of the design and internals docs `CLAUDE.md` routes to, by section or line range rather than wholesale
 4. Follow repo-specific guidance from those files unless it conflicts with higher-priority system, developer, or user instructions
 
 If both files apply:
@@ -62,17 +62,21 @@ will be read as a human hold that overrides the sentinel you finish with. See
 
 ## Running Tests
 
-- Use `uv run pytest ...` as the default test runner
-- Do not use `python -m pytest` directly
+- Stdlib + pytest only; there is no packaging manifest and nothing to install
+- Run against an interpreter that is actually >= 3.11: `python3.13 -m pytest skills/ -q`, or `uv run --python 3.13 --with pytest pytest skills/ -q`
+- Never use bare `python3` — it resolves to 3.9 on stock macOS and under Anaconda, and collection fails on `tomllib`
+- `gh`, `git`, and `codex` must resolve on PATH or the tick's startup probe exits 3
 
 ## Project Overview
 
-This is the toolkit + skill bundle that makes `pr-pipeline` work. Two halves:
+This repository *is* the pipeline. Everything shipped lives under `skills/`:
 
-- **Python toolkit** (`src/pr_pipeline/`) — deterministic CLI primitives. No orchestration logic.
-- **Skill bundle** (`plugin/`) — markdown that an orchestrator agent interprets. The brain.
+- **`skills/pr-pipeline-tick/`** — the control plane. `skills/pr-pipeline-tick/lib/tick.py` is one deterministic Python process that runs HARVEST then DISPATCH per invocation, `skills/pr-pipeline-tick/lib/pipeline.py` holds the primitives it composes (label vocabulary, marker validation, verdict parsing, policy gates), and `skills/pr-pipeline-tick/lib/prompts/` holds the engine prompts. `SKILL.md` is a lean operator SOP, not the orchestrator.
+- **`skills/pr-pipeline-status/`** — a read-only dashboard over the same state. It never writes.
 
-Read `docs/specs/design.md` for the architecture, then `docs/plans/implementation.md` for the build sequence.
+Dispatched engines (`claude --print` / `codex exec`) run in per-task `git worktree` checkouts with fresh context and report through a completion sentinel; the harvest owns every label transition.
+
+Read `skills/pr-pipeline-tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/planning/designs/pr-pipeline-tick.md` for the design rationale.
 
 ## User Prompt Convention
 

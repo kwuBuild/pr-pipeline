@@ -193,7 +193,7 @@ Debugging notes:
   not reporting a healthy engine. Reproduce it by hand with:
 
   ```bash
-  uv run python .claude/skills/pr-pipeline-tick/lib/tick.py engine-progress \
+  uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py engine-progress \
     --wt-root .claude/worktrees
   ```
 
@@ -435,9 +435,9 @@ Add these to `.claude/settings.local.json` (`permissions.allow`):
 
 ```jsonc
 // The tick itself — one uv run for one-shot or --loop mode
-"Bash(uv run python .claude/skills/pr-pipeline-tick/lib/tick.py *)",
+"Bash(uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py *)",
 // Preflight check after install or Codex version change
-"Bash(bash .claude/skills/pr-pipeline-tick/preflight.sh)",
+"Bash(bash $PR_PIPELINE_HOME/skills/pr-pipeline-tick/preflight.sh)",
 ```
 
 Without these, a one-shot tick triggers a permission prompt and unattended loops
@@ -483,7 +483,7 @@ failures such as E2BIG, a missing Python executable, or broken `uv`.
 | Process control | `lib/process_control.py` |
 | Tick audit trail | `.claude/worktrees/.tick-log/tick-*.jsonl` |
 | Engine or wrapper stderr | Per-worktree `stderr.log`; reviewer has bounded sanitized wrapper diagnostics only, while implementer/fixer engine stderr remains available |
-| Dashboard | `/pr-pipeline-status` or `bash .claude/skills/pr-pipeline-status/status.sh` |
+| Dashboard | `/pr-pipeline-status` or `bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh` |
 | Startup failures | First two entries of the latest tick log (see above) |
 | OS-level spawn failures | `dmesg` for E2BIG, `ulimit -a` for arg limits |
 

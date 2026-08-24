@@ -36,7 +36,7 @@ denial probe remains model-reported and explicitly unverified.
 ## CLI
 
 ```bash
-PIPELINE=.claude/skills/pr-pipeline-tick/lib/pipeline.py
+PIPELINE=$PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/pipeline.py
 
 # Decide a finished review's outcome (prints a decision JSON object).
 # --comments accepts the bare array (gh ... -q .comments) or the {"comments": [...]} object.
@@ -152,7 +152,7 @@ uv run python "$PIPELINE" reconcile-dispatch \
 
 # Stop a just-spawned reviewer within bounded TERM/KILL grace periods. Exit zero and
 # {"stopped": true} only after death is confirmed; otherwise preserve PID ownership.
-uv run python .claude/skills/pr-pipeline-tick/lib/process_control.py terminate \
+uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/process_control.py terminate \
   --pid <pid> --grace 5 --kill-grace 2 --poll 0.1
 
 # --- Tick log helpers (structured per-tick audit log) ---
@@ -391,9 +391,9 @@ the intent carries custody across the archive move.
 ## Tests
 
 ```bash
-uv run pytest .claude/skills/pr-pipeline-tick/lib --basetemp="$TMPDIR/ppltest"
-uv run ruff check .claude/skills/pr-pipeline-tick/lib/
-uv run pyright .claude/skills/pr-pipeline-tick/lib/
+uv run pytest $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib --basetemp="$TMPDIR/ppltest"
+uv run ruff check $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/
+uv run pyright $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/
 ```
 
 (`--basetemp` avoids a stale-temp-dir cleanup quirk in pytest's default basetemp;

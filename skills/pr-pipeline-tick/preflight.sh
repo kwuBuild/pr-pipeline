@@ -12,7 +12,7 @@
 #
 # Codex needs network access, so run this with the agent sandbox disabled.
 #
-# Usage: bash .claude/skills/pr-pipeline-tick/preflight.sh
+# Usage: bash $PR_PIPELINE_HOME/skills/pr-pipeline-tick/preflight.sh
 
 set -euo pipefail
 

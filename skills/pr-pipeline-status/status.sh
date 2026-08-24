@@ -3,7 +3,7 @@
 # Read-only status dashboard for the PR pipeline. Safe to run continuously in a
 # watch loop in a separate terminal pane:
 #
-#   watch -n 5 'bash .claude/skills/pr-pipeline-status/status.sh'
+#   watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
 #
 # It makes no writes to pipeline state: it never edits labels, dispatches
 # engines, or touches markers. (The two Python calls below invoke a resolved

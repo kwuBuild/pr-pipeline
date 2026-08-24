@@ -2,7 +2,7 @@
 
 Reference document for the `pr-pipeline-tick` skill's internal mechanisms.
 This is **not** operational documentation — see `SKILL.md` and `README.md` in
-`.claude/skills/pr-pipeline-tick/` for how to run the tick.
+`skills/pr-pipeline-tick/` for how to run the tick.
 
 ---
 
@@ -206,14 +206,14 @@ the reviewer's own behaviour ([tick.py:9007][policy-call]). If so, the PR is
 escalated to human review instead of being auto-reviewed.
 
 The gate is operator-configurable: `[policy] allow_touching = true` in
-`.claude/skills/pr-pipeline-tick/config.toml` lets policy-editing PRs flow to
+`skills/pr-pipeline-tick/config.toml` lets policy-editing PRs flow to
 auto-review anyway (the operator accepts that the review runs under instructions
 the PR itself supplies). Missing config, malformed TOML, or `false` keep the
-escalation — the gate fails closed. This repo's committed config sets
-`allow_touching = true`, so the escalation is currently opted out here; see the
-skill README's "Admission gate: reviewer policy files" section.
+escalation — the gate fails closed. The committed config ships `false`, because
+an install inherits it and the opt-out is a trust decision only the operator can
+make; see the skill README's "Admission gate: reviewer policy files" section.
 
-The gate function `touches_review_policy` ([pipeline.py:1543–1574][policy-fn])
+The gate function `touches_review_policy` ([pipeline.py:1572–1609][policy-fn])
 matches changed paths against:
 
 **Basenames** (matched at any directory level, because both Claude Code and Codex
@@ -222,14 +222,19 @@ load governing files from the nearest match up the tree) — `_POLICY_BASENAMES`
 - `CLAUDE.md`
 - `AGENTS.md`
 
-**Exact paths** — `_POLICY_PATHS` ([pipeline.py:138–153][paths]):
+**Exact paths** — `_POLICY_PATHS` ([pipeline.py:138–141][paths]), plus the suffix set below:
 - `.claude/hooks/sworn-review-checklist.md`
 - `.claude/hooks/sworn-review-checklist-frontend.md`
-- `.claude/skills/pr-pipeline-tick/config.toml` — the file that toggles the
+
+**Path suffixes** (matched per path segment, so the rule is one rule at every
+install depth — `.claude/skills/` in a host repo, `skills/` in the pipeline's
+own repository, or a plugin root) — `_POLICY_PATH_SUFFIXES`
+([pipeline.py:157–164][path-suffixes]):
+- `skills/pr-pipeline-tick/config.toml` — the file that toggles the
   gate itself; a PR flipping `allow_touching` is escalated to a human rather
   than auto-reviewed (a merged flip would otherwise disable the gate for every
   future policy-editing PR)
-- `.claude/skills/pr-pipeline-tick/lib/pipeline.py` and `lib/tick.py` — the
+- `skills/pr-pipeline-tick/lib/pipeline.py` and `lib/tick.py` — the
   gate's own implementation; a PR that rewrites `_policy_touching_allowed` to
   return `True` unconditionally, or removes the gate call from the reviewer
   dispatch, is the same silent-disable vector, so pipeline-code PRs escalate to
@@ -536,8 +541,8 @@ dispatch-time gates are the primary controls:
    [tick.py:9007][policy-call]): if the PR's diff modifies files that govern the
    reviewer's own behaviour (`CLAUDE.md`, `AGENTS.md`, review checklists — see
    section 4), the PR is escalated to human review unless the operator opts out
-   via `config.toml` `[policy] allow_touching = true` (currently opted out in
-   this repo, per section 4). When active, it prevents a trusted author from
+   via `config.toml` `[policy] allow_touching = true` (the shipped config sets
+   `false`, per section 4). When active, it prevents a trusted author from
    (accidentally or otherwise) auto-approving changes to the review policy
    itself.
 
@@ -621,41 +626,42 @@ stay discarded, and the two values that do cross are shape-checked first.
 <!-- Anchors for inline references. Line numbers are approximate and should be
      verified against the current source when the document is updated. -->
 
-[impl-tools]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L591-L663
-[launch-model]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L749
-[launch-flags]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L741-L750
-[engine-env]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L311-L322
-[resolve]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L325-L397
-[ds-effort]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L395
-[popen-impl]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L757-L769
-[rev-model]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6140
-[rev-effort]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6141
-[ignore-config]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6130
-[ignore-rules]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6133
-[schema]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6120-L6122
-[sandbox]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6128
-[codex-exec]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6118
-[popen-rev]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6148-L6156
-[scrub]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6047-L6065
-[policy-call]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L9007
-[impl-wt]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6449
-[fix-wt]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L6855-L6856
-[rev-wt]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L5784-L5785
-[impl-timeout]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L186
-[fix-timeout]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L187
-[fix-model]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L7063-L7068
-[rev-timeout]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L129
-[cli-model]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L9185
-[gh-helper]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L786-L809
+[impl-tools]: ../../skills/pr-pipeline-tick/lib/tick.py#L591-L663
+[launch-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L749
+[launch-flags]: ../../skills/pr-pipeline-tick/lib/tick.py#L741-L750
+[engine-env]: ../../skills/pr-pipeline-tick/lib/tick.py#L311-L322
+[resolve]: ../../skills/pr-pipeline-tick/lib/tick.py#L325-L397
+[ds-effort]: ../../skills/pr-pipeline-tick/lib/tick.py#L395
+[popen-impl]: ../../skills/pr-pipeline-tick/lib/tick.py#L757-L769
+[rev-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L6140
+[rev-effort]: ../../skills/pr-pipeline-tick/lib/tick.py#L6141
+[ignore-config]: ../../skills/pr-pipeline-tick/lib/tick.py#L6130
+[ignore-rules]: ../../skills/pr-pipeline-tick/lib/tick.py#L6133
+[schema]: ../../skills/pr-pipeline-tick/lib/tick.py#L6120-L6122
+[sandbox]: ../../skills/pr-pipeline-tick/lib/tick.py#L6128
+[codex-exec]: ../../skills/pr-pipeline-tick/lib/tick.py#L6118
+[popen-rev]: ../../skills/pr-pipeline-tick/lib/tick.py#L6148-L6156
+[scrub]: ../../skills/pr-pipeline-tick/lib/tick.py#L6047-L6065
+[policy-call]: ../../skills/pr-pipeline-tick/lib/tick.py#L9007
+[impl-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6449
+[fix-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6855-L6856
+[rev-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L5784-L5785
+[impl-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L186
+[fix-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L187
+[fix-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L7063-L7068
+[rev-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L129
+[cli-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L9185
+[gh-helper]: ../../skills/pr-pipeline-tick/lib/tick.py#L786-L809
 [hook-impl]: ../../.claude/hooks/pre-pr-review-implementation.sh
 [hook-docs]: ../../.claude/hooks/pre-pr-review-documentation.sh
-[skill-trust]: ../../.claude/skills/pr-pipeline-tick/SKILL.md#trust-domain-and-sandbox-posture
-[policy-fn]: ../../.claude/skills/pr-pipeline-tick/lib/pipeline.py#L1543-L1574
-[basenames]: ../../.claude/skills/pr-pipeline-tick/lib/pipeline.py#L137
-[paths]: ../../.claude/skills/pr-pipeline-tick/lib/pipeline.py#L138-L153
-[policy-comment]: ../../.claude/skills/pr-pipeline-tick/lib/pipeline.py#L131-L136
-[trusted-candidate]: ../../.claude/skills/pr-pipeline-tick/lib/tick.py#L5719-L5730
+[skill-trust]: ../../skills/pr-pipeline-tick/SKILL.md#trust-domain-and-sandbox-posture
+[policy-fn]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1572-L1609
+[basenames]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L137
+[paths]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L138-L141
+[path-suffixes]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L157-L164
+[policy-comment]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L131-L136
+[trusted-candidate]: ../../skills/pr-pipeline-tick/lib/tick.py#L5719-L5730
 [design-reviewer-ctx]: ../../docs/planning/designs/pr-pipeline-tick.md#L388-L399
 [design-sandbox-scope]: ../../docs/planning/designs/pr-pipeline-tick.md#L447-L448
-[reviewer-prompt]: ../../.claude/skills/pr-pipeline-tick/lib/prompts/reviewer.txt#L1
-[wrapper-setpgrp]: ../../.claude/skills/pr-pipeline-tick/engine_wrapper.py#L69
+[reviewer-prompt]: ../../skills/pr-pipeline-tick/lib/prompts/reviewer.txt#L1
+[wrapper-setpgrp]: ../../skills/pr-pipeline-tick/engine_wrapper.py#L69

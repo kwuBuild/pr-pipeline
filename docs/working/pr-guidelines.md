@@ -174,7 +174,7 @@ State what the issue should not grow to include. This is especially important wh
 
 ## Workflow labels
 
-Tasks are tracked as GitHub Issues and PRs with workflow labels. Keep exactly one current workflow label on each work item whenever possible. Label names use the `ai:` namespace defined in `docs/specs/design.md`.
+Tasks are tracked as GitHub Issues and PRs with workflow labels. Keep exactly one current workflow label on each work item whenever possible. Label names use the `ai:` namespace. `pipeline.py`'s `LABEL_*` constants are the vocabulary: a label not defined there is not part of the workflow, and an item moved to one goes dark, because no dispatch query selects it.
 
 Issue states:
 - `ai:available` — ready for an agent to pick up
@@ -185,13 +185,13 @@ PR states:
 - `ai:reviewing` — reviewer claimed (transient until verdict posts)
 - `ai:changes-requested` — review found issues requiring fixes
 - `ai:fixing` — fixer claimed (transient until fixes push)
-- `ai:recheck` — fixes pushed, re-review needed
+- `ai:revised` — fixes pushed, re-review needed
 - `ai:ready-for-human` — passed AI review; ready for owner merge
 
-Escalation states:
+Escalation and hold states:
 - `ai:needs-human-decision` — scope/design decision beyond agent remit
 - `ai:max-iterations` — review/fix cycles exceeded threshold
-- `ai:permission-pending` — orchestrator proposed a settings change; awaiting approval
+- `ai:blocked` — human-set: waiting on a dependency or decision
 
 Required transitions:
 - **Before starting work:** Run `gh issue list --label "ai:available"` to see open tasks.
@@ -213,11 +213,11 @@ Required transitions:
   - If the review has blocker/major findings or open questions requiring code changes → `ai:changes-requested`
   - Otherwise (no blockers/majors) → `ai:ready-for-human` directly; do not stop at an intermediate label
   - Remove any prior AI workflow label before adding the terminal label so the PR ends with exactly one current AI workflow label
-- **When an AI responds to review comments and pushes a new revision:** Comment with what changed, push the revision, and replace the PR's AI workflow label with `ai:recheck`:
+- **When an AI responds to review comments and pushes a new revision:** Comment with what changed, push the revision, and replace the PR's AI workflow label with `ai:revised`:
   ```bash
-  gh pr edit <pr-number> --remove-label "ai:implemented" --remove-label "ai:reviewing" --remove-label "ai:changes-requested" --remove-label "ai:ready-for-human" --add-label "ai:recheck"
+  gh pr edit <pr-number> --remove-label "ai:implemented" --remove-label "ai:reviewing" --remove-label "ai:changes-requested" --remove-label "ai:ready-for-human" --add-label "ai:revised"
   ```
-- **When escalating to human:** Replace the current label with the appropriate escalation label (`ai:needs-human-decision`, `ai:max-iterations`, or `ai:permission-pending`) and comment with context.
+- **When escalating to human:** Replace the current label with the appropriate escalation label (`ai:needs-human-decision` or `ai:max-iterations`) and comment with context.
 
 Do not use `ai:ready-for-human` if there are unresolved `blocker` or `major` review findings, failing required checks, known test failures, or open questions that require code changes.
 
@@ -245,7 +245,7 @@ Workflow:
    gh pr edit <number> \
      --remove-label "ai:implemented" \
      --remove-label "ai:reviewing" \
-     --remove-label "ai:recheck" \
+     --remove-label "ai:revised" \
      --remove-label "ai:changes-requested" \
      --remove-label "ai:ready-for-human" \
      --add-label "<terminal-label>"

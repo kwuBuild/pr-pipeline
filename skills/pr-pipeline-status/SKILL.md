@@ -27,8 +27,13 @@ It reads only the state sources the pipeline externalizes:
 
 ## Run
 
+Run with the **target repository** as the working directory: the dashboard reads
+pipeline *state* from there, while `$PR_PIPELINE_HOME` — the absolute path of
+this pipeline's install — is where its *code* lives.
+
 ```bash
-bash .claude/skills/pr-pipeline-status/status.sh
+export PR_PIPELINE_HOME=/absolute/path/to/pr-pipeline
+bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh
 ```
 
 Liveness uses `kill -0 "$pid"`, so — like the tick — run it in the **same trust
@@ -39,10 +44,10 @@ Continuous view in a separate terminal pane:
 
 ```bash
 # Primary (Linux / watch installed):
-watch -n 5 'bash .claude/skills/pr-pipeline-status/status.sh'
+watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
 
 # Fallback (macOS / no watch):
-while true; do clear; bash .claude/skills/pr-pipeline-status/status.sh; sleep 5; done
+while true; do clear; bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh; sleep 5; done
 ```
 
 The repo defaults to `kwuBuild/sworn`; override with `PIPELINE_REPO=<owner/repo>`.
