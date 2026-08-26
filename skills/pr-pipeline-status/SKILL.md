@@ -50,7 +50,10 @@ watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
 while true; do clear; bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh; sleep 5; done
 ```
 
-The repo defaults to `kwuBuild/sworn`; override with `PIPELINE_REPO=<owner/repo>`.
+The repo comes from `[target] repo` in `skills/pr-pipeline-tick/config.toml`,
+the same value the tick uses; override for one run with
+`PIPELINE_REPO=<owner/repo>`. With neither set the dashboard exits 2 rather
+than rendering some other repository's queue.
 
 This dashboard is optional — `gh pr list --label ai:...` shows every pipeline stage
 since labels are the source of truth. Its only added value is the **in-flight,

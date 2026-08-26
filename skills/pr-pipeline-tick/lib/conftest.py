@@ -13,6 +13,18 @@ from unittest import mock
 
 import pytest
 
+# The target repo and trusted author every test runs against.
+#
+# `tick.py` resolves both at import time (env first, then `[target]` in
+# `config.toml`), and the shipped config leaves them blank on purpose — a
+# pinned default would point a fresh install at somebody else's repository.
+# Blank is also what `main` refuses to start on, so the suite has to declare a
+# target the way an operator does. Set here, before the first `import tick`
+# anywhere in the session, so every test agrees on one value rather than each
+# patching the module constant.
+os.environ.setdefault("PIPELINE_REPO", "test-owner/test-repo")
+os.environ.setdefault("PIPELINE_TRUSTED_AUTHOR", "test-owner")
+
 # A PR body that satisfies `tick._pr_body_matches_guidelines` for issue #7 — the
 # shape a fixer's replacement body has to reach before the harvest will publish
 # it. Kept here so every revision test agrees on what "valid" means rather than

@@ -29,7 +29,26 @@ set -uo pipefail
 shopt -s nullglob 2>/dev/null || true
 setopt NULL_GLOB 2>/dev/null || true
 
-REPO="${PIPELINE_REPO:-kwuBuild/sworn}"
+# The target repo. Read from the tick's config.toml so the dashboard and the
+# tick cannot disagree about which repository they are talking about, with
+# PIPELINE_REPO as the one-off override. There is no fallback default on
+# purpose: a pinned one would point a fresh install at somebody else's repo and
+# render *their* queue, which reads as a plausible dashboard rather than as an
+# error. Parsed with sed rather than a TOML library because this script must run
+# before any interpreter is resolved.
+SKILL_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO="${PIPELINE_REPO:-}"
+if [ -z "$REPO" ]; then
+  # Scoped to the [target] table: an unscoped match would read a `repo` key
+  # from whichever table happened to declare one first.
+  REPO="$(sed -n '/^\[target\]/,/^\[/ s/^[[:space:]]*repo[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
+    "$SKILL_DIR/../pr-pipeline-tick/config.toml" 2>/dev/null | head -1)"
+fi
+if [ -z "$REPO" ]; then
+  echo "status: no target repo configured. Set [target] repo in" >&2
+  echo "  skills/pr-pipeline-tick/config.toml, or export PIPELINE_REPO." >&2
+  exit 2
+fi
 # Anchor on the git common dir, not --show-toplevel: run from inside a linked
 # worktree the latter names that worktree, whose .claude/worktrees is empty,
 # and the dashboard would report zero in-flight engines for a busy pipeline.
@@ -41,7 +60,6 @@ WT_ROOT="$ROOT/.claude/worktrees"
 # STATE (WT_ROOT, TICK_LOG_DIR) stays repo-relative — it belongs to the repo
 # being operated on. Conflating the two is what makes a moved dashboard report
 # a busy pipeline as idle.
-SKILL_DIR="$(cd "$(dirname "$0")" && pwd)"
 TICK_LIB="$SKILL_DIR/../pr-pipeline-tick/lib"
 NOW=$(date +%s)
 

@@ -76,7 +76,7 @@ This repository *is* the pipeline. Everything shipped lives under `skills/`:
 
 Dispatched engines (`claude --print` / `codex exec`) run in per-task `git worktree` checkouts with fresh context and report through a completion sentinel; the harvest owns every label transition.
 
-Read `skills/pr-pipeline-tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/planning/designs/pr-pipeline-tick.md` for the design rationale.
+Read `skills/pr-pipeline-tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/architecture.md` for the design rationale.
 
 ## User Prompt Convention
 

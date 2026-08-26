@@ -8,7 +8,7 @@ An unattended control plane that drives GitHub issues through implement → revi
 - `skills/pr-pipeline-tick/README.md` — usage, observability, and the tuning knobs.
 - `skills/pr-pipeline-tick/DEBUG.md` — invariants, failure diagnostics, and recovery.
 - `docs/working/pr-pipeline-internals.md` — how the runtime actually behaves, with line-anchored links into the source.
-- `docs/planning/designs/pr-pipeline-tick.md` — the canonical design. `pr-pipeline-tick-python-extraction.md` beside it records the bash → Python extraction.
+- `docs/architecture.md` — the architecture reference: what owns each decision and why each boundary sits where it does. Read before changing dispatch, harvest, custody, or cadence.
 - `docs/working/commit-guidelines.md` — Commit format rules. Read before committing.
 - `docs/working/pr-guidelines.md` — PR body template, issue template, workflow labels, AI review posting. Read before raising a PR, creating an issue, or reviewing.
 

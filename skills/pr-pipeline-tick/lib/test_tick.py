@@ -4885,15 +4885,15 @@ def test_resolve_stage_targets_reads_issue_closing_pr_scope() -> None:
 
     assert gh_json_mock.call_args_list == [
         mock.call(
-            "issue", "view", "462", "--repo", "kwuBuild/sworn",
+            "issue", "view", "462", "--repo", "test-owner/test-repo",
             "--json", "closedByPullRequestsReferences",
         ),
         mock.call(
-            "pr", "view", "550", "--repo", "kwuBuild/sworn",
+            "pr", "view", "550", "--repo", "test-owner/test-repo",
             "--json", "state,number",
         ),
         mock.call(
-            "pr", "view", "551", "--repo", "kwuBuild/sworn",
+            "pr", "view", "551", "--repo", "test-owner/test-repo",
             "--json", "state,number",
         ),
     ]
@@ -11036,7 +11036,7 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
             with mock.patch("tick.gh_text") as gh_text_mock:
                 # No existing PR for the head branch; then create.
                 gh_text_mock.side_effect = [
-                    "https://github.com/kwuBuild/sworn/pull/99\n",
+                    "https://github.com/test-owner/test-repo/pull/99\n",
                 ]
                 with mock.patch("tick.relabel") as relabel_mock:
                     with mock.patch(
@@ -11228,7 +11228,7 @@ def test_harvest_one_implementer_resume_ignores_cross_repository_pr(
     def gh_text_side_effect(*args: str, **_kwargs: object) -> str:
         if args[:2] == ("pr", "create"):
             created.append(args)
-            return "https://github.com/kwuBuild/sworn/pull/99"
+            return "https://github.com/test-owner/test-repo/pull/99"
         raise AssertionError(f"unexpected gh_text call: {args}")
 
     with mock.patch("tick.pipeline.harvest_implementation") as harvest_impl:
@@ -11421,7 +11421,7 @@ def test_harvest_one_implementer_logs_failed_label_removal(
         with mock.patch("tick.gh_json", side_effect=gh_json_no_holds):
             with mock.patch("tick.gh_text") as gh_text_mock:
                 gh_text_mock.return_value = (
-                    "https://github.com/kwuBuild/sworn/pull/99"
+                    "https://github.com/test-owner/test-repo/pull/99"
                 )
                 with mock.patch("tick.relabel"):
                     with mock.patch("tick.cleanup_scratch") as cleanup_mock:
@@ -11509,7 +11509,7 @@ def test_harvest_one_implementer_uses_valid_pr_body_file(
         if "--body-file" in args:
             body_file = args[args.index("--body-file") + 1]
             captured["body"] = Path(body_file).read_text()
-        return "https://github.com/kwuBuild/sworn/pull/99\n"
+        return "https://github.com/test-owner/test-repo/pull/99\n"
 
     with mock.patch("tick.pipeline.harvest_implementation") as harvest_impl:
         harvest_impl.return_value = {
@@ -11583,7 +11583,7 @@ def test_harvest_one_implementer_falls_back_when_pr_body_file_is_malformed(
         with mock.patch("tick.gh_json", side_effect=gh_json_no_holds):
             with mock.patch("tick.gh_text") as gh_text_mock:
                 gh_text_mock.return_value = (
-                    "https://github.com/kwuBuild/sworn/pull/101\n"
+                    "https://github.com/test-owner/test-repo/pull/101\n"
                 )
                 with mock.patch("tick.relabel"):
                     with mock.patch("tick.cleanup_scratch"):
@@ -11713,7 +11713,9 @@ def test_harvest_one_implementer_clears_custody_before_reviewer_dispatch(
         }
         with mock.patch("tick.gh_json", side_effect=gh_json_no_holds):
             with mock.patch("tick.gh_text",
-                            return_value="https://github.com/kwuBuild/sworn/pull/99"):
+                            return_value=(
+                                "https://github.com/test-owner/test-repo/pull/99"
+                            )):
                 with mock.patch("tick.relabel"):
                     with mock.patch(
                         "tick._converge_pipeline_labels", return_value=True,
@@ -12496,7 +12498,7 @@ def test_harvest_implementers_routes_harvest_decisions_to_helper(
     with mock.patch("tick.gh_text") as gh_text_mock:
         gh_text_mock.side_effect = [
             "OPEN",                                 # lifecycle check
-            "https://github.com/kwuBuild/sworn/pull/100\n",  # PR create
+            "https://github.com/test-owner/test-repo/pull/100\n",  # PR create
         ]
         with mock.patch("tick.gh_json") as gh_json_mock:
             gh_json_mock.return_value = {
@@ -19540,6 +19542,57 @@ def test_main_startup_probe_failed_emits_tick_state(tmp_path: Path) -> None:
     assert "tick-state: status=FAILED in_flight=unknown queue=unknown quiescent=unknown" in output
 
 
+def test_main_refuses_to_tick_without_a_configured_target(tmp_path: Path) -> None:
+    """An unconfigured `[target]` stops the tick before any GitHub call.
+
+    Every `gh` invocation the tick makes carries `--repo TRUSTED_HEAD_REPO`.
+    Unset, that resolves against whatever repository the cwd happens to be —
+    so the failure would not be an error but a *plausible* tick against the
+    wrong queue, with real relabels. The check runs ahead of the binary probe
+    because it is the cheaper and more dangerous of the two.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick.TRUSTED_HEAD_REPO", ""):
+            with mock.patch("tick._startup_probe") as probe:
+                import io
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = main()
+
+    assert result == 3
+    output = stderr.getvalue()
+    assert "target not configured" in output
+    assert "[target] repo" in output
+    # The probe may run (it only reads PATH), but nothing past the gate does.
+    probe.assert_called_once()
+    assert "tick-state: status=FAILED" in output
+
+
+def test_main_refuses_to_tick_without_a_trusted_author(tmp_path: Path) -> None:
+    """An unconfigured trusted author stops the tick too.
+
+    It is the reviewer admission gate's whole input: unset, `validate_review_candidate`
+    matches nobody and every PR escalates to a human — a pipeline that looks
+    like it is running while silently reviewing nothing.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", ""):
+            with mock.patch("tick._startup_probe"):
+                import io
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = main()
+
+    assert result == 3
+    assert "[target] trusted_author" in stderr.getvalue()
+
+
 def test_main_crash_emits_tick_state(tmp_path: Path) -> None:
     """main() return-4 path emits tick-state with unknown fields."""
     from tick import main  # type: ignore[import-untyped]
@@ -21590,8 +21643,8 @@ def closing_pr_reference(number: int) -> dict[str, object]:
     return {
         "id": f"PR_{number}",
         "number": number,
-        "repository": {"name": "sworn", "owner": {"login": "kwuBuild"}},
-        "url": f"https://github.com/kwuBuild/sworn/pull/{number}",
+        "repository": {"name": "test-repo", "owner": {"login": "test-owner"}},
+        "url": f"https://github.com/test-owner/test-repo/pull/{number}",
     }
 
 

@@ -1,11 +1,11 @@
 """Executable contract checks for the PR-pipeline skill.
 
-Tests are categorized by verification strategy per the extraction design doc:
+Tests are categorized by verification strategy:
 
 - **Category A — ordering invariants:** mock + assert_has_calls on subprocess
 - **Category B — behavioral invariants:** standard unit tests with mocked returns
 - **Category C — structural invariants:** subprocess call args ARE the invariant
-- **Category D — documentation invariants:** design/skill doc content checks
+- **Category D — documentation invariants:** operator doc content checks
 """
 
 from __future__ import annotations
@@ -52,9 +52,7 @@ STATUS_SCRIPT = (
 )
 POLICY_CONFIG = Path(__file__).parent.parent / "config.toml"
 GUIDELINES = REPO_ROOT / "docs/working/pr-guidelines.md"
-DESIGN = REPO_ROOT / "docs/planning/designs/pr-pipeline-tick.md"
 INTERNALS = REPO_ROOT / "docs/working/pr-pipeline-internals.md"
-EXTRACTION_DESIGN = REPO_ROOT / "docs/planning/designs/pr-pipeline-tick-python-extraction.md"
 
 # The scope the credentialed engine prompts must state verbatim. Ambient `gh`
 # credentials reach every item in the repository, not just the one the engine was
@@ -263,13 +261,6 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
         names_members=False,
     ),
     _OrderingSurface(
-        name="design doc",
-        path=DESIGN,
-        section_start="**Silent escalations, stated by complement.**",
-        section_end="**Publication durability.**",
-        names_members=True,
-    ),
-    _OrderingSurface(
         name="pr-pipeline-internals.md",
         path=INTERNALS,
         section_start="Publication ordering:",
@@ -354,7 +345,7 @@ def test_debug_md_retains_the_invariants_moved_out_of_the_sop() -> None:
 # docs and the internals note from the same question the operator docs answer,
 # so a retired ceiling surviving in any one of them is a second contract.
 _ADMISSION_DOCS = (
-    DEBUG, SKILL, README, LIB_README, DESIGN, EXTRACTION_DESIGN, INTERNALS,
+    DEBUG, SKILL, README, LIB_README, INTERNALS,
 )
 
 
@@ -380,9 +371,9 @@ def test_no_doc_pairs_a_union_with_the_in_flight_count() -> None:
     """No doc may describe in-flight occupancy as a union outside HARVEST.
 
     The assertion above bans three exact strings, so it only catches wordings
-    someone already thought to ban — and the retired ceiling survived a full
-    sweep in ``pr-pipeline-tick.md`` precisely because its end-to-end
-    walkthrough phrased it differently. This asserts the shape instead: a
+    someone already thought to ban — and the retired ceiling once survived a
+    full sweep precisely because an end-to-end walkthrough phrased it
+    differently. This asserts the shape instead: a
     paragraph pairing a union with the in-flight count is describing
     admission, and admission does not union anything any more.
 
@@ -410,8 +401,8 @@ def test_every_admission_doc_credits_the_marker_with_the_slot() -> None:
     someone wrote. It cannot fail on a *missing* right one, so a sweep that
     deletes the contradiction and stops there leaves a doc that teaches
     occupancy while naming no payer at all — and the next author fills that
-    silence with the label, which is how the retired ceiling grew back in the
-    design doc's walkthrough after the first sweep.
+    silence with the label, which is how the retired ceiling grew back into a
+    walkthrough after the first sweep.
 
     This is the mirror assertion, built from the same primitives so the two
     cannot drift: somewhere in every admission doc, a marker must be the
@@ -535,8 +526,8 @@ def test_no_surface_attributes_an_admission_slot_to_a_label() -> None:
     The carve-out is deliberately a positive obligation rather than an
     exemption list: a sentence that puts a label next to a slot must name the
     marker, because the marker is what pays. That cannot be satisfied by
-    rewording around a banned phrase — which is exactly how
-    ``pr-pipeline-tick.md``'s walkthrough survived the last sweep. It is scoped
+    rewording around a banned phrase — which is exactly how a walkthrough
+    survived the last sweep. It is scoped
     to the sentence rather than the paragraph so a correct neighbouring
     sentence cannot vouch for a wrong one.
     """
@@ -593,14 +584,6 @@ def test_skill_md_references_preflight() -> None:
     """SKILL.md must still require preflight.sh before first reviewer dispatch."""
     text = SKILL.read_text()
     assert "preflight.sh" in text
-
-
-def test_design_doc_marks_fixer_as_shipped_not_manual() -> None:
-    """The design doc shipped-slice language must match the runnable fixer stage."""
-    design = DESIGN
-    text = design.read_text()
-    assert "shipped review-only slice" not in text
-    assert "shipped implement/review/fix slice" in text
 
 
 def test_readme_documents_transient_engine_result_contract() -> None:
@@ -795,26 +778,20 @@ def test_operator_docs_preserve_the_human_emergency_hold_override() -> None:
         )
 
 
-def test_state_machine_and_design_docs_treat_hold_provenance_as_unprovable() -> None:
-    """No source of truth may claim a hold beside custody *is* human-set.
+def test_state_machine_treats_hold_provenance_as_unprovable() -> None:
+    """Neither state-machine module may claim a hold beside custody *is* human-set.
 
-    ``pipeline.py`` owns the hold-label set, ``tick.py`` acts on it in
-    ``_reconcile_one`` and ``_resolve_dispatchable_pickup_label``, and both
-    design docs describe reconcile's precedence rule — the canonical one and the
-    extraction
-    doc that restates the dual-label decision step. Engines share the tick's
-    GitHub token, so a `labeled` timeline event names the same account either way
-    and no provenance signal exists. Leaving any of the four asserting proven
-    provenance invites a future recovery change to branch on it.
+    ``pipeline.py`` owns the hold-label set and ``tick.py`` acts on it in
+    ``_reconcile_one`` and ``_resolve_dispatchable_pickup_label``. Engines share
+    the tick's GitHub token, so a `labeled` timeline event names the same account
+    either way and no provenance signal exists. Leaving either module asserting
+    proven provenance invites a future recovery change to branch on it.
     """
     pipeline_source = (Path(__file__).parent / "pipeline.py").read_text()
     tick_source = (Path(__file__).parent / "tick.py").read_text()
-    design = DESIGN.read_text()
     surfaces = (
         ("pipeline.py", pipeline_source),
         ("tick.py", tick_source),
-        ("design doc", design),
-        ("extraction design doc", EXTRACTION_DESIGN.read_text()),
     )
     for name, text in surfaces:
         assert "treated as human-set" in text, (
@@ -859,16 +836,10 @@ def test_publication_ordering_docs_define_the_silent_set_by_complement() -> None
     :func:`test_tick_publishes_only_the_documented_comment_kinds` fails when one
     appears.
 
-    Only #618 is required now. #625 closed the dispatch-side family, and a
-    surface still pointing at it would send an operator to an issue that no
-    longer describes the code — which is the same staleness this file exists to
-    prevent, in the opposite direction.
-
     ``forced transitions`` — the undefined term the original counts were
-    expressed in — must not come back with it.
+    expressed in — must not come back.
     """
     for name, text in ordering_surfaces():
-        assert "#618" in text, f"{name} does not track #618"
         assert _SILENT_SET_RULE in text, (
             f"{name} does not define the silent set as the complement of the "
             f"publishing set"
@@ -918,8 +889,8 @@ def test_publication_ordering_docs_state_the_ast_derived_publishing_bound() -> N
     functions elsewhere for unrelated reasons, and a whole-file scan reads those
     mentions as the ordering surface naming its publishing set.
 
-    Which surfaces carry the names is declared, not inferred. The design doc and
-    internals reference the symbols; the operator README states the bound without
+    Which surfaces carry the names is declared, not inferred. The internals
+    reference names the symbols; the operator README states the bound without
     them. Inferring it from what a surface happens to name is what let a rename of
     *every* posting function pass: the docs named none of the new symbols, so a
     "names none" surface was read as a surface that never names them. Declaring
@@ -1106,46 +1077,6 @@ def test_operator_docs_define_failed_reviewer_terminal_custody() -> None:
                       "`ai:needs-human-decision`", "redispatch", "archive failure",
                       "relabel failure", "scratch"):
             assert token in text
-
-
-def test_design_doc_distinguishes_reviewer_and_wrapperless_completion() -> None:
-    """The canonical design must not require reviewer envelopes from Claude stages."""
-    design = DESIGN
-    text = design.read_text()
-    assert "Reviewer completion authority" in text
-    assert "Wrapperless implementer/fixer completion authority" in text
-
-
-def test_design_doc_defines_failed_reviewer_envelope_and_custody() -> None:
-    """Canonical design must distinguish terminal wrapper failure from staleness."""
-    design = DESIGN
-    text = design.read_text()
-    for token in (
-        "`error_class`",
-        "dispatch-bound",
-        "non-zero",
-        "`result_valid=False`",
-        "classifies as `failed`",
-        "archive before relabel",
-        "`ai:needs-human-decision`",
-        "relabel failure",
-        "final archive",
-        "retains scratch",
-    ):
-        assert token in text, f"Failed-reviewer design contract missing: {token}"
-
-
-def test_design_doc_defines_reviewer_output_suppression() -> None:
-    """Canonical design must not promise candidate-controlled reviewer output."""
-    design = DESIGN
-    text = design.read_text()
-    for token in ("JSONL stdout", "stderr", "bounded", "sanitized",
-                  "review-observation.json", "explicit invocation",
-                  "startup error class", "`EngineExitError`",
-                  "implementer/fixer", "engine stderr"):
-        assert token in text
-    assert "stdout and stderr are both\nredirected to `DEVNULL`" not in text
-    assert "raw reviewer engine stderr" not in text
 
 
 def test_preflight_scopes_model_report_as_unverified_signal() -> None:
@@ -1472,8 +1403,8 @@ def test_main_harvest_phases_called_in_order() -> None:
 
 # Docs that must stay correct wherever the pipeline is installed: the operator
 # entry points plus the internals reference an operator follows into the source.
-# `docs/planning/designs/` is deliberately absent — those records describe the
-# in-repo incubation accurately, as history, and rewriting them would falsify it.
+# The architecture doc is deliberately absent — it explains the design's shape,
+# not how to invoke it, so it names no install-resolved path.
 _INSTALL_PORTABLE_DOCS = (
     SKILL, README, DEBUG, LIB_README, PREFLIGHT, STATUS_SKILL, STATUS_SCRIPT,
     INTERNALS,
@@ -1634,6 +1565,137 @@ def test_workflow_docs_use_the_label_vocabulary_the_tick_implements(
     assert not unknown, (
         f"{workflow_doc} teaches ai: labels the pipeline does not implement: "
         f"{unknown}"
+    )
+
+
+# --- Category F — target-independence invariants ---
+
+# The shipped surfaces that describe what an *engine* does. None of them may
+# name one target repo's toolchain: what to run is the target's CLAUDE.md to
+# state, and what an engine is permitted to run is the operator's config.
+#
+# `lib/README.md` is deliberately absent. It documents how to develop and test
+# the pipeline's own `lib/`, which really is a Python project — naming pytest
+# there is a fact about this repository, not a claim about anyone's target.
+_TARGET_INDEPENDENT_SURFACES = (
+    SKILL, README, DEBUG, STATUS_SKILL, INTERNALS,
+    PROMPTS / "implementer.txt", PROMPTS / "fixer.txt", PROMPTS / "reviewer.txt",
+)
+
+# Build tools that belong to a target repo, not to the pipeline. Matched with
+# word boundaries so `pytest.ini` in a path or `npmjs` in a URL is not a hit,
+# and so the words appear here exactly as an author would write them.
+_TARGET_STACK_TOOLS = (
+    "pytest", "pyright", "ruff", "npm", "cargo", "gradle", "mypy", "eslint",
+)
+
+
+def test_engine_prompts_defer_verification_to_the_target_repo() -> None:
+    """The prompt templates must not name any stack's verification commands.
+
+    The pipeline drives a repository it does not own. Only that repository knows
+    what its tests, linter, and type checker are and in what order they run, and
+    it already says so in its own ``CLAUDE.md``/``AGENTS.md`` — which the engine
+    reads. A prompt that names ``uv run pytest`` is correct in exactly one
+    install and instructs every other engine to run a command that does not
+    exist there.
+
+    The permission to run those commands is a separate concern and stays in the
+    operator's config; see
+    :func:`test_engine_verify_tools_come_from_operator_config`.
+    """
+    for prompt_path in (PROMPTS / "implementer.txt", PROMPTS / "fixer.txt"):
+        text = prompt_path.read_text()
+        assert "the repository's own verification commands" in text, (
+            f"{prompt_path.name} does not defer verification to the target repo"
+        )
+        for tool in _TARGET_STACK_TOOLS:
+            assert not re.search(rf"\b{tool}\b", text), (
+                f"{prompt_path.name} hard-codes the tool {tool!r}"
+            )
+
+
+def test_no_shipped_surface_hardcodes_a_target_repo_toolchain() -> None:
+    """No engine-facing doc or prompt may present one stack as the contract.
+
+    The prompt check above is the load-bearing half, but a doc that still tells
+    an operator "the engine runs ``uv run pytest``" teaches a contract the code
+    no longer has — and the next author restores the code to match the doc,
+    because a doc and an implementation that disagree are resolved in whichever
+    direction is easier to edit.
+    """
+    violations: list[str] = []
+    for surface in _TARGET_INDEPENDENT_SURFACES:
+        text = surface.read_text()
+        lines = text.splitlines()
+        for tool in _TARGET_STACK_TOOLS:
+            for match in re.finditer(rf"\b{tool}\b", text):
+                line = text[: match.start()].count("\n") + 1
+                violations.append(
+                    f"{surface.name}:{line} names {tool!r}: "
+                    f"{lines[line - 1].strip()!r}"
+                )
+
+    assert not violations, (
+        "engine-facing surfaces name a target repo's toolchain; verification "
+        "commands belong to the target's own CLAUDE.md and to "
+        "`[engine] verify_tools`:\n" + "\n".join(violations)
+    )
+
+
+def test_shipped_config_declares_no_target() -> None:
+    """``config.toml`` must ship with ``[target]`` blank.
+
+    The file is copied into every install, so a committed ``repo`` or
+    ``trusted_author`` points a fresh install at somebody else's repository —
+    and every ``gh`` call the tick makes carries ``--repo``, so a wrong value is
+    a remote mutation against a stranger's queue, not a no-op. Blank is what
+    ``main``'s startup gate refuses to run on, which turns the unconfigured case
+    into a legible message instead of a plausible-looking wrong target.
+    """
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    target = config.get("target", {})
+    assert target.get("repo") == "", (
+        "config.toml ships a target repo; every adopter inherits it"
+    )
+    assert target.get("trusted_author") == "", (
+        "config.toml ships a trusted review author; every adopter inherits it"
+    )
+
+
+def test_shipped_config_declares_no_review_checklist_paths() -> None:
+    """``[policy] checklist_paths`` must ship empty.
+
+    ``CLAUDE.md`` and ``AGENTS.md`` gate by basename with no configuration, so
+    the shipped list has nothing it needs to carry. A path pinned here would be
+    one repo's, dead in every other install, and it would make an adopter's gate
+    look configured when nothing in their repo is actually covered.
+    """
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    assert config.get("policy", {}).get("checklist_paths") == [], (
+        "config.toml ships review-checklist paths that belong to one target repo"
+    )
+
+
+def test_status_dashboard_has_no_fallback_target_repo() -> None:
+    """``status.sh`` must not fall back to a hard-coded repository.
+
+    The dashboard is the signal an operator reads to decide the pipeline is idle
+    and safe to touch. Pointed at the wrong repo it renders a real, plausible
+    queue — the worst failure shape available, because nothing about it looks
+    like an error. It reads the tick's own ``[target] repo`` so the two cannot
+    disagree, and exits rather than guessing.
+    """
+    text = STATUS_SCRIPT.read_text()
+    assert 'REPO="${PIPELINE_REPO:-}"' in text, (
+        "status.sh still carries a fallback default for the target repo"
+    )
+    assert "no target repo configured" in text, (
+        "status.sh does not fail loudly when no target is configured"
     )
 
 

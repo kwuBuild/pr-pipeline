@@ -8,8 +8,9 @@ classification — as small, deterministic, unit-tested functions. The
 than re-deriving this logic in inline bash each tick, so an unattended loop behaves
 identically every run.
 
-Stdlib only: the directory must lift out of Sworn (and run under a bare
-``python3``) without pulling Sworn's dependency tree along.
+Stdlib only: the directory installs against a target repo it does not own, so
+it runs under a bare ``python3`` (3.11+) and takes no dependency on any
+target's toolchain.
 """
 
 from __future__ import annotations
@@ -81,8 +82,8 @@ STAGE_IN_FLIGHT_LABELS = {
 
 # In-flight labels: each one means "an engine holds this item". Any of them on a
 # dispatch candidate is a claim by *some* machine, whose dispatch marker lives on
-# that machine's disk — so a local marker scan cannot disprove it. Since #592 the
-# tick no longer converges such an item, which means a partial transition (the
+# that machine's disk — so a local marker scan cannot disprove it. The tick
+# therefore never converges such an item, which means a partial transition (the
 # in-flight label added, the pickup label not yet removed) now persists for the
 # life of that engine and keeps matching the pickup query. Dispatch therefore
 # reads this set directly rather than inferring freedom from a missing marker.
@@ -131,14 +132,17 @@ LOOP_QUIESCENT_STOP_AFTER = 3
 # Files that govern the reviewer's own behaviour. A PR that edits any of these is
 # changing the very policy that decides whether it is promoted, so it must not be
 # auto-reviewed under instructions it controls (see :func:`touches_review_policy`).
-# Codex auto-loads ``AGENTS.md`` as its project doc; ``AGENTS.md`` routes to
-# ``CLAUDE.md``; other standards/checklists are readable at the reviewer's
-# discretion. All three categories are in scope at any directory level.
+# Codex auto-loads ``AGENTS.md`` as its project doc and ``AGENTS.md`` routes to
+# ``CLAUDE.md``, so those two are universal and are matched by basename at any
+# directory level.
+#
+# A target repo's own review checklists are the same class of file but their
+# paths are the target's to name — the pipeline drives a repository it does not
+# own, so hard-coding one repo's checklist paths here would both miss every
+# other repo's and carry a dead entry into every install. They are declared by
+# the operator in ``config.toml`` under ``[policy] checklist_paths``; see
+# :func:`_reviewer_checklist_paths`.
 _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
-_POLICY_PATHS = frozenset({
-    ".claude/hooks/sworn-review-checklist.md",
-    ".claude/hooks/sworn-review-checklist-frontend.md",
-})
 
 # The pipeline's own files are review policy too, matched by path *suffix* rather
 # than exact path. The file that toggles the gate is policy: a PR flipping
@@ -1527,28 +1531,105 @@ def decide_review_harvest(
     }
 
 
-def _policy_touching_allowed() -> bool:
-    """Return whether the operator has opted out of the reviewer-policy gate.
+def read_operator_config() -> dict[str, object]:
+    """Return the operator's ``config.toml``, or an empty mapping.
 
-    Reads ``allow_touching`` from the ``[policy]`` section of the pipeline's
-    ``config.toml`` (``_POLICY_CONFIG_PATH``). A missing file, malformed TOML
+    Read at call time rather than import time so a config change takes effect on
+    the next tick without a redeploy. A missing file or malformed TOML
     (including invalid UTF-8, which ``tomllib`` surfaces as
-    ``UnicodeDecodeError``), or a non-``true`` value all keep the conservative
-    gate — only an explicit ``true`` opts out, so failures fail closed.
+    ``UnicodeDecodeError``) reads as empty, which every caller must treat as the
+    conservative case — the gates built on this fail closed, and the startup
+    probe refuses to run a tick with no target configured.
 
     Returns:
-        ``True`` only when the operator's config explicitly allows PRs that
-        edit reviewer-governing files to be auto-reviewed.
+        The parsed config, or ``{}`` when it is absent or unreadable.
     """
     try:
         with open(_POLICY_CONFIG_PATH, "rb") as fh:
             config = tomllib.load(fh)
     except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
-        return False
-    section = config.get("policy")
-    # A valid-but-wrong-shape value (string, bool, list) must fail closed like
-    # a missing key, never crash the gate into a tick-level exception.
-    return isinstance(section, dict) and section.get("allow_touching") is True
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _config_section(name: str) -> dict[str, object]:
+    """Return one top-level table from the operator config.
+
+    Args:
+        name: The table name (``policy``, ``target``, ``engine``).
+
+    Returns:
+        The table, or ``{}`` when it is absent or not a table.
+    """
+    section = read_operator_config().get(name)
+    return section if isinstance(section, dict) else {}
+
+
+def config_string(section: str, key: str) -> str:
+    """Return a stripped string setting, or ``""`` when unusable.
+
+    A valid-but-wrong-shape value (number, list, table) reads as absent rather
+    than raising, so a typo in the operator's config surfaces as the
+    unconfigured case — which the caller fails closed on — instead of a
+    tick-level exception.
+
+    Args:
+        section: The table name.
+        key: The key within that table.
+
+    Returns:
+        The configured string, or ``""``.
+    """
+    value = _config_section(section).get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def config_string_list(section: str, key: str) -> tuple[str, ...]:
+    """Return a list-of-strings setting, dropping unusable entries.
+
+    Args:
+        section: The table name.
+        key: The key within that table.
+
+    Returns:
+        The configured entries, stripped and with blanks and non-strings
+        dropped. ``()`` when the key is absent or is not a list.
+    """
+    value = _config_section(section).get(key)
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        entry.strip() for entry in value
+        if isinstance(entry, str) and entry.strip()
+    )
+
+
+def _reviewer_checklist_paths() -> tuple[str, ...]:
+    """Return the target repo's reviewer-governing checklist paths.
+
+    Repo-relative paths declared by the operator under ``[policy]
+    checklist_paths``. Empty is the correct default: ``CLAUDE.md`` and
+    ``AGENTS.md`` are matched by basename regardless, so a repo with no extra
+    checklists needs no configuration and gets no dead entries.
+
+    Returns:
+        The configured paths, or ``()``.
+    """
+    return config_string_list("policy", "checklist_paths")
+
+
+def _policy_touching_allowed() -> bool:
+    """Return whether the operator has opted out of the reviewer-policy gate.
+
+    Reads ``allow_touching`` from the ``[policy]`` section. Anything other than
+    an explicit ``true`` — a missing file, malformed TOML, a wrong-shaped value
+    — keeps the conservative gate, so failures fail closed.
+
+    Returns:
+        ``True`` only when the operator's config explicitly allows PRs that
+        edit reviewer-governing files to be auto-reviewed.
+    """
+    return _config_section("policy").get("allow_touching") is True
 
 
 def _ends_with_policy_suffix(path: str) -> bool:
@@ -1573,8 +1654,8 @@ def touches_review_policy(changed_paths: list[str]) -> bool:
     """Return whether a diff modifies any file that governs the reviewer.
 
     The reviewer runs inside the candidate's checked-out worktree and is told to
-    apply ``CLAUDE.md``/``AGENTS.md``/``sworn-review-checklist.md``. A PR that
-    edits any of those steers the very reviewer that decides its own promotion —
+    apply ``CLAUDE.md``/``AGENTS.md`` and the target's own review checklists. A
+    PR that edits any of those steers the very reviewer that decides its own promotion —
     an untrusted-input-controls-the-validator inversion. The dispatch consults
     this and routes such PRs to a human instead of auto-reviewing them under
     instructions the PR itself supplies. Files are matched at any directory level
@@ -1598,11 +1679,16 @@ def touches_review_policy(changed_paths: list[str]) -> bool:
     """
     if _policy_touching_allowed():
         return False
+    # Read once: a diff can carry thousands of paths, and each read re-parses
+    # the whole config file.
+    checklist_paths = _reviewer_checklist_paths()
     for path in changed_paths:
         path = path.strip()
         if not path:
             continue
-        if path in _POLICY_PATHS or os.path.basename(path) in _POLICY_BASENAMES:
+        if os.path.basename(path) in _POLICY_BASENAMES:
+            return True
+        if path in checklist_paths:
             return True
         if _ends_with_policy_suffix(path):
             return True
@@ -2405,8 +2491,8 @@ def trusted_review_candidate(
     """Return whether PR metadata satisfies the shipped reviewer trust boundary.
 
     The review process needs the operator's readable Codex credential. Until the
-    stronger isolation tracked in #441 lands, dispatch is therefore restricted to
-    owner-authored branches in this repository. Missing or mistyped metadata fails
+    stronger isolation lands (see the architecture doc's *Future evolution*),
+    dispatch is therefore restricted to branches the operator declared trusted. Missing or mistyped metadata fails
     closed rather than weakening that boundary.
 
     Args:
@@ -2562,7 +2648,7 @@ def valid_marker(
     vouch for. A marker that fails validation is treated as marker-less, so
     reconciliation retains an ``ai:reviewing`` PR untouched instead of driving an
     incorrect stale-revert or re-dispatch from a corrupt record — absence of
-    proof is not proof of an orphan (issue #592).
+    proof is not proof of an orphan.
 
     Validation requires:
 
@@ -2742,11 +2828,11 @@ def in_flight_refs(
     Occupancy is proved by a local dispatch marker and nothing else. An
     ``ai:`` in-flight label is a *shared workflow state* — ``CLAUDE.md`` tells
     contributors to set ``ai:implementing`` by hand before writing code, and
-    #592 established that the pipeline cannot read custody out of a label it
-    may not own. Counting those labels as paid engines is the same conflation
+    experience established that the pipeline cannot read custody out of a
+    label it may not own. Counting those labels as paid engines is the same conflation
     from the other side: a manual pickup, or a label whose harvest relabel was
-    missed, silently consumed a spend slot forever and starved dispatch (the
-    2026-07-07 and 2026-08-20 incidents, #534). The cap bounds the engines
+    missed, silently consumed a spend slot forever and starved dispatch — twice,
+    on 2026-07-07 and 2026-08-20. The cap bounds the engines
     *this* machine launched and can still see; nothing else is spending its
     budget.
 
@@ -2841,7 +2927,7 @@ def reconcile_dispatch(
     local accelerator file on a control plane whose only shared state is
     GitHub says nothing about custody, so the markerless case is always a
     no-op and any resulting stranding is surfaced by the status dashboard for
-    the operator to clear (issue #592).
+    the operator to clear.
 
     "In custody" means the PR/issue is still at a label this pipeline owns for
     the current stage — the in-flight label (``ai:reviewing`` for reviews,

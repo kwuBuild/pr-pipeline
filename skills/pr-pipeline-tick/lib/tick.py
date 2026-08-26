@@ -5,8 +5,9 @@ Imported by the ``pr-pipeline-tick`` skill's thinned SKILL.md. A single
 with one long-lived Python process that imports ``pipeline`` and
 ``process_control`` directly — no subprocess round-trips for decision logic.
 
-Stdlib only: the directory must lift out of Sworn (and run under a bare
-``python3``) without pulling Sworn's dependency tree along.
+Stdlib only: the directory installs against a target repo it does not own, so
+it runs under a bare ``python3`` (3.11+) and takes no dependency on any
+target's toolchain.
 """
 
 from __future__ import annotations
@@ -147,11 +148,11 @@ WAKE_REQUEST_PATH = os.path.join(WT_ROOT, ".tick-state", "wake-request")
 # so heartbeat silence is *at least* tool-call duration — the model turn that
 # consumes the result and any internal 429/529 backoff land on top of it, which
 # is part of why the threshold keeps a multiple rather than sitting at this
-# bound. Claude Code caps a single Bash call at 600s, and
-# `Bash(uv run pytest *)` is allowlisted
-# (`_ENGINE_ALLOWED_TOOLS_BASE`) against a suite that already outruns the
-# harness's 120s default — so an engine that retries with a longer timeout,
-# the obvious move, legitimately goes quiet for the full cap.
+# bound. Claude Code caps a single Bash call at 600s, and the operator's
+# verification commands are allowlisted (`_engine_verify_tools`) against suites
+# that routinely outrun the harness's 120s default — so an engine that retries
+# with a longer timeout, the obvious move, legitimately goes quiet for the full
+# cap.
 MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = 10 * 60
 # Progress-stall threshold. An implementer/fixer that has emitted no engine
 # output for this long is wedged rather than working — a network call that
@@ -188,8 +189,23 @@ FIXER_TIMEOUT = 60 * 60  # seconds
 DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 60 * 60
 TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
 MIN_CODEX_VERSION = "codex-cli 0.142.5"
-TRUSTED_REVIEW_AUTHOR = "kwuBuild"
-TRUSTED_HEAD_REPO = "kwuBuild/sworn"
+
+# The repository this tick drives, and the GitHub login whose PRs it may
+# auto-review. The pipeline operates a repo it does not own, so neither can be a
+# shipped constant: a pinned default would silently point a fresh install at
+# somebody else's repository, and a wrong `--repo` is a remote mutation, not a
+# no-op. Both come from `config.toml` `[target]`, with an env override for the
+# one-off run against a different repo. Unset reads as empty, and `main` refuses
+# to run a tick in that state (see the startup gate) rather than letting an
+# empty `--repo` reach `gh`.
+TRUSTED_HEAD_REPO = (
+    os.environ.get("PIPELINE_REPO", "").strip()
+    or pipeline.config_string("target", "repo")
+)
+TRUSTED_REVIEW_AUTHOR = (
+    os.environ.get("PIPELINE_TRUSTED_AUTHOR", "").strip()
+    or pipeline.config_string("target", "trusted_author")
+)
 _PR_BODY_SOURCE_FILE = ".pr-body.md"
 _PR_CREATE_BODY_FILE = ".pr-create-body.md"
 # The fixer's optional replacement PR body, and the two-line envelope that binds
@@ -261,18 +277,18 @@ SKILL_DOC_ROOT = ".claude/skills"
 # Discipline skills bound into a dispatched engine's prompt. Skills are
 # discretionary reading unless the executed prompt names when they must run, so
 # each binding is a named constant substituted into the template (never
-# hardcoded in the .txt) — #634 can then move the binding into config without
-# rewriting prompts.
+# hardcoded in the .txt) — a later change can move the binding into config
+# without rewriting prompts.
 REVISION_HYGIENE_SKILL = "review-response-hygiene"
 
 # The skills `_dispatch_one_fixer` resolves before launch. The implementer half
-# (#633) adds its own tuple against the same resolver.
+# adds its own tuple against the same resolver.
 FIXER_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
 
 # Ceiling on each governing document injected into a fixer prompt (the PR body,
 # and the linked issue contract as a whole). The documents are engine- and
 # human-authored with no size contract of their own, so the prompt states one.
-# Generous against the largest pair observed in this repo (PR #645's body at
+# Generous against the largest pair observed in practice (a body at
 # 12989 characters, its issue contract at 10414), and a cut is announced in the
 # text rather than silently swallowing a requirement.
 FIXER_CONTEXT_BUDGET = 20000
@@ -705,10 +721,59 @@ def _reviewer_safe_value(key: str, value: object, source: str) -> str:
 _ENGINE_ALLOWED_TOOLS_BASE = (
     "Read Edit Write "
     "Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) "
-    "Bash(git log *) "
-    "Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright) "
-    "Bash(npm --prefix frontend *)"
+    "Bash(git log *)"
 )
+
+# The verification commands an engine is permitted to run, as bare Bash
+# permission bodies (each is wrapped in `Bash(...)` by _engine_verify_tools).
+#
+# This is the one place a target repo's toolchain has to be named, and it is
+# named as a *permission grant*, not an instruction: the engine prompts tell the
+# engine to run the repository's own verification commands and follow its
+# CLAUDE.md/AGENTS.md, because only the target repo knows what those are. But
+# engines run under `--permission-mode dontAsk` against an exact list, never a
+# glob, so a command the operator never declared is denied rather than run — and
+# a denial mid-run reads to the engine as a broken repo, not a missing grant.
+#
+# The shipped default is a Python stack because an empty default makes a fresh
+# install fail its first dispatch on a permission denial instead of a legible
+# message. An operator on another stack replaces the list wholesale in
+# `config.toml` `[engine] verify_tools`.
+_DEFAULT_VERIFY_TOOLS: tuple[str, ...] = (
+    "uv run pytest *",
+    "uv run ruff *",
+    "uv run pyright",
+    "npm --prefix frontend *",
+)
+
+# A configured permission body may not contain a parenthesis or any newline.
+# `--allowedTools` is a space-separated list of `Tool(body)` entries, so a `)`
+# inside a body closes the entry early and every character after it is parsed as
+# a *new* permission — an operator typo, or a malicious config, would widen the
+# security boundary this list exists to be. Spaces are legal and load-bearing
+# (`uv run pytest *`), so they cannot be the delimiter check.
+_VERIFY_TOOL_RE = re.compile(r"\A[^()\r\n]+\Z")
+
+
+def _engine_verify_tools() -> tuple[str, ...]:
+    """Return the engine's verification-command permissions, as `Bash(...)`.
+
+    Reads ``[engine] verify_tools`` from the operator config, falling back to
+    :data:`_DEFAULT_VERIFY_TOOLS` when the key is absent or contains no usable
+    entry. Entries failing :data:`_VERIFY_TOOL_RE` are dropped individually
+    rather than rejected as a set, so one bad line cannot strip an engine of
+    every verification permission it needs.
+
+    Returns:
+        The permission entries, each already wrapped in ``Bash(...)``.
+    """
+    configured = pipeline.config_string_list("engine", "verify_tools")
+    usable = tuple(
+        entry for entry in (configured or _DEFAULT_VERIFY_TOOLS)
+        if _VERIFY_TOOL_RE.match(entry)
+    )
+    return tuple(f"Bash({entry})" for entry in usable or _DEFAULT_VERIFY_TOOLS)
+
 
 # The implementer worktree checks out its own branch, so the exact permission
 # `git push origin HEAD` (fast-forward push of the checked-out branch) is its
@@ -774,7 +839,8 @@ def _engine_allowed_tools(push_permission: str) -> str:
     Returns:
         The full ``--allowedTools`` string for the engine launch.
     """
-    return f"{_ENGINE_ALLOWED_TOOLS_BASE} {push_permission}"
+    verify = " ".join(_engine_verify_tools())
+    return f"{_ENGINE_ALLOWED_TOOLS_BASE} {verify} {push_permission}"
 
 
 _CLAUDE_STREAM_WRAPPER = os.path.join(
@@ -1033,7 +1099,7 @@ def _notify_terminal_label(
             details={"entity": entity, "label": label},
         )
     _emit_operator_notification(
-        title="Sworn PR pipeline terminal label",
+        title="PR pipeline terminal label",
         message=reason,
     )
 
@@ -1078,7 +1144,7 @@ def _restore_released_in_flight_label(
     other workflow label already owns: the release runs only under a hold, and
     nothing later removes an in-flight label re-added beside a human's
     transition, so the item would sit at a pipeline label no tick will ever
-    clear (#604) and no dispatcher will ever pick up. It costs no admission
+    clear and no dispatcher will ever pick up. It costs no admission
     slot — the cap counts markers — but the item is stranded until a person
     strips the label by hand. An unreadable observation names no owner and is
     restored like an empty one.
@@ -1153,7 +1219,7 @@ def _release_in_flight_label(
     immediately afterwards — and the marker is the only thing that can re-prove
     death. An unconfirmed release would leave the in-flight label standing over
     a destroyed marker: a markerless in-flight item, which no tick clears
-    (#604) and no dispatcher picks up. It spends nothing — the cap counts
+    and no dispatcher picks up. It spends nothing — the cap counts
     markers, so the slot is freed by the very destruction that stranded it —
     but the item is stuck at a pipeline label until a person strips it, with
     the one artifact that could have re-proved death already gone.
@@ -1415,7 +1481,7 @@ def _resolve_dispatchable_pickup_label(
 
     The pickup queries are label *filters*, not eligibility proofs: they select
     every open item carrying a pickup label, including one that also carries an
-    in-flight label or a human hold. Since #592 a markerless in-flight item is
+    in-flight label or a human hold. Since then a markerless in-flight item is
     never converged, so a partial transition on another machine — in-flight
     label added, pickup label not yet removed — is a state that persists for
     the life of that engine and keeps matching the query. The local marker
@@ -1501,14 +1567,14 @@ def cleanup_scratch(wt_path: str) -> None:
     directory itself is also removed.
 
     Also removes the corresponding reviewer scrub directory (``pr-{N}-scrub``
-    under the same parent), which lives outside the worktree since #528.
+    under the same parent), which lives outside the worktree.
 
     Args:
         wt_path: Path to the worktree directory (e.g. ``.claude/worktrees/pr-42``).
     """
     if os.path.isdir(wt_path):
         shutil.rmtree(wt_path, ignore_errors=True)
-    # Scrub dir for reviewers lives alongside the worktree, not inside it (#528).
+    # Scrub dir for reviewers lives alongside the worktree, not inside it.
     scrub_dir = os.path.join(os.path.dirname(wt_path),
                              os.path.basename(wt_path) + "-scrub")
     if os.path.isdir(scrub_dir):
@@ -2627,7 +2693,7 @@ def read_authoritative_human_holds(
 
     The cost tracks occupancy, and occupancy is this machine's dispatch
     markers alone — a markerless in-flight label is a deliberate no-op that
-    no tick clears (#604) and consumes no slot. Admission gates new markers at
+    no tick clears and consumes no slot. Admission gates new markers at
     ``MAX_IN_FLIGHT``, so the read count is bounded by the live marker set
     rather than by ``gh list``'s page size across the in-flight labels. A
     backlog of human-held or stranded labels no longer shows up here as tick
@@ -3055,7 +3121,8 @@ def _admission_states(
     boundary. This keeps the accounting honest if a future stage, writer, or
     validator relaxation puts a live process behind a terminal state again.
 
-    Note the reason is *not* the one #663 gave. A reviewer wrapper cannot
+    Note the reason is *not* the one the label-union rule gave. A reviewer
+    wrapper cannot
     publish an envelope with a live paid child: it writes the success envelope
     only after ``proc.wait()`` returns, and the startup-failure envelope only
     from an ``except`` whose ``try`` ends at ``Popen``, so no child exists. That
@@ -3101,7 +3168,7 @@ def _pipeline_actionable(
     exist today:
 
     - ``hung`` with unprovable identity is alive but *not* actionable. That is
-      the escalate-and-leave shape from #578: the pipeline may not signal a PID
+      the escalate-and-leave shape: the pipeline may not signal a PID
       it cannot prove, so it has decided never to act on it again.
     - A pre-spawn lease is not alive and never becomes so. It records no PID, so
       there is nothing to harvest or signal, and ``classify_dispatch`` pins it
@@ -3678,7 +3745,7 @@ def _reconcile_one(
         # the scratch are untouched, so the operator keeps every piece of
         # evidence and the pending choice stays exactly where they left it.
         #
-        # Unprovable identity still escalates-and-leaves (#578): a PID whose
+        # Unprovable identity still escalates-and-leaves: a PID whose
         # start time cannot be read may have been reused, and signalling it
         # could hit an unrelated process.
         if marker_valid and isinstance(marker, dict):
@@ -3699,7 +3766,7 @@ def _reconcile_one(
                 # receipt, not the human's writing. The admission slot is
                 # freed by destroying the marker, never by removing the label;
                 # the receipt is dropped so the item does not sit at a
-                # pipeline label no tick will ever clear (#604).
+                # pipeline label no tick will ever clear.
                 held_result_outcome = (
                     _held_result_outcome(wt_dir, config)
                     if classify_state == "complete" else ""
@@ -3757,7 +3824,7 @@ def _reconcile_one(
     # stage. Without one, a contradictory remote state is not ours to resolve
     # — it is the normal reading of another machine's dispatch caught between
     # its own two label writes, or of a human hold placed on live work. Acting
-    # on it would reintroduce the markerless escalation of issue #592 through
+    # on it would reintroduce the markerless escalation through
     # a second door, ahead of the reconcile_dispatch no-op that exists to stop
     # exactly that.
     _dual_label_needs_escalation = (
@@ -5027,7 +5094,7 @@ def _terminal_relabel_state(
       by design (see :func:`_converge_pipeline_labels`), so this transition can
       never converge while it stands. Retrying it every tick would leave the
       in-flight label on the item forever, and no tick clears a markerless
-      in-flight label (#604), so the pipeline drops its own in-flight receipt
+      in-flight label, so the pipeline drops its own in-flight receipt
       instead and leaves the human's hold to own the item. That release costs
       and reclaims no admission slot — the cap counts markers — it stops the
       label set from claiming a pipeline custody that has already moved.
@@ -6109,9 +6176,9 @@ def _fallback_implementation_pr_metadata(issue_number: int) -> tuple[str, str]:
             "## Test coverage\n"
             "- The implementer completed the repository verification commands.\n\n"
             "## Test plan\n"
-            "- [x] `uv run pytest`\n"
-            "- [x] `uv run ruff check .`\n"
-            "- [x] `uv run pyright`"
+            "- [x] The repository's verification commands (tests, lint, type "
+            "check) passed before the implementer pushed; the pipeline does not "
+            "record which commands those were."
         ),
     )
 
@@ -7990,7 +8057,7 @@ def _reconcile_stale_in_flight_labels(
     closing PR is not treated as an exception: ``gh search prs "Closes #N"`` is
     a full-text match that hits drafts and PRs under active revision, and
     removing the label would leave the issue carrying no pipeline label at all
-    (issue #592).
+   .
 
     A per-item point-read still runs so the retention decision is logged
     against the item's authoritative current label rather than the search
@@ -8078,7 +8145,7 @@ def _reconcile_stale_in_flight_labels(
         # every item another machine dispatched looks exactly like this, as
         # does the documented manual ai:implementing pickup. No proof of
         # custody is available here, so the sweep never mutates; the status
-        # dashboard surfaces the item for the operator instead (issue #592).
+        # dashboard surfaces the item for the operator instead.
         if tick_log:
             tick_log.log(
                 pr=number,
@@ -10694,7 +10761,7 @@ def main(
     """
     # Resolve repo root. The main checkout, never the linked worktree the
     # operator happened to invoke from: cwd must agree with WT_ROOT or the
-    # tick reads an empty marker space (issue #592).
+    # tick reads an empty marker space.
     try:
         os.chdir(repo_root())
     except (subprocess.CalledProcessError, ValueError):
@@ -10809,6 +10876,38 @@ def _run_single_tick_locked(
             _log_startup_probe(tick_log, probe)
         except Exception:  # noqa: BLE001
             pass
+
+    # Fail fast when the target repository is not configured. Every `gh` call
+    # this tick makes is `--repo TRUSTED_HEAD_REPO`, and the reviewer admission
+    # gate compares against TRUSTED_REVIEW_AUTHOR — unset, the first would
+    # resolve `--repo ""` against whatever the cwd happens to be and the second
+    # would admit nobody. Both are remote-facing, so this refuses the tick with
+    # a legible message rather than discovering it mid-dispatch.
+    unconfigured = [
+        name for name, value in (
+            ("[target] repo", TRUSTED_HEAD_REPO),
+            ("[target] trusted_author", TRUSTED_REVIEW_AUTHOR),
+        ) if not value
+    ]
+    if unconfigured:
+        msg = (
+            "tick: target not configured: "
+            f"{', '.join(unconfigured)} — set them in "
+            "skills/pr-pipeline-tick/config.toml (or export PIPELINE_REPO / "
+            "PIPELINE_TRUSTED_AUTHOR)"
+        )
+        print(msg, file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(
+                pr=None, phase="startup", stage="",
+                action="startup_target_unconfigured",
+                reason=msg,
+            )
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
+        print(tick_state.format_line(), file=sys.stderr)
+        sys.stderr.flush()
+        return 3
 
     # Fail fast when a required binary is missing.
     missing = [name for name in ("gh", "git", "codex")
@@ -11724,7 +11823,7 @@ def _report_engine_stalled(
             },
         )
     _emit_operator_notification(
-        title="Sworn PR pipeline engine stalled",
+        title="PR pipeline engine stalled",
         message=reason,
     )
 
@@ -12115,7 +12214,7 @@ def _notify_loop_quiescent_stop(held_items: Sequence[str] = ()) -> None:
             reason=reason,
         )
     _emit_operator_notification(
-        title="Sworn PR pipeline stopped",
+        title="PR pipeline stopped",
         message=reason,
     )
 

@@ -1,7 +1,7 @@
 """Tests for the PR-pipeline review-stage helper logic.
 
 Co-located with ``pipeline.py`` so the whole ``pr-pipeline-tick/lib`` directory lifts
-out cleanly when the tool is extracted from Sworn. Run with::
+out cleanly against any target repository. Run with::
 
     uv run pytest .claude/skills/pr-pipeline-tick/lib/test_pipeline.py
 """
@@ -935,10 +935,37 @@ def test_touches_review_policy_true_for_nested_claude_or_agents_md() -> None:
     assert pipeline.touches_review_policy(["app/sub/CLAUDE.md"]) is True
 
 
-def test_touches_review_policy_true_for_review_checklist() -> None:
-    assert (
-        pipeline.touches_review_policy([".claude/hooks/sworn-review-checklist.md"]) is True
+def test_touches_review_policy_true_for_configured_review_checklist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An operator-declared checklist path gates, and only that path.
+
+    The target repo's own review checklists steer the reviewer exactly as
+    CLAUDE.md does, but their paths belong to the target, so they are declared
+    in config rather than shipped. A near-miss path must not gate: matching by
+    basename or prefix here would escalate unrelated files in the same
+    directory.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[policy]\nchecklist_paths = [".ci/review-checklist.md"]\n',
+        encoding="utf-8",
     )
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    assert pipeline.touches_review_policy([".ci/review-checklist.md"]) is True
+    assert pipeline.touches_review_policy([".ci/review-checklist-v2.md"]) is False
+    assert pipeline.touches_review_policy(["docs/review-checklist.md"]) is False
+
+
+def test_touches_review_policy_ships_no_checklist_paths() -> None:
+    """The shipped config declares no checklist paths.
+
+    A path pinned here would be one repo's, dead in every other install, and it
+    would make the adopter's gate look configured when it is not. CLAUDE.md and
+    AGENTS.md still gate by basename with no configuration at all.
+    """
+    assert pipeline._reviewer_checklist_paths() == ()
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
 
 
 def test_touches_review_policy_true_for_gate_config() -> None:
@@ -992,10 +1019,6 @@ def test_touches_review_policy_config_allow_touching_true(
     monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is False
     assert pipeline.touches_review_policy(["app/AGENTS.md"]) is False
-    assert (
-        pipeline.touches_review_policy([".claude/hooks/sworn-review-checklist.md"])
-        is False
-    )
     assert pipeline.touches_review_policy(["app/foo.py"]) is False
 
 
@@ -1026,15 +1049,15 @@ def test_touches_review_policy_config_conservative_by_default(
 
 def test_trusted_review_candidate_accepts_owner_authored_same_repo_pr() -> None:
     metadata = {
-        "author": {"login": "kwuBuild"},
-        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "author": {"login": "test-owner"},
+        "headRepository": {"nameWithOwner": "test-owner/test-repo"},
         "isCrossRepository": False,
     }
 
     assert pipeline.trusted_review_candidate(
         metadata,
-        trusted_author="kwuBuild",
-        trusted_repo="kwuBuild/sworn",
+        trusted_author="test-owner",
+        trusted_repo="test-owner/test-repo",
     )
 
 
@@ -1043,20 +1066,20 @@ def test_trusted_review_candidate_accepts_owner_authored_same_repo_pr() -> None:
     [
         {
             "author": {"login": "contributor"},
-            "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+            "headRepository": {"nameWithOwner": "test-owner/test-repo"},
             "isCrossRepository": False,
         },
         {
-            "author": {"login": "kwuBuild"},
+            "author": {"login": "test-owner"},
             "headRepository": {"nameWithOwner": "fork/sworn"},
             "isCrossRepository": True,
         },
         {
-            "author": {"login": "kwuBuild"},
-            "headRepository": {"nameWithOwner": "kwuBuild/other"},
+            "author": {"login": "test-owner"},
+            "headRepository": {"nameWithOwner": "test-owner/other"},
             "isCrossRepository": False,
         },
-        {"author": {"login": "kwuBuild"}, "isCrossRepository": False},
+        {"author": {"login": "test-owner"}, "isCrossRepository": False},
         None,
     ],
 )
@@ -1065,8 +1088,8 @@ def test_trusted_review_candidate_rejects_untrusted_or_malformed_metadata(
 ) -> None:
     assert not pipeline.trusted_review_candidate(
         metadata,
-        trusted_author="kwuBuild",
-        trusted_repo="kwuBuild/sworn",
+        trusted_author="test-owner",
+        trusted_repo="test-owner/test-repo",
     )
 
 
@@ -1470,8 +1493,8 @@ def test_cli_validate_review_candidate_reads_stdin(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     metadata = {
-        "author": {"login": "kwuBuild"},
-        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "author": {"login": "test-owner"},
+        "headRepository": {"nameWithOwner": "test-owner/test-repo"},
         "isCrossRepository": False,
     }
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(metadata)))
@@ -1480,9 +1503,9 @@ def test_cli_validate_review_candidate_reads_stdin(
         [
             "validate-review-candidate",
             "--trusted-author",
-            "kwuBuild",
+            "test-owner",
             "--trusted-repo",
-            "kwuBuild/sworn",
+            "test-owner/test-repo",
         ]
     )
 
@@ -3995,12 +4018,12 @@ def test_validate_review_candidate_public_function_is_importable() -> None:
 
     result = validate_review_candidate(
         candidate={
-            "author": {"login": "kwuBuild"},
-            "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+            "author": {"login": "test-owner"},
+            "headRepository": {"nameWithOwner": "test-owner/test-repo"},
             "isCrossRepository": False,
         },
-        trusted_author="kwuBuild",
-        trusted_repo="kwuBuild/sworn",
+        trusted_author="test-owner",
+        trusted_repo="test-owner/test-repo",
     )
     assert result is True
 
@@ -4150,14 +4173,14 @@ def test_harvest_review_direct_equals_cli(tmp_path: Path) -> None:
 def test_validate_review_candidate_direct_equals_cli() -> None:
     """validate_review_candidate() direct call matches CLI output."""
     candidate = {
-        "author": {"login": "kwuBuild"},
-        "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+        "author": {"login": "test-owner"},
+        "headRepository": {"nameWithOwner": "test-owner/test-repo"},
         "isCrossRepository": False,
     }
     direct = pipeline.validate_review_candidate(
         candidate=candidate,
-        trusted_author="kwuBuild",
-        trusted_repo="kwuBuild/sworn",
+        trusted_author="test-owner",
+        trusted_repo="test-owner/test-repo",
     )
 
     import sys as _sys
@@ -4171,8 +4194,8 @@ def test_validate_review_candidate_direct_equals_cli() -> None:
         ret = pipeline.main(
             [
                 "validate-review-candidate",
-                "--trusted-author=kwuBuild",
-                "--trusted-repo=kwuBuild/sworn",
+                "--trusted-author=test-owner",
+                "--trusted-repo=test-owner/test-repo",
             ]
         )
     finally:
@@ -4994,3 +5017,78 @@ def test_stage_pickup_labels_cover_every_in_flight_stage() -> None:
     to one and forgotten in the other."""
     assert set(pipeline.STAGE_PICKUP_LABELS) == set(pipeline.STAGE_IN_FLIGHT_LABELS)
     assert set(pipeline.STAGE_ENTITIES) == set(pipeline.STAGE_IN_FLIGHT_LABELS)
+
+
+# --- Operator config accessors ---
+
+
+def test_config_string_reads_a_table_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A configured string is returned stripped."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[target]\nrepo = "  owner/name  "\n', encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+
+    assert pipeline.config_string("target", "repo") == "owner/name"
+
+
+def test_config_string_reads_wrong_shapes_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A wrong-typed value must read as unconfigured, never raise.
+
+    Everything built on these accessors fails closed on the empty string — the
+    startup gate refuses the tick, the policy gate escalates. A typed crash
+    instead would surface as a tick-level exception with no useful message, and
+    on the `--loop` path it would take down a run mid-flight.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[target]\nrepo = 42\n", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+
+    assert pipeline.config_string("target", "repo") == ""
+    assert pipeline.config_string("target", "absent") == ""
+    assert pipeline.config_string("absent", "repo") == ""
+
+
+def test_config_string_list_drops_unusable_entries(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Blank and non-string entries are dropped, the rest survive.
+
+    Dropping per entry rather than rejecting the list is deliberate: these
+    lists carry security-relevant grants, and one bad line silently emptying
+    the whole list is a worse failure than one bad line being ignored.
+    """
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[engine]\nverify_tools = ["  a  ", "", 7, "b"]\n', encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+
+    assert pipeline.config_string_list("engine", "verify_tools") == ("a", "b")
+
+
+def test_config_string_list_reads_a_non_list_as_absent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A scalar where a list belongs reads as unconfigured."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[engine]\nverify_tools = "uv run pytest"\n', encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+
+    assert pipeline.config_string_list("engine", "verify_tools") == ()
+
+
+def test_read_operator_config_is_empty_when_the_file_is_malformed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Unparseable TOML reads as empty rather than raising."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[policy\nallow_touching = tru", encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+
+    assert pipeline.read_operator_config() == {}
+    # And the gate it feeds stays closed.
+    assert pipeline.touches_review_policy(["CLAUDE.md"]) is True

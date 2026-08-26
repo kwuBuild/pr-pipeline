@@ -24,7 +24,7 @@ guarantees the bare invocation cannot:
    ``classify_dispatch(envelope_valid=True)``. Without the envelope, even a
    present result file is not harvested.
 
-Stdlib only: this script runs alongside ``pipeline.py`` without pulling Sworn's
+Stdlib only: this script runs alongside ``pipeline.py`` without pulling a target repo's
 dependency tree.
 """
 

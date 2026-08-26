@@ -7,7 +7,7 @@ description: Use when revising a PR after review feedback or re-reviewing a revi
 
 Use this skill after review feedback lands and before declaring a revision done.
 
-The purpose is narrow: prevent the common Sworn pattern where the main blocker is
+The purpose is narrow: prevent the common pattern where the main blocker is
 fixed, but one adjacent source-of-truth, sibling path, or PR-body claim remains
 stale and causes another avoidable review round.
 
@@ -71,7 +71,3 @@ Structure the pass in these buckets:
   section names or tests
 - One stage/engine path updated, sibling stage still on the old contract
 - Revision note claims older verification after a later force-push/rebase
-
-*Source patterns: PR #541 two-round docs split correction; PR #540 repeated
-cadence/custody re-reviews; PR #542 blocker-area re-check plus post-rebase truth
-maintenance.*

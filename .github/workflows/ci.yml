@@ -15,6 +15,18 @@ jobs:
     # supported platforms and at both ends of the version range, with no uv and
     # no project dependency install -- an accidental third-party import or a
     # 3.12+ syntax feature has to fail here rather than on an adopter's machine.
+    #
+    # Why exactly 3.11 and 3.13, and nothing between:
+    #   3.11 is the floor, and it is a hard one: tick.py and pipeline.py parse
+    #        config.toml with `tomllib`, which is 3.11+. Below it the tool does
+    #        not import at all.
+    #   3.13 is the newest release the pipeline claims to support, so it is
+    #        where a removed-in-3.13 stdlib API or a new DeprecationWarning
+    #        surfaces first.
+    # The two ends bracket the range: a syntax or stdlib feature that exists in
+    # neither cannot hide in 3.12, because anything 3.12 accepts and 3.11
+    # rejects already fails the floor leg. Adding 3.12 would double the matrix
+    # for no failure it can catch on its own.
     strategy:
       fail-fast: false
       matrix:

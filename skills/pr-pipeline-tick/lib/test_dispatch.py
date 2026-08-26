@@ -582,8 +582,8 @@ def test_dispatch_reviewers_launches_for_implemented_pr() -> None:
             with mock.patch("tick.gh_json") as gh_json_mock:
                 # Trusted candidate gate: return matching metadata
                 gh_json_mock.return_value = {
-                    "author": {"login": "kwuBuild"},
-                    "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+                    "author": {"login": "test-owner"},
+                    "headRepository": {"nameWithOwner": "test-owner/test-repo"},
                     "isCrossRepository": False,
                 }
                 with mock.patch("tick.can_dispatch_now") as cdn_mock:
@@ -619,8 +619,8 @@ def test_dispatch_reviewers_skips_human_hold_candidate() -> None:
         with mock.patch("tick.gh_text", side_effect=gh_text_side_effect):
             with mock.patch("tick.gh_json") as gh_json_mock:
                 gh_json_mock.return_value = {
-                    "author": {"login": "kwuBuild"},
-                    "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+                    "author": {"login": "test-owner"},
+                    "headRepository": {"nameWithOwner": "test-owner/test-repo"},
                     "isCrossRepository": False,
                 }
                 with mock.patch("tick.can_dispatch_now") as cdn_mock:
@@ -673,7 +673,7 @@ def test_dispatch_reviewers_skips_untrusted_candidate() -> None:
                 # Different author — not trusted
                 gh_json_mock.return_value = {
                     "author": {"login": "outsider"},
-                    "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+                    "headRepository": {"nameWithOwner": "test-owner/test-repo"},
                     "isCrossRepository": False,
                 }
                 with mock.patch("tick.can_dispatch_now") as cdn_mock:
@@ -700,8 +700,8 @@ def test_dispatch_reviewers_respects_target_filter() -> None:
             gh_text_mock.side_effect = ["42\n99", "", "ai:implemented"]
             with mock.patch("tick.gh_json") as gh_json_mock:
                 gh_json_mock.return_value = {
-                    "author": {"login": "kwuBuild"},
-                    "headRepository": {"nameWithOwner": "kwuBuild/sworn"},
+                    "author": {"login": "test-owner"},
+                    "headRepository": {"nameWithOwner": "test-owner/test-repo"},
                     "isCrossRepository": False,
                 }
                 with mock.patch("tick.can_dispatch_now") as cdn_mock:
@@ -2863,30 +2863,35 @@ def test_dispatch_one_fixer_passes_parent_env_to_popen(
     assert env == parent_env
 
 
-# --- M2: Frontend review checklist in policy-touch gate ---
+# --- Review checklists in the policy-touch gate ---
 
 
-def test_touches_review_policy_catches_frontend_checklist() -> None:
-    """touches_review_policy must return True when a PR edits the frontend
-    review checklist. The frontend checklist governs reviewer criteria
-    (touch targets, token compliance, a11y) and editing it mid-review is
-    an untrusted-input-controls-the-validator inversion.
+def test_touches_review_policy_catches_every_configured_checklist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Every operator-declared checklist gates, not just the first one.
+
+    A repo commonly splits its review criteria across several checklists
+    (backend, frontend, security). Each governs reviewer criteria, so editing
+    any of them mid-review is the same untrusted-input-controls-the-validator
+    inversion — a gate that reads only one entry would auto-review a PR that
+    rewrote the others.
     """
+    import pipeline as pipeline_mod
     from pipeline import touches_review_policy
 
-    # Frontend checklist (was missing from gate)
-    assert touches_review_policy(
-        [".claude/hooks/sworn-review-checklist-frontend.md"]
-    ) is True, (
-        "frontend review checklist must be in policy-touch gate"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[policy]\nchecklist_paths = ["
+        '".ci/review-checklist.md", ".ci/review-checklist-frontend.md"]\n',
+        encoding="utf-8",
     )
+    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
 
-    # Backend checklist (already covered)
-    assert touches_review_policy(
-        [".claude/hooks/sworn-review-checklist.md"]
-    ) is True
+    assert touches_review_policy([".ci/review-checklist.md"]) is True
+    assert touches_review_policy([".ci/review-checklist-frontend.md"]) is True
 
-    # CLAUDE.md/AGENTS.md at any level (already covered)
+    # CLAUDE.md/AGENTS.md at any level need no configuration.
     assert touches_review_policy(["CLAUDE.md"]) is True
     assert touches_review_policy(["src/AGENTS.md"]) is True
 
@@ -3699,13 +3704,20 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
 
     popen.assert_called_once()
     prompt = (wt_root / "pr-42" / "prompt.txt").read_text()
-    for command in ("uv run pytest", "uv run ruff check .", "uv run pyright"):
-        assert command in prompt, (
-            f"fixer prompt must name {command!r}, got: {prompt}"
+    assert "the repository's own verification commands" in prompt
+    assert "`CLAUDE.md`/`AGENTS.md`" in prompt
+    # The pipeline drives repositories it does not own, so the prompt must not
+    # name any one stack's toolchain: what to run and in what order is the
+    # target repo's own guides to state, and what the engine is *permitted* to
+    # run is the operator's `[engine] verify_tools` grant. A stack name that
+    # creeps back in here is wrong for every install but one.
+    for tool in ("pytest", "ruff", "pyright", "npm", "cargo", "gradle"):
+        assert tool not in prompt, (
+            f"prompt hard-codes the tool {tool!r}, got: {prompt}"
         )
     assert (
-        "Only output FIXES_PUSHED_RECHECK_NEEDED after all three verification "
-        "commands pass"
+        "Only output FIXES_PUSHED_RECHECK_NEEDED after every verification "
+        "command the repository prescribes passes"
     ) in prompt
     assert "If any verification command cannot be made green" in prompt
     assert "NEEDS_HUMAN_DECISION" in prompt
@@ -3819,7 +3831,7 @@ def test_dispatch_one_fixer_retains_custody_when_the_issue_read_fails(
             "body": "## Summary\nCloses #7\n",
             "closingIssuesReferences": [{
                 "number": 7,
-                "repository": {"name": "sworn", "owner": {"login": "kwuBuild"}},
+                "repository": {"name": "test-repo", "owner": {"login": "test-owner"}},
             }],
         }
 
@@ -4051,9 +4063,10 @@ def test_dispatch_one_fixer_prompt_rechecks_the_declaration_before_the_sentinel(
         "owes an audit of the new design's call sites, operating modes, and "
         "failure or interrupted states, plus every doc and PR-body claim that "
         "still teaches the replaced contract.",
-        "Only output FIXES_PUSHED_RECHECK_NEEDED after all three verification "
-        "commands pass, the push succeeds, and every finding you addressed "
-        "carries a decision that matches the diff you pushed.",
+        "Only output FIXES_PUSHED_RECHECK_NEEDED after every verification "
+        "command the repository prescribes passes, the push succeeds, and "
+        "every finding you addressed carries a decision that matches the diff "
+        "you pushed.",
     ):
         assert clause in prompt, (
             f"fixer prompt is missing the completion gate: {clause!r}, "
@@ -5081,13 +5094,20 @@ def test_dispatch_one_implementer_prompt_requires_green_verification_before_sent
                         )
 
     prompt = (wt_root / "issue-461" / "prompt.txt").read_text()
-    for command in ("uv run pytest", "uv run ruff check .", "uv run pyright"):
-        assert command in prompt, (
-            f"implementer prompt must name {command!r}, got: {prompt}"
+    assert "the repository's own verification commands" in prompt
+    assert "`CLAUDE.md`/`AGENTS.md`" in prompt
+    # The pipeline drives repositories it does not own, so the prompt must not
+    # name any one stack's toolchain: what to run and in what order is the
+    # target repo's own guides to state, and what the engine is *permitted* to
+    # run is the operator's `[engine] verify_tools` grant. A stack name that
+    # creeps back in here is wrong for every install but one.
+    for tool in ("pytest", "ruff", "pyright", "npm", "cargo", "gradle"):
+        assert tool not in prompt, (
+            f"prompt hard-codes the tool {tool!r}, got: {prompt}"
         )
     assert (
-        "Only output IMPLEMENTATION_COMPLETE after all three verification "
-        "commands pass"
+        "Only output IMPLEMENTATION_COMPLETE after every verification command "
+        "the repository prescribes passes"
     ) in prompt
     assert "If any verification command cannot be made green" in prompt
     assert "NEEDS_HUMAN_DECISION" in prompt
@@ -5785,3 +5805,115 @@ def codex_positionals(codex_argv: list[str]) -> list[str]:
             positionals.append(arg)
             i += 1
     return positionals
+
+
+# --- Operator-configured verification permissions ---
+
+
+def test_engine_verify_tools_default_to_the_shipped_stack() -> None:
+    """With no config, the engine still gets a usable verification grant.
+
+    An empty default would make a fresh install fail its *first* dispatch on a
+    permission denial, which reads to the engine as a broken repository rather
+    than as a missing grant — the engine has no way to tell the difference and
+    escalates for the wrong reason.
+    """
+    import tick
+
+    tools = tick._engine_verify_tools()
+
+    assert tools == tuple(f"Bash({entry})" for entry in tick._DEFAULT_VERIFY_TOOLS)
+    assert all(entry.startswith("Bash(") and entry.endswith(")") for entry in tools)
+
+
+def test_engine_verify_tools_come_from_operator_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A configured list replaces the default wholesale, not additively.
+
+    An operator on a non-Python stack must be able to *remove* the Python
+    grants, not merely add to them: the allowlist is a security boundary, and a
+    grant nobody needs is a grant nobody audits.
+    """
+    import pipeline as pipeline_mod
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[engine]\nverify_tools = ["cargo test *", "cargo clippy *"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+
+    tools = tick._engine_verify_tools()
+
+    assert tools == ("Bash(cargo test *)", "Bash(cargo clippy *)")
+    assert not any("pytest" in entry for entry in tools)
+
+
+def test_engine_verify_tools_drop_entries_that_escape_the_allowlist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An entry containing a parenthesis must never reach ``--allowedTools``.
+
+    The flag takes a space-separated list of ``Tool(body)`` entries, so a ``)``
+    inside a body closes its entry early and every character after it is parsed
+    as a *new* permission. ``rm -rf /) Bash(git push --force`` in a config file
+    would otherwise widen the exact boundary the allowlist exists to be. Bad
+    entries are dropped individually rather than rejecting the whole list, so
+    one typo cannot strip an engine of every verification permission it has.
+    """
+    import pipeline as pipeline_mod
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[engine]\n"
+        'verify_tools = ["cargo test *", "rm -rf /) Bash(git push --force"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+
+    tools = tick._engine_verify_tools()
+
+    assert tools == ("Bash(cargo test *)",)
+    assert not any("--force" in entry for entry in tools)
+
+
+def test_engine_verify_tools_fall_back_when_every_entry_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An all-invalid list falls back rather than granting nothing.
+
+    Granting nothing is indistinguishable to the engine from a repo whose test
+    command is broken, and it fails at dispatch time on a paid engine rather
+    than at config time. The default is the legible outcome.
+    """
+    import pipeline as pipeline_mod
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[engine]\nverify_tools = ["bad)entry"]\n', encoding="utf-8")
+    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+
+    assert tick._engine_verify_tools() == tuple(
+        f"Bash({entry})" for entry in tick._DEFAULT_VERIFY_TOOLS
+    )
+
+
+def test_engine_allowed_tools_carries_the_verification_grant() -> None:
+    """The composed allowlist must contain the verification permissions.
+
+    The prompts no longer name a stack, so this grant is the only thing that
+    lets an engine run its repo's tests at all. A regression here is silent
+    until a paid engine is halfway through a dispatch.
+    """
+    import tick
+
+    allowed = tick._engine_allowed_tools(tick._IMPLEMENTER_PUSH_PERMISSION)
+
+    for entry in tick._engine_verify_tools():
+        assert entry in allowed, f"allowlist is missing the grant {entry!r}"
+    assert tick._IMPLEMENTER_PUSH_PERMISSION in allowed
+    # The git surface stays exact: no wildcard push crept in alongside.
+    assert "Bash(git push *)" not in allowed

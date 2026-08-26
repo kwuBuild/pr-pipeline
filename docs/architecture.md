@@ -1,27 +1,23 @@
-# Design: PR Pipeline Tick System
+# PR Pipeline Architecture
 
-Status: DRAFT (original proposal — see extraction doc for as-built state)
-Created: 2026-06-15
-Mode: Developer tooling (workflow automation — not product code)
+This is the architecture reference for the pipeline: what the control plane is,
+which component owns each decision, and *why* each boundary sits where it does.
+It is the doc to read before changing dispatch, harvest, custody, or cadence.
 
-> **Note (2026-06-28):** The bash-based tick orchestrator described in this proposal
-> has been extracted into a single Python process. See
-> [`pr-pipeline-tick-python-extraction.md`](pr-pipeline-tick-python-extraction.md)
-> for the as-built implementation (HARVEST complete, DISPATCH stubs), the two rounds
-> of adversarial review, and the updated invocation (`uv run python lib/tick.py`
-> instead of `/pr-pipeline-tick`). The E2E usage guide at
-> `.claude/skills/pr-pipeline-tick/README.md` has been updated for the new invocation.
-> This document is preserved as the original design rationale.
+It is not the operator manual. For invocation, flags, and troubleshooting see
+[`skills/pr-pipeline-tick/README.md`](../skills/pr-pipeline-tick/README.md) and
+[`DEBUG.md`](../skills/pr-pipeline-tick/DEBUG.md); for the internal call-site
+map see [`docs/working/pr-pipeline-internals.md`](working/pr-pipeline-internals.md).
 
 ## Problem Statement
 
-At 5+ concurrent PRs on Sworn, the implement → review → fix → re-review loop
-requires constant manual relay between agents. The developer acts as a human
-message bus: finding which worktree an implementer worked in, copying review
-output to a fixer session, tracking which PRs need re-review, and deciding
-what to dispatch next. This babysitting overhead scales linearly with
-concurrent PR count and displaces higher-value work (plan review,
-architecture decisions, product direction).
+At 5+ concurrent PRs on a repository, the implement → review → fix → re-review
+loop requires constant manual relay between agents. The developer acts as a
+human message bus: finding which worktree an implementer worked in, copying
+review output to a fixer session, tracking which PRs need re-review, and
+deciding what to dispatch next. This babysitting overhead scales linearly with
+concurrent PR count and displaces higher-value work (plan review, architecture
+decisions, product direction).
 
 The core bottleneck is not pipeline architecture — it is the handoff between
 implementer and reviewer agents. Each handoff requires the developer to:
@@ -42,8 +38,7 @@ implementer and reviewer agents. Each handoff requires the developer to:
 
 ## Non-Goals
 
-- Generic/distributable tool (Sworn-specific for now)
-- Multi-repo orchestration
+- Multi-repo orchestration (one tick drives one target repository)
 - Autonomous merging (human merge gate always)
 - Daemon mode (manual tick + `/loop` only)
 - CAS-style claim logic (single orchestrator)
@@ -93,7 +88,7 @@ This design keeps each tick under 30 seconds regardless of concurrent PR
 count. Engines run as detached background processes writing results to files.
 The next tick harvests those results.
 
-### Loop and cadence **(LANDED — #437)**
+### Loop and cadence
 
 Because engines are detached background processes, the harness never notifies
 the orchestrator when one finishes — the loop must poll. The cadence is
@@ -161,7 +156,7 @@ Admission counts **local dispatch markers only** — those classified `live`,
 `(kind, number, stage label)`. An authoritative `ai:` in-flight label is shared
 workflow state, not a pipeline lease: `ai:implementing` is also the documented
 manual pickup label, so counting it let stale hand-set labels starve dispatch
-permanently (#534, #663). The cap bounds the engines *this* machine launched
+permanently. The cap bounds the engines *this* machine launched
 and can still see; a corrupt or unreadable marker still aborts dispatch for the
 tick. Kind and stage are load-bearing: issue `#42` and PR `#42` are different
 processes, as are accidentally overlapping review and fix dispatches for one PR.
@@ -197,8 +192,8 @@ custody and logs `held_result_comment_failed` for retry.
 The tick resolves holds with one label read per occupied identity, so open and
 terminal items share one contract without a `--state all` scan. The cost tracks
 occupancy, and occupancy is this machine's dispatch markers alone: manual
-`ai:implementing` pickups and the markerless labels #604 deliberately leaves in
-place hold no slot and are never read here, so the bound is the live marker set
+`ai:implementing` pickups and the markerless labels reconciliation
+deliberately leaves in place hold no slot and are never read here, so the bound is the live marker set
 that admission already gates at `MAX_IN_FLIGHT`. No local *custody* receipt is
 written. The completed-result publication
 uses a short-lived comment receipt for replay suppression, but ownership remains
@@ -209,7 +204,7 @@ The hold suspends automation custody; it does not transfer the pipeline's own
 bookkeeping to the human. When the recorded process group is proven dead, the
 tick releases both the scratch and its in-flight label — the label is an
 automation receipt, and retaining it past proven death would strand the item at
-a pipeline label no tick clears (#604). It would cost no spend cap: destroying
+a pipeline label no tick clears. It would cost no spend cap: destroying
 the marker is what returns the slot. The release is ordered before the
 archive so a failed remote mutation leaves the marker behind to re-prove death.
 The hold label itself is never a target of any mutation.
@@ -227,10 +222,10 @@ and terminal intents under the worktree root support replay of already-decided
 side effects, but they do not authorize engine custody. A lost or recreated item
 worktree therefore cannot forge either a stage transition or a human handoff.
 
-This pipeline reuses the existing Sworn label vocabulary from
-`docs/working/pr-guidelines.md` wherever a label already carries the right
-meaning, and introduces a small number of new labels only where automation needs
-a distinction the human workflow does not.
+The label vocabulary lives in `docs/working/pr-guidelines.md`. It reuses the
+labels a human workflow already carries wherever one means the right thing, and
+introduces new labels only where automation needs a distinction the human
+workflow does not.
 
 - **Reused as-is:** `ai:available`, `ai:implementing`, `ai:implemented`,
   `ai:changes-requested`, `ai:revised` (fixes pushed, awaiting re-review),
@@ -351,7 +346,7 @@ dispatch marker}` and folds the current label into a single tested decision
   does not converge a held item onto `ai:needs-human-decision` (or fold
   `ai:blocked` into it): the hold is already the human's own writing, and
   converging it would replace that writing with the pipeline's terminal label —
-  the authority behavior #614 removed. A live or hung engine with dual
+  the authority behavior that was removed. A live or hung engine with dual
   labels keeps custody of its scratch: live defers escalation until the engine
   exits and hung routes to the identity-verified kill path, so evidence is
   archived rather than deleted under a running process. Dispatch applies the
@@ -510,14 +505,14 @@ is funnelled through the two publishing helpers. The one provable site left in
 each `_dispatch_one_*` is the post-launch guard, so a *second* provable site
 there means a new silent pre-launch path.
 
-**On #625's third named path.** The issue named three silent escalations: the
-dispatch-setup failure, the ambiguous marker, and the stale in-flight label
-(`stale_label_escalated`). The first two are closed above. The third no longer
-exists to close — #604 made `_reconcile_stale_in_flight_labels` retain every
+**On the third named silent path.** Three silent escalations were originally
+named: the dispatch-setup failure, the ambiguous marker, and the stale in-flight
+label (`stale_label_escalated`). The first two are closed above. The third no
+longer exists to close — `_reconcile_stale_in_flight_labels` now retains every
 stale ref and never relabel, because a missing local marker is the steady-state
 reading of another machine's live dispatch and cannot prove custody either way.
-Its "Done when" is therefore met by the two surviving paths plus the four
-pre-launch escalations found by the census while closing them.
+Its closure condition is therefore met by the two surviving paths plus the
+four pre-launch escalations the census found while closing them.
 
 What is left is one shape: an engine was launched, and no result reached the
 tick. It divides by whether that engine is finished, which decides how to fix it:
@@ -526,10 +521,10 @@ tick. It divides by whether that engine is finished, which decides how to fix it
   because the archive under `.harvest-evidence/` makes the item's only
   explanation machine-local. One member remains: `_harvest_failed_reviewer`,
   which escalates a wrapper-confirmed reviewer failure. Reconciliation's hold
-  escalation over a completed marker was the other, and #618 moved it into the
-  gated set above — it now publishes its validated outcome before releasing the
-  in-flight label. The reviewer path has the same shape, is tracked by neither
-  issue, and belongs with #618.
+  escalation over a completed marker was the other, and it has since moved into
+  the gated set above — it now publishes its validated outcome before releasing
+  the in-flight label. The reviewer path has the same shape, is tracked by
+  nothing, and belongs with it.
 - **It may still be running**: the reconcile escalations (hung engine,
   unverified live custody) and each stage's post-launch guard, which fires when
   the in-flight relabel failed *and* the engine could not be killed. These are
@@ -616,7 +611,7 @@ One source state proves the relabel never ran *and* that it never can: the
 in-flight label still present beside a workflow hold. Convergence refuses a hold
 by design, so re-attempting it every tick would leave the in-flight label on the
 item until the operator lifts the hold — stranding it at a label no tick clears
-(#604), though the destroyed marker means it consumes no slot, with no
+, though the destroyed marker means it consumes no slot, with no
 engine behind it, which is the leak the release exists to prevent. The
 transition instead makes the one mutation the hold permits: it releases the
 pipeline's own in-flight label and finishes local custody, leaving the exact
@@ -668,7 +663,7 @@ without dispatch-time provenance.
 
 ### Why custody is not inferred, and not yet proven
 
-**Decision (2026-08-02, issue #592, PR #604): reconciliation never acts on a
+**Decision (2026-08-02): reconciliation never acts on a
 markerless in-flight item, and the pipeline does not attempt to prove custody
 at all. Revisit only when a genuine orphan is observed.**
 
@@ -680,8 +675,8 @@ another machine's, and `CLAUDE.md` instructs contributors to move an issue to
 `ai:implementing` by hand before writing code. "No marker" is therefore the
 steady-state reading of healthy work, not evidence of an orphan.
 
-It fired accordingly. On 2026-08-01 it escalated issues #585 and #583, both
-being implemented normally (#583's PR opened two minutes later). Across the
+It fired accordingly. On 2026-08-01 it escalated two issues that were both
+being implemented normally — one of them opened its PR two minutes later. Across the
 entire tick log to that date the path had recovered **zero** genuine orphans
 and produced **two** false positives. Every `escalate` and `cleanup` event
 actually recorded was semantic — an engine emitting `NEEDS_HUMAN_DECISION`, or
@@ -694,7 +689,7 @@ signal that fires on healthy work stops being believed, and then it cannot stop
 anything.
 
 **Why the fix is a no-op rather than a better proof.** A GitHub-side dispatch
-receipt was designed and built (PR #604, first revision): dispatch posts a
+receipt was designed and built once: dispatch posts a
 comment carrying the dispatch id, stage, host, and deadline, and reconciliation
 binds it to the in-flight label applied within the next 120 seconds. It was cut
 before merge. An ordinary issue comment is not an authenticated custody record
@@ -782,10 +777,12 @@ DeepSeek-routed launches across the tick history.
 
 The implementer gets:
 - Full read/write access to the worktree
-- Test/lint/typecheck tools matching Sworn's stack
+- The verification commands the operator declared in `config.toml`
+  (`[engine] verify_tools`) — the target repo's tests, linter, and type checker
 - `git` for committing and pushing to its own branch
 - No network tools beyond what sandbox allows
-- Sworn's CLAUDE.md governs behavior (TDD, commit hygiene, etc.)
+- The target repo's own `CLAUDE.md` governs behavior (TDD, commit hygiene, and
+  which verification commands to run in which order)
 
 **Git surface and remote blast radius — stated exactly.** The implementer has no
 `gh`, so it cannot label, comment on, merge, or close PRs/issues. But `git push`
@@ -892,9 +889,9 @@ worktree's `AGENTS.md` as its project doc — that file carries the binding
 review obligations (review the full change scope against adjacent contracts;
 report the complete set of blocker/major findings) — and the read-only sandbox
 leaves every repo file readable, so the reviewer decides for itself which
-additional standards docs (`CLAUDE.md`,
-`.claude/hooks/sworn-review-checklist.md`, design docs) to consult, with the
-same independence as a manually invoked codex review. Verified empirically on
+additional standards docs (`CLAUDE.md`, the target's review checklists,
+architecture docs) to consult, with the same independence as a manually invoked
+codex review. Verified empirically on
 the pinned CLI with the exact dispatch flags: the project `AGENTS.md` is loaded
 automatically and doc pointers inside it are followed. The accepted trade:
 guaranteed context is `AGENTS.md` only; the hook checklist's obligations apply
@@ -977,7 +974,7 @@ locked down with an **allowlist, not a blocklist**:
 
 Scrub state lives at a tick-owned path **outside** the candidate worktree
 (`WT_ROOT/pr-{N}-scrub`, not `wt_dir/.scrub`). This removes the vector where a committed
-symlink at `.scrub` could theoretically redirect `HOME`/`CODEX_HOME`/`TMPDIR` (#528). The
+symlink at `.scrub` could theoretically redirect `HOME`/`CODEX_HOME`/`TMPDIR`. The
 trusted-author/trusted-repo eligibility gate below remains as the primary control that
 prevents untrusted candidates from reaching dispatch. The shipped dispatch
 prompt does **not** carry untrusted-data framing or a no-secrets-in-findings instruction;
@@ -990,13 +987,17 @@ primary control.
 the Codex process and its tools, so the review slice is not safe for arbitrary candidate
 content. Before worktree creation or credential exposure, dispatch reads the PR author,
 head repository, and cross-repository flag from GitHub and checks them against the
-operator-owned repository contract: author `kwuBuild`, head repository
-`kwuBuild/sworn`, and `isCrossRepository=false`. Only a proven match may proceed.
-Anything missing, malformed, or outside that allowlist routes to
-`ai:needs-human-decision`; it never launches Codex. This is an enforced v1 trust
-boundary, not a prose assumption. Full untrusted-review isolation remains #441.
+operator-owned repository contract: the author and head repository the operator
+declared in `config.toml` (`[target] trusted_author`, `[target] repo`), and
+`isCrossRepository=false`. Only a proven match may proceed. Anything missing,
+malformed, or outside that allowlist routes to `ai:needs-human-decision`; it
+never launches Codex. This is an enforced trust boundary, not a prose
+assumption — and it is configuration rather than a constant because the
+pipeline drives a repository it does not own, so a shipped default would be a
+trust decision made on the adopter's behalf. Full untrusted-review isolation
+remains open (see *Future evolution*).
 
-**Atomic launch/completion ownership (#434, implemented).** The dispatch flow runs
+**Atomic launch/completion ownership.** The dispatch flow runs
 the reviewer engine through `engine_wrapper.py`, which provides four guarantees:
 (1) ownership before spawn — the wrapper creates a dedicated process group
 (`os.setpgrp`), then writes its PID + `start_time` + PGID + `dispatch_id` to the
@@ -1024,16 +1025,24 @@ scratch or releasing marker custody; wrapper exit alone is insufficient.
 
 **Candidate-controlled review policy (trust boundary).** Because the reviewer runs
 inside the PR's checked-out tree, auto-loads that tree's `AGENTS.md`, and reads its
-`CLAUDE.md`/`sworn-review-checklist.md` at its own discretion, a PR that *edits* any of those
+`CLAUDE.md` and review checklists at its own discretion, a PR that *edits* any of those
 files would steer the very reviewer that decides whether it is promoted — untrusted
 input controlling its own validator. Reading policy from the head is safe only when
 the PR does not change it (then head == base for those files); when it does, dispatch
 must not auto-review under instructions the PR supplies. So dispatch checks the diff
 (`git diff --name-only <base_sha>...<head_sha>`) for any reviewer-governing file
-(`CLAUDE.md` or `AGENTS.md` at any level, or `sworn-review-checklist.md`) and routes
-such a PR to `ai:needs-human-decision` instead of launching a reviewer. The match set
-is intentionally narrow — an unrelated file elsewhere under `.claude/` does not steer
-the reviewer and is still auto-reviewed.
+(`CLAUDE.md` or `AGENTS.md` at any level, plus any path the operator listed under
+`[policy] checklist_paths`) and routes such a PR to `ai:needs-human-decision`
+instead of launching a reviewer. `CLAUDE.md`/`AGENTS.md` are universal and matched
+by basename; a target's own checklists are its to name, which is why they are
+configuration rather than a shipped path list. The match set is intentionally
+narrow — an unrelated file elsewhere under `.claude/` does not steer the reviewer
+and is still auto-reviewed.
+
+The pipeline's own gate files (`config.toml`, `lib/pipeline.py`, `lib/tick.py`)
+are review policy on the same reasoning and are matched by path *suffix*, per
+segment, so the rule holds at every install depth rather than only the one the
+skills were incubated at.
 
 This gate is operator-configurable in the shipped skill: `[policy] allow_touching =
 true` in the skill's `config.toml` lets policy-editing PRs flow to auto-review anyway
@@ -1107,7 +1116,7 @@ dispatch (`verify_codex_bin` returns non-zero → `break`) rather than launching
 reviewer whose sandbox/schema behaviour was never proven. The launch then invokes the
 resolved `"$CODEX_BIN"`, not a bare PATH lookup.
 
-> **Deferred hardening (#441).** The shipped review slice enforces its self-authored,
+> **Deferred hardening.** The shipped review slice enforces its self-authored,
 > same-repository boundary before dispatch. Two reviewer-launch hardening items are
 > still required before widening that allowlist: (1) keeping the Codex credential
 > outside the reviewer's reachable filesystem,
@@ -1332,7 +1341,8 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
 **Implementation prompt:**
 - Issue body and title (via `gh issue view`)
 - Relevant architecture doc sections (referenced in issue)
-- Sworn's CLAUDE.md conventions (inherited by the worktree)
+- The target repo's own `CLAUDE.md` conventions (inherited by the worktree),
+  which are also where the verification commands to run come from
 - **Sentinel instruction:** end with `IMPLEMENTATION_COMPLETE` once code is
   committed and pushed, or `NEEDS_HUMAN_DECISION` if blocked on scope/design
 
@@ -1343,7 +1353,7 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   output schema, with the verdict and findings semantics spelled out
 - No pinned reading list — deliberate. The worktree's `AGENTS.md` auto-loads as
   the codex project doc, and the reviewer consults further standards docs
-  (`CLAUDE.md`, `sworn-review-checklist.md`) at its own discretion (see
+  (`CLAUDE.md`, the target's review checklists) at its own discretion (see
   *Reviewer (Codex)*)
 - `--output-schema` pointing at `review-schema.json`; verdict read from the typed
   `review.json` the wrapper validates and publishes
@@ -1456,7 +1466,7 @@ the commits it published — but the harvest uses that file to *open* a PR that 
 not exist yet, so there is no live body to clobber and no undo to be missing. The
 reviewer runs read-only and pushes nothing.
 
-### Worktree management **(LANDED — #437, cleanup for merged/closed)**
+### Worktree management
 
 The pipeline uses a single worktree root (created on first dispatch; it does not
 exist in the repo yet):
@@ -1509,51 +1519,78 @@ unparseable, or schema-invalid `review.json` for the reviewer):
 - Fix stage: treat as `NEEDS_HUMAN_DECISION` (ambiguous output escalates)
 - Implement stage: treat as `NEEDS_HUMAN_DECISION`
 
-### Sworn-specific scoping
+### What belongs to the target repo, and what belongs to the pipeline
 
-This is not the generic pr-pipeline. Sworn-specific choices:
+The pipeline drives a repository it does not own. Anything that varies per
+target is the target's to state; the tick's job is to carry it, not to encode
+it.
 
-- **Test command:** `uv run pytest` (no Docker, Unix socket Postgres)
-- **Lint/type:** `uv run ruff check . --fix` and `uv run pyright`
-- **Frontend:** `npm --prefix frontend test` and `npm --prefix frontend run typecheck`
-- **Commit conventions:** From `docs/working/commit-guidelines.md`
-- **PR format:** From `docs/working/pr-guidelines.md`
-- **Review checklists:** `.claude/hooks/sworn-review-checklist.md` is injected
-  by the Claude Code review hooks for interactive reviews; the pipeline's codex
-  reviewer reads it at its own discretion (see *Prompt assembly*)
-- **Implementation model:** Claude Sonnet via `claude -p` (can be swapped
-  to DeepSeek by setting `ANTHROPIC_BASE_URL` in the dispatch env)
-- **Review model:** GPT-5.5 at high reasoning effort, pinned explicitly in the
-  dispatch argv because `--ignore-user-config` discards the operator's
-  config.toml defaults
+**The target repo owns its own standards.** Test, lint and typecheck commands,
+commit conventions, PR body format, and review checklists all live in the
+target's `CLAUDE.md`/`AGENTS.md` and the docs those route to. Engine prompts say
+*run the repository's verification commands and follow its workflow* — they do
+not name `pytest`, `ruff`, `npm`, or any other stack. A pipeline that hard-coded
+one repo's toolchain would be installable in exactly one repo.
+
+The one place a command name is unavoidable is the engine tool allowlist:
+headless engines run under `--permission-mode dontAsk` with an *exact*
+permission list, never a glob (see *Permission mode for headless Claude*), so
+the operator declares the verification commands their repo actually uses in
+`config.toml` under `[engine] verify_tools`. That list is a permission grant,
+not an instruction — the prompt still defers to the repo's own guides for what
+to run and in what order. The shipped default is the Python triple, because a
+default that grants nothing makes a fresh install fail its first dispatch with
+a permission denial rather than a legible message.
+
+**The pipeline owns the control plane.** The label vocabulary
+(`docs/working/pr-guidelines.md`), the state machine, custody, and the cadence
+are pipeline concerns and are identical for every target.
+
+**Models are operator configuration.** The implementer runs Claude via
+`claude -p` and can be routed to another provider by setting
+`ANTHROPIC_BASE_URL` in the dispatch env. The reviewer's model is pinned
+explicitly in the dispatch argv, because `--ignore-user-config` discards the
+operator's `config.toml` defaults.
 
 ## Skill structure
 
 The implementation is delivered as Claude Code skills. Each command is its own
 discoverable skill directory with a `SKILL.md` entrypoint (the directory name is the
 `/command`); the decision logic the tick depends on lives in a small, stdlib-only,
-unit-tested Python CLI co-located with the tick skill. As of 2026-06-28 the
-tick orchestrator was extracted from bash (SKILL.md) into Python (`lib/tick.py`);
-see `docs/planning/designs/pr-pipeline-tick-python-extraction.md` for the
-extraction contract:
+unit-tested Python CLI co-located with the tick skill. The tick orchestrator is
+Python (`lib/tick.py`), not shell: `SKILL.md` is an invocation stub, so the
+decisions a tick makes are unit-testable rather than re-derived in bash on every
+run.
+
+The layout below is written at the pipeline repo's own depth (`skills/`). Under
+a host repo it sits at `.claude/skills/`, and under a plugin install outside the
+repo entirely — which is why nothing here resolves a pipeline path by counting
+directories.
 
 ```
-.claude/skills/
+skills/
   pr-pipeline-tick/
     SKILL.md                    # /pr-pipeline-tick — invocation stub (thin)
+    README.md                   # operator guide: usage, observability, knobs
+    DEBUG.md                    # invariants, diagnostics, recovery
+    config.toml                 # operator config: [target], [policy], [engine]
     review-schema.json          # Codex reviewer output schema (verdict + findings)
     preflight.sh                # one-time live verification gate
     preflight-probe-schema.json # typed schema for the read-only sandbox probe
+    engine_wrapper.py           # process-group ownership around the reviewer
     lib/
+      tick.py                   # the orchestrator: HARVEST then DISPATCH, one process
       pipeline.py               # pure decision logic + argparse CLI (imported by tick.py)
-      test_pipeline.py          # unit tests for every function and CLI path
       process_control.py        # bounded TERM/KILL rollback helper
-      test_process_control.py   # process-control unit and CLI tests
-      test_skill_contract.py    # executable checks for security/control-plane wiring
+      claude_stream_wrapper.py  # stream-json reader + progress heartbeat
+      reviewer_observability.py # bounded, sanitized reviewer stderr capture
+      prompts/                  # implementer / reviewer / fixer templates
       README.md                 # CLI reference + pinned Codex version
+      test_*.py                 # unit, dispatch, and executable-contract suites
   pr-pipeline-status/
     SKILL.md                    # /pr-pipeline-status — read-only dashboard
     status.sh                   # the dashboard implementation
+    test_status.py              # dashboard rendering tests
 ```
 
 The skills compose `gh`, `git`, `claude -p`, and `codex exec` directly. The decisions
@@ -1561,9 +1598,10 @@ a tick must make about a finished review (schema validation, verdict→label map
 iteration counting, base/head-SHA drift, dispatch-liveness, idempotent replay) are
 **not** re-derived in inline code each tick — they live in `lib/pipeline.py` as pure,
 tested functions behind a thin CLI, so an unattended loop behaves identically every
-run. `lib/` is stdlib-only (no Sworn dependencies) to preserve the cheap-extraction
-seam. The config artifacts are the two JSON Schemas (`review-schema.json`,
-`preflight-probe-schema.json`).
+run. `lib/` is stdlib-only — it takes no dependency on any target repo's
+toolchain, which is what makes it installable against an arbitrary repository.
+The config artifacts are the operator's `config.toml` and the two JSON Schemas
+(`review-schema.json`, `preflight-probe-schema.json`).
 
 ## Usage
 
@@ -1721,69 +1759,53 @@ standing between the agent and the rest of GitHub. Two boundaries back it up:
    history or delete branches. Combined with worktree isolation, the bounded
    capability is exactly "commit and fast-forward-push the agent's own branch."
 
-## Rollout & repo strategy
+## Repo strategy
 
-**Decision: incubate inside Sworn (the `sworn/.claude/skills/pr-pipeline-*`
-skills), then extract to a dedicated repo before running it unattended.** Not
-own-repo from day one.
+The pipeline was incubated inside its first target repository and now lives in
+its own repository as the source of truth. That order was deliberate: the
+unknowns were behavioral, not structural — whether the `--output-schema` verdict
+capture worked end-to-end against the installed Codex, whether the dynamic
+cadence converged instead of thrashing, whether the state machine ever stranded
+work, whether spend stayed bounded before the iteration cap. Those are only
+answerable by running the loop against real PRs, and that learning cycle was far
+cheaper with everything in one repo. Extracting earlier would have forced a
+multi-repo abstraction to be designed before anyone knew where the real
+target-vs-generic seams were.
 
-The rationale is about *what is unvalidated*. Nothing here has run yet — this is
-a proposal. The real unknowns are behavioral, not structural: does the
-`--output-schema` verdict capture work end-to-end against the installed Codex,
-does the dynamic cadence converge instead of thrashing, does the state machine
-ever strand work, does spend stay bounded before the iteration cap. Those are
-only answerable by running the loop against *real* Sworn PRs, and that learning
-cycle is far cheaper with everything in one repo. Starting in a separate repo
-would put a cross-repo token and a two-repo edit/test loop on the critical path
-during exactly the phase that needs the fastest iteration — and would force a
-generic, multi-repo abstraction to be designed before we know where the real
-Sworn-vs-generic seams are. Premature extraction bakes in the wrong seam.
+Two properties made the extraction cheap when it came, and both are still
+load-bearing constraints on new work:
 
-The dedicated-repo + scoped-token model in *Permission mode for headless Claude*
-is a **productionization** boundary, not a day-one one. It becomes load-bearing
-only when the loop runs *truly unattended* (overnight, auto mode, no human
-watching). The first milestone is the opposite: a supervised run with a low
-`MAX_IN_FLIGHT`, the developer present, taking one PR through
-implement → review → fix without stranding or overspending. At that stage the
-human in the loop is the blast-radius boundary.
+1. **Every pipeline artifact lives under the `pr-pipeline-*` skill
+   directories.** The tick skill carries the `lib/` CLI; the status skill is a
+   thin read-only sibling. No pipeline logic is scattered elsewhere.
+2. **Nothing target-specific is hard-coded inline.** Verification commands,
+   review checklists, and the target's own conventions are configuration or
+   prompt-level deferrals — see *What belongs to the target repo* above. The
+   moment a stack name appears in engine or tick logic, the pipeline is
+   installable in one repo again.
 
-**Design for cheap extraction from the start** so incubation does not silently
-become permanent:
-
-1. Keep every pipeline artifact under the `.claude/skills/pr-pipeline-*` skill
-   directories (the tick skill carries the extractable `lib/` CLI; the status skill
-   is a thin read-only sibling) — no pipeline logic scattered elsewhere in the repo.
-2. Keep all Sworn-specific choices confined to the *Sworn-specific scoping*
-   block (test commands, review checklists, models, label vocabulary). That
-   block is the seam: at extraction it becomes per-target configuration. Engine
-   and tick logic must not hard-code `uv`/`pytest`/`ruff` or Sworn label names
-   inline.
-3. Use a repo-scoped bot token even during incubation if practical. It is the
-   one piece of the safety model worth pulling forward early, and it is
-   independent of where the skill code physically lives.
-
-**Extraction trigger:** extract to the dedicated repo *before* the first
-unattended/overnight run. That is the moment the scoped-token boundary stops
-being theoretical — and, not coincidentally, roughly the moment the abstraction
-seams are known from real runs.
-
-**Exception:** start separate only if 2+ target repos are imminent. Then the
-multi-repo design is a real requirement, not speculation, and incubating in one
-repo would bake in single-repo assumptions. If Sworn is the only near-term
-target, that is premature generality.
+The dedicated-repo boundary matters most for the **scoped bot token**. It is the
+piece of the safety model that becomes load-bearing when the loop runs truly
+unattended (overnight, no human watching), which is the opposite of the
+supervised first milestone: a low `MAX_IN_FLIGHT`, the developer present, one PR
+taken through implement → review → fix without stranding or overspending. At
+that stage the human in the loop is the blast-radius boundary; after it, the
+token is.
 
 ## Future evolution
 
-Once this version is validated on real Sworn PRs and the extraction trigger
-fires (first unattended run), the dedicated-repo end state is:
+Known gaps, in the order they block adoption:
 
-1. Skills live in the pipeline repo, pointed at Sworn (and later other repos) as
-   targets; the *Sworn-specific scoping* block becomes per-target config
-2. Extract the `gh`-based primitives into the pr-pipeline Python CLI for
-   testability and distribution
-3. Add CAS claim logic for multi-orchestrator safety
-4. Package as a Claude Code plugin for others to install
-
-The generic pr-pipeline repo (`/Users/keithwu/Documents/open_source_projects/pr-pipeline`)
-has the full design for that future. This spec is the pragmatic first step:
-prove the loop in Sworn, then lift it out.
+1. **Standalone install.** The trusted-reviewer gate and the status dashboard
+   still resolve their target from pinned constants rather than operator
+   configuration, so a fresh install cannot yet point itself at an arbitrary
+   repository without editing source.
+2. **Process-level install proof.** No test yet proves the *installed* plugin
+   behaves identically to an in-repo copy; that needs a shim harness driving the
+   shipped entry points from outside the checkout.
+3. **`gh` primitives into the Python CLI.** The remaining shell-level `gh` calls
+   belong in `lib/` for testability and distribution.
+4. **CAS claim logic** for multi-orchestrator safety. Today a single
+   orchestrator is assumed.
+5. **Claude Code plugin packaging** so the pipeline installs without a manual
+   `PR_PIPELINE_HOME`.

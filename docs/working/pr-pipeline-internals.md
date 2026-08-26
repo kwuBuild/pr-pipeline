@@ -194,7 +194,7 @@ fixer hands back".
 up the directory tree as its project doc. `AGENTS.md` routes to `CLAUDE.md`
 (line 8: "Read `CLAUDE.md`"), but `CLAUDE.md` is not auto-loaded — it is
 consulted at the reviewer's discretion, along with other standards docs
-(`.claude/hooks/sworn-review-checklist.md`, design docs). Guaranteed context
+(the target repo's review checklists, its architecture docs). Guaranteed context
 is `AGENTS.md` only ([design:388–399][design-reviewer-ctx]). The reviewer
 prompt itself is minimal (`Review PR #...`); it does not pin a reading list
 or explicitly apply any checklist ([reviewer.txt:1][reviewer-prompt]).
@@ -222,9 +222,10 @@ load governing files from the nearest match up the tree) — `_POLICY_BASENAMES`
 - `CLAUDE.md`
 - `AGENTS.md`
 
-**Exact paths** — `_POLICY_PATHS` ([pipeline.py:138–141][paths]), plus the suffix set below:
-- `.claude/hooks/sworn-review-checklist.md`
-- `.claude/hooks/sworn-review-checklist-frontend.md`
+**Operator-declared paths** — `[policy] checklist_paths` in `config.toml`, read
+by `_reviewer_checklist_paths` ([pipeline.py][paths]). Repo-relative, matched
+exactly, and empty by default: a target repo's own review checklists are the
+target's to name, so the pipeline ships none. Plus the suffix set below:
 
 **Path suffixes** (matched per path segment, so the rule is one rule at every
 install depth — `.claude/skills/` in a host repo, `skills/` in the pipeline's
@@ -258,9 +259,13 @@ The `--allowedTools` allowlist is a named security boundary
 Read Edit Write
 Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *)
 Bash(git log *) Bash(git push origin HEAD)
-Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright)
-Bash(npm --prefix frontend *)
+<one Bash(...) entry per [engine] verify_tools value in config.toml>
 ```
+
+The verification entries are the operator's, not the pipeline's: `_engine_verify_tools`
+wraps each configured value in `Bash(...)` and drops any that contains a parenthesis
+or newline, which would close the entry early and turn the rest of the string into
+extra permissions.
 
 This restricts the git surface to commit + fast-forward push of the engine's own
 branch. No force-push, remote-branch deletion, or arbitrary refspec push is
@@ -349,9 +354,9 @@ read a result from it. **It finished and nothing is published** — now only
 `_harvest_failed_reviewer`'s wrapper-confirmed reviewer failure — is a hole in
 the gate; it archives under `.harvest-evidence/`, so the explanation is
 machine-local rather than absent. Reconciliation's hold escalation over a
-completed marker was the other member until #618 moved it into the gated set; the
-reviewer path has the same shape, is tracked by neither issue, and belongs with
-it. **It may still be running** — the reconcile escalations (hung engine,
+completed marker was the other member until a later change moved it into the
+gated set; the reviewer path has the same shape, is tracked by nothing, and
+belongs with it. **It may still be running** — the reconcile escalations (hung engine,
 unverified live custody) and each stage's post-launch guard, which fires when the
 in-flight relabel failed *and* the engine could not be killed. Those relabel
 through `_relabel_with_context`, whose only terminal side effect is
@@ -393,7 +398,7 @@ that terminal label. The record is typed by kind (`cap`, `transient_exhausted`,
 exactly; the resume validates it as a whole against that closed schema, so an
 unreadable, malformed, or unknown-kind record retains custody for inspection
 (`terminal_intent_unresolved`) rather than defaulting into a transition nobody
-decided. The one accepted exception is the pre-#618 key set (`dispatch_id`,
+decided. The one accepted exception is the legacy key set (`dispatch_id`,
 `label`, `stage`, plus the `phase` a resume may since have added), which is
 read as the cap it could only have been — an upgrade that landed
 mid-transition must not pin the item its intent exists to release. First sight
@@ -459,7 +464,7 @@ the wrapper runs with `cwd` set to the worktree, so a relative path would
 resolve a second time underneath it — and because heartbeat failures are
 swallowed by design, that misresolution would be silent and would leave every
 healthy engine reading as stalled once the fallback clock expired. `WT_ROOT` is
-absolute on both branches of `_resolve_wt_root` (#604), so the resolution is
+absolute on both branches of `_resolve_wt_root`, so the resolution is
 what keeps absoluteness a property of the path rather than of that anchoring.
 
 That mtime is read to distinguish a wedged engine from a working one, and the
@@ -556,7 +561,7 @@ Additional flags:
 
 Env isolation: scrub-dir pattern ([tick.py:6047–6065][scrub]). `HOME` and
 `CODEX_HOME` are redirected to a tick-owned `pr-{N}-scrub/` directory alongside
-the worktree under `WT_ROOT`, not inside it (#528). Only
+the worktree under `WT_ROOT`, not inside it. Only
 `auth.json` is symlinked from the real `~/.codex/` directory. The inherited env
 vars are `HOME` (scrub dir), `CODEX_HOME`, `PATH`, `GIT_TERMINAL_PROMPT`, and
 `TMPDIR`. Provider API keys (`DEEPSEEK_API_KEY`, `OPENAI_API_KEY`,
@@ -642,26 +647,26 @@ stay discarded, and the two values that do cross are shape-checked first.
 [codex-exec]: ../../skills/pr-pipeline-tick/lib/tick.py#L6118
 [popen-rev]: ../../skills/pr-pipeline-tick/lib/tick.py#L6148-L6156
 [scrub]: ../../skills/pr-pipeline-tick/lib/tick.py#L6047-L6065
-[policy-call]: ../../skills/pr-pipeline-tick/lib/tick.py#L9007
+[policy-call]: ../../skills/pr-pipeline-tick/lib/tick.py#L9074
 [impl-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6449
 [fix-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6855-L6856
 [rev-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L5784-L5785
-[impl-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L186
-[fix-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L187
+[impl-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L187
+[fix-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L188
 [fix-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L7063-L7068
-[rev-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L129
+[rev-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L130
 [cli-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L9185
 [gh-helper]: ../../skills/pr-pipeline-tick/lib/tick.py#L786-L809
 [hook-impl]: ../../.claude/hooks/pre-pr-review-implementation.sh
 [hook-docs]: ../../.claude/hooks/pre-pr-review-documentation.sh
 [skill-trust]: ../../skills/pr-pipeline-tick/SKILL.md#trust-domain-and-sandbox-posture
-[policy-fn]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1572-L1609
-[basenames]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L137
-[paths]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L138-L141
-[path-suffixes]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L157-L164
-[policy-comment]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L131-L136
+[policy-fn]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1653-L1694
+[basenames]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L145
+[paths]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1607-L1618
+[path-suffixes]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L161-L168
+[policy-comment]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L132-L143
 [trusted-candidate]: ../../skills/pr-pipeline-tick/lib/tick.py#L5719-L5730
-[design-reviewer-ctx]: ../../docs/planning/designs/pr-pipeline-tick.md#L388-L399
-[design-sandbox-scope]: ../../docs/planning/designs/pr-pipeline-tick.md#L447-L448
+[design-reviewer-ctx]: ../architecture.md
+[design-sandbox-scope]: ../architecture.md
 [reviewer-prompt]: ../../skills/pr-pipeline-tick/lib/prompts/reviewer.txt#L1
 [wrapper-setpgrp]: ../../skills/pr-pipeline-tick/engine_wrapper.py#L69

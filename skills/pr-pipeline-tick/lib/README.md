@@ -10,8 +10,9 @@ logic in inline bash each tick.
 
 ## Constraints
 
-- **Stdlib only.** This directory must lift out of Sworn (the design's
-  extraction seam) and run under a bare `python3` without Sworn's dependency tree.
+- **Stdlib only.** This directory installs against a target repo it does not
+  own, so it runs under a bare `python3` (3.11+) and takes no dependency on any
+  target's toolchain.
   Do not add third-party imports.
 - All logic lives in tested functions; the CLI is I/O glue. New behaviour starts
   with a failing test in `test_pipeline.py`.
@@ -97,7 +98,8 @@ uv run python "$PIPELINE" classify-dispatch \
 printf '%s' "$json" | uv run python "$PIPELINE" atomic-write --path dispatch.json
 
 # Report whether a diff touches a reviewer-governing file (CLAUDE.md/AGENTS.md at
-# any level, or sworn-review-checklist.md). Reads paths from stdin; prints
+# any level, or a path listed under [policy] checklist_paths). Reads paths
+# from stdin; prints
 # {"touches_policy": true|false}. Dispatch escalates a true result to a human.
 git diff --name-only <base>...<head> | uv run python "$PIPELINE" touches-review-policy
 
@@ -106,7 +108,7 @@ git diff --name-only <base>...<head> | uv run python "$PIPELINE" touches-review-
 # prints {"trusted": true}. Missing or mismatched metadata fails closed.
 gh pr view 100 --json author,headRepository,isCrossRepository \
   | uv run python "$PIPELINE" validate-review-candidate \
-      --trusted-author kwuBuild --trusted-repo kwuBuild/sworn
+      --trusted-author "$PIPELINE_TRUSTED_AUTHOR" --trusted-repo "$PIPELINE_REPO"
 
 # Report whether a dispatch marker is structurally valid for a given PR/stage
 # (prints {"valid": true|false}). Validation is by type + enumeration + identity and
@@ -142,9 +144,8 @@ uv run python "$PIPELINE" validate-marker \
 # pr-pipeline-status dashboard makes the item *visible* rather than having a tick
 # relabel work it cannot prove it owns — but the dashboard reads only this
 # machine's markers, so an absent engine row is not custody proof for an operator
-# either. Recovery needs out-of-band confirmation. See issue #592 and
-# docs/planning/designs/pr-pipeline-tick.md -> "Why custody is not inferred, and
-# not yet proven".
+# either. Recovery needs out-of-band confirmation. See
+# docs/architecture.md -> "Why custody is not inferred, and not yet proven".
 uv run python "$PIPELINE" reconcile-dispatch \
   --dispatch dispatch.json --pr 100 [--stage review] --current-label ai:reviewing \
   --classify-state complete|live|stale|hung|launching \
@@ -276,8 +277,8 @@ a human to decide and they need the engine's words. A `recheck` needs it for a
 different reason: only the `escalate` branch calls `_archive_harvest_evidence`, so
 a successful fixer run archives nothing and `cleanup_scratch` deletes the worktree
 holding `result.json`. Omitting the excerpt there would leave the run recorded
-nowhere but a truncated tick-log line — and #585 requires the recheck comment to
-name what was fixed, not just that a head moved. The excerpt is neutralised for
+nowhere but a truncated tick-log line — and the recheck comment has to name
+what was fixed, not just that a head moved. The excerpt is neutralised for
 `<!--`, `-->`, ` ``` `, and `</details>` before rendering. The first two matter for
 correctness, not tidiness: `count_review_rounds` matches the raw `REVIEW_MARKER`
 substring in a comment body, so a fixer quoting a reviewer comment back at us would

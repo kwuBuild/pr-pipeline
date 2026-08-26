@@ -110,8 +110,8 @@ That threshold is 3x the longest silence a *healthy* engine can produce
 (`MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`). Engines emit stream events only at
 message boundaries, so heartbeat silence is *at least* tool-call duration —
 the model turn that consumes the tool result and any internal 429/529 backoff
-add to it — and Claude Code caps a single `Bash` call, `Bash(uv run pytest *)`
-being allowlisted, at 10 minutes. A threshold set *at* that bound would report
+add to it — and Claude Code caps a single `Bash` call, the operator's
+verification commands being allowlisted, at 10 minutes. A threshold set *at* that bound would report
 a healthy engine on its longest legal call; the multiple is what absorbs the
 turn latency stacked on top of it.
 
@@ -324,7 +324,7 @@ It will still terminate an *overdue* engine whose identity is proven `matched`
 have no PID and cannot signal it, so a hold cannot silently extend the dispatch
 deadline. The kill advances no decision — labels and scratch are untouched, so
 all evidence and the pending choice survive. An overdue engine whose identity is
-*unprovable* is still left alone under the #578 escalate-and-leave contract,
+*unprovable* is still left alone under the escalate-and-leave contract,
 because its PID may have been reused.
 
 Proven group death is the only release. For resultless scratch, the tick emits a
@@ -536,5 +536,7 @@ is still captured in `stderr.log`.
   length `tick._PR_BODY_MAX_CHARS=65536`, enforced against both the character
   count and the UTF-8 byte length; the classifier reads at most
   `tick._PR_BODY_REVISION_READ_LIMIT`
-- Trusted reviewer gate: author `kwuBuild`, head repo `kwuBuild/sworn`
+- Trusted reviewer gate: `[target] trusted_author` / `[target] repo` from
+  `config.toml` (env override `PIPELINE_TRUSTED_AUTHOR` / `PIPELINE_REPO`);
+  a tick with either unset exits 3 before dispatching anything
 - Reviewer Codex floor: `codex-cli 0.142.5`

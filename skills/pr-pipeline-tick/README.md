@@ -17,10 +17,9 @@ engines inherit the sandbox, losing network access to non-allowlisted LLM
 endpoints and `~/.codex` writes, so they stall silently after the label flip.
 Scope: the tick process and its children, not the entire session.
 
-The orchestrator was extracted from 25 bash code blocks into a single Python process
-(`lib/tick.py`). The skill's `SKILL.md` is now a lean operator SOP. See
-`docs/planning/designs/pr-pipeline-tick-python-extraction.md` for the extraction
-design and post-implementation review findings.
+The orchestrator is a single Python process (`lib/tick.py`); the skill's
+`SKILL.md` is a lean operator SOP. See `docs/architecture.md` for why the
+control plane is shaped the way it is.
 
 **Where the pipeline lives.** Pipeline *code* is resolved from the install, not
 from the repository being operated on: `$PR_PIPELINE_HOME` is the absolute path
@@ -308,7 +307,7 @@ bound is discounted.
 | `live`, group alive | enforce the deadline; archive the evidence and reclaim the slot on proven death | **No** |
 | `complete`, group alive | archive the result once the group dies | **No** |
 | `hung`, identity `matched` | terminate the runaway | **No** |
-| `hung`, identity unprovable | nothing — escalate-and-leave (#578) | Yes |
+| `hung`, identity unprovable | nothing — escalate-and-leave | Yes |
 | `launching` (pre-spawn lease) | nothing — the marker records no PID | Yes |
 | markerless | nothing — no process to harvest or signal | Yes |
 
@@ -388,7 +387,7 @@ the local scratch, into the ordinary archive/cleanup path, and the pipeline's
 pure `--remove-label` that never names the hold. That label is an automation
 receipt, not human custody; the admission slot is freed by destroying the
 marker, not by removing the label, and leaving the label behind would strand
-the item at a pipeline label no tick clears (#604) and no dispatcher picks
+the item at a pipeline label no tick clears and no dispatcher picks
 up — costing an operator's attention rather than a slot. The release is ordered
 *before* the archive and confirmed by a read-back: if the removal or its
 confirmation fails, the marker survives as the only thing that can re-prove
@@ -413,7 +412,7 @@ manual pickup label, and a markerless in-flight label is a deliberate no-op
 that no tick clears. Counting those as paid engines meant a hand-set label, or
 one whose harvest relabel was missed, silently consumed a slot forever with no
 dispatch marker behind it — four of them starved every dispatch on 2026-07-07
-and again on 2026-08-20 (#534) until an operator diagnosed the count and
+and again on 2026-08-20 until an operator diagnosed the count and
 stripped labels by hand. The cap now
 bounds this machine's concurrent spend, which is the thing it exists to bound.
 
@@ -425,7 +424,7 @@ launch → relabel, so two ticks that both select an item before either relabel
 lands will both spawn a paid engine, and the loser terminates its own when its
 relabel fails. That bounded acquisition race is unchanged by this section — see
 the lease → launch → relabel step under "File-based handoff" in
-`docs/planning/designs/pr-pipeline-tick.md` for why closing it needs
+`docs/architecture.md` for why closing it needs
 compare-and-swap acquisition.
 
 What is deliberately given up here is the sum across machines: another host's
@@ -828,8 +827,8 @@ label — until it lands, and it is the retained *marker* that keeps one admissi
 slot occupied; the label alone never does. That is acceptable only because the
 item is already awaiting a human by definition: the operator who set the hold
 resolves it, the next tick then harvests the completion through the ordinary
-path, and clearing the marker there is what frees the slot. The trade is deliberate: releasing custody on a failed post is what left
-PR #578 merged under an unexplained `ai:needs-human-decision`. If a post can never
+path, and clearing the marker there is what frees the slot. The trade is deliberate: releasing custody on a failed post is what once left
+a PR merged under an unexplained `ai:needs-human-decision`. If a post can never
 succeed — a locked or archived item — the operator's own hold removal is the
 release, not another tick.
 
@@ -868,7 +867,7 @@ finished — that is what decides where the explanation lives:
 
 | | Silent transitions | Where the explanation is | Tracked by |
 |---|---|---|---|
-| **An engine finished** | wrapper-confirmed reviewer failure | `.harvest-evidence/` bundle — machine-local, not on the item | untracked. #618 closed the sibling case (a hold beside a completed marker, now the gated row above); this path has the same shape and needs the same treatment |
+| **An engine finished** | wrapper-confirmed reviewer failure | `.harvest-evidence/` bundle — machine-local, not on the item | untracked. The sibling case is closed (a hold beside a completed marker, now the gated row above); this path has the same shape and needs the same treatment |
 | **An engine may still be running** | reconcile escalations (hung engine, unverified live custody); each stage's post-launch guard, when the in-flight relabel failed *and* the engine could not be killed | tick log only — no evidence bundle is written, and the scratch is retained because a live engine may still own it | untracked; the marker is retained, so harvest still owns the item |
 
 The top row is unfinished work, not an exemption: nothing bounds its post today
@@ -1125,7 +1124,7 @@ pickup that `CLAUDE.md` tells contributors to perform before writing code.
 
 So the tick **never acts on a markerless in-flight item**. No relabel, no
 cleanup, no escalation. An earlier rule did escalate on marker absence and
-mass-relabelled healthy work with it (issue #592); the credibility of
+mass-relabelled healthy work with it; the credibility of
 `ai:needs-human-decision` is worth more than the automation it bought. Every
 custody escalation the tick can raise routes to that one label — the reviewer's
 iteration cap is the only path to `ai:max-iterations` — so a signal that fires on
@@ -1183,7 +1182,7 @@ reconcile means the spawn crashed after starting the engine, and that escalates 
 `ai:needs-human-decision` because a paid engine may be alive and unkillable.
 
 The full rationale, the incident data, and the conditions for revisiting this are
-in `docs/planning/designs/pr-pipeline-tick.md` → "Why custody is not inferred, and
+in `docs/architecture.md` → "Why custody is not inferred, and
 not yet proven".
 
 ### Retained scratch and harvest evidence

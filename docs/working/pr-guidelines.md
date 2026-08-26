@@ -359,7 +359,7 @@ An issue being actively implemented MUST carry `ai:implementing`. The label tran
 
 ### Pipeline automation states (pr-pipeline-tick)
 
-The `pr-pipeline-tick` skill (`docs/planning/designs/pr-pipeline-tick.md`) introduces
+The `pr-pipeline-tick` skill (`docs/architecture.md`) introduces
 four labels the human workflow does not need. They mark "an engine is dispatched"
 (transient work the human convention treats as happening *between* labels) and two
 escalation terminals with no human-workflow equivalent. A human reviewing manually
@@ -403,7 +403,7 @@ which relabelled healthy work and burned down the
 credibility of `ai:needs-human-decision` — the label every custody escalation in
 the tick routes to, `ai:max-iterations` being reachable only from the reviewer's
 iteration cap below. See
-`docs/planning/designs/pr-pipeline-tick.md` → "Why custody is not inferred, and
+`docs/architecture.md` → "Why custody is not inferred, and
 not yet proven".
 
 Automation transitions (driven by the tick, not by a human):
@@ -442,7 +442,7 @@ Each transition is an explicit add + remove. Never rely on "swapping" — always
   gh issue edit <number> --add-label ai:blocked --remove-label ai:available --remove-label ai:implementing
   gh issue comment <number> --body "<what is blocked and what would unblock it>"
   ```
-- **When raising the PR:** Push the branch, create a PR that references the issue (`Closes #N`), then add `ai:implemented` to the PR and remove `ai:implementing` from the issue. This keeps exactly one pipeline label on the work and leaves the issue in a state a dispatcher will pick up; it frees no concurrency budget, because the pipeline's spend cap counts the dispatch markers on the machine running the tick, never labels (#663):
+- **When raising the PR:** Push the branch, create a PR that references the issue (`Closes #N`), then add `ai:implemented` to the PR and remove `ai:implementing` from the issue. This keeps exactly one pipeline label on the work and leaves the issue in a state a dispatcher will pick up; it frees no concurrency budget, because the pipeline's spend cap counts the dispatch markers on the machine running the tick, never labels:
   ```bash
   gh pr edit <pr-number> --add-label ai:implemented
   gh issue edit <issue-number> --remove-label ai:implementing
