@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # The runtime contract is "stdlib only, Python >= 3.11". Prove it on both
+    # supported platforms and at both ends of the version range, with no uv and
+    # no project dependency install -- an accidental third-party import or a
+    # 3.12+ syntax feature has to fail here rather than on an adopter's machine.
+    #
+    # Why exactly 3.11 and 3.13, and nothing between:
+    #   3.11 is the floor, and it is a hard one: tick.py and pipeline.py parse
+    #        config.toml with `tomllib`, which is 3.11+. Below it the tool does
+    #        not import at all.
+    #   3.13 is the newest release the pipeline claims to support, so it is
+    #        where a removed-in-3.13 stdlib API or a new DeprecationWarning
+    #        surfaces first.
+    # The two ends bracket the range: a syntax or stdlib feature that exists in
+    # neither cannot hide in 3.12, because anything 3.12 accepts and 3.11
+    # rejects already fails the floor leg. Adding 3.12 would double the matrix
+    # for no failure it can catch on its own.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.13"]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # pytest only. Installing anything else would defeat the point of the job:
+      # the suite must pass without the pipeline's own code gaining a dependency.
+      - name: Install test runner
+        run: python -m pip install --disable-pip-version-check pytest
+
+      # The tick's startup probe requires `gh`, `git` and `codex` to be present
+      # before it will run at all, and exits 3 when any is missing. Runners ship
+      # git and gh but never codex, so without this every test that reaches a
+      # dispatch path fails for a reason that has nothing to do with the change
+      # under review.
+      #
+      # A stub is the right shape here, not a real install. The probe only calls
+      # shutil.which -- it never executes the binary -- and the suite already
+      # mocks every actual codex invocation, so installing the real CLI would
+      # buy no additional coverage: it cannot authenticate and must not make
+      # paid calls from CI. The `--version` line is here so anything that shells
+      # out for a version check sees a string above the pinned minimum.
+      #
+      # This is the same PATH-interception seam the process-level smoke harness
+      # is designed around: `codex` is resolved by name, so a script earlier on
+      # PATH intercepts it with no production-code change.
+      - name: Stub external CLIs the startup probe requires
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/bin/sh\necho "codex-cli 0.142.5"\n' > "$RUNNER_TEMP/bin/codex"
+          chmod +x "$RUNNER_TEMP/bin/codex"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Verify the probe's binaries resolve
+        shell: bash
+        run: |
+          for binary in gh git codex; do
+            command -v "$binary" || { echo "missing: $binary" >&2; exit 1; }
+          done
+
+      - name: Test
+        run: python -m pytest skills/ -q
+
+  shellcheck:
+    # status.sh and preflight.sh carry real control-flow: interpreter
+    # resolution, path anchoring, and probe gating. They are shipped to other
+    # people's machines, so lint them rather than discovering a quoting bug in
+    # someone else's dashboard.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Syntax check
+        run: |
+          bash -n skills/pr-pipeline-tick/preflight.sh
+          bash -n skills/pr-pipeline-status/status.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck --severity=error \
+            skills/pr-pipeline-tick/preflight.sh \
+            skills/pr-pipeline-status/status.sh

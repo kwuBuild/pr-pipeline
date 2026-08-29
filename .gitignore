@@ -29,3 +29,8 @@ env/
 .pr-pipeline/
 .worktrees/
 tmp/
+
+# Engine-authored PR metadata (prompts forbid committing these; the repo enforces it)
+.pr-body.md
+.pr-create-body.md
+.pr-body-revision.md

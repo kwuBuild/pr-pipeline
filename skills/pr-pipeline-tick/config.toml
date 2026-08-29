@@ -1,0 +1,58 @@
+# Operator configuration for the PR-pipeline control plane.
+#
+# The pipeline drives a repository it does not own, so everything that varies
+# per target lives here rather than in the code. This file is copied into every
+# install: a value committed here is a decision made on an adopter's behalf, so
+# the trust-boundary defaults are the conservative ones and the target is blank.
+
+# The repository this pipeline operates on, and the GitHub login whose PRs it
+# may auto-review. Both are required; a tick refuses to start with either unset
+# rather than resolving an empty `--repo` against whatever the cwd happens to
+# be. Override for a one-off run with PIPELINE_REPO / PIPELINE_TRUSTED_AUTHOR.
+#
+# trusted_author is a trust boundary, not a convenience: the reviewer runs with
+# the operator's credentials inside the PR's own checked-out tree, so a PR from
+# anyone else is escalated to a human instead of auto-reviewed.
+[target]
+repo = ""
+trusted_author = ""
+
+# [policy] governs the reviewer admission gate. A PR whose diff edits files that
+# steer the reviewer (CLAUDE.md, AGENTS.md, the review checklists) is escalated
+# to a human instead of auto-reviewed — the reviewer runs on the PR's own
+# worktree, so it would review under instructions the PR itself supplied.
+#
+# The gate ships ON, and that is the shipped default precisely because it is a
+# trust boundary: an install inherits whatever is committed here, so opting
+# every adopter out by default would make the choice for them. An operator who
+# accepts that boundary sets allow_touching = true in their own copy. The human
+# merge gate after ai:ready-for-human still stands either way.
+#
+# A missing or malformed config.toml keeps the conservative gate (fail closed).
+#
+# checklist_paths names the target repo's *own* reviewer-governing docs, as
+# repo-relative paths. CLAUDE.md and AGENTS.md are matched by basename at any
+# depth and need no entry here. Empty is correct for a repo with no separate
+# checklists.
+[policy]
+allow_touching = false
+checklist_paths = []
+
+# The verification commands an engine is permitted to run, as Bash permission
+# bodies (each is wrapped in `Bash(...)`). This is a permission grant, not an
+# instruction: the engine prompts tell the engine to run the verification
+# commands the target repo's own CLAUDE.md/AGENTS.md prescribe. But engines run
+# under an exact allowlist, never a glob, so a command that is not granted here
+# is denied rather than run.
+#
+# Replace this list wholesale for a non-Python stack. A trailing ` *` allows
+# arguments; without it only the bare command is permitted. An entry containing
+# a parenthesis or newline is dropped — it would break out of the allowlist
+# entry and widen the boundary.
+[engine]
+verify_tools = [
+    "uv run pytest *",
+    "uv run ruff *",
+    "uv run pyright",
+    "npm --prefix frontend *",
+]

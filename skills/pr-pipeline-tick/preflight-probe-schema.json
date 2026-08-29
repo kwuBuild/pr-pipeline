@@ -1,0 +1,15 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["write_attempted", "write_blocked"],
+  "properties": {
+    "write_attempted": {
+      "type": "boolean",
+      "description": "true ONLY if you actually executed a shell command that tried to create the file. false if you did not run any such command."
+    },
+    "write_blocked": {
+      "type": "boolean",
+      "description": "true if the executed write command was denied by the sandbox (e.g. 'operation not permitted'); false if it succeeded or was not attempted."
+    }
+  }
+}

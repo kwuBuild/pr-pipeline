@@ -1,0 +1,3859 @@
+"""Pure logic for the PR-pipeline review stage.
+
+This module holds the bug-prone decisions a tick must make about a review
+result — schema validation, verdict→label mapping, iteration counting, base-SHA
+drift, trusted-candidate gating, marker-based admission, and dispatch-liveness
+classification — as small, deterministic, unit-tested functions. The
+``pr-pipeline-tick`` skill shells out to the CLI at the bottom of this file rather
+than re-deriving this logic in inline bash each tick, so an unattended loop behaves
+identically every run.
+
+Stdlib only: the directory installs against a target repo it does not own, so
+it runs under a bare ``python3`` (3.11+) and takes no dependency on any
+target's toolchain.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import glob
+import json
+import math
+import os
+import re
+import sys
+import tempfile
+import time
+import tomllib
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal, TypedDict, cast
+
+# Verdict values the Codex reviewer emits (pinned by review-schema.json).
+VERDICT_READY = "ready_for_human"
+VERDICT_CHANGES = "changes_requested"
+_VALID_VERDICTS = frozenset({VERDICT_READY, VERDICT_CHANGES})
+_VALID_SEVERITIES = frozenset({"blocker", "major", "minor"})
+
+Verdict = Literal["ready_for_human", "changes_requested"]
+
+# Pipeline labels.
+LABEL_AVAILABLE = "ai:available"  # pre-dispatch label for the implement stage
+LABEL_IMPLEMENTING = "ai:implementing"  # in-flight: an implementer engine is dispatched
+LABEL_IMPLEMENTED = "ai:implemented"  # pre-dispatch label for the review stage
+LABEL_REVISED = "ai:revised"  # alternate pre-dispatch label (re-review after a fix)
+LABEL_REVIEWING = "ai:reviewing"  # in-flight: a reviewer engine is dispatched
+LABEL_FIXING = "ai:fixing"  # in-flight: a fixer engine is dispatched
+LABEL_READY_FOR_HUMAN = "ai:ready-for-human"
+LABEL_CHANGES_REQUESTED = "ai:changes-requested"
+LABEL_MAX_ITERATIONS = "ai:max-iterations"
+LABEL_NEEDS_HUMAN = "ai:needs-human-decision"  # escalation terminal
+LABEL_BLOCKED = "ai:blocked"  # human-set: waiting on a dependency or decision
+
+# Human holds. The tick never produces or targets ai:blocked, and it only pairs
+# ai:needs-human-decision with an in-flight label when its own harvest target is
+# that label — so either hold coexisting with pipeline custody is
+# treated as human-set, and outranks the dispatch marker.
+#
+# "Treated as" rather than "is": a dispatched implementer or fixer runs under the
+# operator's full environment and can reach `gh pr edit`, so it can label its own
+# item mid-run. Nothing here can tell that apart from a human hold — engines share
+# the tick's token, so even the timeline actor matches. The engine prompts and
+# pr-guidelines.md ("Pipeline label authority") close the engine-set route by
+# contract; the runtime rule stays fail closed toward the human, because a human
+# racing to stop a bad run must win.
+#
+# Neither hold is automation's to move: convergence refuses every target while
+# either is present, including an escalation to LABEL_NEEDS_HUMAN itself, so one
+# hold can never be swapped for the other. LABEL_NEEDS_HUMAN remains the label
+# the operator sees named first when both are present.
+HOLD_LABELS = frozenset({LABEL_NEEDS_HUMAN, LABEL_BLOCKED})
+
+# The in-flight label each pipeline stage claims its item with. Sole source of
+# truth for the stage/label pairing; IN_FLIGHT_LABELS below is derived from it so
+# a new stage cannot be added to one and forgotten in the other.
+STAGE_IN_FLIGHT_LABELS = {
+    "review": LABEL_REVIEWING,
+    "implement": LABEL_IMPLEMENTING,
+    "fix": LABEL_FIXING,
+}
+
+# In-flight labels: each one means "an engine holds this item". Any of them on a
+# dispatch candidate is a claim by *some* machine, whose dispatch marker lives on
+# that machine's disk — so a local marker scan cannot disprove it. The tick
+# therefore never converges such an item, which means a partial transition (the
+# in-flight label added, the pickup label not yet removed) now persists for the
+# life of that engine and keeps matching the pickup query. Dispatch therefore
+# reads this set directly rather than inferring freedom from a missing marker.
+IN_FLIGHT_LABELS = frozenset(STAGE_IN_FLIGHT_LABELS.values())
+
+# The pickup (pre-dispatch) labels each stage dispatches from, and the GitHub
+# entity each stage operates on. Sole source of truth for both pairings: the
+# queue listing, the dispatch eligibility gate, and every cadence probe derive
+# from these two tables, so none of them can drift into a different idea of what
+# counts as pickup-eligible work.
+STAGE_PICKUP_LABELS: dict[str, tuple[str, ...]] = {
+    "implement": (LABEL_AVAILABLE,),
+    "review": (LABEL_IMPLEMENTED, LABEL_REVISED),
+    "fix": (LABEL_CHANGES_REQUESTED,),
+}
+
+STAGE_ENTITIES: dict[str, str] = {
+    "implement": "issue",
+    "review": "pr",
+    "fix": "pr",
+}
+
+# Every pickup label an entity of this type can be dispatched from, across all
+# stages. Eligibility counts pickup labels over this set rather than over one
+# stage's, because two stages that each see exactly one of their own labels
+# would each claim the same item: a PR at ai:implemented + ai:changes-requested
+# satisfied review and fix independently, and the second engine then met the
+# first's live marker.
+ENTITY_PICKUP_LABELS: dict[str, frozenset[str]] = {
+    entity: frozenset(
+        label
+        for stage, labels in STAGE_PICKUP_LABELS.items()
+        for label in labels
+        if STAGE_ENTITIES[stage] == entity
+    )
+    for entity in sorted(set(STAGE_ENTITIES.values()))
+}
+
+# In-process loop cadence. Kept as public constants for compatibility with
+# older callers; decide_loop_cadence delegates to compute_next_wake below.
+LOOP_SHORT_POLL_SECONDS = 270
+LOOP_MAX_POLL_SECONDS = 270
+LOOP_HEARTBEAT_SECONDS = 30 * 60
+LOOP_QUIESCENT_STOP_AFTER = 3
+
+# Files that govern the reviewer's own behaviour. A PR that edits any of these is
+# changing the very policy that decides whether it is promoted, so it must not be
+# auto-reviewed under instructions it controls (see :func:`touches_review_policy`).
+# Codex auto-loads ``AGENTS.md`` as its project doc and ``AGENTS.md`` routes to
+# ``CLAUDE.md``, so those two are universal and are matched by basename at any
+# directory level.
+#
+# A target repo's own review checklists are the same class of file but their
+# paths are the target's to name — the pipeline drives a repository it does not
+# own, so hard-coding one repo's checklist paths here would both miss every
+# other repo's and carry a dead entry into every install. They are declared by
+# the operator in ``config.toml`` under ``[policy] checklist_paths``; see
+# :func:`_reviewer_checklist_paths`.
+_POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
+
+# The pipeline's own files are review policy too, matched by path *suffix* rather
+# than exact path. The file that toggles the gate is policy: a PR flipping
+# allow_touching to true must be escalated to a human, not auto-reviewed —
+# otherwise a merged flip would silently disable the gate for every future
+# policy-editing PR. The gate's implementation is the same vector: a PR that
+# rewrites _policy_touching_allowed to return True unconditionally (pipeline.py),
+# or removes the gate call from the reviewer dispatch (tick.py), disables the
+# gate exactly like a config flip.
+#
+# The suffix is what makes that hold. An exact path encodes one install depth
+# (`.claude/skills/...`, where the skills were incubated) and silently exempts
+# the identical edit in the pipeline's own repository, where they live at
+# `skills/`, and under any plugin layout. Matching is per path segment, so
+# `other-skills/pr-pipeline-tick/config.toml` is not a hit.
+_POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
+    tuple(suffix.split("/"))
+    for suffix in (
+        "skills/pr-pipeline-tick/config.toml",
+        "skills/pr-pipeline-tick/lib/pipeline.py",
+        "skills/pr-pipeline-tick/lib/tick.py",
+    )
+)
+
+# Operator config for admission gates, read at call time so a config change
+# takes effect on the next tick without a redeploy. Resolved via __file__ so it
+# is cwd-independent (the tick and its CLI helpers run from different cwds).
+# A missing or malformed file falls back to the conservative default.
+_POLICY_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
+
+# Logical verdict sentinels the harvest acts on (see design "Sentinel tokens").
+SENTINEL_NO_BLOCKERS = "NO_BLOCKERS_READY_FOR_HUMAN"
+SENTINEL_BLOCKERS = "BLOCKERS_FOUND"
+
+# Implementer/fixer sentinel tokens emitted literally in result.json text.
+SENTINEL_IMPL_COMPLETE = "IMPLEMENTATION_COMPLETE"
+SENTINEL_FIXES_PUSHED = "FIXES_PUSHED_RECHECK_NEEDED"
+SENTINEL_NEEDS_HUMAN_DECISION = "NEEDS_HUMAN_DECISION"
+OUTCOME_UNRECOGNIZED = "unrecognized"
+_IMPLEMENTATION_SENTINELS = (SENTINEL_IMPL_COMPLETE, SENTINEL_NEEDS_HUMAN_DECISION)
+_FIXER_SENTINELS = (SENTINEL_FIXES_PUSHED, SENTINEL_NEEDS_HUMAN_DECISION)
+_HELD_COMPLETION_OUTCOMES = {
+    "review": frozenset({VERDICT_READY, VERDICT_CHANGES, OUTCOME_UNRECOGNIZED}),
+    "implement": frozenset({*_IMPLEMENTATION_SENTINELS, OUTCOME_UNRECOGNIZED}),
+    "fix": frozenset({*_FIXER_SENTINELS, OUTCOME_UNRECOGNIZED}),
+}
+
+# Fixed header the reviewer harvest stamps on every posted review comment. This is
+# the durable, GitHub-visible authority for the fix-iteration count, so it must
+# never change without a migration plan (see design "Iteration counter").
+REVIEW_MARKER = "<!-- pr-pipeline:review -->"
+
+# Per-comment idempotency key. Each review comment embeds the full review identity
+# it was posted for — (diff base, base tip, head) SHAs plus the pinned base branch
+# *name* — so a tick interrupted between posting the comment and flipping the label
+# can recognise its own already-posted comment and re-apply only the label instead
+# of posting a duplicate (which would inflate the iteration count). Every identity
+# component matters, not the head alone: a base that advances under an unchanged
+# head triggers a legitimate re-review, and a retarget to a base branch whose tip
+# is the *same commit* changes none of the SHAs while still invalidating the old
+# round. Keying on less would mistake such a fresh round for a replay and silently
+# drop its findings, leaving the next fixer with a stale review as its handoff.
+_ROUND_MARKER_PREFIX = "<!-- pr-pipeline:round:"
+
+# Fixed header the fixer harvest stamps on every posted fixer comment. It is
+# deliberately distinct from :data:`REVIEW_MARKER`: ``count_review_rounds`` tallies
+# the iteration cap by counting marker-stamped comments, so a fixer comment sharing
+# the reviewer's marker would inflate the round count and trip the runaway-spend
+# valve early. Engine-authored text embedded in the body is stripped of HTML
+# comments (see :func:`_sanitize_engine_report`) for the same reason.
+FIX_MARKER = "<!-- pr-pipeline:fix -->"
+
+# Fixed header for the attempt-cap escalation comment. Distinct from both markers
+# above for the same reason: it is published by every stage's harvest, not only the
+# fixer's, and it must never be counted as a review round.
+ESCALATION_MARKER = "<!-- pr-pipeline:escalation -->"
+
+# Size contract for the fixer's change summary, stated to the engine in its own
+# prompt (substituted, never hardcoded there) and enforced here at publish time.
+#
+# The budget covers one block per finding, each carrying its own
+# repair-or-replacement decision — a replacement states the rejected shape, why
+# it was rejected, the contract that replaced it, and the surfaces it audited,
+# and the whole point of demanding that reasoning is that the next reviewer gets
+# to read it. A run with several replacements repeats those four lines per
+# finding, which is why the budget is per-run rather than per-finding. Squeezing
+# all of it into the old limit would publish a truncated rationale, which is
+# worse than none: it reads as a complete argument that happens to stop.
+FIX_SUMMARY_BUDGET = 3000
+
+# Slack between the budget the prompt states and the limit the excerpt is cut
+# at, so a summary written *to* the budget still survives the completion
+# sentinel and any blank lines the engine wraps around it. Without it the two
+# numbers would be equal and every compliant summary would truncate by exactly
+# the length of ``FIXES_PUSHED_RECHECK_NEEDED``.
+_FIX_REPORT_HEADROOM = 200
+
+# Upper bound on the engine-authored excerpt embedded in a fixer comment. The
+# fixer's ``result`` text is unbounded model output; a PR comment is a shared
+# record, not a transcript dump, and GitHub rejects bodies past 65536 characters.
+_FIX_REPORT_LIMIT = FIX_SUMMARY_BUDGET + _FIX_REPORT_HEADROOM
+
+
+def decide_loop_cadence(
+    *,
+    in_flight_count: int,
+    nearest_engine_deadline: float | None,
+    actionable_queue: bool,
+    at_cap: bool,
+    quiescent: bool,
+    consecutive_quiescent: int,
+    now: float | None = None,
+    quiescent_stop_after: int = LOOP_QUIESCENT_STOP_AFTER,
+    held_items: Sequence[str] = (),
+) -> tuple[int, bool]:
+    """Choose the next sleep for unattended in-process loop mode.
+
+    Args:
+        in_flight_count: Number of items currently carrying in-flight labels.
+        nearest_engine_deadline: Nearest dispatch deadline epoch seconds among
+            identity-verified markers still classified ``live`` or
+            ``launching``, or ``None``. Callers must not pass a deadline from a
+            mismatched, dead, or hung marker: it is a fixed past timestamp, so
+            it would pin the wake to the overdue floor indefinitely.
+        actionable_queue: Whether any label queue can dispatch work now.
+        at_cap: Whether *supervisable* occupancy is saturated. This is not the
+            admission cap: human-held slots are discounted here on purpose, so
+            that an all-held pipeline can still reach quiescence. Real
+            admission saturation is reported through ``held_items``.
+        quiescent: Whether there is no in-flight or actionable work.
+        consecutive_quiescent: Number of consecutive quiescent heartbeats seen,
+            including the current one.
+        now: Epoch seconds for deadline math. Defaults to current time.
+        quiescent_stop_after: Number of consecutive quiescent heartbeats after
+            which the loop should stop.
+        held_items: Operator-facing identifiers for the slots excluded from
+            ``in_flight_count`` while a human hold is active.
+
+    Returns:
+        ``(sleep_seconds, stop)``.
+    """
+    nearest_deadline_s: float | None = None
+    if nearest_engine_deadline is not None:
+        current = time.time() if now is None else now
+        nearest_deadline_s = max(1, math.ceil(nearest_engine_deadline - current))
+
+    decision = compute_next_wake(
+        in_flight_count=in_flight_count,
+        nearest_deadline_s=nearest_deadline_s,
+        has_actionable_queue=actionable_queue,
+        at_capacity=at_cap,
+        is_quiescent=quiescent,
+        consecutive_quiescent_ticks=(
+            max(0, consecutive_quiescent - 1) if quiescent else 0
+        ),
+        quiescent_stop_after=quiescent_stop_after,
+        held_items=held_items,
+    )
+    return decision.next_wake_seconds, decision.stop
+
+
+# Completion envelope fields the engine wrapper must write after the engine exits.
+# The envelope is the gate: its presence proves the engine exited and the wrapper
+# confirmed exit status. Without it, a bare result file may be partially written.
+_REQUIRED_ENVELOPE_FIELDS = frozenset({
+    "dispatch_id", "exit_status", "wrapper_pid", "start_time", "result_valid",
+})
+
+_ALLOWED_ENVELOPE_KEYS = _REQUIRED_ENVELOPE_FIELDS
+_REQUIRED_FAILURE_ENVELOPE_FIELDS = _REQUIRED_ENVELOPE_FIELDS | {"error_class"}
+
+
+# --- Public TypedDicts and dataclasses (imported by tick.py) ---
+
+
+class HarvestResult(TypedDict, total=False):
+    """The outcome of harvesting one finished engine.
+
+    Keys vary by stage. All stages include ``action`` and ``label``.
+    Stage-specific keys (e.g. ``base_drift``, ``sentinel``, ``verdict``)
+    are only present when the stage sets them.
+    """
+
+    action: Literal[
+        "promote",
+        "request_changes",
+        "max_iterations",
+        "discard",
+        "escalate",
+        "create_pr",
+        "recheck",
+        "retry",
+    ]
+    label: str
+    sentinel: str | None
+    failure_class: str
+    post_comment: bool
+    comment_body: str
+
+
+class ClassifyResult(TypedDict):
+    """The classified state of one dispatch marker after liveness check."""
+
+    state: Literal["live", "launching", "complete", "stale", "hung"]
+    identity: Literal["matched", "mismatched", "unknown"]
+
+
+class ReconcileResult(TypedDict):
+    """The action reconcile_dispatch prescribes for one in-flight PR/issue."""
+
+    action: Literal[
+        "noop",
+        "leave",
+        "harvest",
+        "escalate",
+        "revert",
+        "kill_escalate",
+        "cleanup",
+        "kill_cleanup",
+    ]
+    label: str
+    kill: bool
+
+
+class CandidateMetadata(TypedDict):
+    """PR metadata required by the trusted-candidate gate.
+
+    Mirrors the shape of ``gh pr view --json author,headRepository,isCrossRepository``.
+    """
+
+    author: dict[str, object]
+    headRepository: dict[str, object]
+    isCrossRepository: bool
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    """The outcome of the dispatch admission gate.
+
+    Attributes:
+        can_dispatch: Whether the cap allows another engine to launch.
+        reason: Empty string when ``can_dispatch`` is True; otherwise
+            ``"max_in_flight"`` (the cap is reached) or ``"admission_error"``
+            (the in-flight count could not be established, so admission fails
+            closed).
+        in_flight_count: Number of engines currently occupying a concurrency slot.
+        max_in_flight: The configured ceiling.
+    """
+
+    can_dispatch: bool
+    reason: str
+    in_flight_count: int
+    max_in_flight: int
+
+
+@dataclass(frozen=True)
+class InFlightRef:
+    """A reference to one item that is currently in-flight (occupying a slot).
+
+    Attributes:
+        kind: ``"issue"`` or ``"pr"``.
+        number: The GitHub issue or PR number.
+        label: The in-flight pipeline label (e.g. ``ai:implementing``).
+    """
+
+    kind: Literal["issue", "pr"]
+    number: int
+    label: Literal["ai:implementing", "ai:reviewing", "ai:fixing"]
+
+
+@dataclass(frozen=True)
+class PickupEligibility:
+    """Whether one item's label set proves it is free to be dispatched.
+
+    Attributes:
+        label: The single pickup label the item may be dispatched from, or
+            ``""`` when it is not dispatchable.
+        reason: Empty when ``label`` is set; otherwise why dispatch must skip.
+        blocking: The labels that produced ``reason``, sorted. Empty when the
+            item is dispatchable.
+    """
+
+    label: str
+    reason: str
+    blocking: tuple[str, ...]
+
+
+def resolve_pickup_eligibility(
+    labels: Iterable[str],
+    *,
+    entity: str,
+    stage: str = "",
+) -> PickupEligibility:
+    """Decide, from an item's complete label set, whether it may be dispatched.
+
+    The one eligibility rule the whole control plane shares. Dispatch calls it
+    with a ``stage`` to answer "may *this* stage launch against this item?";
+    cadence calls it without one to answer "can *any* stage?". They must agree:
+    an item cadence counts as work but dispatch permanently refuses holds the
+    loop short of its quiescent stop forever, polling work no tick can take.
+
+    Pickup labels are counted across every stage for the entity, not within the
+    calling stage. A PR at ``ai:implemented`` + ``ai:changes-requested`` shows
+    exactly one review label and exactly one fix label, so a per-stage count
+    admits it twice — and the second engine then meets the first's live marker.
+
+    Every branch fails closed. The item simply waits for a tick that can prove
+    it is free; nothing here mutates, and nothing here infers custody from the
+    absence of local state.
+
+    Args:
+        labels: The item's complete label set, as read at the point of decision.
+        entity: ``"issue"`` or ``"pr"``. An entity with no pickup vocabulary is
+            never dispatchable.
+        stage: The pipeline stage asking, or ``""`` to ask for any stage.
+
+    Returns:
+        A :class:`PickupEligibility` whose ``label`` is the resolved pickup
+        label, or ``""`` with a ``reason`` and the ``blocking`` labels.
+    """
+    label_set = set(labels)
+
+    in_flight = IN_FLIGHT_LABELS & label_set
+    if in_flight:
+        return PickupEligibility(
+            label="",
+            reason="in-flight label present; an engine already holds this item",
+            blocking=tuple(sorted(in_flight)),
+        )
+
+    holds = HOLD_LABELS & label_set
+    if holds:
+        return PickupEligibility(
+            label="",
+            reason="human hold label present",
+            blocking=tuple(sorted(holds)),
+        )
+
+    pickup = ENTITY_PICKUP_LABELS.get(entity, frozenset()) & label_set
+    if len(pickup) != 1:
+        return PickupEligibility(
+            label="",
+            reason="no single pickup label; cannot prove dispatch eligibility",
+            blocking=tuple(sorted(pickup)),
+        )
+
+    resolved = next(iter(pickup))
+    if stage and resolved not in STAGE_PICKUP_LABELS.get(stage, ()):
+        return PickupEligibility(
+            label="",
+            reason="pickup label belongs to another stage",
+            blocking=(resolved,),
+        )
+    return PickupEligibility(label=resolved, reason="", blocking=())
+
+
+@dataclass(frozen=True)
+class TickState:
+    """Machine-readable end-of-tick state for supervised loops.
+
+    All fields are strings so that unknown/uncomputed values can be
+    represented as ``"unknown"`` on failed tick paths.
+
+    Attributes:
+        status: Tick exit status — ``"ok"``, ``"FAILED"``, or ``"PARTIAL"``.
+        in_flight: Count of *supervisable* in-flight engines, or ``"unknown"``.
+            Held slots are excluded — see ``held``.
+        queue: ``"true"`` if any item is dispatch-eligible, ``"false"``
+            if none are, or ``"unknown"``.
+        quiescent: ``"true"`` when every tracked item is terminal and no
+            engines are in flight, ``"false"`` otherwise, or ``"unknown"``.
+        held: Count of slots excluded from ``in_flight`` because they are
+            currently held by a human, or ``"unknown"``. They still
+            occupy an admission slot, so the count is what explains an
+            ``in_flight=0`` tick that still cannot dispatch at the cap.
+    """
+
+    status: str
+    in_flight: str
+    queue: str
+    quiescent: str
+    held: str = "unknown"
+
+    def format_line(self) -> str:
+        """Format as the parseable ``tick-state:`` stderr line."""
+        return (
+            f"tick-state: status={self.status}"
+            f" in_flight={self.in_flight}"
+            f" queue={self.queue}"
+            f" quiescent={self.quiescent}"
+            f" held={self.held}"
+        )
+
+
+def derive_tick_state(
+    *,
+    status: str,
+    in_flight_count: int | None = None,
+    has_actionable_queue: bool | None = None,
+    held_count: int | None = None,
+) -> TickState:
+    """Derive machine-readable tick state from values the tick computes.
+
+    Args:
+        status: Tick exit status (``"ok"``, ``"FAILED"``, ``"PARTIAL"``).
+        in_flight_count: Number of supervisable engines currently in flight,
+            or ``None`` when the count could not be determined (failed tick).
+        has_actionable_queue: Whether any item carries a dispatch-eligible
+            label, or ``None`` when unknown.
+        held_count: Number of occupied slots excluded from
+            ``in_flight_count`` because they are currently held by a human, or
+            ``None`` when the marker scan could not determine it.
+
+    Returns:
+        A ``TickState`` with all fields populated. Fields that could not
+        be computed are set to ``"unknown"``.
+    """
+    if in_flight_count is not None:
+        in_flight_str = str(in_flight_count)
+    else:
+        in_flight_str = "unknown"
+
+    if has_actionable_queue is not None:
+        queue_str = "true" if has_actionable_queue else "false"
+    else:
+        queue_str = "unknown"
+
+    if in_flight_count is not None and has_actionable_queue is not None:
+        quiescent_str = (
+            "true" if in_flight_count == 0 and not has_actionable_queue
+            else "false"
+        )
+    else:
+        quiescent_str = "unknown"
+
+    return TickState(
+        status=status,
+        in_flight=in_flight_str,
+        queue=queue_str,
+        quiescent=quiescent_str,
+        held=(
+            str(held_count) if held_count is not None else "unknown"
+        ),
+    )
+
+
+# --- Cadence ---
+#
+# The loop must poll because engines are detached background processes the
+# harness never signals on completion. Two cache-aware bands only, never 300s
+# (the prompt-cache TTL breakpoint that pays a cache miss without amortizing it).
+
+# Cache-warm band: stay under the 300s TTL cliff so the prompt cache survives.
+_CADENCE_CACHE_WARM = 270
+
+# Cache-cold band: long enough to amortize the cache-miss cost; short enough
+# that a new item doesn't wait half an hour for the next poll.
+_CADENCE_HEARTBEAT = 1800
+
+# The prompt-cache TTL cliff — must never be the chosen interval.
+_CADENCE_TTL_CLIFF = 300
+
+# Number of consecutive quiescent heartbeats before the loop stops.
+_DEFAULT_QUIESCENT_STOP_AFTER = 3
+
+
+@dataclass(frozen=True)
+class CadenceDecision:
+    """The outcome of computing the next wake interval for the tick loop.
+
+    Attributes:
+        next_wake_seconds: Seconds until the next tick should fire.
+        stop: When ``True``, the loop should end — do not schedule a
+            next wake. The caller should notify the developer.
+        reason: Human-readable description of the decision for logging.
+    """
+
+    next_wake_seconds: int
+    stop: bool
+    reason: str
+
+    def format_line(self) -> str:
+        """Format as the parseable ``tick-cadence:`` stderr line."""
+        return (
+            f"tick-cadence: next_wake={self.next_wake_seconds}"
+            f" stop={'true' if self.stop else 'false'}"
+            f' reason="{self.reason}"'
+        )
+
+
+def compute_next_wake(
+    *,
+    in_flight_count: int | None,
+    nearest_deadline_s: float | None = None,
+    has_actionable_queue: bool | None = False,
+    at_capacity: bool | None = False,
+    is_quiescent: bool = False,
+    consecutive_quiescent_ticks: int = 0,
+    quiescent_stop_after: int = _DEFAULT_QUIESCENT_STOP_AFTER,
+    held_items: Sequence[str] = (),
+) -> CadenceDecision:
+    """Compute the next wake interval from end-of-tick state.
+
+    The cadence is load-bearing because engines are detached background
+    processes — the loop must poll, and the interval determines both
+    convergence latency and spend. Two cache-aware bands only, never 300s.
+
+    Decision table (first match wins):
+
+    ======================================  ===================================
+    State at end of tick                    Next wake
+    ======================================  ===================================
+    ≥1 engine in-flight                    ``min(nearest deadline, 270s)``
+    Actionable queue non-empty             ~270s
+    At ``MAX_IN_FLIGHT`` with work           ~270s (harvest to free a slot)
+    Quiescent                              ~1800s heartbeat
+    Quiescent for N consecutive heartbeats  stop (caller notifies developer)
+    ======================================  ===================================
+
+    Args:
+        in_flight_count: Number of engines currently occupying a concurrency
+            slot (live + launching + hung), or ``None`` when the tick could not
+            read marker state.
+        nearest_deadline_s: Seconds from now until the nearest actionable
+            in-flight deadline, or ``None`` when no marker is still
+            ``live``/``launching`` or the deadline is unknown. A non-positive
+            value means the deadline lapsed while the caller was scanning.
+        has_actionable_queue: ``True`` when any item carries a
+            dispatch-eligible label, or ``None`` when queue reads failed.
+        at_capacity: ``True`` when ``in_flight_count >= MAX_IN_FLIGHT``;
+            ``None`` is treated as unknown.
+        is_quiescent: ``True`` when every tracked item is in a terminal
+            label and no engines are in flight.
+        consecutive_quiescent_ticks: How many consecutive ticks have been
+            quiescent before this one (caller tracks this across ticks).
+        quiescent_stop_after: Stop the loop after this many consecutive
+            quiescent heartbeats (default 3).
+        held_items: Operator-facing identifiers for slots excluded from
+            ``in_flight_count`` because a human currently holds them. Named in
+            *every* reason, because the reason line is the only thing the
+            one-shot ``/loop`` path has to notify with. A quiescent stop is
+            *caused* by a human holding these, and an unexplained stop leaves
+            that engine unattended; a non-quiescent tick that is nonetheless
+            wedged at the admission cap needs the same explanation, since
+            ``in_flight_count`` has already discounted the cause.
+
+    Returns:
+        A :class:`CadenceDecision` with the next wake interval in seconds,
+        whether the loop should stop, and a human-readable reason.
+    """
+    # Guard: never return exactly the TTL cliff.
+    def _guard(seconds: int) -> int:
+        if seconds == _CADENCE_TTL_CLIFF:
+            return _CADENCE_CACHE_WARM
+        return seconds
+
+    # Held items are discounted from in_flight_count, so without this suffix
+    # every non-quiescent reason silently under-describes the tick. The
+    # cap-saturated case is the one that needs it most: the loop reports an
+    # ordinary warm poll while admission is in fact blocked by human custody
+    # and no tick can ever dispatch until the operator acts.
+    def _with_custody(reason: str) -> str:
+        if not held_items:
+            return reason
+        return f"{reason}; awaiting human decision: {', '.join(held_items)}"
+
+    # Unknown control-plane reads are not quiescence. Retry cache-warm so the
+    # loop can recover promptly once GitHub or marker reads become trustworthy.
+    if in_flight_count is None or has_actionable_queue is None or at_capacity is None:
+        return CadenceDecision(
+            next_wake_seconds=_CADENCE_CACHE_WARM,
+            stop=False,
+            reason=_with_custody(f"state unknown -> wake {_CADENCE_CACHE_WARM}s"),
+        )
+
+    # 1. In-flight engines: pace to the nearest deadline, clamped to
+    #    cache-warm so we never burn a cache miss on a distant deadline.
+    if in_flight_count >= 1:
+        if nearest_deadline_s is not None and nearest_deadline_s > 0:
+            wake = min(int(nearest_deadline_s), _CADENCE_CACHE_WARM)
+        elif nearest_deadline_s is not None and nearest_deadline_s <= 0:
+            wake = 1
+        else:
+            wake = _CADENCE_CACHE_WARM
+        # Guard against the TTL cliff before constructing the decision.
+        wake = _guard(wake)
+        return CadenceDecision(
+            next_wake_seconds=wake,
+            stop=False,
+            reason=_with_custody(
+                f"{in_flight_count} in-flight, "
+                + (
+                    f"nearest deadline {nearest_deadline_s:.0f}s → "
+                    if nearest_deadline_s is not None
+                    else ""
+                )
+                + f"wake {wake}s"
+            ),
+        )
+
+    # 2. Actionable queue: poll promptly to dispatch.
+    if has_actionable_queue:
+        return CadenceDecision(
+            next_wake_seconds=_CADENCE_CACHE_WARM,
+            stop=False,
+            reason=_with_custody(
+                f"actionable queue non-empty → wake {_CADENCE_CACHE_WARM}s",
+            ),
+        )
+
+    # 3. At capacity: poll to harvest and free a slot.
+    if at_capacity:
+        return CadenceDecision(
+            next_wake_seconds=_CADENCE_CACHE_WARM,
+            stop=False,
+            reason=_with_custody(
+                f"at capacity ({in_flight_count} in-flight) → "
+                f"wake {_CADENCE_CACHE_WARM}s",
+            ),
+        )
+
+    # 4. Quiescent: heartbeat slowly, stop after N consecutive.
+    if is_quiescent:
+        # consecutive_quiescent_ticks counts PRIOR quiescent ticks;
+        # this tick is also quiescent, so this is heartbeat #(prior + 1).
+        stop = consecutive_quiescent_ticks + 1 >= quiescent_stop_after
+        return CadenceDecision(
+            next_wake_seconds=_CADENCE_HEARTBEAT,
+            stop=stop,
+            reason=_with_custody(
+                f"quiescent (heartbeat {consecutive_quiescent_ticks + 1}/{quiescent_stop_after})"
+                + (" → stop" if stop else f" → wake {_CADENCE_HEARTBEAT}s")
+            ),
+        )
+
+    # Fallback (should not be reachable with correct inputs).
+    return CadenceDecision(
+        next_wake_seconds=_CADENCE_HEARTBEAT,
+        stop=False,
+        reason=_with_custody("fallback → heartbeat"),
+    )
+
+
+@dataclass(frozen=True)
+class StageConfig:
+    """Parameterisation of reconcile_engine for one pipeline stage.
+
+    Attributes:
+        stage: Which pipeline stage this config drives.
+        worktree_prefix: ``"pr"`` or ``"issue"`` — the worktree directory prefix.
+        attempts_key_prefix: ``""`` for PR, ``"issue-"`` for issue — durable
+            attempt-counter filename prefix.
+        result_file: ``"review.json"`` or ``"result.json"`` — the engine output file.
+        in_flight_label: The GitHub label set when an engine is dispatched.
+        pre_label: The GitHub label that was on the item before dispatch.
+        strict_dual_label: When True, re-read labels after dual-label convergence
+            to verify exactly one ``ai:`` label remains before dropping scratch.
+        tick_abort_on_enum_failure: When True, abort the entire tick on enumeration
+            failure. When False, set ``reconcile_failed=1`` and continue.
+    """
+
+    stage: Literal["review", "implement", "fix"]
+    worktree_prefix: str
+    attempts_key_prefix: str
+    result_file: str
+    in_flight_label: str
+    pre_label: str
+    strict_dual_label: bool
+    tick_abort_on_enum_failure: bool
+
+
+def validate_completion_envelope(
+    obj: object,
+    *,
+    expected_dispatch_id: str | None = None,
+) -> bool:
+    """Validate a completion envelope written by the engine wrapper.
+
+    The envelope is the single signal that the engine exited cleanly and the
+    wrapper confirmed the result. A bare result file without an envelope may be
+    partially written or belong to a different dispatch.
+
+    Args:
+        obj: The parsed ``completion.json`` (any JSON value).
+        expected_dispatch_id: When given, the envelope's ``dispatch_id`` must
+            match this value exactly (links the envelope to its dispatch marker).
+
+    Returns:
+        ``True`` only when the envelope is structurally valid, records a
+        successful exit with a valid result, and (when checked) belongs to
+        the expected dispatch.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if not set(obj.keys()) <= _ALLOWED_ENVELOPE_KEYS:
+        return False
+    if not _REQUIRED_ENVELOPE_FIELDS.issubset(obj.keys()):
+        return False
+    exit_status = obj.get("exit_status")
+    if isinstance(exit_status, bool) or exit_status != 0:
+        return False
+    if obj.get("result_valid") is not True:
+        return False
+    dispatch_id = obj.get("dispatch_id")
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return False
+    if expected_dispatch_id is not None and dispatch_id != expected_dispatch_id:
+        return False
+    wrapper_pid = obj.get("wrapper_pid")
+    if not _is_positive_int(wrapper_pid):
+        return False
+    start_time = obj.get("start_time")
+    if isinstance(start_time, bool) or not isinstance(start_time, (int, float)):
+        return False
+    if not math.isfinite(start_time):
+        return False
+    return True
+
+
+def validate_failure_envelope(
+    obj: object,
+    *,
+    expected_dispatch_id: str,
+) -> bool:
+    """Validate a wrapper-confirmed, dispatch-bound engine failure envelope.
+
+    Args:
+        obj: Parsed ``completion.json`` value.
+        expected_dispatch_id: Dispatch marker identifier that must own the envelope.
+
+    Returns:
+        ``True`` only for a structurally valid nonzero-exit envelope whose wrapper
+        rejected the result and whose dispatch identifier matches the marker.
+    """
+    if not isinstance(obj, dict):
+        return False
+    if set(obj.keys()) != _REQUIRED_FAILURE_ENVELOPE_FIELDS:
+        return False
+    exit_status = obj.get("exit_status")
+    if isinstance(exit_status, bool) or not isinstance(exit_status, int) or exit_status == 0:
+        return False
+    if obj.get("result_valid") is not False:
+        return False
+    error_class = obj.get("error_class")
+    if not isinstance(error_class, str) or not error_class:
+        return False
+    dispatch_id = obj.get("dispatch_id")
+    if dispatch_id != expected_dispatch_id:
+        return False
+    wrapper_pid = obj.get("wrapper_pid")
+    if not _is_positive_int(wrapper_pid):
+        return False
+    start_time = obj.get("start_time")
+    if isinstance(start_time, bool) or not isinstance(start_time, (int, float)):
+        return False
+    return math.isfinite(start_time)
+
+
+IdentityResult = Literal["matched", "mismatched", "unknown"]
+
+
+def verify_process_identity(
+    recorded_start: float,
+    live_start: float | None,
+    tolerance: float = 1.0,
+) -> IdentityResult:
+    """Determine whether a live process is the same one that was recorded.
+
+    A bare PID check (``kill -0``) is vulnerable to PID reuse: the OS can
+    assign the same PID to an unrelated process after the original exits.
+    Comparing the recorded start time against the live process's start time
+    (within a tolerance for clock granularity) proves identity.
+
+    Three-valued result:
+
+    - ``"matched"``: the live process start time is within tolerance of the
+      recorded start time — same process, safe to signal.
+    - ``"mismatched"``: both times are readable but differ beyond tolerance —
+      confirmed PID reuse, must NOT signal.
+    - ``"unknown"``: the live start time could not be read (``None``). The
+      process may be alive or dead, but identity cannot be proven either way.
+      Callers must retain custody and count the slot — never drive kill,
+      cleanup, or requeue from ``"unknown"``.
+
+    Args:
+        recorded_start: Epoch seconds the wrapper recorded at startup.
+        live_start: Epoch seconds of the live process's start time, or
+            ``None`` if the process does not exist or the start time could
+            not be read.
+        tolerance: Maximum allowable difference in seconds between recorded
+            and live start times (default 1.0).
+
+    Returns:
+        One of ``"matched"``, ``"mismatched"``, or ``"unknown"``.
+    """
+    if live_start is None:
+        return "unknown"
+    if abs(recorded_start - live_start) <= tolerance:
+        return "matched"
+    return "mismatched"
+
+
+def _round_token(
+    diff_base_sha: str,
+    base_tip_sha: str,
+    head_sha: str,
+    base_ref: str = "",
+) -> str:
+    """Return the hidden idempotency token for one reviewed round.
+
+    The token covers the full review identity — the (diff anchor, freshness
+    snapshot, head) SHA triple plus the pinned base branch name — so a
+    re-dispatch that changes any component counts as a new round. The ref is
+    included because it is part of review identity without being visible in
+    the SHAs: two branch names can point at the same commit, and a review
+    posted under one must not suppress the fresh review under the other.
+    A git ref name can never contain ``:``, so the delimiter is unambiguous.
+
+    Args:
+        diff_base_sha: The merge-base the diff was anchored to.
+        base_tip_sha: The base tip snapshot pinned at dispatch.
+        head_sha: The reviewed head SHA.
+        base_ref: The pinned base branch name. Empty keeps the legacy
+            three-part format for markers that predate the ref key (the two
+            formats never match each other, so a cross-format replay re-posts
+            at most once — the accepted one-time upgrade edge).
+    """
+    identity = f"{diff_base_sha}:{base_tip_sha}:{head_sha}"
+    if base_ref:
+        identity = f"{identity}:{base_ref}"
+    return f"{_ROUND_MARKER_PREFIX}{identity} -->"
+
+# Default runaway-spend safety valve: crossing this many completed review rounds
+# routes the PR to ai:max-iterations instead of looping further.
+MAX_ITERATIONS = 5
+
+# Durable cap on *resultless* dispatch attempts for one PR (a dispatch that died
+# without producing review.json). The comment-based round cap never counts these —
+# a repeatable infrastructure failure posts no comment — so this separate ceiling
+# stops an endlessly failing engine from re-dispatching (and re-spending) forever.
+MAX_DISPATCH_ATTEMPTS = 3
+
+
+def validate_review(obj: object) -> Verdict | None:
+    """Validate a parsed ``review.json`` against the reviewer output schema.
+
+    A defensive re-check of what ``codex exec --output-schema`` should already
+    guarantee: the harvest must never promote a PR to human review on the basis
+    of malformed reviewer output, so anything that does not conform is rejected
+    and the caller applies the conservative ``changes_requested`` default.
+
+    Args:
+        obj: The object parsed from ``review.json`` (any JSON value).
+
+    Returns:
+        The validated verdict string, or ``None`` if ``obj`` does not conform to
+        ``review-schema.json`` (missing/unknown ``verdict``, a missing or
+        non-list ``findings`` array, or a malformed ``findings`` entry).
+    """
+    if not isinstance(obj, dict):
+        return None
+    verdict = obj.get("verdict")
+    if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
+        return None
+    # ``findings`` is required by review-schema.json. A payload missing it (or with
+    # the wrong type) did not come through the schema-constrained reviewer path, so
+    # the promote guard rejects it rather than trust truncated/drifted output.
+    if "findings" not in obj:
+        return None
+    findings = obj.get("findings")
+    if not isinstance(findings, list):
+        return None
+    for finding in findings:  # type: ignore[var-annotated]
+        if not _valid_finding(finding):
+            return None
+    # verdict is one of the literal values by the membership check above.
+    return verdict  # type: ignore[return-value]
+
+
+def count_review_rounds(comments: list[object], marker: str = REVIEW_MARKER) -> int:
+    """Count completed review rounds from a PR's comment history.
+
+    The comment history is the durable authority for the fix-iteration count: it
+    survives worktree loss or recreation, so a cleaned-up worktree cannot silently
+    reset the runaway-spend valve. Each completed review round posts exactly one
+    marker-stamped comment, so the count is the number of comments containing the
+    marker.
+
+    Args:
+        comments: The ``comments`` array from ``gh pr view <N> --json comments``.
+            Each entry is expected to be a mapping with a ``body`` string; missing
+            or non-string bodies are ignored defensively.
+        marker: The fixed header string the reviewer stamps on its comments.
+
+    Returns:
+        The number of marker-stamped review comments.
+    """
+    count = 0
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if isinstance(body, str) and marker in body:
+            count += 1
+    return count
+
+
+def at_max_iterations(rounds: int, threshold: int = MAX_ITERATIONS) -> bool:
+    """Return whether the fix-iteration count has reached the runaway-spend cap.
+
+    Args:
+        rounds: Completed review rounds (from :func:`count_review_rounds`).
+        threshold: The cap; defaults to :data:`MAX_ITERATIONS`.
+
+    Returns:
+        ``True`` if the PR should route to ``ai:max-iterations`` rather than loop.
+    """
+    return rounds >= threshold
+
+
+def base_advanced(pinned_sha: str, current_tip_sha: str) -> bool:
+    """Return whether the PR's base moved since the review was dispatched.
+
+    Reviewing against a stale base is the unattended-loop failure mode: a PR can
+    be declared clean and promoted while its real base has moved underneath it.
+    The dispatch pins ``base_sha``; the harvest resolves the current base tip and
+    calls this. The caller resolves SHAs with git, so this stays a pure equality
+    check — an unresolved (empty) tip is treated as drift, never as safe.
+
+    Args:
+        pinned_sha: The base SHA recorded in ``dispatch.json`` at review dispatch.
+        current_tip_sha: The base ref tip resolved now, at harvest.
+
+    Returns:
+        ``True`` if the review must be discarded and the PR re-dispatched.
+    """
+    if not current_tip_sha:
+        return True
+    return pinned_sha != current_tip_sha
+
+
+def head_advanced(pinned_sha: str, current_sha: str) -> bool:
+    """Return whether the PR head moved since the review was dispatched.
+
+    The base-drift guard (:func:`base_advanced`) is not enough on its own: a PR can
+    be force-pushed or revised externally *while the review runs*, so a clean verdict
+    would otherwise promote a head the reviewer never saw. The dispatch checks out
+    and pins the exact head SHA; the harvest resolves the live head and calls this.
+
+    Args:
+        pinned_sha: The head SHA recorded in ``dispatch.json`` at review dispatch.
+            Empty only in unit tests — a production dispatch always pins the head.
+        current_sha: The PR head resolved now, at harvest.
+
+    Returns:
+        ``True`` if the review must be discarded and the PR re-dispatched. With no
+        pinned head the gate cannot assert drift and returns ``False``; a pinned but
+        now-unresolvable head is treated as drift (never as safe).
+    """
+    if not pinned_sha:
+        return False
+    if not current_sha:
+        return True
+    return pinned_sha != current_sha
+
+
+def has_blocking_findings(findings: list[object]) -> bool:
+    """Return whether any finding is severity ``blocker`` or ``major``.
+
+    The promotion gate relies on this rather than trusting the reviewer's stated
+    ``verdict`` field: ``review-schema.json`` defines ``ready_for_human`` as "no
+    blocker/major issues", but a model can emit a ``ready_for_human`` verdict
+    alongside a blocker finding. Promoting on the verdict alone would ship that
+    contradiction to a human as "clean", so the harvest derives blocker presence
+    from the findings themselves and refuses to promote when any exists.
+
+    Args:
+        findings: The reviewer's ``findings`` array (entries may be malformed).
+
+    Returns:
+        ``True`` if at least one well-formed finding has a blocking severity.
+    """
+    for finding in findings:
+        if isinstance(finding, dict) and finding.get("severity") in ("blocker", "major"):
+            return True
+    return False
+
+
+def review_already_posted(
+    comments: list[object],
+    base_sha: str,
+    head_sha: str,
+    marker: str = REVIEW_MARKER,
+    *,
+    base_tip_sha: str = "",
+    base_ref: str = "",
+) -> bool:
+    """Return whether this exact round's review comment was already posted.
+
+    Makes the harvest replay-safe: if a prior tick posted the review comment but
+    crashed (or hit a GitHub error) before flipping the label, the next tick re-reads
+    the same result and must not post a second comment for the same round — that would
+    inflate the comment-derived iteration count and could trip the cap early. The
+    posted comment embeds a hidden per-round token over the *(diff base, base tip,
+    head, base ref)* identity (see :func:`render_review_comment`), so this is an exact
+    match, not a fuzzy substring scan. Keying on the bases too means a base that
+    advanced under an unchanged head is recognised as a new round rather than
+    suppressed as a replay; keying on the base *name* means a retarget to a branch
+    whose tip is the same commit is recognised as a new round as well.
+
+    Args:
+        comments: The PR's ``comments`` array (``gh pr view --json comments``).
+        base_sha: The diff anchor (merge-base) the round was reviewed against.
+        head_sha: The reviewed head SHA whose comment to look for.
+        marker: The fixed review-comment header; defaults to :data:`REVIEW_MARKER`.
+        base_tip_sha: The base tip snapshot pinned at dispatch. Defaults to
+            ``base_sha`` for markers written before the two-SHA split (where the
+            single pinned base was the tip and the diff anchor at once).
+        base_ref: The base branch name pinned at dispatch. Empty matches only
+            the legacy three-part token format (markers without ``base_ref``).
+
+    Returns:
+        ``True`` if a marker-stamped comment carrying this round's token exists.
+    """
+    if not head_sha:
+        return False
+    token = _round_token(
+        base_sha, base_tip_sha or base_sha, head_sha, base_ref,
+    )
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = comment.get("body")
+        if isinstance(body, str) and marker in body and token in body:
+            return True
+    return False
+
+
+def classify_dispatch(
+    *,
+    now: float,
+    deadline: float,
+    pid_alive: bool,
+    result_exists: bool,
+    state: str = "",
+    envelope_valid: bool = False,
+    failure_envelope_valid: bool = False,
+) -> Literal["complete", "failed", "live", "stale", "hung", "launching"]:
+    """Classify the state of a dispatched engine from its marker and liveness.
+
+    Drives both harvest and stale/hung recovery:
+
+    - ``complete``: a valid completion envelope exists AND the result file is
+      present, proving the wrapper confirmed the engine exited successfully.
+      Both conditions are required: a bare result without an envelope may be
+      partially written, and an envelope without a result file means the result
+      was deleted or never materialised despite the wrapper's claim.
+    - ``failed``: a dispatch-bound failure envelope records a nonzero wrapper exit
+      and invalid result after the reviewer process has died.
+    - ``live``: still running within its deadline — leave it, count as in-flight.
+    - ``stale``: dead with no result (or only a bare result without envelope) —
+      clean up and revert the in-flight label so the next dispatch re-queues it.
+    - ``hung``: still alive but past its deadline — escalate to a human and free
+      the slot so a stuck engine cannot pin the cadence at "busy".
+    - ``launching``: a pre-spawn lease whose real PID was never published (the tick
+      crashed between spawning ``codex`` and rewriting the marker). The liveness of
+      the paid child cannot be proven from a dead/absent PID, so this is reported
+      distinctly — reconciliation fails closed to a human rather than re-dispatching
+      (which would double-spend).
+
+    Args:
+        now: Current epoch seconds.
+        deadline: The ``deadline`` epoch seconds recorded in ``dispatch.json``.
+        pid_alive: Whether the dispatched PID is still running.
+        result_exists: Whether the engine's result file is present.
+        state: The marker's ``state`` field; ``"launching"`` for a pre-spawn lease,
+            empty for a fully published dispatch marker.
+        envelope_valid: Whether a valid completion envelope exists, proving the
+            engine exited with success and the wrapper confirmed the result.
+        failure_envelope_valid: Whether a structurally valid failure envelope is
+            bound to this dispatch.
+
+    Returns:
+        One of ``"complete"``, ``"failed"``, ``"live"``, ``"stale"``, ``"hung"``,
+        or ``"launching"``.
+    """
+    if envelope_valid and result_exists:
+        return "complete"
+    if failure_envelope_valid and not pid_alive:
+        return "failed"
+    if state == "launching":
+        return "launching"
+    if pid_alive:
+        return "hung" if now > deadline else "live"
+    return "stale"
+
+
+def atomic_write(path: str, data: str) -> None:
+    """Write ``data`` to ``path`` atomically via temp-file-then-rename.
+
+    Marker files (``dispatch.json``, ``iter.txt``) are written this way so a tick
+    that fires while a marker is mid-write always reads a complete object — under
+    the tight adaptive cadence the writer and a reader can overlap. The temp file
+    is created in the destination directory so the final ``os.replace`` is a
+    same-filesystem atomic rename.
+
+    Args:
+        path: Destination file path.
+        data: File contents to write.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".swap")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(data)
+        os.replace(tmp, path)
+    except BaseException:
+        # Never leave a half-written temp file behind on failure.
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def render_review_comment(
+    *,
+    verdict: Verdict,
+    findings: list[object],
+    base_sha: str,
+    head_sha: str,
+    base_tip_sha: str = "",
+    base_ref: str = "",
+    marker: str = REVIEW_MARKER,
+) -> str:
+    """Render the PR review comment from the typed verdict and findings.
+
+    The body is stamped with ``marker`` as its first line so
+    :func:`count_review_rounds` can tally this round from the PR's comment
+    history, and embeds the pinned ``base_sha`` (the merge-base the diff was
+    actually anchored to), ``base_tip_sha`` (the base tip snapshot the freshness
+    guard compared), ``head_sha``, and ``base_ref`` (the base branch the review
+    targeted) so the record is self-describing about exactly which commit range
+    was reviewed and against which base. The same identity doubles as a hidden
+    idempotency token (see :func:`review_already_posted`) so a re-run never
+    posts a duplicate, while a re-review against a new base — advanced tip *or*
+    different branch name at the same tip — still posts.
+
+    Args:
+        verdict: The validated verdict the comment reports.
+        findings: The reviewer's ``findings`` array (validated entries; may be
+            empty for a clean review).
+        base_sha: The diff anchor (merge-base) the diff was reviewed against.
+        head_sha: The pinned head SHA that was reviewed (idempotency key).
+        base_tip_sha: The base tip snapshot pinned at dispatch. Defaults to
+            ``base_sha`` for pre-two-SHA callers, where the single pinned base
+            was the tip and the diff anchor at once.
+        base_ref: The base branch name pinned at dispatch. Empty keeps the
+            legacy token format and omits the ref from the audit line.
+        marker: The fixed header string; defaults to :data:`REVIEW_MARKER`.
+
+    Returns:
+        A Markdown comment body suitable for ``gh pr comment``.
+    """
+    tip_sha = base_tip_sha or base_sha
+    headline = (
+        "✅ No blockers — ready for human review."
+        if verdict == VERDICT_READY
+        else "🔧 Changes requested."
+    )
+    ref_note = f"base `{base_ref}`, " if base_ref else ""
+    lines = [
+        marker,
+        _round_token(base_sha, tip_sha, head_sha, base_ref),
+        "",
+        (
+            f"**Codex review** ({ref_note}diff base `{base_sha}`, "
+            f"base tip `{tip_sha}`, head `{head_sha}`)"
+        ),
+        "",
+        headline,
+    ]
+    if findings:
+        lines.append("")
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            severity = finding.get("severity", "minor")
+            file = finding.get("file", "?")
+            summary = finding.get("summary", "")
+            lines.append(f"- **{severity}** `{file}` — {summary}")
+    return "\n".join(lines)
+
+
+def decide_review_harvest(
+    *,
+    review_obj: object,
+    comments: list[object],
+    pinned_base: str,
+    current_base: str,
+    pinned_head: str = "",
+    current_head: str = "",
+    pre_label: str = LABEL_IMPLEMENTED,
+    threshold: int = MAX_ITERATIONS,
+    diff_base_sha: str = "",
+    pinned_base_ref: str = "",
+    current_base_ref: str = "",
+) -> dict[str, object]:
+    """Decide the full outcome of harvesting one finished review.
+
+    Composes the review-stage primitives into the single decision the tick acts
+    on, so the skill never re-derives this branching in bash. Order matters:
+    a PR retargeted to a different base, or a base *or* head that drifted
+    under the review, invalidates the verdict entirely, so retarget and drift
+    are checked first and short-circuit to a discard-and-re-dispatch.
+
+    The promote gate is the conjunction of the reviewer's verdict *and* the
+    findings: it promotes only when the verdict is ``ready_for_human`` **and** no
+    blocker/major finding is present, so a contradictory ``ready_for_human``+
+    blocker payload is routed to changes rather than shipped to a human as clean.
+
+    The decision is idempotent: if the comment for this exact head was already
+    posted by an interrupted earlier attempt, ``post_comment`` is ``False`` and the
+    already-counted round is not double-counted against the iteration cap, so a
+    replay only re-applies the label.
+
+    Args:
+        review_obj: The parsed ``review.json`` contents (any JSON value).
+        comments: The PR's ``comments`` array (iteration-count authority).
+        pinned_base: The base tip snapshot recorded at dispatch in
+            ``dispatch.json`` (``base_tip_sha``; older markers pinned only the
+            tip-valued ``base_sha``). Compared against ``current_base`` for
+            drift.
+        current_base: The base ref tip resolved now, at harvest.
+        pinned_head: The head SHA recorded at dispatch (reviewed commit).
+        current_head: The PR head resolved now, at harvest.
+        pre_label: The PR's label *before* this review was dispatched
+            (``ai:implemented`` or ``ai:revised``). A discard reverts to it so an
+            ``ai:revised`` PR is not silently downgraded to ``ai:implemented``.
+        threshold: Runaway-spend cap; defaults to :data:`MAX_ITERATIONS`.
+        diff_base_sha: The merge-base recorded at dispatch — the anchor the
+            reviewer's diff actually ran from. Embedded in the audit
+            comment/idempotency token as the true diff base. Defaults to
+            ``pinned_base`` for markers that predate the two-SHA split.
+        pinned_base_ref: The base branch *name* recorded at dispatch
+            (``dispatch.json`` ``base_ref``). Compared against
+            ``current_base_ref`` for retargeting (empty disables the check)
+            and embedded in the comment/replay token, so a round reviewed
+            under a different base name never suppresses this round's post
+            even when every SHA matches.
+        current_base_ref: The PR's live base branch name point-read at
+            harvest; empty disables the check.
+
+    Returns:
+        A decision mapping with keys: ``action`` (``"promote"`` |
+        ``"request_changes"`` | ``"max_iterations"`` | ``"discard"`` |
+        ``"escalate"`` for an unusable/contradictory payload),
+        ``label`` (the label to set), ``sentinel``, ``verdict`` (validated, may
+        be ``None``), ``base_retarget`` (bool), ``base_drift`` (bool),
+        ``head_drift`` (bool), ``rounds`` (prior recorded rounds),
+        ``post_comment`` (bool), and ``comment_body`` (str, empty when not
+        posting).
+    """
+    rounds = count_review_rounds(comments)
+    verdict = validate_review(review_obj)
+
+    # A retargeted PR invalidates the review outright: the diff was anchored
+    # to the old base, and the SHA drift checks below cannot see the change —
+    # the old ref's tip and the head can both be unchanged while the PR now
+    # merges into a different branch. Checked before drift because the old
+    # ref may no longer resolve (e.g. deleted after its own merge), leaving
+    # ``current_base`` empty.
+    base_retarget = (
+        bool(pinned_base_ref)
+        and bool(current_base_ref)
+        and pinned_base_ref != current_base_ref
+    )
+    if base_retarget:
+        return {
+            "action": "discard",
+            "label": pre_label,
+            "sentinel": SENTINEL_BLOCKERS,
+            "verdict": verdict,
+            "base_retarget": True,
+            "base_drift": False,
+            "head_drift": False,
+            "rounds": rounds,
+            "post_comment": False,
+            "comment_body": "",
+        }
+
+    base_drift = base_advanced(pinned_base, current_base)
+    head_drift = head_advanced(pinned_head, current_head)
+    if base_drift or head_drift:
+        return {
+            "action": "discard",
+            "label": pre_label,
+            "sentinel": SENTINEL_BLOCKERS,
+            "verdict": verdict,
+            "base_retarget": False,
+            "base_drift": base_drift,
+            "head_drift": head_drift,
+            "rounds": rounds,
+            "post_comment": False,
+            "comment_body": "",
+        }
+
+    findings_raw = review_obj.get("findings", []) if isinstance(review_obj, dict) else []
+    findings = findings_raw if isinstance(findings_raw, list) else []
+
+    # Escalate unusable payloads instead of feeding them to the paid fix loop:
+    #   * verdict is None — the reviewer output did not validate against the schema
+    #     (infra/output failure); routing it to changes_requested would post an
+    #     empty review and spend further rounds on nothing.
+    #   * changes_requested with NO blocker/major finding — contradicts the repo rule
+    #     that nits alone do not warrant changes, and would dispatch a fixer with no
+    #     actionable finding. (The opposite contradiction — ready_for_human WITH a
+    #     blocker — is safely downgraded to changes below, not escalated.)
+    blocking = has_blocking_findings(findings)
+    if verdict is None or (verdict == VERDICT_CHANGES and not blocking):
+        return {
+            "action": "escalate",
+            "label": LABEL_NEEDS_HUMAN,
+            "sentinel": SENTINEL_BLOCKERS,
+            "verdict": verdict,
+            "base_retarget": False,
+            "base_drift": False,
+            "head_drift": False,
+            "rounds": rounds,
+            "post_comment": False,
+            "comment_body": "",
+        }
+
+    # Promote only when the verdict AND the findings agree there is nothing
+    # blocking — never on the stated verdict alone (finding: contradictory output).
+    promote = verdict == VERDICT_READY and not blocking
+    render_verdict: Verdict = VERDICT_READY if promote else VERDICT_CHANGES
+    # Audit truth: the comment/token carry the diff anchor the review actually
+    # ran from (merge-base) plus the pinned freshness snapshot — not the
+    # harvest-time tip masquerading as "the reviewed range". The no-drift check
+    # above guarantees pinned_base == current_base here, so pinning is not a
+    # semantic change for the drift guard, only for the record's honesty.
+    diff_base = diff_base_sha or pinned_base
+    comment_body = render_review_comment(
+        verdict=render_verdict,
+        findings=findings,
+        base_sha=diff_base,
+        base_tip_sha=pinned_base,
+        head_sha=pinned_head,
+        base_ref=pinned_base_ref,
+    )
+
+    # Idempotency: a comment already posted for this round means it is already
+    # reflected in ``rounds`` — do not re-post it or double-count it. The
+    # lookup keys on the pinned base *ref* as well as the SHAs: a comment from
+    # a pre-retarget round can carry the identical SHA triple (old and new
+    # base branches pointing at the same commit) and must not suppress this
+    # round's comment — the posted comment is the next fixer's handoff.
+    already_posted = review_already_posted(
+        comments, diff_base, pinned_head,
+        base_tip_sha=pinned_base, base_ref=pinned_base_ref,
+    )
+    rounds_after = rounds if already_posted else rounds + 1
+
+    if promote:
+        action = "promote"
+        label, sentinel = LABEL_READY_FOR_HUMAN, SENTINEL_NO_BLOCKERS
+    elif at_max_iterations(rounds_after, threshold):
+        # This changes-requested round hits the cap; stop the fix loop instead of
+        # dispatching another fixer.
+        action = "max_iterations"
+        label, sentinel = LABEL_MAX_ITERATIONS, SENTINEL_BLOCKERS
+    else:
+        action = "request_changes"
+        label, sentinel = LABEL_CHANGES_REQUESTED, SENTINEL_BLOCKERS
+
+    return {
+        "action": action,
+        "label": label,
+        "sentinel": sentinel,
+        "verdict": verdict,
+        "base_retarget": False,
+        "base_drift": False,
+        "head_drift": False,
+        "rounds": rounds,
+        "post_comment": not already_posted,
+        "comment_body": comment_body,
+    }
+
+
+def read_operator_config() -> dict[str, object]:
+    """Return the operator's ``config.toml``, or an empty mapping.
+
+    Read at call time rather than import time so a config change takes effect on
+    the next tick without a redeploy. A missing file or malformed TOML
+    (including invalid UTF-8, which ``tomllib`` surfaces as
+    ``UnicodeDecodeError``) reads as empty, which every caller must treat as the
+    conservative case — the gates built on this fail closed, and the startup
+    probe refuses to run a tick with no target configured.
+
+    Returns:
+        The parsed config, or ``{}`` when it is absent or unreadable.
+    """
+    try:
+        with open(_POLICY_CONFIG_PATH, "rb") as fh:
+            config = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def _config_section(name: str) -> dict[str, object]:
+    """Return one top-level table from the operator config.
+
+    Args:
+        name: The table name (``policy``, ``target``, ``engine``).
+
+    Returns:
+        The table, or ``{}`` when it is absent or not a table.
+    """
+    section = read_operator_config().get(name)
+    return section if isinstance(section, dict) else {}
+
+
+def config_string(section: str, key: str) -> str:
+    """Return a stripped string setting, or ``""`` when unusable.
+
+    A valid-but-wrong-shape value (number, list, table) reads as absent rather
+    than raising, so a typo in the operator's config surfaces as the
+    unconfigured case — which the caller fails closed on — instead of a
+    tick-level exception.
+
+    Args:
+        section: The table name.
+        key: The key within that table.
+
+    Returns:
+        The configured string, or ``""``.
+    """
+    value = _config_section(section).get(key)
+    return value.strip() if isinstance(value, str) else ""
+
+
+def config_string_list(section: str, key: str) -> tuple[str, ...]:
+    """Return a list-of-strings setting, dropping unusable entries.
+
+    Args:
+        section: The table name.
+        key: The key within that table.
+
+    Returns:
+        The configured entries, stripped and with blanks and non-strings
+        dropped. ``()`` when the key is absent or is not a list.
+    """
+    value = _config_section(section).get(key)
+    if not isinstance(value, list):
+        return ()
+    return tuple(
+        entry.strip() for entry in value
+        if isinstance(entry, str) and entry.strip()
+    )
+
+
+def _reviewer_checklist_paths() -> tuple[str, ...]:
+    """Return the target repo's reviewer-governing checklist paths.
+
+    Repo-relative paths declared by the operator under ``[policy]
+    checklist_paths``. Empty is the correct default: ``CLAUDE.md`` and
+    ``AGENTS.md`` are matched by basename regardless, so a repo with no extra
+    checklists needs no configuration and gets no dead entries.
+
+    Returns:
+        The configured paths, or ``()``.
+    """
+    return config_string_list("policy", "checklist_paths")
+
+
+def _policy_touching_allowed() -> bool:
+    """Return whether the operator has opted out of the reviewer-policy gate.
+
+    Reads ``allow_touching`` from the ``[policy]`` section. Anything other than
+    an explicit ``true`` — a missing file, malformed TOML, a wrong-shaped value
+    — keeps the conservative gate, so failures fail closed.
+
+    Returns:
+        ``True`` only when the operator's config explicitly allows PRs that
+        edit reviewer-governing files to be auto-reviewed.
+    """
+    return _config_section("policy").get("allow_touching") is True
+
+
+def _ends_with_policy_suffix(path: str) -> bool:
+    """Return whether ``path`` ends in one of the pipeline's own gate files.
+
+    Compares whole path segments so the match cannot straddle a segment
+    boundary: ``other-skills/pr-pipeline-tick/config.toml`` is not a hit, while
+    ``.claude/skills/...``, ``skills/...`` and any plugin prefix all are.
+
+    Args:
+        path: A repo-relative path from ``git diff --name-only``.
+
+    Returns:
+        ``True`` when the path's trailing segments match a suffix in
+        :data:`_POLICY_PATH_SUFFIXES`.
+    """
+    segments = tuple(path.split("/"))
+    return any(segments[-len(s):] == s for s in _POLICY_PATH_SUFFIXES)
+
+
+def touches_review_policy(changed_paths: list[str]) -> bool:
+    """Return whether a diff modifies any file that governs the reviewer.
+
+    The reviewer runs inside the candidate's checked-out worktree and is told to
+    apply ``CLAUDE.md``/``AGENTS.md`` and the target's own review checklists. A
+    PR that edits any of those steers the very reviewer that decides its own promotion —
+    an untrusted-input-controls-the-validator inversion. The dispatch consults
+    this and routes such PRs to a human instead of auto-reviewing them under
+    instructions the PR itself supplies. Files are matched at any directory level
+    because codex loads the nearest governing file up the tree.
+
+    The pipeline's own gate files (``config.toml``, ``pipeline.py``, ``tick.py``)
+    match by path suffix instead, so the self-protection holds at every install
+    depth rather than only where the skills were incubated.
+
+    The operator may opt out via ``config.toml`` ``[policy] allow_touching``
+    (see :func:`_policy_touching_allowed`) when they accept that the review
+    runs under instructions the PR itself supplies.
+
+    Args:
+        changed_paths: Repo-relative paths from ``git diff --name-only`` (blank
+            lines are ignored).
+
+    Returns:
+        ``True`` if any changed path is a reviewer-governing policy file,
+        unless the operator's config explicitly opts out.
+    """
+    if _policy_touching_allowed():
+        return False
+    # Read once: a diff can carry thousands of paths, and each read re-parses
+    # the whole config file.
+    checklist_paths = _reviewer_checklist_paths()
+    for path in changed_paths:
+        path = path.strip()
+        if not path:
+            continue
+        if os.path.basename(path) in _POLICY_BASENAMES:
+            return True
+        if path in checklist_paths:
+            return True
+        if _ends_with_policy_suffix(path):
+            return True
+    return False
+
+
+def _parse_result_sentinel(obj: object, sentinels: tuple[str, ...]) -> str | None:
+    """Extract the last matching sentinel from a ``claude -p`` result.
+
+    Shared parser for both implementer and fixer: each engine emits a literal
+    sentinel token in the ``result`` field of ``result.json``. When multiple
+    sentinels appear (e.g. the model changed its mind mid-run), the *last* one
+    wins — it reflects the final state.
+
+    Args:
+        obj: The parsed ``result.json`` contents (any JSON value).
+        sentinels: The recognised sentinel tokens to search for.
+
+    Returns:
+        The sentinel string, or ``None`` if ``obj`` is not a valid result or
+        contains no recognised sentinel.
+    """
+    if not isinstance(obj, dict):
+        return None
+    result_text = obj.get("result")
+    if not isinstance(result_text, str):
+        return None
+    last_sentinel: str | None = None
+    last_pos = -1
+    for sentinel in sentinels:
+        pos = result_text.rfind(sentinel)
+        if pos > last_pos:
+            last_pos = pos
+            last_sentinel = sentinel
+    return last_sentinel
+
+
+def parse_implementation_result(obj: object) -> str | None:
+    """Extract the implementer sentinel from a ``claude -p --output-format json`` result.
+
+    The implementer's ``result.json`` is the JSON output of ``claude -p``. The
+    ``result`` field contains the model's text output, which must end with one of
+    the sentinel tokens (``IMPLEMENTATION_COMPLETE`` or ``NEEDS_HUMAN_DECISION``).
+    When both appear (e.g. the model changed its mind mid-run), the *last* one wins
+    — it reflects the final state.
+
+    Args:
+        obj: The parsed ``result.json`` contents (any JSON value).
+
+    Returns:
+        The sentinel string, or ``None`` if ``obj`` is not a valid result or
+        contains no recognised sentinel.
+    """
+    return _parse_result_sentinel(obj, _IMPLEMENTATION_SENTINELS)
+
+
+def parse_fix_result(obj: object) -> str | None:
+    """Extract the fixer sentinel from a ``claude -p --output-format json`` result.
+
+    The fixer's ``result.json`` uses ``FIXES_PUSHED_RECHECK_NEEDED`` (code
+    committed and pushed, ready for re-review) or ``NEEDS_HUMAN_DECISION``
+    (blocked on a finding that is out of scope). Mirrors
+    :func:`parse_implementation_result` with the fixer sentinel set.
+
+    Args:
+        obj: The parsed ``result.json`` contents (any JSON value).
+
+    Returns:
+        The sentinel string, or ``None`` if ``obj`` is not a valid result or
+        contains no recognised sentinel.
+    """
+    return _parse_result_sentinel(obj, _FIXER_SENTINELS)
+
+
+def held_completion_outcome(stage: str, result_obj: object) -> str:
+    """Return the validated engine outcome completed under a human hold.
+
+    Args:
+        stage: Pipeline stage that produced the result.
+        result_obj: Parsed stage result payload.
+
+    Returns:
+        The stage's validated verdict or sentinel, or
+        :data:`OUTCOME_UNRECOGNIZED` when the payload is malformed or has no
+        recognized outcome.
+
+    Raises:
+        ValueError: If ``stage`` is not a known pipeline stage.
+    """
+    if stage == "review":
+        outcome = validate_review(result_obj)
+    elif stage == "implement":
+        outcome = parse_implementation_result(result_obj)
+    elif stage == "fix":
+        outcome = parse_fix_result(result_obj)
+    else:
+        raise ValueError(f"unknown pipeline stage: {stage}")
+    return outcome or OUTCOME_UNRECOGNIZED
+
+
+def classify_engine_result_failure(result_obj: object) -> str | None:
+    """Classify a transient provider failure in an engine result.
+
+    Args:
+        result_obj: Parsed ``claude -p --output-format json`` result.
+
+    Returns:
+        ``"quota_or_limit"`` for a recognized quota/session-limit result,
+        otherwise ``None``.
+    """
+    if not isinstance(result_obj, dict):
+        return None
+    api_error_status = result_obj.get("api_error_status")
+    if not isinstance(api_error_status, bool) and api_error_status == 429:
+        return "quota_or_limit"
+    subtype = result_obj.get("subtype")
+    if isinstance(subtype, str) and subtype.casefold() in {
+        "quota_exceeded",
+        "rate_limit_error",
+        "usage_limit_error",
+    }:
+        return "quota_or_limit"
+    result_text = result_obj.get("result")
+    if not isinstance(result_text, str):
+        return None
+    normalized = result_text.casefold().replace("’", "'")
+    if any(
+        phrase in normalized
+        for phrase in (
+            "you've hit your session limit",
+            "quota exceeded",
+            "usage limit reached",
+            "rate limit exceeded",
+        )
+    ):
+        return "quota_or_limit"
+    return None
+
+
+def _transient_engine_result_decision(
+    result_obj: object,
+    pre_label: str,
+) -> dict[str, object] | None:
+    """Return the shared implementer/fixer retry decision when transient."""
+    failure_class = classify_engine_result_failure(result_obj)
+    if failure_class is None:
+        return None
+    return {
+        "action": "retry",
+        "sentinel": None,
+        "label": pre_label,
+        "failure_class": failure_class,
+    }
+
+
+def decide_implementation_harvest(
+    *,
+    result_obj: object,
+    pre_label: str,
+) -> dict[str, object]:
+    """Decide the outcome of a finished implementer engine.
+
+    The implementer emits a sentinel token literally in ``result.json``. The
+    harvest parses it and decides: ``create_pr`` (code committed and pushed,
+    ready for PR creation) or ``escalate`` (blocked, missing sentinel, or
+    unparseable output). Unlike the review harvest, there is no drift guard or
+    iteration cap — the implementer runs once against a fresh branch.
+
+    Args:
+        result_obj: The parsed ``result.json`` contents (any JSON value).
+        pre_label: The issue's label before dispatch (``ai:available``); used
+            for the escalation label revert target (informational, not acted on
+            directly since escalation always goes to ``ai:needs-human-decision``).
+
+    Returns:
+        A decision mapping with keys: ``action`` (``"create_pr"`` |
+        ``"escalate"``), ``label`` (the label to set on escalation, empty for
+        ``create_pr`` since the PR is created fresh), and ``sentinel`` (the
+        extracted sentinel string, or ``None``).
+    """
+    sentinel = parse_implementation_result(result_obj)
+    if sentinel == SENTINEL_IMPL_COMPLETE:
+        return {"action": "create_pr", "sentinel": sentinel, "label": ""}
+    if sentinel is None:
+        transient = _transient_engine_result_decision(result_obj, pre_label)
+        if transient is not None:
+            return transient
+    return {
+        "action": "escalate",
+        "sentinel": sentinel,
+        "label": LABEL_NEEDS_HUMAN,
+    }
+
+
+def _sanitize_engine_report(value: object) -> str:
+    """Return a bounded, comment-safe excerpt of engine-authored result text.
+
+    The excerpt is unbounded model output embedded in a shared record, so three
+    substrings are neutralised beyond the length bound. HTML comment delimiters
+    go first: the pipeline's round-counting and idempotency markers *are* HTML
+    comments, and a fixer that quotes a reviewer comment back at us would
+    otherwise smuggle a :data:`REVIEW_MARKER` into the body and inflate the
+    iteration count (``count_review_rounds`` matches the raw substring, so
+    fencing the payload does not help). The fence delimiter and the closing
+    ``</details>`` tag go next, because an unbalanced one in the payload would
+    let the remainder of the report escape the block it is rendered in.
+
+    Args:
+        value: The engine's ``result`` field (any JSON value; non-strings yield
+            an empty excerpt).
+
+    Returns:
+        The sanitised excerpt, truncated with an ellipsis marker, or ``""``.
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if len(text) > _FIX_REPORT_LIMIT:
+        text = f"{text[:_FIX_REPORT_LIMIT]}\n… (truncated)"
+    return _neutralize_comment_markup(text)
+
+
+def _neutralize_comment_markup(text: str) -> str:
+    """Return ``text`` with the delimiters a comment body reserves defanged.
+
+    Applies to any span of a published body that the controller did not author
+    in full. HTML comment delimiters go first: the pipeline's round-counting and
+    idempotency markers *are* HTML comments, and ``count_review_rounds`` matches
+    the raw substring, so a smuggled :data:`REVIEW_MARKER` inflates the
+    iteration count no matter how the payload is fenced. The fence delimiter and
+    the closing ``</details>`` tag go next, because an unbalanced one lets the
+    remainder of the span escape the block it is rendered in.
+
+    Args:
+        text: The untrusted span.
+
+    Returns:
+        The span with those four delimiters broken.
+    """
+    return (
+        text.replace("<!--", "<!- -")
+        .replace("-->", "- ->")
+        .replace("```", "` ` `")
+        .replace("</details>", "< /details>")
+    )
+
+
+# What the PR comment says about the fixer's replacement PR body, keyed by the
+# state the harvest reached. Every rejection states its reason: the body is the
+# handoff the next reviewer reads first, and "the pipeline left it alone" with no
+# cause is indistinguishable from "the pipeline never looked". A state with no
+# entry here — including the empty state, meaning the fixer offered no
+# replacement — renders no line at all, so the common run keeps its old comment.
+_BODY_REVISION_NOTES = {
+    "ready": "replaced with the fixer's revision",
+    "not-applied": (
+        "left unchanged — the fixer offered a revision, but this run did not "
+        "reach re-review"
+    ),
+    "conflict": "left unchanged — it was edited while the fixer ran",
+    "invalid": (
+        "left unchanged — the fixer's revision did not satisfy the required "
+        "PR body sections"
+    ),
+    "unreadable": (
+        "left unchanged — the fixer's revision file could not be read"
+    ),
+    "oversized": (
+        "left unchanged — the fixer's revision is longer than GitHub accepts"
+    ),
+    "unstamped": (
+        "left unchanged — the revision file did not carry this run's marker "
+        "lines"
+    ),
+    "unavailable": (
+        "left unchanged — the body this run was dispatched against could not "
+        "be pinned"
+    ),
+    "truncated": (
+        "left unchanged — the fixer was shown only part of it, so a full "
+        "replacement could drop what it never saw"
+    ),
+    "stale-head": (
+        "left unchanged — the fixer's revision names a commit other than the "
+        "head it pushed"
+    ),
+    "closure-drift": (
+        "left unchanged — the fixer's revision changes which issues merging "
+        "this PR closes"
+    ),
+}
+
+# The subset a caller may supply: the states ``tick._fixer_body_revision``
+# actually returns. ``not-applied`` is excluded because it is derived here, from
+# a ``ready`` revision on a non-``recheck`` outcome — accepting it as an input
+# would let a caller render "this run did not reach re-review" onto a recheck
+# comment, a sentence the tick itself can never produce.
+_BODY_REVISION_INPUTS = tuple(
+    sorted(state for state in _BODY_REVISION_NOTES if state != "not-applied")
+)
+
+
+def render_fix_comment(
+    *,
+    action: str,
+    label: str,
+    sentinel: str | None,
+    pinned_head: str = "",
+    current_head: str = "",
+    escalation_reason: str = "",
+    engine_report: str = "",
+    body_revision: str = "",
+    marker: str = FIX_MARKER,
+) -> str:
+    """Render the PR comment recording one finished fixer run.
+
+    A PR is the shared record. Without this comment a reviewer landing on the PR
+    after a fixer run sees new commits and a changed label with no stated
+    reason, and an ``ai:needs-human-decision`` escalation tells an operator a
+    decision is required without saying what it is. The body therefore states
+    the classification, the head SHA before and after the run, what the engine
+    reported, and the resulting label — everything needed to audit the run from
+    GitHub alone.
+
+    Args:
+        action: The harvest classification (``"recheck"`` or ``"escalate"``).
+        label: The label the harvest is about to set.
+        sentinel: The extracted completion sentinel, or ``None`` when the engine
+            emitted none.
+        pinned_head: The PR head SHA recorded at fixer dispatch. Empty renders
+            as ``unknown`` (markers that predate head pinning).
+        current_head: The PR's live head SHA at harvest. Empty renders as
+            ``unknown``.
+        escalation_reason: Why the run escalated; required for ``escalate`` and
+            ignored otherwise.
+        engine_report: Already-sanitised engine result text (see
+            :func:`_sanitize_engine_report`). Empty omits the section.
+        body_revision: The outcome of the fixer's replacement PR body, keyed
+            into :data:`_BODY_REVISION_NOTES`. Empty (the common run, where the
+            fixer offered none) omits the line.
+        marker: The fixed header string; defaults to :data:`FIX_MARKER`.
+
+    Returns:
+        A Markdown comment body suitable for ``gh pr comment``.
+    """
+    headline = (
+        "🔧 Fixes pushed — re-review requested."
+        if action == "recheck"
+        else "🚨 Escalated for a human decision."
+    )
+    before = pinned_head or "unknown"
+    after = current_head or "unknown"
+    lines = [
+        marker,
+        "",
+        f"**Fixer run** (head `{before}` → `{after}`)",
+        "",
+        headline,
+        "",
+        f"- Outcome: `{action}` → `{label}`",
+        f"- Engine sentinel: {f'`{sentinel}`' if sentinel else '_none emitted_'}",
+    ]
+    if action == "escalate" and escalation_reason:
+        lines.append(f"- Escalation reason: {escalation_reason}")
+    body_note = _BODY_REVISION_NOTES.get(body_revision)
+    if body_note:
+        lines.append(f"- PR body: {body_note}")
+    if sentinel and engine_report.strip() == sentinel:
+        # The engine emitted its completion sentinel and nothing else. That is a
+        # protocol-valid result even though the fixer prompt asks for a change
+        # summary, so the comment has to stay honest: republishing the token
+        # under an "Engine report" heading would read as an answer to "what was
+        # fixed" when no such answer exists. Name the gap and point at the range
+        # a reader can diff instead.
+        lines.append(
+            "- Engine report: _the engine emitted no change summary — "
+            f"review `{before}..{after}` for what was fixed_",
+        )
+    elif engine_report:
+        lines.extend([
+            "",
+            "<details><summary>Engine report</summary>",
+            "",
+            "```",
+            engine_report,
+            "```",
+            "",
+            "</details>",
+        ])
+    return "\n".join(lines)
+
+
+def render_cap_escalation_comment(
+    *,
+    stage: str,
+    failures: int,
+    marker: str = ESCALATION_MARKER,
+) -> str:
+    """Render the comment recording an attempt-cap escalation.
+
+    A harvest whose GitHub side effect keeps failing is forced to
+    ``ai:needs-human-decision`` so it stops pinning an admission slot. That
+    transition is remote-visible and must explain itself, and it must say so
+    loudly: the run's own comment (posted before the side effect failed) states
+    the outcome the harvest *wanted*, which is not the label the item ends up
+    wearing. Without this note the PR carries a comment that contradicts its
+    own label.
+
+    Args:
+        stage: The harvest stage (``"fix"``, ``"review"``, ``"implement"``).
+        failures: How many consecutive failed harvests this escalation is
+            reporting, counting the one that tripped the cap. The durable
+            counter is compared against :data:`MAX_DISPATCH_ATTEMPTS` *before*
+            it is incremented, so the escalating harvest is the
+            ``MAX_DISPATCH_ATTEMPTS + 1``-th failure — printing the cap
+            constant here would understate the count by one.
+        marker: The fixed header string; defaults to :data:`ESCALATION_MARKER`.
+
+    Returns:
+        A Markdown comment body suitable for ``gh pr comment``.
+    """
+    return "\n".join([
+        marker,
+        "",
+        f"**Pipeline escalation** (`{stage}` harvest)",
+        "",
+        "🚨 A required GitHub side effect for this run failed "
+        f"{failures} times in a row, so the item is being handed to a human "
+        f"rather than left holding an admission slot.",
+        "",
+        f"- Outcome: `attempt-cap` → `{LABEL_NEEDS_HUMAN}`",
+        f"- Attempts: {failures} (cap reached)",
+        "",
+        "This **supersedes** any earlier comment from this run: that comment "
+        "records the outcome the harvest computed, not the label the item now "
+        "carries. The engine's own output is retained in the operator's local "
+        "harvest-evidence archive.",
+    ])
+
+
+OUTCOME_TRANSIENT_EXHAUSTED = "transient-exhausted"
+OUTCOME_ATTEMPT_STATE_ERROR = "attempt-state-error"
+
+# Why each transient-path terminal transition happened, in operator-facing
+# prose. Keyed by the outcome slug printed in the comment so the label, the
+# slug, and the explanation can never drift apart.
+_TRANSIENT_ESCALATION_CAUSES = {
+    OUTCOME_TRANSIENT_EXHAUSTED: (
+        "The engine returned a transient failure on every attempt of its retry "
+        "budget, so this stage cannot make progress on its own."
+    ),
+    OUTCOME_ATTEMPT_STATE_ERROR: (
+        "The durable attempt counter could not be written, so the retry budget "
+        "cannot be tracked and further retries would be unbounded."
+    ),
+}
+
+
+def render_held_completion_comment(
+    *,
+    stage: str,
+    outcome: str,
+    marker: str = ESCALATION_MARKER,
+) -> str:
+    """Render the publication required before releasing a held completion.
+
+    Args:
+        stage: Pipeline stage whose engine completed.
+        outcome: Validated stage verdict or sentinel returned by
+            :func:`held_completion_outcome`.
+        marker: The fixed escalation header.
+
+    Returns:
+        A Markdown comment naming the unharvested engine outcome.
+
+    Raises:
+        ValueError: If the stage or outcome is not part of the held-completion
+            protocol.
+    """
+    if outcome not in _HELD_COMPLETION_OUTCOMES.get(stage, frozenset()):
+        raise ValueError(
+            f"unknown held completion outcome for {stage}: {outcome}"
+        )
+    return "\n".join([
+        marker,
+        "",
+        f"**Pipeline escalation** (`{stage}` reconciliation)",
+        "",
+        "🚨 A workflow hold was observed while the engine was running. The "
+        "workflow hold remains authoritative, so the completed result is not "
+        "being harvested.",
+        "",
+        f"- Engine outcome: `{outcome}`",
+        "",
+        "The engine's output is retained in the operator's local "
+        "harvest-evidence archive.",
+    ])
+
+
+def render_transient_escalation_comment(
+    *,
+    stage: str,
+    outcome: str,
+    failure_class: str,
+    attempts: int | None = None,
+    evidence_archived: bool = False,
+    marker: str = ESCALATION_MARKER,
+) -> str:
+    """Render the comment recording a transient-path escalation.
+
+    The transient retry path ends at ``ai:needs-human-decision`` in two ways:
+    the engine keeps failing transiently until the retry budget is spent, or the
+    counter that bounds that budget cannot be persisted. Both are remote-visible
+    terminal transitions, so both must explain themselves — a label that turns
+    red because of a quota outage looks identical to one that turned red because
+    the work was rejected.
+
+    Args:
+        stage: The harvest stage (``"fix"``, ``"review"``, ``"implement"``).
+        outcome: :data:`OUTCOME_TRANSIENT_EXHAUSTED` or
+            :data:`OUTCOME_ATTEMPT_STATE_ERROR`.
+        failure_class: The engine failure classification that drove the retries.
+        attempts: The attempt number this escalation ends on, when the retry
+            budget was being tracked; ``None`` when it could not be.
+        evidence_archived: Whether the run's engine output was archived locally.
+            Only the exhaustion path archives, so the pointer is conditional
+            rather than a standing promise.
+        marker: The fixed header string; defaults to :data:`ESCALATION_MARKER`.
+
+    Returns:
+        A Markdown comment body suitable for ``gh pr comment``.
+
+    Raises:
+        ValueError: If ``outcome`` is not a known transient escalation outcome.
+    """
+    cause = _TRANSIENT_ESCALATION_CAUSES.get(outcome)
+    if cause is None:
+        raise ValueError(f"unknown transient escalation outcome: {outcome}")
+    lines = [
+        marker,
+        "",
+        f"**Pipeline escalation** (`{stage}` harvest)",
+        "",
+        f"🚨 {cause} It is being handed to a human rather than left holding an "
+        "admission slot.",
+        "",
+        f"- Outcome: `{outcome}` → `{LABEL_NEEDS_HUMAN}`",
+        f"- Engine failure class: `{failure_class}`",
+    ]
+    if attempts is not None:
+        lines.append(f"- Attempts: {attempts} (budget exhausted)")
+    if evidence_archived:
+        lines.extend([
+            "",
+            "The engine's own output is retained in the operator's local "
+            "harvest-evidence archive.",
+        ])
+    return "\n".join(lines)
+
+
+OUTCOME_DISPATCH_SETUP_FAILED = "dispatch-setup-failed"
+OUTCOME_AMBIGUOUS_MARKER = "ambiguous-marker"
+OUTCOME_REVIEW_POLICY_TOUCHED = "review-policy-touched"
+
+# Why each dispatch-side terminal transition happened, in operator-facing prose.
+# Keyed by the outcome slug printed in the comment, for the same reason as
+# :data:`_TRANSIENT_ESCALATION_CAUSES`: the label, the slug, and the explanation
+# cannot drift apart if they are written once.
+#
+# Each cause states what an operator would otherwise have to infer from an
+# absence — whether any engine ran, and whether anything was kept — because none
+# of these paths leaves an evidence bundle to point at.
+_DISPATCH_ESCALATION_CAUSES = {
+    OUTCOME_DISPATCH_SETUP_FAILED: (
+        "Dispatch setup failed before any engine was launched, so no work was "
+        "performed and no engine output exists. The scratch directory is "
+        "removed rather than archived."
+    ),
+    OUTCOME_AMBIGUOUS_MARKER: (
+        "A dispatch marker was found that this tick could not prove safe to "
+        "clear, so it cannot tell whether an engine still owns the item. No new "
+        "engine was launched, and the scratch directory is retained locally for "
+        "inspection."
+    ),
+    OUTCOME_REVIEW_POLICY_TOUCHED: (
+        "This PR changes files that govern the reviewer's own instructions, so "
+        "it is not auto-reviewed: the review would run under instructions the "
+        "PR itself supplies. Nothing is wrong with the PR — it needs a human "
+        "reviewer."
+    ),
+}
+
+
+def render_dispatch_escalation_comment(
+    *,
+    stage: str,
+    outcome: str,
+    reason: str,
+    engine: str = "",
+    marker: str = ESCALATION_MARKER,
+) -> str:
+    """Render the comment recording a dispatch-side escalation.
+
+    DISPATCH escalates to ``ai:needs-human-decision`` before it launches
+    anything: setup broke, an existing marker leaves custody ambiguous, or the
+    PR is one the reviewer may not judge. All are remote-visible terminal
+    transitions with *no* engine result behind them — the setup path deletes its
+    scratch, and none of them writes a ``.harvest-evidence/`` bundle. Without
+    this comment the only account of the transition is the operator's local,
+    rotated tick log, so the item's own history explains nothing.
+
+    The body is a controller fact throughout: no engine ran, so nothing here is
+    engine-authored. The reason is still passed through
+    :func:`_neutralize_comment_markup` — one of them interpolates the PR's base
+    ref, which the PR author names.
+
+    Args:
+        stage: The dispatch stage (``"review"``, ``"implement"``, ``"fix"``).
+        outcome: One of :data:`OUTCOME_DISPATCH_SETUP_FAILED`,
+            :data:`OUTCOME_AMBIGUOUS_MARKER`, or
+            :data:`OUTCOME_REVIEW_POLICY_TOUCHED`.
+        reason: The failure reason the tick recorded.
+        engine: The engine that would have been launched, or ``""`` when the
+            escalation is not tied to one.
+        marker: The fixed header string; defaults to :data:`ESCALATION_MARKER`.
+
+    Returns:
+        A Markdown comment body suitable for ``gh pr comment``.
+
+    Raises:
+        ValueError: If ``outcome`` is not a known dispatch escalation outcome.
+    """
+    cause = _DISPATCH_ESCALATION_CAUSES.get(outcome)
+    if cause is None:
+        raise ValueError(f"unknown dispatch escalation outcome: {outcome}")
+    lines = [
+        marker,
+        "",
+        f"**Pipeline escalation** (`{stage}` dispatch)",
+        "",
+        f"🚨 {cause} It is being handed to a human.",
+        "",
+        f"- Outcome: `{outcome}` → `{LABEL_NEEDS_HUMAN}`",
+        f"- Reason: {_neutralize_comment_markup(reason)}",
+    ]
+    if engine:
+        lines.append(f"- Engine: `{engine}` (never launched)")
+    return "\n".join(lines)
+
+
+def _fix_escalation_reason(sentinel: str | None, *, head_advanced: bool) -> str:
+    """Return the operator-facing reason one fixer run escalated.
+
+    Args:
+        sentinel: The extracted completion sentinel, or ``None``.
+        head_advanced: Whether a ``FIXES_PUSHED`` claim was contradicted by an
+            unchanged live head (``False`` only for that contradiction).
+
+    Returns:
+        A single sentence naming the escalation cause.
+    """
+    if not head_advanced:
+        return (
+            "the engine reported fixes were pushed, but the PR head did not "
+            "advance — the push never landed, so there is nothing to re-review."
+        )
+    if sentinel == SENTINEL_NEEDS_HUMAN_DECISION:
+        return (
+            "the fixer reported it is blocked and cannot resolve the review "
+            "findings without a human decision."
+        )
+    return (
+        "the engine produced no recognised completion sentinel — its output was "
+        "missing, truncated, or unparseable, so the run cannot be trusted."
+    )
+
+
+def decide_fix_harvest(
+    *,
+    result_obj: object,
+    pre_label: str,
+    pinned_head: str = "",
+    current_head: str = "",
+    body_revision: str = "",
+) -> dict[str, object]:
+    """Decide the outcome of a finished fixer engine.
+
+    The fixer emits a sentinel token literally in ``result.json``. The
+    harvest parses it and decides: ``recheck`` (fixes committed and pushed,
+    ready for re-review at ``ai:revised``) or ``escalate`` (blocked, missing
+    sentinel, or unparseable output → ``ai:needs-human-decision``).
+
+    The sentinel is the engine's claim, not proof: ``FIXES_PUSHED`` is
+    cross-checked against the live head when both head SHAs are provided. A
+    fast-forward push always advances the head and force-push is not
+    permitted, so a success claim with an unchanged head is contradictory
+    output and escalates. Trusting it would relabel to ``ai:revised`` and
+    re-enter a review round with an identity identical to the last one — the
+    replay token then suppresses the comment and the comment-derived
+    iteration count freezes below :data:`MAX_ITERATIONS`, looping reviewer
+    and fixer spend without a terminal state.
+
+    Both terminal outcomes also carry ``post_comment`` and ``comment_body``:
+    the harvest records the run on the PR before flipping the label, so the
+    pushed head, the bounded engine report, and (on an escalation) the reason
+    are auditable from GitHub rather than from a local evidence archive — which
+    on the ``recheck`` path does not exist, since only ``escalate`` archives
+    harvest evidence. The transient ``retry`` outcome posts nothing — it
+    reverts to ``pre_label`` for re-dispatch, so there is no outcome to record
+    yet.
+
+    Args:
+        result_obj: The parsed ``result.json`` contents (any JSON value).
+        pre_label: The PR's label before dispatch (``ai:changes-requested``);
+            informational — escalation always goes to
+            ``ai:needs-human-decision``.
+        pinned_head: The PR head SHA recorded in ``dispatch.json`` at fixer
+            dispatch. Empty disables the push check (markers that predate
+            it, or a caller without marker provenance).
+        current_head: The PR's live head SHA point-read at harvest; empty
+            disables the push check.
+        body_revision: The state the controller reached on the fixer's
+            replacement PR body (see ``tick._fixer_body_revision``). A
+            publishable revision is reported as applied only on ``recheck``:
+            the other outcomes did not necessarily push the head the
+            replacement describes, so the caller leaves the body alone and the
+            comment says so.
+
+    Returns:
+        A decision mapping with keys: ``action`` (``"recheck"`` |
+        ``"escalate"`` | ``"retry"``), ``label`` (the label to set),
+        ``sentinel`` (the extracted sentinel string, or ``None``),
+        ``post_comment`` (bool), and ``comment_body`` (str, empty when no
+        comment is due). When a ``FIXES_PUSHED`` claim was checked against the
+        live head, ``head_advanced`` reports the comparison (``False`` marks
+        the contradictory escalate).
+    """
+    sentinel = parse_fix_result(result_obj)
+    report = _sanitize_engine_report(
+        result_obj.get("result") if isinstance(result_obj, dict) else None
+    )
+
+    def terminal(action: str, label: str, *, head_advanced: bool) -> dict[str, object]:
+        """Build a terminal fixer decision with its PR-comment payload."""
+        decision: dict[str, object] = {
+            "action": action,
+            "sentinel": sentinel,
+            "label": label,
+            "post_comment": True,
+            "comment_body": render_fix_comment(
+                action=action,
+                label=label,
+                sentinel=sentinel,
+                pinned_head=pinned_head,
+                current_head=current_head,
+                escalation_reason=(
+                    _fix_escalation_reason(sentinel, head_advanced=head_advanced)
+                    if action == "escalate"
+                    else ""
+                ),
+                # Both terminal outcomes publish the bounded, sanitised engine
+                # report, because for both of them the PR comment is the only
+                # durable record of what the engine did. An escalation needs it
+                # so the operator being asked to decide has the engine's own
+                # words. A recheck needs it because the recheck path archives no
+                # harvest evidence and deletes the scratch that held
+                # ``result.json`` — omitting it here loses the run entirely, and
+                # "what was fixed" is what the next reviewer is landing on.
+                engine_report=report,
+                body_revision=(
+                    "not-applied"
+                    if body_revision == "ready" and action != "recheck"
+                    else body_revision
+                ),
+            ),
+        }
+        if not head_advanced:
+            decision["head_advanced"] = False
+        return decision
+
+    if sentinel == SENTINEL_FIXES_PUSHED:
+        if pinned_head and current_head and pinned_head == current_head:
+            return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=False)
+        return terminal("recheck", LABEL_REVISED, head_advanced=True)
+    if sentinel is None:
+        transient = _transient_engine_result_decision(result_obj, pre_label)
+        if transient is not None:
+            return transient
+    return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=True)
+
+
+def trusted_review_candidate(
+    metadata: object,
+    *,
+    trusted_author: str,
+    trusted_repo: str,
+) -> bool:
+    """Return whether PR metadata satisfies the shipped reviewer trust boundary.
+
+    The review process needs the operator's readable Codex credential. Until the
+    stronger isolation lands (see the architecture doc's *Future evolution*),
+    dispatch is therefore restricted to branches the operator declared trusted. Missing or mistyped metadata fails
+    closed rather than weakening that boundary.
+
+    Args:
+        metadata: ``gh pr view`` JSON containing ``author``, ``headRepository``,
+            and ``isCrossRepository``.
+        trusted_author: GitHub login allowed to author automated-review candidates.
+        trusted_repo: Exact ``owner/repo`` allowed to host the candidate head.
+
+    Returns:
+        ``True`` only for an exact author/repository match on a non-cross-repository PR.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    author = metadata.get("author")
+    head_repository = metadata.get("headRepository")
+    if not isinstance(author, dict) or not isinstance(head_repository, dict):
+        return False
+    return (
+        author.get("login") == trusted_author
+        and head_repository.get("nameWithOwner") == trusted_repo
+        and metadata.get("isCrossRepository") is False
+    )
+
+
+# Identity + provenance fields every dispatch marker (lease or published) must carry.
+# Liveness, kill, cleanup, drift guards, and the stale-revert all key off these, so a
+# marker missing any one is not a trustworthy dispatch record and fails closed. Each
+# field guards a concrete failure mode: a missing ``head_sha``/``base_sha`` disables the
+# drift guards, a missing ``deadline`` misclassifies a live engine as ``hung``, a
+# missing ``pre_label`` leaves the stale revert no target, and a missing ``dispatch_id``
+# prevents envelope binding. These are the review-stage fields; future implement/fix
+# slices extend this set with their own provenance.
+_REQUIRED_MARKER_FIELDS = frozenset(
+    {"engine", "stage", "pr_number", "deadline", "base_ref", "base_sha", "head_sha",
+     "pre_label", "dispatch_id"}
+)
+
+# The complete set of keys a valid marker may carry: the required provenance fields plus
+# ownership signals. A published marker carries ``pid`` + ``start_time`` + ``pgid``
+# (full process identity); a pre-spawn lease carries only ``state``. A key outside this
+# set means the marker did not come from this pipeline's writer, so it is rejected
+# rather than partially trusted.
+_ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
+    {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body"}
+)
+
+# Pipeline stages a dispatch marker may legitimately record. A marker for an
+# unknown stage is never one this pipeline wrote, so it is not trusted.
+_VALID_STAGES = frozenset({"review", "implement", "fix"})
+
+# Each stage has an explicit engine contract. Treat any other marker value as
+# corruption rather than deriving recovery or cooldown ownership from an arbitrary
+# string.
+_VALID_ENGINES_BY_STAGE: dict[str, frozenset[str]] = {
+    "review": frozenset({"codex"}),
+    "implement": frozenset({"claude", "claude-ds"}),
+    "fix": frozenset({"claude", "claude-ds"}),
+}
+
+# The only lease ``state`` a pre-spawn marker may carry. Any other value (a corrupt
+# or hand-edited marker) must fail closed rather than be classified as in-flight.
+_VALID_LEASE_STATES = frozenset({"launching"})
+
+# Canonical full git commit OID (40 lowercase hex chars) — the only shape
+# ``base_tip_sha`` may take, since the base-drift guard compares it by equality
+# against a ``git rev-parse`` result.
+_COMMIT_OID_RE = re.compile(r"[0-9a-f]{40}")
+
+# Canonical hex SHA-256 — the only shape a ``pr_body`` block's ``digest`` may
+# take, since the fixer's PR-body conflict check compares it by equality against
+# a digest the harvest recomputes.
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+
+# Per-stage pre-dispatch labels a marker may legitimately record. The marker's
+# ``pre_label`` is the stale-revert target fed straight into reconciliation, so a
+# corrupt marker naming a terminal label (e.g. ``ai:ready-for-human``) could otherwise
+# let a dead, resultless dispatch silently "promote" a PR. Constrain to the real
+# pre-dispatch labels for each stage.
+_VALID_PRE_LABELS_BY_STAGE: dict[str, frozenset[str]] = {
+    "review": frozenset({LABEL_IMPLEMENTED, LABEL_REVISED}),
+    "implement": frozenset({LABEL_AVAILABLE}),
+    "fix": frozenset({LABEL_CHANGES_REQUESTED}),
+}
+
+
+def _is_positive_int(value: object) -> bool:
+    """Return whether ``value`` is a positive, non-bool ``int``."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+# Every field a marker's ``pr_body`` block carries, and the predicate each must
+# satisfy. Kept as one table because the block is validated as a unit: a
+# candidate PR body is judged against all four together, so any subset is a
+# contract the harvest cannot evaluate and must not half-trust.
+_PR_BODY_PROVENANCE_FIELDS: dict[str, Callable[[object], bool]] = {
+    # The body's fingerprint as dispatch read it, compared by equality.
+    "digest": lambda v: isinstance(v, str) and bool(_SHA256_HEX_RE.fullmatch(v)),
+    # The issue its ``## Summary`` opened by closing.
+    "summary_closes": _is_positive_int,
+    # Every closing directive the body declared, anywhere in it.
+    "closes": lambda v: isinstance(v, list) and all(
+        isinstance(ref, str) and ref for ref in cast("list[object]", v)
+    ),
+    # Whether the engine was shown only a prefix of the body.
+    "truncated": lambda v: isinstance(v, bool),
+}
+
+
+def valid_pr_body_provenance(value: object) -> bool:
+    """Return whether ``value`` is a complete PR-body provenance block.
+
+    The schema half of the fixer's PR-body revision: what a marker must carry
+    for a harvest to judge a replacement body at all. Exported because
+    ``tick.PRBodyProvenance.from_marker`` parses the same bytes and must not
+    carry a second copy of the rules — a validator and a parser that disagree
+    would let a marker reconciliation trusts be rejected by the harvest, or
+    worse, the reverse.
+
+    All-or-nothing by construction. The fields are written in one dispatch and
+    mean nothing individually, so a block missing one is corruption rather than
+    a marker from an older version; the *block* is what may legitimately be
+    absent.
+
+    Args:
+        value: The marker's ``pr_body`` field, of unknown shape.
+
+    Returns:
+        Whether every field is present and well typed.
+    """
+    if not isinstance(value, dict):
+        return False
+    block = cast("dict[str, object]", value)
+    if set(block) != set(_PR_BODY_PROVENANCE_FIELDS):
+        return False
+    return all(
+        check(block[field])
+        for field, check in _PR_BODY_PROVENANCE_FIELDS.items()
+    )
+
+
+def valid_marker(
+    obj: object,
+    *,
+    expected_pr: int | None = None,
+    expected_stage: str | None = None,
+) -> bool:
+    """Return whether ``obj`` is a trustworthy dispatch marker.
+
+    Atomic temp-then-rename prevents torn writes, but it does not prove the object
+    carries fields recovery can act on. Liveness, kill, cleanup, and label
+    transitions all key off this marker, so it is validated by *type and
+    enumeration* — not mere key presence — and fails closed on anything it cannot
+    vouch for. A marker that fails validation is treated as marker-less, so
+    reconciliation retains an ``ai:reviewing`` PR untouched instead of driving an
+    incorrect stale-revert or re-dispatch from a corrupt record — absence of
+    proof is not proof of an orphan.
+
+    Validation requires:
+
+    - a mapping whose keys are all within the allowed set (no unknown field) and that
+      carries every required provenance field (``engine``, ``stage``, ``pr_number``,
+      ``deadline``, ``base_ref``, ``base_sha``, ``head_sha``, ``pre_label``,
+      ``dispatch_id``);
+    - ``engine`` is valid for its stage (``codex`` for review, ``claude`` or
+      ``claude-ds`` for implement/fix);
+    - ``dispatch_id`` is a non-empty string (links the marker to its completion envelope);
+    - ``stage`` is a known pipeline stage, and equals ``expected_stage`` when given
+      (a ``fix`` marker must not drive a ``review`` reconciliation);
+    - ``pr_number`` is a real (non-bool) ``int``, and equals ``expected_pr`` when
+      given (a marker for another PR is never trusted for this directory's PR);
+    - ``base_ref``/``base_sha``/``head_sha`` are non-empty strings (the drift guards
+      compare them; an empty/typed-wrong value would make a guard meaningless);
+    - ``base_tip_sha``, when present, is a canonical full commit OID on a *review*
+      marker only (it is the freshness anchor the base-drift guard compares; only
+      reviewer dispatch writes it, and a malformed value would silently degrade the
+      guard to the merge-base fallback);
+    - ``pre_label`` is one of the real pre-dispatch labels (``ai:implemented`` /
+      ``ai:revised``) — never an arbitrary or terminal label, which reconciliation
+      would otherwise revert to;
+    - ``deadline`` is a *finite* number (a string deadline would crash
+      ``classify-dispatch``; ``json.loads`` also accepts ``NaN``/``Infinity``, and a
+      ``NaN`` deadline makes ``now > deadline`` always false so a live engine could
+      never time out);
+    - **exactly one** ownership signal group — a published marker carries ``pid`` +
+      ``start_time`` + ``pgid`` (full process identity that prevents PID-reuse
+      mis-targeting); a pre-spawn lease carries only ``state`` (no process identity
+      fields). A marker carrying both groups is corrupt.
+
+    Args:
+        obj: The object parsed from ``dispatch.json`` (any JSON value).
+        expected_pr: The PR number this marker must belong to (the directory/PR
+            under reconciliation), or ``None`` to skip the cross-check.
+        expected_stage: The pipeline stage this marker must record, or ``None`` to
+            skip the cross-check.
+
+    Returns:
+        ``True`` only if ``obj`` is a structurally valid, identity-matched marker.
+    """
+    if not isinstance(obj, dict):
+        return False
+    # Reject unknown keys, then require the full provenance set: a marker carrying a
+    # field this pipeline never writes, or missing one it always writes, is not trusted.
+    if not set(obj.keys()) <= _ALLOWED_MARKER_KEYS:
+        return False
+    if not _REQUIRED_MARKER_FIELDS.issubset(obj.keys()):
+        return False
+
+    dispatch_id = obj.get("dispatch_id")
+    if not isinstance(dispatch_id, str) or not dispatch_id:
+        return False
+
+    stage = obj.get("stage")
+    if stage not in _VALID_STAGES:
+        return False
+    if expected_stage is not None and stage != expected_stage:
+        return False
+
+    engine = obj.get("engine")
+    stage_engines = _VALID_ENGINES_BY_STAGE.get(str(stage), frozenset())
+    if engine not in stage_engines:
+        return False
+
+    pr_number = obj.get("pr_number")
+    if not (isinstance(pr_number, int) and not isinstance(pr_number, bool)):
+        return False
+    if expected_pr is not None and pr_number != expected_pr:
+        return False
+
+    # Provenance the drift guards compare: each must be a present, non-empty string.
+    for ref_field in ("base_ref", "base_sha", "head_sha"):
+        value = obj.get(ref_field)
+        if not isinstance(value, str) or not value:
+            return False
+
+    # base_tip_sha is optional (markers written before the two-SHA split omit it), but
+    # when present it is the freshness anchor the base-drift guard compares, so it is
+    # validated as provenance, not merely allowlisted: review markers only (only
+    # reviewer dispatch writes it), and a canonical full commit OID. A mistyped value
+    # would make harvest silently fall back to base_sha (the merge-base), gutting the
+    # stale-base guard precisely at the field added to strengthen it.
+    if "base_tip_sha" in obj:
+        if stage != "review":
+            return False
+        base_tip_sha = obj.get("base_tip_sha")
+        if not isinstance(base_tip_sha, str) or not _COMMIT_OID_RE.fullmatch(base_tip_sha):
+            return False
+
+    # pr_body is the fixer's PR-body-revision provenance: the fingerprint of the
+    # body dispatch handed the engine, the closure contract a replacement must
+    # keep, and whether the engine saw the whole body. Only fixer dispatch writes
+    # it, and every field gates a remote write with no undo — a mistyped digest
+    # would read as "the body changed while the fixer ran" and silently disable
+    # the replacement, a mistyped closure set would silently reject every
+    # candidate, and a missing truncation flag would let a body the engine only
+    # saw a prefix of be replaced wholesale.
+    #
+    # One nested block, validated whole. The fields are written together and mean
+    # nothing apart, so a marker carrying some of them is corruption rather than
+    # a legacy marker — and the way to make that unrepresentable is to give them
+    # a single key that is either wholly valid or absent. The block as a whole
+    # stays optional, which is the real legacy case: markers written before the
+    # revision path omit it, as do PRs whose body pins no closure.
+    if "pr_body" in obj:
+        if stage != "fix" or not valid_pr_body_provenance(obj.get("pr_body")):
+            return False
+
+    # pre_label is the stale-revert target; constrain to the real pre-dispatch labels
+    # for this marker's stage. A review marker with an implement pre_label (or vice
+    # versa) is never one this pipeline's dispatch wrote for this stage.
+    pre_label = obj.get("pre_label")
+    stage_pre_labels = _VALID_PRE_LABELS_BY_STAGE.get(str(stage), frozenset())
+    if pre_label not in stage_pre_labels:
+        return False
+
+    deadline = obj.get("deadline")
+    # bool is an int subclass; exclude it, require a real number, and reject the
+    # non-finite NaN/Infinity that json.loads accepts.
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return False
+    if not math.isfinite(deadline):
+        return False
+
+    # Exactly one ownership group: a published marker carries pid + start_time + pgid
+    # (full process identity); a lease carries only state (no identity fields). The
+    # groups are mutually exclusive: pid with state is corrupt (classify would read
+    # `launching` and reconcile would escalate without killing the live pid), and state
+    # with start_time/pgid is corrupt (process identity without a pid is meaningless).
+    has_pid_key = "pid" in obj
+    has_state_key = "state" in obj
+    has_start_time = "start_time" in obj
+    has_pgid = "pgid" in obj
+    if has_pid_key == has_state_key:
+        return False
+    if has_pid_key:
+        if not has_start_time or not has_pgid:
+            return False
+        if not _is_positive_int(obj.get("pid")):
+            return False
+        start_time = obj.get("start_time")
+        if isinstance(start_time, bool) or not isinstance(start_time, (int, float)):
+            return False
+        if not math.isfinite(start_time):
+            return False
+        pgid = obj.get("pgid")
+        return _is_positive_int(pgid)
+    # Lease: no process identity fields allowed.
+    if has_start_time or has_pgid:
+        return False
+    return obj.get("state") in _VALID_LEASE_STATES
+
+
+# Classify states that hold a concurrency slot. This answers the *admission*
+# question — "could a paid engine still be running here?" — and nothing else.
+#
+# Cadence asks a different question of the same markers: "is there anything left
+# for the loop to supervise?" A marker currently held by a human answers yes to
+# the first and no to the second, so it stays in this set
+# while the loop discounts it from GitHub human holds. Never widen
+# this set to serve quiescence: freeing an admission slot would let a second paid
+# engine launch onto work an unverifiable process may still be doing.
+ENGINE_OCCUPIED_STATES = frozenset(("live", "launching", "hung"))
+
+
+def in_flight_refs(
+    marker_states: list[tuple[str, int, str, str, bool]],
+) -> set[tuple[str, int, str]]:
+    """Return distinct dispatch identities occupying this machine's spend cap.
+
+    Item kind and stage label are both part of the identity. Issue ``#42`` and
+    PR ``#42`` are different processes, as are a reviewer and fixer that a
+    partial transition accidentally launched for the same PR.
+
+    Occupancy is proved by a local dispatch marker and nothing else. An
+    ``ai:`` in-flight label is a *shared workflow state* — ``CLAUDE.md`` tells
+    contributors to set ``ai:implementing`` by hand before writing code, and
+    experience established that the pipeline cannot read custody out of a
+    label it may not own. Counting those labels as paid engines is the same conflation
+    from the other side: a manual pickup, or a label whose harvest relabel was
+    missed, silently consumed a spend slot forever and starved dispatch — twice,
+    on 2026-07-07 and 2026-08-20. The cap bounds the engines
+    *this* machine launched and can still see; nothing else is spending its
+    budget.
+
+    This changes the ceiling, not per-item acquisition. Eligibility is a
+    separate gate that still reads the authoritative label set at the point of
+    decision (:func:`tick._resolve_dispatchable_pickup_label`), and it was
+    never an exclusive lock: dispatch runs lease → launch → relabel, so two
+    ticks that both select an item before either relabel lands will both spawn,
+    and the loser terminates its engine when its relabel fails. That bounded
+    acquisition race predates this function and is unchanged by it — closing it
+    needs compare-and-swap acquisition, which the design doc scopes out
+    separately. What *is* deliberately given up here is the sum across
+    machines: another host's engine no longer consumes this host's budget.
+
+    Args:
+        marker_states: ``(kind, number, in_flight_label, classify_state,
+            engine_alive)`` records for every local dispatch marker.
+
+    Returns:
+        The ``(kind, number, label)`` identities occupying an in-flight slot.
+
+    Raises:
+        ValueError: If any kind, number, label, or classify state is
+            malformed. Admission fails closed rather than under-counting
+            paid processes.
+    """
+    valid_kinds = {"issue", "pr"}
+    valid_labels = {LABEL_IMPLEMENTING, LABEL_REVIEWING, LABEL_FIXING}
+    valid_states = {"complete", "failed", "live", "stale", "hung", "launching"}
+    occupied: set[tuple[str, int, str]] = set()
+
+    for kind, number, label, state, engine_alive in marker_states:
+        if kind not in valid_kinds:
+            raise ValueError(f"unknown item kind: {kind}")
+        if not _is_positive_int(number):
+            raise ValueError("marker item numbers must be positive integers")
+        if label not in valid_labels:
+            raise ValueError(f"unknown in-flight label: {label}")
+        if state not in valid_states:
+            raise ValueError(f"unknown dispatch state: {state}")
+        if not isinstance(engine_alive, bool):
+            raise ValueError("engine liveness must be a bool")
+        # A living process group spends whatever its classify state says, and
+        # the pipeline still owes it a harvest, an archive, or a kill — the
+        # `complete`-envelope-with-a-live-child case reaches here.
+        if state in ENGINE_OCCUPIED_STATES or engine_alive:
+            occupied.add((kind, number, label))
+
+    return occupied
+
+
+def can_dispatch(*, in_flight: int, max_in_flight: int) -> bool:
+    """Return whether another reviewer may be launched without exceeding the cap.
+
+    The cap is the pipeline's global spend ceiling, so the decision is a tested
+    primitive rather than inline arithmetic the calling tick re-derives.
+
+    Args:
+        in_flight: Engines currently holding a slot — the size of
+            :func:`in_flight_refs`, which is the only admission count.
+        max_in_flight: The configured ceiling (``MAX_IN_FLIGHT`` in the skill).
+
+    Returns:
+        ``True`` if ``in_flight`` is below ``max_in_flight``.
+    """
+    return in_flight < max_in_flight
+
+
+def reconcile_dispatch(
+    *,
+    current_label: str,
+    marker_valid: bool,
+    classify_state: str,
+    pre_label: str,
+    in_flight_label: str = LABEL_REVIEWING,
+    dispatch_attempts: int = 0,
+    attempt_threshold: int = MAX_DISPATCH_ATTEMPTS,
+) -> dict[str, object]:
+    """Decide what HARVEST does with one PR/issue that may have an in-flight engine.
+
+    GitHub labels are authoritative and the worktree marker is a disposable
+    accelerator, so reconciliation must be driven by *both* the label and the
+    marker — never the marker alone. The gap this closes: a completed result
+    whose post-dispatch label edit failed leaves the PR at its pre-dispatch
+    label. A result-gated dedup would let dispatch launch a *second* engine
+    over the finished result; custody-aware harvest reaps the existing one
+    instead.
+
+    A *missing* marker, by contrast, decides nothing. Markers live on local
+    disk, so a tick can never see another machine's; humans also claim
+    ``ai:implementing`` by hand as the documented pickup step. Absence of a
+    local accelerator file on a control plane whose only shared state is
+    GitHub says nothing about custody, so the markerless case is always a
+    no-op and any resulting stranding is surfaced by the status dashboard for
+    the operator to clear.
+
+    "In custody" means the PR/issue is still at a label this pipeline owns for
+    the current stage — the in-flight label (``ai:reviewing`` for reviews,
+    ``ai:implementing`` for implementations) or the recorded ``pre_label``. Any
+    other non-hold label means the item has left pipeline custody — a human
+    took over — so we never clobber it: a hung process is still killed (it must
+    not pin the cadence), but the label is left alone.
+
+    The tick gates ``HOLD_LABELS`` before calling this primitive, so a held item
+    never reaches it. That gate suspends *workflow* custody only — it still
+    terminates a hung engine whose identity is proven ``matched``, because
+    process custody never transfers to a human. What a hold prevents here is the
+    label mutation and the archive, not the kill.
+
+    Args:
+        current_label: The PR/issue's current pipeline label, resolved at harvest.
+        marker_valid: Whether a parseable dispatch marker exists for this PR/issue.
+        classify_state: :func:`classify_dispatch` output when ``marker_valid``;
+            an empty string when there is no usable marker.
+        pre_label: The pre-dispatch label recorded in the marker (e.g.
+            ``ai:implemented`` for review, ``ai:available`` for implement); the
+            re-queue target on a stale revert.
+        in_flight_label: The label this stage uses when an engine is dispatched
+            (``ai:reviewing`` for review, ``ai:implementing`` for implement).
+            Defaults to ``ai:reviewing`` for backward compatibility.
+        dispatch_attempts: How many resultless dispatch failures this PR has already
+            accumulated (durable counter that survives worktree cleanup). Bounds
+            re-dispatch so a repeatable infrastructure failure cannot spend forever.
+        attempt_threshold: Cap on resultless dispatch attempts; a revert that would
+            reach it escalates to a human instead.
+
+    Returns:
+        A mapping with ``action`` (one of ``"escalate"``, ``"fail"``, ``"noop"``,
+        ``"harvest"``, ``"cleanup"``, ``"leave"``, ``"revert"``,
+        ``"kill_escalate"``, ``"kill_cleanup"``), ``kill`` (whether the engine
+        PID must be killed), and ``label`` (the label to set, or ``""`` when the
+        action sets none directly).
+    """
+    in_custody = current_label in (in_flight_label, pre_label)
+
+    if not marker_valid:
+        # No usable marker proves nothing about custody: markers are
+        # machine-local, and the documented manual `ai:implementing` pickup
+        # looks identical. Never act. A genuinely stranded item stays visible
+        # on the status dashboard (in-flight label, no live engine).
+        return {"action": "noop", "kill": False, "label": ""}
+
+    if classify_state == "launching":
+        # A launching lease seen at reconcile means the spawn crashed between
+        # starting codex and publishing its PID. Unlike the markerless case
+        # this is proven custody — our own marker — and the paid child's
+        # liveness is unprovable, so fail closed to a human rather than
+        # re-dispatch (which would double-spend). Money may be burning.
+        if in_custody:
+            return {"action": "escalate", "kill": False, "label": LABEL_NEEDS_HUMAN}
+        return {"action": "cleanup", "kill": False, "label": ""}
+
+    if classify_state == "hung":
+        # A hung engine is always killed; the label is escalated only if still ours.
+        if in_custody:
+            return {"action": "kill_escalate", "kill": True, "label": LABEL_NEEDS_HUMAN}
+        return {"action": "kill_cleanup", "kill": True, "label": ""}
+
+    if classify_state == "live":
+        return {"action": "leave", "kill": False, "label": ""}
+
+    if classify_state == "complete":
+        if in_custody:
+            return {"action": "harvest", "kill": False, "label": ""}
+        return {"action": "cleanup", "kill": False, "label": ""}
+
+    if classify_state == "failed":
+        if in_custody:
+            return {"action": "fail", "kill": False, "label": LABEL_NEEDS_HUMAN}
+        return {"action": "cleanup", "kill": False, "label": ""}
+
+    # stale: dead PID, no result.
+    if in_custody:
+        # Bound retries: a resultless failure posts no review comment, so it is
+        # invisible to the comment-based round cap. Once reverting would reach the
+        # attempt cap, escalate to a human instead of re-queueing (and re-spending).
+        if dispatch_attempts + 1 >= attempt_threshold:
+            return {"action": "escalate", "kill": False, "label": LABEL_NEEDS_HUMAN}
+        return {"action": "revert", "kill": False, "label": pre_label}
+    return {"action": "cleanup", "kill": False, "label": ""}
+
+
+def _valid_finding(finding: object) -> bool:
+    """Return whether a single ``findings`` entry conforms to the schema."""
+    if not isinstance(finding, dict):
+        return False
+    severity = finding.get("severity")
+    if not isinstance(severity, str) or severity not in _VALID_SEVERITIES:
+        return False
+    return isinstance(finding.get("file"), str) and isinstance(finding.get("summary"), str)
+
+
+# --- Public API (imported by tick.py) ---
+#
+# Each function below is the public entry point for one pipeline subcommand.
+# The CLI wrappers in the # --- CLI --- section read args + stdin, call these
+# functions, and print JSON. tick.py imports these directly — no subprocess.
+
+
+def harvest_review(
+    *,
+    review: str,
+    comments: str,
+    pinned_base: str,
+    current_base: str,
+    pinned_head: str = "",
+    current_head: str = "",
+    pre_label: str = LABEL_IMPLEMENTED,
+    threshold: int = MAX_ITERATIONS,
+    diff_base_sha: str = "",
+    pinned_base_ref: str = "",
+    current_base_ref: str = "",
+) -> HarvestResult:
+    """Decide the outcome of harvesting one finished review.
+
+    Args:
+        review: JSON string of ``review.json`` contents.
+        comments: JSON string of the PR's comments array (or wrapped object).
+        pinned_base: The base tip snapshot recorded at dispatch (freshness
+            anchor for the drift guard).
+        current_base: The base ref tip resolved now.
+        pinned_head: The head SHA recorded at dispatch (reviewed commit).
+        current_head: The PR head resolved now.
+        pre_label: The PR's label before this review was dispatched.
+        threshold: Runaway-spend cap.
+        diff_base_sha: The merge-base the reviewer's diff was anchored to
+            (audit/idempotency truth). Defaults to ``pinned_base`` for markers
+            that predate the two-SHA split.
+        pinned_base_ref: The base branch name recorded at dispatch; compared
+            against ``current_base_ref`` for retargeting (empty disables).
+        current_base_ref: The PR's live base branch name at harvest (empty
+            disables the retarget check).
+
+    Returns:
+        A HarvestResult mapping with action, label, and stage-specific keys.
+    """
+    review_obj = _load_json_string(review, None)
+    comments_list = _as_comment_list(_load_json_string(comments, []))
+    result = decide_review_harvest(
+        review_obj=review_obj,
+        comments=comments_list,
+        pinned_base=pinned_base,
+        current_base=current_base,
+        pinned_head=pinned_head,
+        current_head=current_head,
+        pre_label=pre_label,
+        threshold=threshold,
+        diff_base_sha=diff_base_sha,
+        pinned_base_ref=pinned_base_ref,
+        current_base_ref=current_base_ref,
+    )
+    return result  # type: ignore[return-value]
+
+
+def validate_review_candidate(
+    *,
+    candidate: object,
+    trusted_author: str,
+    trusted_repo: str,
+) -> bool:
+    """Return whether PR metadata satisfies the trusted reviewer boundary.
+
+    Accepts any JSON value (the raw ``gh pr view`` output); non-dict or
+    mistyped values fail closed.
+
+    Args:
+        candidate: PR metadata from ``gh pr view`` (any JSON value).
+        trusted_author: Allowed author login.
+        trusted_repo: Allowed ``owner/repo`` head.
+
+    Returns:
+        ``True`` only for an exact author/repository match.
+    """
+    return trusted_review_candidate(
+        candidate,
+        trusted_author=trusted_author,
+        trusted_repo=trusted_repo,
+    )
+
+
+def validate_marker(
+    *,
+    dispatch: object,
+    pr: int | None = None,
+    stage: str = "review",
+) -> bool:
+    """Return whether a dispatch marker is structurally valid.
+
+    Args:
+        dispatch: The parsed ``dispatch.json`` contents.
+        pr: PR number the marker must belong to, or ``None`` to skip.
+        stage: Pipeline stage the marker must record.
+
+    Returns:
+        ``True`` only if the marker is structurally valid and identity-matched.
+    """
+    return valid_marker(dispatch, expected_pr=pr, expected_stage=stage)
+
+
+def harvest_implementation(
+    *,
+    result: str,
+    pre_label: str = LABEL_AVAILABLE,
+) -> HarvestResult:
+    """Decide the outcome of a finished implementer engine.
+
+    Args:
+        result: JSON string of ``result.json`` contents.
+        pre_label: The issue's label before dispatch.
+
+    Returns:
+        A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
+    """
+    result_obj = _load_json_string(result, None)
+    decision = decide_implementation_harvest(
+        result_obj=result_obj,
+        pre_label=pre_label,
+    )
+    return decision  # type: ignore[return-value]
+
+
+def harvest_fix(
+    *,
+    result: str,
+    pre_label: str = LABEL_CHANGES_REQUESTED,
+    pinned_head: str = "",
+    current_head: str = "",
+    body_revision: str = "",
+) -> HarvestResult:
+    """Decide the outcome of a finished fixer engine.
+
+    Args:
+        result: JSON string of ``result.json`` contents.
+        pre_label: The PR's label before dispatch.
+        pinned_head: The PR head SHA recorded at fixer dispatch; with
+            ``current_head``, gates the ``FIXES_PUSHED`` claim (empty
+            disables the push check).
+        current_head: The PR's live head SHA at harvest (empty disables the
+            push check).
+        body_revision: The state the controller reached on the fixer's
+            replacement PR body; empty when it offered none.
+
+    Returns:
+        A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
+    """
+    result_obj = _load_json_string(result, None)
+    decision = decide_fix_harvest(
+        result_obj=result_obj,
+        pre_label=pre_label,
+        pinned_head=pinned_head,
+        current_head=current_head,
+        body_revision=body_revision,
+    )
+    return decision  # type: ignore[return-value]
+
+
+def validate_envelope(
+    *,
+    envelope: object,
+    dispatch_id: str | None = None,
+) -> bool:
+    """Return whether a completion envelope is valid and dispatch-id-bound.
+
+    Args:
+        envelope: The parsed ``completion.json`` contents.
+        dispatch_id: Expected ``dispatch_id`` from the marker, or ``None``.
+
+    Returns:
+        ``True`` only when the envelope is structurally valid.
+    """
+    return validate_completion_envelope(
+        envelope,
+        expected_dispatch_id=dispatch_id,
+    )
+
+
+def verify_identity(
+    *,
+    recorded_start: float,
+    live_start: float | None,
+    tolerance: float = 1.0,
+) -> IdentityResult:
+    """Determine whether a live process matches a recorded start time.
+
+    Args:
+        recorded_start: Epoch seconds the wrapper recorded at startup.
+        live_start: Epoch seconds of the live process's start time, or
+            ``None`` if unreadable.
+        tolerance: Maximum allowable difference in seconds.
+
+    Returns:
+        ``"matched"``, ``"mismatched"``, or ``"unknown"``.
+    """
+    return verify_process_identity(
+        recorded_start,
+        live_start,
+        tolerance=tolerance,
+    )
+
+
+def tick_log_open(*, log_dir: str, keep: int = 50) -> str:
+    """Create a new tick log file, prune old ones, and return the path.
+
+    Args:
+        log_dir: Directory for tick log files.
+        keep: Max existing log files to retain.
+
+    Returns:
+        Absolute path to the newly created (empty) log file.
+    """
+    return open_tick_log(log_dir, keep_n=keep)
+
+
+def tick_log_write(*, log_path: str, entry: dict[str, object]) -> None:
+    """Append one JSON-lines entry to a tick log file.
+
+    Args:
+        log_path: Path to the ``*.jsonl`` log file.
+        entry: Mapping to serialise as a single JSON line.
+    """
+    append_tick_entry(log_path, entry)
+
+
+def tick_log_tail(*, log_dir: str) -> list[dict[str, object]]:
+    """Return parsed entries from the most recent tick log file.
+
+    Args:
+        log_dir: Directory containing ``tick-*.jsonl`` log files.
+
+    Returns:
+        List of parsed entry dicts from the newest log file.
+    """
+    return read_latest_tick_log(log_dir)
+
+
+# --- CLI ---
+#
+# The pr-pipeline-tick skill shells out to these subcommands instead of
+# re-implementing the logic above in inline bash, so every tick makes the same
+# decision deterministically. Each subcommand reads small inputs and writes a
+# single JSON object (or atomic file) — never a diff or engine transcript.
+
+
+def _load_json(path: str, default: object) -> object:
+    """Load JSON from ``path``, returning ``default`` if missing or unparseable."""
+    try:
+        with open(path) as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def _read_file(path: str, default: str = "") -> str:
+    """Read a file's raw text, returning ``default`` on failure."""
+    try:
+        with open(path) as handle:
+            return handle.read()
+    except OSError:
+        return default
+
+
+def _load_json_string(raw: str, default: object) -> object:
+    """Parse a JSON string, returning ``default`` on parse failure."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return default
+
+
+def _as_comment_list(loaded: object) -> list[object]:
+    """Coerce loaded comments JSON to a list.
+
+    ``gh pr view <N> --json comments`` writes an *object* ``{"comments": [...]}``,
+    while ``-q .comments`` writes a bare array. Accept either shape so the
+    iteration count is never silently zeroed by an unwrapped object.
+    """
+    if isinstance(loaded, list):
+        return loaded
+    if isinstance(loaded, dict):
+        inner = loaded.get("comments")
+        if isinstance(inner, list):
+            return inner
+    return []
+
+
+def _cmd_harvest_review(args: argparse.Namespace) -> int:
+    review_raw = _read_file(args.review)
+    comments_raw = _read_file(args.comments)
+    decision = harvest_review(
+        review=review_raw,
+        comments=comments_raw,
+        pinned_base=args.pinned_base,
+        current_base=args.current_base,
+        pinned_head=args.pinned_head,
+        current_head=args.current_head,
+        pre_label=args.pre_label,
+        threshold=args.threshold,
+        diff_base_sha=args.diff_base_sha,
+        pinned_base_ref=args.pinned_base_ref,
+        current_base_ref=args.current_base_ref,
+    )
+    print(json.dumps(decision))
+    return 0
+
+
+def _cmd_validate_review(args: argparse.Namespace) -> int:
+    verdict = validate_review(_load_json(args.review, None))
+    if verdict is None:
+        print("INVALID")
+        return 1
+    print(verdict)
+    return 0
+
+
+def _cmd_classify_dispatch(args: argparse.Namespace) -> int:
+    dispatch = _load_json(args.dispatch, {})
+    is_dict = isinstance(dispatch, dict)
+    raw_deadline = dispatch.get("deadline", 0) if is_dict else 0
+    # A corrupt marker may carry a non-numeric deadline; coerce defensively so this
+    # never crashes mid-tick (a crash here would leave classify_state empty and let a
+    # malformed marker fall through reconciliation). valid_marker rejects such markers
+    # upstream, but classify is also called for admission counting WITHOUT that gate —
+    # so coerce to +inf, never 0.0: with +inf a live engine reads `live` (counts as an
+    # in-flight slot), failing CLOSED on spend. Coercing to 0.0 would read `hung`,
+    # freeing the slot and letting the cap admit an extra reviewer over a running one.
+    if isinstance(raw_deadline, bool):
+        deadline = float("inf")
+    else:
+        try:
+            deadline = float(raw_deadline)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            deadline = float("inf")
+    marker_state = str(dispatch.get("state", "")) if is_dict else ""
+    state = classify_dispatch(
+        now=args.now,
+        deadline=deadline,
+        pid_alive=bool(args.pid_alive),
+        result_exists=bool(args.result_exists),
+        state=marker_state,
+        envelope_valid=bool(args.envelope_valid),
+    )
+    print(json.dumps({"state": state}))
+    return 0
+
+
+def _cmd_atomic_write(args: argparse.Namespace) -> int:
+    atomic_write(args.path, sys.stdin.read())
+    return 0
+
+
+def _cmd_touches_review_policy(_args: argparse.Namespace) -> int:
+    paths = sys.stdin.read().splitlines()
+    print(json.dumps({"touches_policy": touches_review_policy(paths)}))
+    return 0
+
+
+def _cmd_validate_review_candidate(args: argparse.Namespace) -> int:
+    try:
+        metadata: object = json.load(sys.stdin)
+    except json.JSONDecodeError:
+        metadata = None
+    trusted = validate_review_candidate(
+        candidate=metadata,
+        trusted_author=args.trusted_author,
+        trusted_repo=args.trusted_repo,
+    )
+    print(json.dumps({"trusted": trusted}))
+    return 0
+
+
+def _cmd_harvest_implementation(args: argparse.Namespace) -> int:
+    result_raw = _read_file(args.result)
+    decision = harvest_implementation(
+        result=result_raw,
+        pre_label=args.pre_label,
+    )
+    print(json.dumps(decision))
+    return 0
+
+
+def _cmd_harvest_fix(args: argparse.Namespace) -> int:
+    result_raw = _read_file(args.result)
+    decision = harvest_fix(
+        result=result_raw,
+        pre_label=args.pre_label,
+        pinned_head=args.pinned_head,
+        current_head=args.current_head,
+        body_revision=args.body_revision,
+    )
+    print(json.dumps(decision))
+    return 0
+
+
+def _cmd_validate_marker(args: argparse.Namespace) -> int:
+    marker = _load_json(args.dispatch, None)
+    valid = validate_marker(
+        dispatch=marker, pr=args.pr, stage=args.stage,
+    )
+    print(json.dumps({"valid": valid}))
+    return 0
+
+
+def _cmd_validate_envelope(args: argparse.Namespace) -> int:
+    envelope = _load_json(args.envelope, None)
+    valid = validate_envelope(
+        envelope=envelope,
+        dispatch_id=args.dispatch_id,
+    )
+    print(json.dumps({"valid": valid}))
+    return 0
+
+
+def _cmd_verify_identity(args: argparse.Namespace) -> int:
+    live_start: float | None = args.live_start if args.live_start >= 0 else None
+    identity = verify_identity(
+        recorded_start=args.recorded_start,
+        live_start=live_start,
+        tolerance=args.tolerance,
+    )
+    print(json.dumps({"identity": identity}))
+    return 0
+
+
+def _cmd_reconcile_dispatch(args: argparse.Namespace) -> int:
+    marker = _load_json(args.dispatch, None)
+    marker_valid = valid_marker(marker, expected_pr=args.pr, expected_stage=args.stage)
+    pre_label = (
+        marker.get("pre_label", LABEL_IMPLEMENTED)
+        if isinstance(marker, dict)
+        else LABEL_IMPLEMENTED
+    )
+    decision = reconcile_dispatch(
+        current_label=args.current_label,
+        marker_valid=marker_valid,
+        classify_state=args.classify_state,
+        pre_label=str(pre_label),
+        in_flight_label=args.in_flight_label,
+        dispatch_attempts=args.dispatch_attempts,
+        attempt_threshold=args.attempt_threshold,
+    )
+    print(json.dumps(decision))
+    return 0
+
+
+def prune_tick_logs(log_dir: str, keep_n: int = 50) -> int:
+    """Remove the oldest tick log files, keeping only the most recent ``keep_n``.
+
+    Log files are identified by the ``tick-*.jsonl`` glob and sorted lexicographically
+    (the timestamp-prefixed naming makes lexicographic order identical to chronological
+    order). Files beyond the ``keep_n`` most recent are deleted.
+
+    Args:
+        log_dir: Directory containing tick log files.
+        keep_n: Maximum number of log files to retain.
+
+    Returns:
+        The number of files deleted (0 if the directory does not exist).
+    """
+    if not os.path.isdir(log_dir):
+        return 0
+    files = sorted(glob.glob(os.path.join(log_dir, "tick-*.jsonl")))
+    to_delete = files[: max(0, len(files) - keep_n)]
+    for path in to_delete:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+    return len(to_delete)
+
+
+def open_tick_log(log_dir: str, keep_n: int = 50) -> str:
+    """Create a new tick log file, prune old ones, and return the file path.
+
+    The file is named ``tick-<YYYYMMDDTHHMMSS>-<epoch>-<counter>.jsonl`` so that
+    lexicographic sort equals chronological order while still keeping a distinct
+    file per tick when two ticks start within the same second. The directory is
+    created if it does not exist. Old log files are pruned to ``keep_n`` before
+    the new file is created, so the directory holds at most ``keep_n + 1`` files
+    while a tick is running.
+
+    Args:
+        log_dir: Directory where tick logs are written.
+        keep_n: Number of existing log files to retain before adding the new one.
+
+    Returns:
+        Absolute path to the newly created (empty) log file.
+    """
+    os.makedirs(log_dir, exist_ok=True)
+    prune_tick_logs(log_dir, keep_n=keep_n)
+    now = time.time()
+    ts = datetime.datetime.fromtimestamp(now, tz=datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%S"
+    )
+    epoch = int(now)
+    for counter in range(1000):
+        path = os.path.join(log_dir, f"tick-{ts}-{epoch}-{counter:03d}.jsonl")
+        try:
+            with open(path, "x"):
+                pass
+        except FileExistsError:
+            continue
+        return os.path.abspath(path)
+    raise FileExistsError("could not allocate a unique tick log file")
+
+
+def append_tick_entry(log_path: str, entry: dict[str, object]) -> None:
+    """Append one JSON-lines entry to a tick log file.
+
+    Each call appends exactly one line (the serialised ``entry`` followed by a
+    newline). The directory must already exist (see :func:`open_tick_log`).
+
+    Args:
+        log_path: Path to the ``*.jsonl`` log file.
+        entry: Mapping to serialise as a single JSON line.
+    """
+    with open(log_path, "a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+def latest_tick_log_path(log_dir: str) -> str | None:
+    """Return the path of the most recent tick log file, or ``None``.
+
+    Tick log names sort lexicographically in chronological order (see
+    :func:`open_tick_log`), so the newest file is the last one. Callers that
+    need to append to the log a running tick already owns must use this
+    instead of :func:`open_tick_log`, which would create a *newer* file and
+    silently become the one :func:`read_latest_tick_log` reports.
+
+    Args:
+        log_dir: Directory containing ``tick-*.jsonl`` log files.
+
+    Returns:
+        Absolute-or-relative path to the newest log file, or ``None`` when the
+        directory does not exist or holds no tick log files.
+    """
+    if not os.path.isdir(log_dir):
+        return None
+    files = sorted(glob.glob(os.path.join(log_dir, "tick-*.jsonl")))
+    return files[-1] if files else None
+
+
+def read_latest_tick_log(log_dir: str) -> list[dict[str, object]]:
+    """Return parsed entries from the most recent tick log file.
+
+    Lines that are not valid JSON objects are silently skipped so a partially
+    written final line (e.g. after a crash) does not corrupt the summary.
+
+    Args:
+        log_dir: Directory containing ``tick-*.jsonl`` log files.
+
+    Returns:
+        List of parsed entry dicts from the newest log file, in file order.
+        Returns an empty list when the directory does not exist or contains no
+        tick log files.
+    """
+    latest = latest_tick_log_path(log_dir)
+    if latest is None:
+        return []
+    entries: list[dict[str, object]] = []
+    with open(latest) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                entries.append(obj)
+    return entries
+
+
+def _cmd_tick_log_open(args: argparse.Namespace) -> int:
+    path = tick_log_open(log_dir=args.log_dir, keep=args.keep)
+    print(path)
+    return 0
+
+
+def _cmd_tick_log_write(args: argparse.Namespace) -> int:
+    try:
+        entry_obj: object = json.loads(args.entry)
+    except json.JSONDecodeError as exc:
+        print(f"tick-log-write: invalid JSON entry: {exc}", file=sys.stderr)
+        return 1
+    if not isinstance(entry_obj, dict):
+        print("tick-log-write: entry must be a JSON object", file=sys.stderr)
+        return 1
+    tick_log_write(log_path=args.log_path, entry=entry_obj)
+    return 0
+
+
+def _cmd_tick_log_tail(args: argparse.Namespace) -> int:
+    entries = tick_log_tail(log_dir=args.log_dir)
+    print(json.dumps(entries))
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    """CLI entry point for the pr-pipeline-tick skill.
+
+    Args:
+        argv: Argument vector (defaults to ``sys.argv[1:]``).
+
+    Returns:
+        Process exit code (0 on success).
+    """
+    parser = argparse.ArgumentParser(prog="pipeline", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_harvest = sub.add_parser("harvest-review", help="Decide a finished review's outcome")
+    p_harvest.add_argument("--review", required=True, help="Path to review.json")
+    p_harvest.add_argument("--comments", required=True, help="Path to gh comments JSON")
+    p_harvest.add_argument(
+        "--pinned-base", required=True,
+        help="base tip snapshot from dispatch.json (base_tip_sha; freshness anchor)",
+    )
+    p_harvest.add_argument("--current-base", required=True, help="base ref tip resolved now")
+    p_harvest.add_argument(
+        "--diff-base-sha", default="",
+        help="merge-base from dispatch.json (base_sha; the reviewer's diff anchor)",
+    )
+    p_harvest.add_argument(
+        "--pinned-head", default="", help="head_sha from dispatch.json (reviewed commit)"
+    )
+    p_harvest.add_argument(
+        "--current-head", default="", help="PR head resolved now, at harvest"
+    )
+    p_harvest.add_argument(
+        "--pre-label", default=LABEL_IMPLEMENTED, help="pre-dispatch label to revert to on drift"
+    )
+    p_harvest.add_argument(
+        "--pinned-base-ref", default="",
+        help="base branch name recorded at dispatch (empty disables the retarget check)",
+    )
+    p_harvest.add_argument(
+        "--current-base-ref", default="",
+        help="PR's live base branch name at harvest (empty disables the retarget check)",
+    )
+    p_harvest.add_argument("--threshold", type=int, default=MAX_ITERATIONS)
+    p_harvest.set_defaults(func=_cmd_harvest_review)
+
+    p_validate = sub.add_parser("validate-review", help="Validate a review.json against the schema")
+    p_validate.add_argument("--review", required=True, help="Path to review.json")
+    p_validate.set_defaults(func=_cmd_validate_review)
+
+    p_classify = sub.add_parser("classify-dispatch", help="Classify a dispatch's liveness")
+    p_classify.add_argument("--dispatch", required=True, help="Path to dispatch.json")
+    p_classify.add_argument("--now", type=float, required=True, help="Current epoch seconds")
+    p_classify.add_argument("--pid-alive", type=int, required=True, help="1 if PID alive else 0")
+    p_classify.add_argument(
+        "--result-exists", type=int, required=True, help="1 if result file present else 0"
+    )
+    p_classify.add_argument(
+        "--envelope-valid", type=int, default=0, help="1 if completion envelope is valid else 0"
+    )
+    p_classify.set_defaults(func=_cmd_classify_dispatch)
+
+    p_write = sub.add_parser("atomic-write", help="Atomically write stdin to a file")
+    p_write.add_argument("--path", required=True, help="Destination path")
+    p_write.set_defaults(func=_cmd_atomic_write)
+
+    p_policy = sub.add_parser(
+        "touches-review-policy",
+        help="Report whether stdin paths include a reviewer-governing file",
+    )
+    p_policy.set_defaults(func=_cmd_touches_review_policy)
+
+    p_candidate = sub.add_parser(
+        "validate-review-candidate",
+        help="Report whether PR metadata satisfies the trusted reviewer boundary",
+    )
+    p_candidate.add_argument("--trusted-author", required=True, help="Allowed author login")
+    p_candidate.add_argument("--trusted-repo", required=True, help="Allowed owner/repo head")
+    p_candidate.set_defaults(func=_cmd_validate_review_candidate)
+
+    p_validate_marker = sub.add_parser(
+        "validate-marker",
+        help="Report whether a dispatch marker is structurally valid for this PR/stage",
+    )
+    p_validate_marker.add_argument("--dispatch", required=True, help="Path to dispatch.json")
+    p_validate_marker.add_argument(
+        "--pr", type=int, default=None, help="PR number the marker must belong to"
+    )
+    p_validate_marker.add_argument(
+        "--stage", default="review", help="Pipeline stage the marker must record"
+    )
+    p_validate_marker.set_defaults(func=_cmd_validate_marker)
+
+    p_harvest_impl = sub.add_parser(
+        "harvest-implementation", help="Decide a finished implementer's outcome"
+    )
+    p_harvest_impl.add_argument("--result", required=True, help="Path to result.json")
+    p_harvest_impl.add_argument(
+        "--pre-label",
+        default=LABEL_AVAILABLE,
+        help="pre-dispatch label (ai:available)",
+    )
+    p_harvest_impl.set_defaults(func=_cmd_harvest_implementation)
+
+    p_harvest_fix = sub.add_parser(
+        "harvest-fix", help="Decide a finished fixer's outcome"
+    )
+    p_harvest_fix.add_argument("--result", required=True, help="Path to result.json")
+    p_harvest_fix.add_argument(
+        "--pre-label",
+        default=LABEL_CHANGES_REQUESTED,
+        help="pre-dispatch label (ai:changes-requested)",
+    )
+    p_harvest_fix.add_argument(
+        "--pinned-head", default="",
+        help="head_sha from dispatch.json (empty disables the push check)",
+    )
+    p_harvest_fix.add_argument(
+        "--current-head", default="",
+        help="PR's live head SHA at harvest (empty disables the push check)",
+    )
+    p_harvest_fix.add_argument(
+        "--body-revision", default="",
+        choices=("", *_BODY_REVISION_INPUTS),
+        help=(
+            "state of the fixer's replacement PR body (empty: none offered). "
+            "Decides the comment's PR-body line only; applying the body is the "
+            "tick's job, never this subcommand's"
+        ),
+    )
+    p_harvest_fix.set_defaults(func=_cmd_harvest_fix)
+
+    p_reconcile = sub.add_parser(
+        "reconcile-dispatch", help="Decide HARVEST's action for one in-flight review"
+    )
+    p_reconcile.add_argument("--dispatch", required=True, help="Path to dispatch.json")
+    p_reconcile.add_argument(
+        "--pr", type=int, default=None, help="PR number the marker must belong to"
+    )
+    p_reconcile.add_argument(
+        "--stage", default="review", help="Pipeline stage the marker must record"
+    )
+    p_reconcile.add_argument(
+        "--current-label", required=True, help="The PR's current pipeline label"
+    )
+    p_reconcile.add_argument(
+        "--in-flight-label",
+        default=LABEL_REVIEWING,
+        help="in-flight label for this stage (ai:reviewing or ai:implementing)",
+    )
+    p_reconcile.add_argument(
+        "--classify-state",
+        default="",
+        help="classify-dispatch state, or empty when no usable marker",
+    )
+    p_reconcile.add_argument(
+        "--dispatch-attempts",
+        type=int,
+        default=0,
+        help="prior resultless dispatch failures for this PR (durable counter)",
+    )
+    p_reconcile.add_argument(
+        "--attempt-threshold",
+        type=int,
+        default=MAX_DISPATCH_ATTEMPTS,
+        help="cap on resultless dispatch attempts before escalating",
+    )
+    p_reconcile.set_defaults(func=_cmd_reconcile_dispatch)
+
+    p_envelope = sub.add_parser(
+        "validate-envelope",
+        help="Report whether a completion envelope is valid and dispatch-id-bound",
+    )
+    p_envelope.add_argument("--envelope", required=True, help="Path to completion.json")
+    p_envelope.add_argument(
+        "--dispatch-id", default=None, help="Expected dispatch_id from the marker"
+    )
+    p_envelope.set_defaults(func=_cmd_validate_envelope)
+
+    p_identity = sub.add_parser(
+        "verify-identity",
+        help="Report whether a live process matches a recorded start time",
+    )
+    p_identity.add_argument(
+        "--recorded-start", type=float, required=True, help="Start time from marker"
+    )
+    p_identity.add_argument(
+        "--live-start", type=float, required=True,
+        help="Live process start time (-1 if not readable)",
+    )
+    p_identity.add_argument(
+        "--tolerance", type=float, default=1.0, help="Allowable clock skew in seconds"
+    )
+    p_identity.set_defaults(func=_cmd_verify_identity)
+
+    p_tlog_open = sub.add_parser(
+        "tick-log-open",
+        help="Create a new tick log file, prune old ones, print its path",
+    )
+    p_tlog_open.add_argument("--log-dir", required=True, help="Directory for tick logs")
+    p_tlog_open.add_argument(
+        "--keep", type=int, default=50, help="Max existing log files to retain (default 50)"
+    )
+    p_tlog_open.set_defaults(func=_cmd_tick_log_open)
+
+    p_tlog_write = sub.add_parser(
+        "tick-log-write",
+        help="Append one JSON entry to a tick log file",
+    )
+    p_tlog_write.add_argument("--log-path", required=True, help="Path to the .jsonl log file")
+    p_tlog_write.add_argument("--entry", required=True, help="JSON-encoded entry object")
+    p_tlog_write.set_defaults(func=_cmd_tick_log_write)
+
+    p_tlog_tail = sub.add_parser(
+        "tick-log-tail",
+        help="Print all entries from the latest tick log as a JSON array",
+    )
+    p_tlog_tail.add_argument("--log-dir", required=True, help="Directory for tick logs")
+    p_tlog_tail.set_defaults(func=_cmd_tick_log_tail)
+
+    args = parser.parse_args(argv)
+    func: object = args.func
+    assert callable(func)
+    return int(func(args))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -1,30 +1,44 @@
 # pr-pipeline
 
-A skill-driven automation that drives GitHub issues through implement → review → fix → re-review using AI agents (Claude Code, Codex). The Claude Code skill bundle is the orchestrator; the Python `pr-pipeline` CLI is a deterministic toolkit of primitives.
+An unattended control plane that drives GitHub issues through implement → review → fix → re-review using AI engines (Claude Code, Codex). It ships as two Claude Code skills under `skills/`; GitHub labels are the only source of truth for what stage a work item is in.
 
 ## Document Map
 
-- `docs/specs/design.md` — Architecture spec. Read this first.
-- `docs/plans/implementation.md` — Implementation plan, 28 TDD tasks. The build sequence.
+- `skills/pr-pipeline-tick/SKILL.md` — the operator SOP. Lean by contract; read it first to run anything.
+- `skills/pr-pipeline-tick/README.md` — usage, observability, and the tuning knobs.
+- `skills/pr-pipeline-tick/DEBUG.md` — invariants, failure diagnostics, and recovery.
+- `docs/working/pr-pipeline-internals.md` — how the runtime actually behaves, with line-anchored links into the source.
+- `docs/architecture.md` — the architecture reference: what owns each decision and why each boundary sits where it does. Read before changing dispatch, harvest, custody, or cadence.
 - `docs/working/commit-guidelines.md` — Commit format rules. Read before committing.
 - `docs/working/pr-guidelines.md` — PR body template, issue template, workflow labels, AI review posting. Read before raising a PR, creating an issue, or reviewing.
 
 ## Architecture in one paragraph
 
-Two layers of agency. The **orchestrator agent** (a Claude Code session running the skill) reads issue and PR labels, claims work atomically, dispatches engine subprocesses in per-task git worktrees, parses verdicts, applies transitions, and handles exceptions inline (proposes settings fixes, retries transient errors). The **engine subprocesses** (`claude --print` / `codex exec`) run with fresh context per dispatch. The Python toolkit composes deterministic primitives (`list-issues`, `list-prs`, `claim`, `dispatch`, `transition`, `post-comment`, etc.) — no orchestration in code.
+One deterministic orchestrator, many disposable engines. `skills/pr-pipeline-tick/lib/tick.py` is a single Python process: each invocation runs HARVEST (collect finished engines, archive evidence, apply the transition their sentinel earned) and then DISPATCH (admit eligible work under a concurrency cap and launch an engine for it). `skills/pr-pipeline-tick/lib/pipeline.py` holds the deterministic primitives it composes — label vocabulary, marker validation, verdict parsing, policy gates. The **engines** (`claude --print` / `codex exec`) are subprocesses with fresh context per dispatch, each in its own `git worktree`, and they never move an `ai:` label — they report through a completion sentinel and the harvest relabels. Pipeline *code* resolves from the install; pipeline *state* (`.claude/worktrees/`) lives in the repository being operated on.
 
 ## Tech Stack
 
-- Python 3.11+
-- Click (CLI), PyYAML (config), `string.Template` stdlib (prompt templates)
-- `gh` CLI (GitHub I/O)
-- `git worktree` (per-task isolation)
-- pytest + pytest-mock (testing)
-- Markdown skill bundle for Claude Code
+- Python 3.11+, **standard library only** (`tomllib` is the 3.11 floor). CI proves this on `{ubuntu, macos} × {3.11, 3.13}` with nothing but pytest installed — an accidental third-party import must fail there, not on an adopter's machine.
+- pytest (no plugins; `unittest.mock` for doubles)
+- `gh` CLI (GitHub I/O), `git worktree` (per-task isolation)
+- Claude Code and Codex CLIs as dispatched engines
+- Markdown skill bundle for Claude Code (`skills/`)
 
 ## Task Coordination
 
 Tasks are tracked as GitHub Issues and PRs with workflow labels. The full label set and transition rules live in `docs/working/pr-guidelines.md` under [Workflow labels](docs/working/pr-guidelines.md#workflow-labels) — read that doc before picking up, raising, reviewing, or revising any work.
+
+**If you were dispatched by `pr-pipeline-tick`, every label instruction in this
+file and in `pr-guidelines.md` is not for you.** The tick owns both ends of your
+stage's label transitions. Do not add, remove, or change any `ai:` label on any
+issue or PR; report your outcome through the completion sentinel named in your
+prompt and let the harvest do the relabel. A label you set mid-run cannot be
+retracted and will be read as a human hold that overrides the sentinel you
+finish with. For the same reason, do not run `gh pr create` — the instructions
+elsewhere in this file that tell you to raise the PR yourself are for
+interactive agents. The harvest opens your PR from the `pr-body` file your
+prompt names, and labels it. See
+[Pipeline label authority](docs/working/pr-guidelines.md#pipeline-label-authority).
 
 ### Workflow labels
 
@@ -37,19 +51,21 @@ PR states:
 - `ai:reviewing` — reviewer claimed (transient)
 - `ai:changes-requested` — review found issues requiring fixes
 - `ai:fixing` — fixer claimed (transient)
-- `ai:recheck` — fixes pushed, re-review needed
+- `ai:revised` — fixes pushed, re-review needed
 - `ai:ready-for-human` — passed AI review; ready for owner merge
 
-Escalation states:
+Escalation and hold states:
 - `ai:needs-human-decision` — scope/design decision beyond agent remit
 - `ai:max-iterations` — review/fix cycles exceeded threshold
-- `ai:permission-pending` — orchestrator proposed a settings change; awaiting approval
+- `ai:blocked` — human-set: waiting on a dependency or decision
+
+`pipeline.py`'s `LABEL_*` constants are the vocabulary. A label not defined there is not part of the workflow, and an item moved to one goes dark: no dispatch query selects it.
 
 Quick reminders:
 - Before starting: `gh issue list --label "ai:available"`
 - When creating issues: include the required rationale sections from `docs/working/pr-guidelines.md`, especially why the work matters and what fails if skipped
 - Keep exactly one current workflow label per work item
-- An AI reviewer goes straight from `ai:implemented` (or `ai:recheck`) to `ai:ready-for-human` when there are no blocker/major findings — do not stop at an intermediate label just because a comment was posted
+- An AI reviewer goes straight from `ai:implemented` (or `ai:revised`) to `ai:ready-for-human` when there are no blocker/major findings — do not stop at an intermediate label just because a comment was posted
 
 ## TDD Enforcement
 
@@ -65,7 +81,7 @@ When implementing any feature or fix:
    those tests too.
 5. Repeat steps 1-4 for each requirement within the task autonomously.
    For doc/spec/plan-only changes, skip steps 1-5 and go directly to step 6.
-6. Self-review the diff (`git diff main...HEAD`) as if presenting to a principal engineer.
+6. Self-review the diff (`git diff origin/main...HEAD`) as if presenting to a principal engineer.
    For code changes: check for missing edge cases, naming clarity, unnecessary complexity,
    security issues, and test coverage gaps.
    For doc/spec/plan changes: verify the content is complete, ordered correctly, executable
@@ -122,7 +138,16 @@ Only use Bash for commands that genuinely require shell execution (running tests
 
 ## Running Tests
 
-Use `uv run pytest ...` as the default test runner. Do not use `python -m pytest` directly.
+There is no packaging manifest and no dependency install — the suite is stdlib + pytest, run against an interpreter that is actually 3.11 or newer:
+
+```bash
+python3.13 -m pytest skills/ -q        # or any python >= 3.11
+uv run --python 3.13 --with pytest pytest skills/ -q
+```
+
+Do **not** use bare `python3`: it resolves to 3.9 on a stock macOS box and under Anaconda, and collection fails on `tomllib`. This is a PATH-precedence problem, so "install a newer Python" does not fix it. CI runs `python -m pytest skills/ -q` on a pinned matrix for the same reason.
+
+The suite also needs `gh`, `git`, and `codex` on PATH — the tick's startup probe exits 3 without them. Every real invocation is mocked; only resolution is required.
 
 ## Review Feedback Hygiene
 
@@ -141,4 +166,4 @@ on any review finding:
 
 ## Conventions
 
-- Internal task codes (Task 1, Task 2, etc. in the implementation plan) are private planning references. Never use them in commits, PRs, or branch names. Use descriptive names instead.
+- Internal task codes (Task 1, Task 2, etc. used while planning) are private references. Never use them in commits, PRs, or branch names. Use descriptive names instead.
