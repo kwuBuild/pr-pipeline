@@ -1,9 +1,9 @@
 """Tests for the PR-pipeline tick orchestrator.
 
-Co-located with ``tick.py`` so the whole ``pr-pipeline-tick/lib`` directory lifts
+Co-located with ``tick.py`` so the whole ``tick/lib`` directory lifts
 out cleanly. Run with::
 
-    uv run pytest .claude/skills/pr-pipeline-tick/lib/test_tick.py
+    uv run pytest .claude/skills/tick/lib/test_tick.py
 """
 
 from __future__ import annotations

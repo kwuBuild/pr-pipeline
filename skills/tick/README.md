@@ -21,15 +21,41 @@ The orchestrator is a single Python process (`lib/tick.py`); the skill's
 `SKILL.md` is a lean operator SOP. See `docs/architecture.md` for why the
 control plane is shaped the way it is.
 
+**Installing.** The repository is its own plugin marketplace, so there is no
+separate registry to add:
+
+```
+/plugin marketplace add kwuBuild/pr-pipeline
+/plugin install pr-pipeline
+```
+
+That publishes three commands: `/pr-pipeline:tick`, `/pr-pipeline:status`, and
+`/pr-pipeline:definition-of-done`. `claude plugin details pr-pipeline` lists
+them.
+
 **Where the pipeline lives.** Pipeline *code* is resolved from the install, not
-from the repository being operated on: `$PR_PIPELINE_HOME` is the absolute path
-of your `pr-pipeline` checkout (or plugin install). Pipeline *state*
-(`.claude/worktrees/`) stays relative to the target repo, which is why every
-command below runs with the target repo as the working directory.
+from the repository being operated on. Pipeline *state* (`.claude/worktrees/`)
+stays relative to the target repo, which is why every command below runs with
+the target repo as the working directory.
+
+The install root is named two different ways, and the difference is not
+cosmetic. Inside `SKILL.md` it is `${CLAUDE_PLUGIN_ROOT}`, which Claude
+substitutes into plugin skill *content* as it loads — an agent invoking the
+skill reads an absolute path and never sees the variable. **This file is not
+substituted.** It is read as plain text, by you in a separate terminal or by an
+agent via `Read`, and `CLAUDE_PLUGIN_ROOT` is not exported into a Bash tool
+call's environment either — so the commands below are written against
+`$PR_PIPELINE_HOME`, which you export yourself:
 
 ```bash
 export PR_PIPELINE_HOME=/absolute/path/to/pr-pipeline
 ```
+
+For a development checkout that is the checkout path, and this stays the
+supported way to run the pipeline from a git working tree. For a plugin install,
+read the path out of `/pr-pipeline:tick` itself — it hands you commands with the
+install root already substituted. The skill commands need no export; this is
+only for the shell-run commands here.
 
 The examples are unquoted for readability; quote `"$PR_PIPELINE_HOME/..."`
 yourself if your install path contains spaces. Under `watch '...'` the variable
@@ -37,27 +63,27 @@ must be exported, not just set.
 
 ```bash
 # 1. One-time: verify the Codex binary and schema (required before first reviewer dispatch)
-bash $PR_PIPELINE_HOME/skills/pr-pipeline-tick/preflight.sh
+bash $PR_PIPELINE_HOME/skills/tick/preflight.sh
 
 # 2. Open the dashboard in a separate pane
 # Primary (Linux / watch installed):
-watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
+watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'
 # Fallback (macOS / no watch):
-while true; do clear; bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh; sleep 5; done
+while true; do clear; bash $PR_PIPELINE_HOME/skills/status/status.sh; sleep 5; done
 
 # 3. Run one tick (full HARVEST + DISPATCH loop)
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py
 
 # 4. Run a targeted tick (single PR or issue)
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py pr:468
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py '#439'
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py pr:468
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'
 
 # 5. Verify the dispatch landed (use find to avoid bare-glob errors in zsh)
 find .claude/worktrees -maxdepth 2 -name dispatch.json -path '*/issue-*' \
   -exec jq '{engine, stage, pid}' {} \;
 
 # 6. Loop in-process (autonomous polling with mutex + quiescence stop)
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py --loop
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --loop
 ```
 
 ## Document split
@@ -86,13 +112,13 @@ edge-triggered wake nudges, quiescence stop, and terminal-label notifications.
 ## Invocation
 
 The orchestrator is a single Python process: `uv run python lib/tick.py`. The
-`/pr-pipeline-tick` skill now loads a lean SOP that tells the operator when to
+`/pr-pipeline:tick` skill now loads a lean SOP that tells the operator when to
 run `preflight.sh`, how to invoke the tick, and where to inspect outcomes.
 
 ### Basic
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py
 ```
 
 Runs one full tick: HARVEST all three stages (review → implement → fix) with full
@@ -103,8 +129,8 @@ success, 1 when reconciliation failed and dispatch was skipped.
 ### Targeted (single issue/PR)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py pr:468   # PR #468 only
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py '#439'   # issue #439 only
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py pr:468   # PR #468 only
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'   # issue #439 only
 ```
 
 `pr:N` stays direct PR scope for reviewer and fixer work; it does not switch to
@@ -138,7 +164,7 @@ global, so a targeted loop never mistakes a saturated pipeline for a quiet one.
 ### Looped (autonomous polling)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py --loop
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --loop
 ```
 
 Runs ticks inside one Python process. `--loop` keeps the same HARVEST →
@@ -481,7 +507,7 @@ nor a wedged cap caused by a human holding an engine can go unexplained.
 ### Engine selection (`--impl-engine`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py --impl-engine claude-ds
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --impl-engine claude-ds
 ```
 
 Controls whether the implementer and fixer engines use `claude` (default) or
@@ -490,7 +516,7 @@ Controls whether the implementer and fixer engines use `claude` (default) or
 ### Model override (`--model`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py --model claude-sonnet-4-6
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --model claude-sonnet-4-6
 ```
 
 Overrides the model used by implementer and fixer engines. When not given, the
@@ -510,7 +536,7 @@ and additionally sets `ANTHROPIC_MODEL` for `claude-ds`.
 ### Reviewer model and effort (`--review-model`, `--review-effort`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py --review-model gpt-6 --review-effort xhigh
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --review-model gpt-6 --review-effort xhigh
 ```
 
 The reviewer is a separate provider from the implementer/fixer engines, so it
@@ -559,7 +585,7 @@ A PR whose diff edits files that govern the reviewer itself — `CLAUDE.md`,
 of auto-reviewed: the reviewer runs inside the PR's own worktree, so it would
 review under instructions the PR itself supplied. The operator can accept that
 trust boundary for the whole gate in
-`$PR_PIPELINE_HOME/skills/pr-pipeline-tick/config.toml`:
+`$PR_PIPELINE_HOME/skills/tick/config.toml`:
 
 ```toml
 [policy]
@@ -581,7 +607,7 @@ unconditionally, or removes the gate call from the reviewer dispatch is
 escalated to a human (while the gate is enabled) instead of auto-reviewed —
 otherwise a merged change would silently disable the gate for every future
 policy-editing PR. Those three are matched by path *suffix*
-(`skills/pr-pipeline-tick/config.toml` and the two `lib/` files), so the
+(`skills/tick/config.toml` and the two `lib/` files), so the
 self-protection holds wherever the skill is installed — under `.claude/skills/`
 in a host repo, at `skills/` in the pipeline's own repository, or under a
 plugin root.
@@ -911,10 +937,10 @@ Run in a watch loop in a separate terminal pane:
 
 ```bash
 # Primary (Linux / watch installed):
-watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
+watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'
 
 # Fallback (macOS / no watch):
-while true; do clear; bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh; sleep 5; done
+while true; do clear; bash $PR_PIPELINE_HOME/skills/status/status.sh; sleep 5; done
 ```
 
 Read-only — safe to run alongside a live tick. It reads GitHub labels and worktree
@@ -1144,7 +1170,7 @@ reading steals live work the same way the old automation did.
 
 So establish custody out of band before editing any label:
 
-1. Ask on every machine that runs ticks. `pr-pipeline-status` on *that* machine
+1. Ask on every machine that runs ticks. `pr-pipeline:status` on *that* machine
    shows its markers; a live engine appears under `IN-FLIGHT ENGINES` there.
 2. Ask whoever may have taken the item by hand — `CLAUDE.md` tells contributors
    to add `ai:implementing` before writing code, so an issue at that label with
@@ -1276,7 +1302,7 @@ a failed lookup or malformed response leaves the label unchanged either way.
 
 ## Worked example
 
-You run `uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py '#439'` with issue #439 at `ai:available`.
+You run `uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'` with issue #439 at `ai:available`.
 
 **Dashboard** (after dispatch):
 ```

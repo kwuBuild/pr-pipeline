@@ -5,7 +5,7 @@ review — schema validation, verdict→label mapping, iteration counting, base-
 drift, trusted-candidate gating, marker-based admission, and dispatch-liveness
 classification — as small, deterministic, unit-tested functions plus a thin CLI.
 `process_control.py` owns the one effectful helper: bounded TERM→KILL rollback. The
-`pr-pipeline-tick` skill shells out to these helpers rather than re-deriving control
+`pr-pipeline:tick` skill shells out to these helpers rather than re-deriving control
 logic in inline bash each tick.
 
 ## Constraints
@@ -37,7 +37,7 @@ denial probe remains model-reported and explicitly unverified.
 ## CLI
 
 ```bash
-PIPELINE=$PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/pipeline.py
+PIPELINE=$PR_PIPELINE_HOME/skills/tick/lib/pipeline.py
 
 # Decide a finished review's outcome (prints a decision JSON object).
 # --comments accepts the bare array (gh ... -q .comments) or the {"comments": [...]} object.
@@ -141,7 +141,7 @@ uv run python "$PIPELINE" validate-marker \
 # A markerless in-flight item is ALWAYS a no-op. Markers are machine-local, so
 # their absence proves nothing: it is equally consistent with another machine's
 # live dispatch and with the documented manual `ai:implementing` pickup. The
-# pr-pipeline-status dashboard makes the item *visible* rather than having a tick
+# pr-pipeline:status dashboard makes the item *visible* rather than having a tick
 # relabel work it cannot prove it owns — but the dashboard reads only this
 # machine's markers, so an absent engine row is not custody proof for an operator
 # either. Recovery needs out-of-band confirmation. See
@@ -153,7 +153,7 @@ uv run python "$PIPELINE" reconcile-dispatch \
 
 # Stop a just-spawned reviewer within bounded TERM/KILL grace periods. Exit zero and
 # {"stopped": true} only after death is confirmed; otherwise preserve PID ownership.
-uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/process_control.py terminate \
+uv run python $PR_PIPELINE_HOME/skills/tick/lib/process_control.py terminate \
   --pid <pid> --grace 5 --kill-grace 2 --poll 0.1
 
 # --- Tick log helpers (structured per-tick audit log) ---
@@ -167,7 +167,7 @@ uv run python "$PIPELINE" tick-log-write \
   --log-path <path> \
   --entry '{"ts":1234567890,"pr":123,"phase":"harvest","stage":"review","action":"revert","reason":"stale"}'
 
-# Print all entries from the latest tick log as a JSON array. Used by pr-pipeline-status.
+# Print all entries from the latest tick log as a JSON array. Used by pr-pipeline:status.
 uv run python "$PIPELINE" tick-log-tail \
   --log-dir .claude/worktrees/.tick-log
 ```
@@ -392,9 +392,9 @@ the intent carries custody across the archive move.
 ## Tests
 
 ```bash
-uv run pytest $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib --basetemp="$TMPDIR/ppltest"
-uv run ruff check $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/
-uv run pyright $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/
+uv run pytest $PR_PIPELINE_HOME/skills/tick/lib --basetemp="$TMPDIR/ppltest"
+uv run ruff check $PR_PIPELINE_HOME/skills/tick/lib/
+uv run pyright $PR_PIPELINE_HOME/skills/tick/lib/
 ```
 
 (`--basetemp` avoids a stale-temp-dir cleanup quirk in pytest's default basetemp;

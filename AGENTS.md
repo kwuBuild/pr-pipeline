@@ -19,7 +19,7 @@ If both files apply:
 
 ## Working Rules
 
-**If you were dispatched by `pr-pipeline-tick`, every label instruction in this
+**If you were dispatched by `pr-pipeline:tick`, every label instruction in this
 file and in `pr-guidelines.md` is not for you** — not the workflow bullets
 below, not the blanket pre-authorization for updating workflow labels, and not
 the review-posting flow that runs `gh pr edit`. The scope is unbounded on
@@ -71,12 +71,12 @@ will be read as a human hold that overrides the sentinel you finish with. See
 
 This repository *is* the pipeline. Everything shipped lives under `skills/`:
 
-- **`skills/pr-pipeline-tick/`** — the control plane. `skills/pr-pipeline-tick/lib/tick.py` is one deterministic Python process that runs HARVEST then DISPATCH per invocation, `skills/pr-pipeline-tick/lib/pipeline.py` holds the primitives it composes (label vocabulary, marker validation, verdict parsing, policy gates), and `skills/pr-pipeline-tick/lib/prompts/` holds the engine prompts. `SKILL.md` is a lean operator SOP, not the orchestrator.
-- **`skills/pr-pipeline-status/`** — a read-only dashboard over the same state. It never writes.
+- **`skills/tick/`** — the control plane. `skills/tick/lib/tick.py` is one deterministic Python process that runs HARVEST then DISPATCH per invocation, `skills/tick/lib/pipeline.py` holds the primitives it composes (label vocabulary, marker validation, verdict parsing, policy gates), and `skills/tick/lib/prompts/` holds the engine prompts. `SKILL.md` is a lean operator SOP, not the orchestrator.
+- **`skills/status/`** — a read-only dashboard over the same state. It never writes.
 
 Dispatched engines (`claude --print` / `codex exec`) run in per-task `git worktree` checkouts with fresh context and report through a completion sentinel; the harvest owns every label transition.
 
-Read `skills/pr-pipeline-tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/architecture.md` for the design rationale.
+Read `skills/tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/architecture.md` for the design rationale.
 
 ## User Prompt Convention
 

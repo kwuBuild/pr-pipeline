@@ -93,12 +93,12 @@ jobs:
 
       - name: Syntax check
         run: |
-          bash -n skills/pr-pipeline-tick/preflight.sh
-          bash -n skills/pr-pipeline-status/status.sh
+          bash -n skills/tick/preflight.sh
+          bash -n skills/status/status.sh
 
       - name: ShellCheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck --severity=error \
-            skills/pr-pipeline-tick/preflight.sh \
-            skills/pr-pipeline-status/status.sh
+            skills/tick/preflight.sh \
+            skills/status/status.sh

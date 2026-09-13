@@ -1,6 +1,6 @@
 """PR-pipeline tick orchestrator.
 
-Imported by the ``pr-pipeline-tick`` skill's thinned SKILL.md. A single
+Imported by the ``pr-pipeline:tick`` skill's thinned SKILL.md. A single
 ``uv run python lib/tick.py`` call replaces 25 bash ``Bash`` tool invocations
 with one long-lived Python process that imports ``pipeline`` and
 ``process_control`` directly — no subprocess round-trips for decision logic.
@@ -10893,7 +10893,7 @@ def _run_single_tick_locked(
         msg = (
             "tick: target not configured: "
             f"{', '.join(unconfigured)} — set them in "
-            "skills/pr-pipeline-tick/config.toml (or export PIPELINE_REPO / "
+            "skills/tick/config.toml (or export PIPELINE_REPO / "
             "PIPELINE_TRUSTED_AUTHOR)"
         )
         print(msg, file=sys.stderr)
@@ -11712,7 +11712,7 @@ def _stalled_engine_identity(
 def engine_progress_report(wt_root: str) -> list[tuple[str, str]]:
     """Render the progress verdict for every dispatch marker under a root.
 
-    The ``pr-pipeline-status`` dashboard shells out to this rather than
+    The ``pr-pipeline:status`` dashboard shells out to this rather than
     re-deriving a verdict in bash. That is the whole point: a stall is
     *quiet past the threshold* **and** identity-verified live, and bash can
     prove neither the identity nor the thresholds without duplicating them in

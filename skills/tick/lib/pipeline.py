@@ -4,7 +4,7 @@ This module holds the bug-prone decisions a tick must make about a review
 result — schema validation, verdict→label mapping, iteration counting, base-SHA
 drift, trusted-candidate gating, marker-based admission, and dispatch-liveness
 classification — as small, deterministic, unit-tested functions. The
-``pr-pipeline-tick`` skill shells out to the CLI at the bottom of this file rather
+``pr-pipeline:tick`` skill shells out to the CLI at the bottom of this file rather
 than re-deriving this logic in inline bash each tick, so an unattended loop behaves
 identically every run.
 
@@ -157,13 +157,13 @@ _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 # (`.claude/skills/...`, where the skills were incubated) and silently exempts
 # the identical edit in the pipeline's own repository, where they live at
 # `skills/`, and under any plugin layout. Matching is per path segment, so
-# `other-skills/pr-pipeline-tick/config.toml` is not a hit.
+# `other-skills/tick/config.toml` is not a hit.
 _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(suffix.split("/"))
     for suffix in (
-        "skills/pr-pipeline-tick/config.toml",
-        "skills/pr-pipeline-tick/lib/pipeline.py",
-        "skills/pr-pipeline-tick/lib/tick.py",
+        "skills/tick/config.toml",
+        "skills/tick/lib/pipeline.py",
+        "skills/tick/lib/tick.py",
     )
 )
 
@@ -1636,7 +1636,7 @@ def _ends_with_policy_suffix(path: str) -> bool:
     """Return whether ``path`` ends in one of the pipeline's own gate files.
 
     Compares whole path segments so the match cannot straddle a segment
-    boundary: ``other-skills/pr-pipeline-tick/config.toml`` is not a hit, while
+    boundary: ``other-skills/tick/config.toml`` is not a hit, while
     ``.claude/skills/...``, ``skills/...`` and any plugin prefix all are.
 
     Args:
@@ -3270,7 +3270,7 @@ def tick_log_tail(*, log_dir: str) -> list[dict[str, object]]:
 
 # --- CLI ---
 #
-# The pr-pipeline-tick skill shells out to these subcommands instead of
+# The pr-pipeline:tick skill shells out to these subcommands instead of
 # re-implementing the logic above in inline bash, so every tick makes the same
 # decision deterministically. Each subcommand reads small inputs and writes a
 # single JSON object (or atomic file) — never a diff or engine transcript.
@@ -3632,7 +3632,7 @@ def _cmd_tick_log_tail(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point for the pr-pipeline-tick skill.
+    """CLI entry point for the pr-pipeline:tick skill.
 
     Args:
         argv: Argument vector (defaults to ``sys.argv[1:]``).

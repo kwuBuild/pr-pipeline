@@ -15,7 +15,7 @@ from unittest import mock
 
 import pytest
 
-TICK_LIB = Path(__file__).resolve().parents[1] / "pr-pipeline-tick" / "lib"
+TICK_LIB = Path(__file__).resolve().parents[1] / "tick" / "lib"
 
 
 @pytest.fixture
@@ -353,7 +353,7 @@ def test_status_marks_the_progress_column_unknown_when_the_report_fails(
     )
     # The lib the dashboard shells out to is gone: an upgrade mid-render, a
     # partially-checked-out repo, or a lift-out that took only this skill.
-    (repo / ".claude/skills/pr-pipeline-tick/lib/tick.py").unlink()
+    (repo / ".claude/skills/tick/lib/tick.py").unlink()
 
     result = run_status(repo)
 
@@ -437,7 +437,7 @@ def test_status_lists_open_issues_at_every_pipeline_label(tmp_path: Path) -> Non
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
 
     result = subprocess.run(
-        ["bash", str(repo / ".claude/skills/pr-pipeline-status/status.sh")],
+        ["bash", str(repo / ".claude/skills/status/status.sh")],
         cwd=repo, env=env, check=False, capture_output=True, text=True,
     )
 
@@ -483,10 +483,10 @@ def install_status_script(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    script_dst = repo / ".claude/skills/pr-pipeline-status/status.sh"
+    script_dst = repo / ".claude/skills/status/status.sh"
     script_dst.parent.mkdir(parents=True)
     shutil.copy(Path(__file__).with_name("status.sh"), script_dst)
-    lib_dst = repo / ".claude/skills/pr-pipeline-tick/lib"
+    lib_dst = repo / ".claude/skills/tick/lib"
     lib_dst.mkdir(parents=True)
     for name in os.listdir(TICK_LIB):
         if name.endswith(".py") and not name.startswith("test_"):
@@ -596,7 +596,7 @@ def run_status(
     env = os.environ.copy()
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
     return subprocess.run(
-        ["bash", str(repo / ".claude/skills/pr-pipeline-status/status.sh")],
+        ["bash", str(repo / ".claude/skills/status/status.sh")],
         cwd=cwd or repo,
         env=env,
         check=False,

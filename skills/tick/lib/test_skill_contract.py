@@ -11,6 +11,7 @@ Tests are categorized by verification strategy:
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import subprocess
@@ -43,16 +44,52 @@ README = Path(__file__).parent.parent / "README.md"
 DEBUG = Path(__file__).parent.parent / "DEBUG.md"
 LIB_README = Path(__file__).parent / "README.md"
 PREFLIGHT = Path(__file__).parent.parent / "preflight.sh"
-STATUS_SKILL = (
-    Path(__file__).parent.parent.parent / "pr-pipeline-status" / "SKILL.md"
-)
+STATUS_SKILL = Path(__file__).parent.parent.parent / "status" / "SKILL.md"
 PROMPTS = Path(__file__).parent / "prompts"
-STATUS_SCRIPT = (
-    Path(__file__).parent.parent.parent / "pr-pipeline-status" / "status.sh"
+STATUS_SCRIPT = Path(__file__).parent.parent.parent / "status" / "status.sh"
+DONE_SKILL = (
+    Path(__file__).parent.parent.parent / "definition-of-done" / "SKILL.md"
+)
+DONE_WHY = (
+    Path(__file__).parent.parent.parent
+    / "definition-of-done"
+    / "references"
+    / "why.md"
 )
 POLICY_CONFIG = Path(__file__).parent.parent / "config.toml"
 GUIDELINES = REPO_ROOT / "docs/working/pr-guidelines.md"
 INTERNALS = REPO_ROOT / "docs/working/pr-pipeline-internals.md"
+
+# --- Plugin packaging ---
+
+SKILLS_ROOT = REPO_ROOT / "skills"
+PLUGIN_MANIFEST = REPO_ROOT / ".claude-plugin" / "plugin.json"
+MARKETPLACE_MANIFEST = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+
+# The plugin's own name. Claude Code namespaces a plugin's skills by it, so this
+# is the prefix on every command the plugin publishes: `/pr-pipeline:tick`.
+PLUGIN_NAME = "pr-pipeline"
+
+# Every command this plugin publishes, and nothing else. Asserted as equality
+# rather than containment, because `"skills": "./skills"` in the manifest makes
+# *any* directory under `skills/` a namespaced, user-invocable command whose
+# description loads into every session's context. An unintended command is the
+# observable symptom of a misplaced file, and a containment check cannot see it.
+_PUBLISHED_SKILLS = frozenset({"tick", "status", "definition-of-done"})
+
+# How a skill body names the install root. `${CLAUDE_PLUGIN_ROOT}` is
+# substituted into plugin skill *content* as Claude loads it, so a command
+# written here reaches the agent as an absolute path. It is deliberately not
+# used in `README.md`/`DEBUG.md`: those are read as plain text by a human in a
+# separate terminal or by an agent via `Read`, nothing substitutes them, and the
+# variable is not exported into a Bash tool call's environment — so the same
+# string there would silently resolve to a root-relative path.
+PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
+
+# The install root as the *shell-run* surfaces name it, still, until a resolving
+# launcher replaces it. Retained as the explicit override that keeps development
+# from a git working tree — where there is no plugin cache — working.
+INSTALL_ROOT_VAR = "$PR_PIPELINE_HOME"
 
 # The scope the credentialed engine prompts must state verbatim. Ambient `gh`
 # credentials reach every item in the repository, not just the one the engine was
@@ -100,7 +137,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
 # scoped between them because the clauses they pin — `gh pr create`, label
 # commands — also appear elsewhere in the same files as *instructions to follow*.
 # A whole-file substring check would pass on those occurrences and prove nothing.
-_CARVE_OUT_OPENER = "If you were dispatched by `pr-pipeline-tick`"
+_CARVE_OUT_OPENER = "If you were dispatched by `pr-pipeline:tick`"
 _CARVE_OUT_CLOSER = "#pipeline-label-authority)"
 
 # Carve-out clauses that only one root agent doc owes. `CLAUDE.md` reaches the
@@ -276,7 +313,7 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
 def test_skill_md_references_tick_py_invocation() -> None:
     """SKILL.md must reference the new Python orchestrator entry point."""
     text = SKILL.read_text()
-    assert "uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py" in text
+    assert f"uv run python {PLUGIN_ROOT_VAR}/skills/tick/lib/tick.py" in text
 
 
 def test_skill_md_is_lean_operator_sop() -> None:
@@ -297,9 +334,9 @@ def test_skill_md_loop_section_has_paste_ready_iteration_prompt() -> None:
     """Loop supervision must schedule the compact tick contract, not reinvoke the skill."""
     text = SKILL.read_text()
     assert "Paste this prompt into /loop" in text
-    assert "Do not invoke /pr-pipeline-tick" in text
+    assert f"Do not invoke /{PLUGIN_NAME}:tick" in text
     assert "dangerouslyDisableSandbox: true" in text
-    assert "uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py" in text
+    assert f"uv run python {PLUGIN_ROOT_VAR}/skills/tick/lib/tick.py" in text
     assert ".claude/worktrees/.tick-log" in text
     assert "tick-cadence:" in text
     assert "ScheduleWakeup" in text
@@ -1407,15 +1444,21 @@ def test_main_harvest_phases_called_in_order() -> None:
 # not how to invoke it, so it names no install-resolved path.
 _INSTALL_PORTABLE_DOCS = (
     SKILL, README, DEBUG, LIB_README, PREFLIGHT, STATUS_SKILL, STATUS_SCRIPT,
-    INTERNALS,
+    INTERNALS, DONE_SKILL,
 )
 
 # A pipeline path as a doc can legitimately write one: repo-relative in prose and
-# links, or install-root-anchored in a runnable command. The optional `.claude/`
-# alternative is matched only so the stale in-repo layout is reported as the
-# specific defect it is rather than as a generic missing file.
+# links, or install-root-anchored in a runnable command — under the plugin root
+# in a skill body, under `$PR_PIPELINE_HOME` in a command run from a shell. The
+# optional `.claude/` alternative is matched only so the stale in-repo layout is
+# reported as the specific defect it is rather than as a generic missing file.
+#
+# The published skill names are spelled out rather than matched as `skills/*`
+# because `.claude/skills/` in a target repository is a different directory that
+# these docs legitimately name; only this plugin's own skills resolve here.
 _PIPELINE_PATH_RE = re.compile(
-    r"(?:\$PR_PIPELINE_HOME/|\.claude/)?skills/pr-pipeline-[\w./-]*\w"
+    r"(?:\$\{CLAUDE_PLUGIN_ROOT\}/|\$PR_PIPELINE_HOME/|\.claude/)?"
+    r"skills/(?:" + "|".join(sorted(_PUBLISHED_SKILLS)) + r")(?:/[\w.-]+)*"
 )
 
 # Tokens that bind a shipped, paste-ready prompt to one machine or one target.
@@ -1467,10 +1510,10 @@ def test_no_operator_doc_names_a_pipeline_path_that_does_not_exist() -> None:
     source links in the internals doc resolve above the repository.
 
     Pipeline *code* is therefore named relative to the install root
-    (``$PR_PIPELINE_HOME``) in runnable commands and repo-relative in prose,
-    never relative to the repository the tick operates on. Pipeline *state*
-    (``.claude/worktrees/``) stays target-repo-relative and is untouched by this
-    guard.
+    (``${CLAUDE_PLUGIN_ROOT}`` in a skill body, ``$PR_PIPELINE_HOME`` in a
+    command run from a shell) and repo-relative in prose, never relative to the
+    repository the tick operates on. Pipeline *state* (``.claude/worktrees/``)
+    stays target-repo-relative and is untouched by this guard.
     """
     unresolved: list[str] = []
     for doc in _INSTALL_PORTABLE_DOCS:
@@ -1481,7 +1524,9 @@ def test_no_operator_doc_names_a_pipeline_path_that_does_not_exist() -> None:
             if named.startswith(".claude/"):
                 unresolved.append(f"{label}: {named} (stale in-repo skill layout)")
                 continue
-            relative = named.removeprefix("$PR_PIPELINE_HOME/")
+            relative = named.removeprefix(f"{PLUGIN_ROOT_VAR}/").removeprefix(
+                f"{INSTALL_ROOT_VAR}/"
+            )
             if not (REPO_ROOT / relative).exists():
                 unresolved.append(f"{label}: {named}")
 
@@ -1578,7 +1623,7 @@ def test_workflow_docs_use_the_label_vocabulary_the_tick_implements(
 # the pipeline's own `lib/`, which really is a Python project — naming pytest
 # there is a fact about this repository, not a claim about anyone's target.
 _TARGET_INDEPENDENT_SURFACES = (
-    SKILL, README, DEBUG, STATUS_SKILL, INTERNALS,
+    SKILL, README, DEBUG, STATUS_SKILL, INTERNALS, DONE_SKILL, DONE_WHY,
     PROMPTS / "implementer.txt", PROMPTS / "fixer.txt", PROMPTS / "reviewer.txt",
 )
 
@@ -1643,6 +1688,62 @@ def test_no_shipped_surface_hardcodes_a_target_repo_toolchain() -> None:
     )
 
 
+def test_no_shipped_surface_names_the_incubation_checkout() -> None:
+    """No engine-facing surface may name one machine or the incubation repo.
+
+    These surfaces travel to every install, and the tokens are the ones that
+    only ever arrive by being carried over from where the skills were written:
+    an author's home directory, or the name of the codebase they were incubated
+    in. Neither resolves for an adopter, and neither fails loudly there — the
+    reader simply follows a path or a repo that is not theirs.
+    """
+    violations: list[str] = []
+    for surface in _TARGET_INDEPENDENT_SURFACES:
+        text = surface.read_text()
+        lines = text.splitlines()
+        for token in _OPERATOR_SPECIFIC_TOKENS:
+            for match in re.finditer(re.escape(token), text, re.IGNORECASE):
+                line_no = text[: match.start()].count("\n") + 1
+                violations.append(
+                    f"{surface.name}:{line_no} names {token!r}: "
+                    f"{lines[line_no - 1].strip()!r}"
+                )
+
+    assert not violations, (
+        "shipped surfaces name a checkout an adopter does not have:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_definition_of_done_cites_no_work_item_number() -> None:
+    """``definition-of-done`` must describe its evidence, not reference it.
+
+    Its two files are the one place where a bare ``#614`` can only be a citation
+    of a past review — the skill is argued from defects it has seen, so a number
+    there is offered as proof. No adopter can open it against any repository
+    they have, so it reads as evidence while proving nothing: the "receipt
+    attached" shape the skill itself exists to reject. The failure shape is the
+    transferable part, and it has to be written out.
+
+    Markdown headings never match; a ``#`` here is followed by a digit.
+    """
+    violations: list[str] = []
+    for surface in (DONE_SKILL, DONE_WHY):
+        text = surface.read_text()
+        lines = text.splitlines()
+        for match in re.finditer(r"(?<!\w)#\d+", text):
+            line_no = text[: match.start()].count("\n") + 1
+            violations.append(
+                f"{surface.name}:{line_no} cites {match.group(0)}: "
+                f"{lines[line_no - 1].strip()!r}"
+            )
+
+    assert not violations, (
+        "definition-of-done cites work items an adopter cannot resolve; "
+        "describe the failure shape instead:\n" + "\n".join(violations)
+    )
+
+
 def test_shipped_config_declares_no_target() -> None:
     """``config.toml`` must ship with ``[target]`` blank.
 
@@ -1697,6 +1798,190 @@ def test_status_dashboard_has_no_fallback_target_repo() -> None:
     assert "no target repo configured" in text, (
         "status.sh does not fail loudly when no target is configured"
     )
+
+
+# --- Category G — plugin packaging invariants ---
+
+
+def test_plugin_manifest_publishes_the_skills_directory() -> None:
+    """``plugin.json`` must exist, parse, and point at ``./skills``.
+
+    This file is what makes the repository installable at all. Without it
+    ``/plugin install`` has nothing to read, and every other packaging decision
+    below describes a plugin an adopter cannot obtain.
+    """
+    assert PLUGIN_MANIFEST.exists(), (
+        f"no plugin manifest at {PLUGIN_MANIFEST.relative_to(REPO_ROOT)}"
+    )
+    manifest = json.loads(PLUGIN_MANIFEST.read_text())
+
+    assert manifest.get("name") == PLUGIN_NAME, (
+        "the plugin name prefixes every command it publishes; it must be "
+        f"{PLUGIN_NAME!r}, not {manifest.get('name')!r}"
+    )
+    assert manifest.get("skills") == "./skills", (
+        "plugin.json must publish ./skills; the existing layout is already "
+        "plugin-shaped and moving it would be a restructure, not packaging"
+    )
+
+
+def test_marketplace_manifest_makes_this_repository_its_own_source() -> None:
+    """``marketplace.json`` must publish this repository as the plugin source.
+
+    The repository being its own marketplace is what makes
+    ``/plugin marketplace add kwuBuild/pr-pipeline`` work with no separate
+    registry to stand up and keep in step with releases. A ``source`` naming
+    anywhere but ``./`` reintroduces exactly that second thing to maintain.
+    """
+    assert MARKETPLACE_MANIFEST.exists(), (
+        f"no marketplace manifest at "
+        f"{MARKETPLACE_MANIFEST.relative_to(REPO_ROOT)}"
+    )
+    manifest = json.loads(MARKETPLACE_MANIFEST.read_text())
+
+    plugins = manifest.get("plugins", [])
+    assert len(plugins) == 1, (
+        f"the marketplace must publish exactly one plugin, found {len(plugins)}"
+    )
+    entry = plugins[0]
+    assert entry.get("name") == PLUGIN_NAME
+    assert entry.get("source") == "./", (
+        "the plugin source must be this repository itself, not "
+        f"{entry.get('source')!r}"
+    )
+
+
+def test_published_skill_set_is_exactly_the_intended_commands() -> None:
+    """``skills/`` must hold exactly the commands the plugin means to publish.
+
+    ``"skills": "./skills"`` publishes the *directory*, so anything dropped into
+    it becomes a namespaced, user-invocable command whose description loads into
+    every session's context. That makes an unintended command a side effect
+    nobody asked for, and one an at-least assertion cannot detect — so this is
+    an equality, and adding a skill is deliberately a test edit.
+    """
+    published = {
+        path.parent.name for path in SKILLS_ROOT.glob("*/SKILL.md")
+    }
+    assert published == set(_PUBLISHED_SKILLS), (
+        "the published command set drifted from the recorded decision:\n"
+        f"  unexpected: {sorted(published - _PUBLISHED_SKILLS)}\n"
+        f"  missing:    {sorted(_PUBLISHED_SKILLS - published)}"
+    )
+
+
+def test_every_skills_subdirectory_is_a_loadable_skill() -> None:
+    """No directory may sit under ``skills/`` without being a real skill.
+
+    A subdirectory with no ``SKILL.md`` is invisible to the command-set
+    assertion above, so ``skills/`` is the one place a resource cannot be parked
+    "out of the way". Anything that is not a published command belongs outside
+    the manifest's ``skills`` entry entirely.
+    """
+    orphans = [
+        str(path.relative_to(REPO_ROOT))
+        for path in sorted(SKILLS_ROOT.iterdir())
+        if path.is_dir() and not (path / "SKILL.md").exists()
+    ]
+    assert not orphans, (
+        "these directories are under the published skills root but are not "
+        f"skills, so the command-set assertion cannot see them: {orphans}"
+    )
+
+
+def test_each_published_skill_is_invoked_by_its_directory_name() -> None:
+    """A skill's directory name and its frontmatter ``name`` must agree.
+
+    The directory name is what the harness namespaces into the command:
+    ``skills/tick/`` under this plugin is ``/pr-pipeline:tick``. That was
+    measured, not assumed — a user-level skill whose ``SKILL.md`` declares
+    ``name: gstack`` from a directory named ``.gstack-bak`` is offered as
+    ``.gstack-bak``, so the frontmatter does not win.
+
+    Keeping the two equal is what makes that ordering stop mattering. They
+    disagree only while a rename is half-applied, which is precisely when the
+    published command name is not what anyone reading the frontmatter expects.
+    """
+    for name in sorted(_PUBLISHED_SKILLS):
+        skill_md = SKILLS_ROOT / name / "SKILL.md"
+        declared = frontmatter_name(skill_md.read_text())
+        assert declared == name, (
+            f"skills/{name}/SKILL.md declares name: {declared!r}; the command "
+            f"published from this directory is /{PLUGIN_NAME}:{name}"
+        )
+
+
+def test_skill_bodies_resolve_the_install_through_the_plugin_root() -> None:
+    """Commands inside a ``SKILL.md`` must be anchored at the plugin root.
+
+    An operator cannot know the cache path a plugin installs to, so
+    ``$PR_PIPELINE_HOME`` cannot be the contract for an installed plugin: it
+    asks them to export a path only the harness knows. Skill bodies are the one
+    surface where the harness answers that for them — ``${CLAUDE_PLUGIN_ROOT}``
+    is substituted into the content as Claude loads it, so the agent reads an
+    absolute path.
+
+    ``README.md`` and ``DEBUG.md`` are excluded on purpose and asserted
+    elsewhere: nothing substitutes them, and the same string there resolves to a
+    root-relative path that fails without saying why.
+    """
+    for skill_md in (SKILL, STATUS_SKILL):
+        text = skill_md.read_text()
+        label = str(skill_md.resolve().relative_to(REPO_ROOT))
+        assert INSTALL_ROOT_VAR not in text, (
+            f"{label} still anchors a command at {INSTALL_ROOT_VAR}, which an "
+            "operator of an installed plugin has no way to set correctly"
+        )
+        assert PLUGIN_ROOT_VAR in text, (
+            f"{label} names no install root at all; a bare relative path "
+            "resolves against the target repo, not the install"
+        )
+
+
+def test_permission_rules_never_name_the_install_root_as_a_variable() -> None:
+    """A documented ``permissions.allow`` rule must carry no unexpanded variable.
+
+    A permission rule is matched against the *command text* the agent is about to
+    run, and nothing expands inside one. `SKILL.md` hands the agent a command in
+    which `${CLAUDE_PLUGIN_ROOT}` has already been substituted for the install's
+    absolute path, so a rule written against either variable matches nothing.
+
+    That failure is silent in the worst way: not an error, not a tick-log entry,
+    just a permission prompt on every tick — which is precisely the condition the
+    section documenting these rules exists to prevent. The rules are therefore
+    written with a placeholder the reader must replace.
+    """
+    offenders: list[str] = []
+    for doc in (DEBUG, README):
+        label = str(doc.resolve().relative_to(REPO_ROOT))
+        for rule in re.findall(r"\"Bash\([^\"]*\)\"", doc.read_text()):
+            if PLUGIN_ROOT_VAR in rule or INSTALL_ROOT_VAR in rule:
+                offenders.append(f"{label}: {rule}")
+
+    assert not offenders, (
+        "these permission rules name the install root as a variable, which "
+        "expands in no rule and so grants nothing:\n" + "\n".join(offenders)
+    )
+
+
+def test_debug_md_documents_the_stale_plugin_root_after_upgrade() -> None:
+    """``DEBUG.md`` must carry the stale-``CLAUDE_PLUGIN_ROOT`` caveat.
+
+    The substitution happens once, when the session loads the skill. A session
+    that was already running when ``/plugin marketplace update`` installed a new
+    cache version keeps running the *old* version's code, silently and with no
+    error, which is a debugging surface an operator reaches only by knowing to
+    look for it.
+    """
+    text = normalize_prose(DEBUG.read_text())
+    assert "claude_plugin_root" in text, (
+        "DEBUG.md never mentions CLAUDE_PLUGIN_ROOT"
+    )
+    for phrase in ("already running", "restart"):
+        assert phrase in text, (
+            f"DEBUG.md does not document the stale plugin root caveat: "
+            f"missing {phrase!r}"
+        )
 
 
 # --- Helpers ---
@@ -1949,6 +2234,35 @@ def carve_out_block(text: str) -> str:
     start = text.index(_CARVE_OUT_OPENER)
     end = text.find(_CARVE_OUT_CLOSER, start)
     return text[start:] if end == -1 else text[start : end + len(_CARVE_OUT_CLOSER)]
+
+
+def frontmatter_name(text: str) -> str | None:
+    """Return the ``name`` a ``SKILL.md`` declares in its YAML frontmatter.
+
+    Deliberately not a YAML parse: the runtime contract is stdlib-only, and the
+    frontmatter this reads is three or four flat scalar keys. Scanning the
+    delimited block for one ``key: value`` line is the whole requirement, and it
+    fails as a missing name rather than as an import error on a machine with no
+    YAML library.
+
+    Args:
+        text: Raw contents of a ``SKILL.md``.
+
+    Returns:
+        The declared name, or ``None`` when the file has no frontmatter block or
+        no ``name`` key inside it.
+    """
+    if not text.startswith("---\n"):
+        return None
+    _, _, rest = text.partition("---\n")
+    block, sep, _ = rest.partition("\n---")
+    if not sep:
+        return None
+    for line in block.splitlines():
+        key, delimiter, value = line.partition(":")
+        if delimiter and key.strip() == "name":
+            return value.strip()
+    return None
 
 
 def normalize_prose(text: str) -> str:

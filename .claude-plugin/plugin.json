@@ -1,0 +1,19 @@
+{
+  "name": "pr-pipeline",
+  "description": "An unattended control plane that drives GitHub issues through implement, review, fix, and re-review using Claude Code and Codex engines. GitHub labels are the only source of truth for what stage a work item is in.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Keith Wu"
+  },
+  "homepage": "https://github.com/kwuBuild/pr-pipeline",
+  "repository": "https://github.com/kwuBuild/pr-pipeline",
+  "license": "MIT",
+  "keywords": [
+    "automation",
+    "code-review",
+    "github",
+    "orchestration",
+    "unattended"
+  ],
+  "skills": "./skills"
+}
