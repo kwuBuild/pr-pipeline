@@ -10,6 +10,7 @@ An unattended control plane that drives GitHub issues through implement → revi
 - `docs/working/pr-pipeline-internals.md` — how the runtime actually behaves, with line-anchored links into the source.
 - `docs/architecture.md` — the architecture reference: what owns each decision and why each boundary sits where it does. Read before changing dispatch, harvest, custody, or cadence.
 - `docs/working/plugin-distribution-design.md` — design for shipping the pipeline as an installable Claude Code plugin: operator-owned config, issue-author trust, and the staged independence validation. Not yet implemented.
+- `docs/working/phase-1-issue-breakdown.md` — handoff note for issues #7-#21: why the design was cut into those issues, which orderings are unsafe to break, and what was deliberately not filed.
 - `docs/working/commit-guidelines.md` — Commit format rules. Read before committing.
 - `docs/working/pr-guidelines.md` — PR body template, issue template, workflow labels, AI review posting. Read before raising a PR, creating an issue, or reviewing.
 
