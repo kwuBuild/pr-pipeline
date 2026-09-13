@@ -1,41 +1,97 @@
-# Operator configuration for the PR-pipeline control plane.
+# The PACKAGED FLOOR for the PR-pipeline control plane. Layer 1 of the
+# configuration order, and read-only.
 #
-# The pipeline drives a repository it does not own, so everything that varies
-# per target lives here rather than in the code. This file is copied into every
-# install: a value committed here is a decision made on an adopter's behalf, so
-# the trust-boundary defaults are the conservative ones and the target is blank.
+# THIS IS NOT WHERE YOU PUT YOUR SETTINGS. Operator configuration lives in
+# ~/.claude/pr-pipeline/config.toml (honouring $CLAUDE_CONFIG_DIR). A plugin
+# install lands at ~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/ and
+# `/plugin update` installs the next version at a *different* hash, so a value
+# written here is silently discarded on every upgrade — including verification
+# grants, which would leave the next dispatch running with no verification while
+# still awarding ai:ready-for-human. The resolver reports an [operator],
+# [repos.*] or [scan] table found here as a configuration error rather than
+# reading it.
+#
+# The layers, later overriding earlier:
+#
+#   1. this file                     the shipped floor
+#   2. [defaults]                    operator-wide, in the operator's own config
+#   3. [repos."owner/name"]          per-repository overrides
+#   4. environment variables         PIPELINE_TRUSTED_AUTHOR (one-off runs)
+#   5. explicit CLI flags            --permission-mode and friends
+#
+# Lists replace wholesale; they never merge. An operator narrowing a grant for
+# one target is the direction that matters for a permission list.
+#
+# $PR_PIPELINE_CONFIG and $CLAUDE_CONFIG_DIR must name an absolute location. A
+# relative one is refused at startup: the tick changes directory after it starts,
+# and an engine runs with its cwd inside a checkout of the PR under review.
+#
+# The operator's file looks like this:
+#
+#   [operator]
+#   login = "your-github-login"
+#
+#   [defaults]
+#   allow_touching  = false
+#   checklist_paths = []
+#   verify_tools    = ["uv run pytest *"]
+#   base_ref        = ""
+#   permission_mode = "dontAsk"
+#
+#   [scan]
+#   repos = []                        # empty or absent = unrestricted
+#
+#   [repos."owner/notes-app"]
+#   base_ref     = "master"
+#   verify_tools = ["npm test *"]
 
-# The repository this pipeline operates on, and the GitHub login whose PRs it
-# may auto-review. Both are required; a tick refuses to start with either unset
-# rather than resolving an empty `--repo` against whatever the cwd happens to
-# be. Override for a one-off run with PIPELINE_REPO / PIPELINE_TRUSTED_AUTHOR.
+# DEPRECATED, and the one exception to "no operator value lives here": the
+# target repository, still read from this file because resolving it from the
+# working directory's git remote is a later change. An install that filled this
+# in before configuration moved to the operator's home keeps working across that
+# move — the dashboard (skills/status/status.sh) parses this same
+# key with sed, because it must run before any interpreter is resolved.
 #
-# trusted_author is a trust boundary, not a convenience: the reviewer runs with
-# the operator's credentials inside the PR's own checked-out tree, so a PR from
-# anyone else is escalated to a human instead of auto-reviewed.
+# trusted_author is superseded by [operator] login in the operator's own config
+# and is read only as that key's floor. Set the new key, not this one.
+#
+# Both are blank on purpose: a committed value would point a fresh install at
+# somebody else's repository, and every `gh` call the tick makes carries
+# `--repo`, so a wrong value is a remote mutation rather than a no-op. `main`
+# refuses to run a tick with either unset. Override for a one-off run with
+# PIPELINE_REPO / PIPELINE_TRUSTED_AUTHOR.
 [target]
 repo = ""
 trusted_author = ""
 
-# [policy] governs the reviewer admission gate. A PR whose diff edits files that
-# steer the reviewer (CLAUDE.md, AGENTS.md, the review checklists) is escalated
-# to a human instead of auto-reviewed — the reviewer runs on the PR's own
-# worktree, so it would review under instructions the PR itself supplied.
+# The shipped floor for every per-target setting. Each key here is overridable
+# in the operator's [defaults] and again in their [repos."owner/name"].
+[defaults]
+# allow_touching governs the reviewer admission gate. A PR whose diff edits
+# files that steer the reviewer (CLAUDE.md, AGENTS.md, the review checklists,
+# the pipeline's own config/pipeline.py/tick.py) is escalated to a human instead
+# of auto-reviewed — the reviewer runs on the PR's own worktree, so it would
+# otherwise review under instructions the PR itself supplied.
 #
-# The gate ships ON, and that is the shipped default precisely because it is a
-# trust boundary: an install inherits whatever is committed here, so opting
-# every adopter out by default would make the choice for them. An operator who
-# accepts that boundary sets allow_touching = true in their own copy. The human
-# merge gate after ai:ready-for-human still stands either way.
+# The gate ships ON, and that is the shipped floor precisely because it is a
+# trust boundary: an install inherits whatever is written here, so opting every
+# adopter out by default would make the choice for them. An operator who accepts
+# that boundary sets allow_touching = true in their own config. The human merge
+# gate after ai:ready-for-human still stands either way.
 #
-# A missing or malformed config.toml keeps the conservative gate (fail closed).
-#
+# A missing or malformed config keeps the conservative gate (fail closed).
+allow_touching = false
+
 # checklist_paths names the target repo's *own* reviewer-governing docs, as
 # repo-relative paths. CLAUDE.md and AGENTS.md are matched by basename at any
 # depth and need no entry here. Empty is correct for a repo with no separate
-# checklists.
-[policy]
-allow_touching = false
+# checklists — and a path pinned in this file would be one repo's, dead in every
+# other install, while making an adopter's gate look configured when it is not.
+#
+# These are paths to *block*, so unlike every other list here the empty state is
+# the permissive one. A malformed value is therefore a startup error, and until
+# the tick stops the gate keeps every usable path any layer named: a typo in a
+# per-repository override must not quietly unprotect a valid [defaults] list.
 checklist_paths = []
 
 # The verification commands an engine is permitted to run, as Bash permission
@@ -48,11 +104,31 @@ checklist_paths = []
 # Replace this list wholesale for a non-Python stack. A trailing ` *` allows
 # arguments; without it only the bare command is permitted. An entry containing
 # a parenthesis or newline is dropped — it would break out of the allowlist
-# entry and widen the boundary.
-[engine]
+# entry and widen the boundary. A value that is not a list of strings is a
+# startup error, which is deliberately *not* the same state as an empty list:
+# read as empty, one typo would dispatch an unverified PR and still promote it.
+#
+# This list is the *only* source of the shipped grants. An explicitly empty
+# `verify_tools` — in [defaults] or for one repository — grants nothing, because
+# a permission grant an operator cannot narrow to nothing is not a grant they
+# control.
 verify_tools = [
     "uv run pytest *",
     "uv run ruff *",
     "uv run pyright",
     "npm --prefix frontend *",
 ]
+
+# The base branch the implementer branches from and targets its PR at. Blank
+# means "resolve the target's default branch"; until that resolution lands the
+# dispatch falls back to `main`. A malformed value is a startup error naming the
+# key — there is no conservative branch to fall back to, and silently picking
+# one would target a branch the operator never named.
+base_ref = ""
+
+# The engine `--permission-mode`: "dontAsk" (an exact allowlist, nothing else
+# runs) or the experimental classifier-gated "auto". The floor is the
+# conservative one; `--permission-mode` on a single run outranks it. Blank is
+# not one of the values — unlike base_ref, it names nothing — and is a startup
+# error rather than a ValueError raised after a dispatch lease already exists.
+permission_mode = "dontAsk"

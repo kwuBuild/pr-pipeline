@@ -777,8 +777,8 @@ DeepSeek-routed launches across the tick history.
 
 The implementer gets:
 - Full read/write access to the worktree
-- The verification commands the operator declared in `config.toml`
-  (`[engine] verify_tools`) — the target repo's tests, linter, and type checker
+- The verification commands the operator declared as `verify_tools` — the target
+  repo's tests, linter, and type checker
 - `git` for committing and pushing to its own branch
 - No network tools beyond what sandbox allows
 - The target repo's own `CLAUDE.md` governs behavior (TDD, commit hygiene, and
@@ -990,8 +990,9 @@ primary control.
 the Codex process and its tools, so the review slice is not safe for arbitrary candidate
 content. Before worktree creation or credential exposure, dispatch reads the PR author,
 head repository, and cross-repository flag from GitHub and checks them against the
-operator-owned repository contract: the author and head repository the operator
-declared in `config.toml` (`[target] trusted_author`, `[target] repo`), and
+operator-owned repository contract: the login the operator declared as
+`[operator] login` (in their own config), the repository from the packaged
+file's deprecated `[target] repo`, and
 `isCrossRepository=false`. Only a proven match may proceed. Anything missing,
 malformed, or outside that allowlist routes to `ai:needs-human-decision`; it
 never launches Codex. This is an enforced trust boundary, not a prose
@@ -1035,7 +1036,7 @@ the PR does not change it (then head == base for those files); when it does, dis
 must not auto-review under instructions the PR supplies. So dispatch checks the diff
 (`git diff --name-only <base_sha>...<head_sha>`) for any reviewer-governing file
 (`CLAUDE.md` or `AGENTS.md` at any level, plus any path the operator listed under
-`[policy] checklist_paths`) and routes such a PR to `ai:needs-human-decision`
+`checklist_paths`) and routes such a PR to `ai:needs-human-decision`
 instead of launching a reviewer. `CLAUDE.md`/`AGENTS.md` are universal and matched
 by basename; a target's own checklists are its to name, which is why they are
 configuration rather than a shipped path list. The match set is intentionally
@@ -1047,12 +1048,17 @@ are review policy on the same reasoning and are matched by path *suffix*, per
 segment, so the rule holds at every install depth rather than only the one the
 skills were incubated at.
 
-This gate is operator-configurable in the shipped skill: `[policy] allow_touching =
-true` in the skill's `config.toml` lets policy-editing PRs flow to auto-review anyway
-(the operator accepts that the review runs under instructions the PR itself supplies);
-the config fails closed — missing, malformed, or `false` keep the escalation. This
-repo's committed config currently sets `allow_touching = true`, so the gate is opted
-out here; see the skill README's "Admission gate: reviewer policy files" section.
+This gate is operator-configurable: `allow_touching = true` under `[defaults]` or
+`[repos."owner/name"]` in the operator's own config lets policy-editing PRs flow to
+auto-review anyway (the operator accepts that the review runs under instructions the
+PR itself supplies); the config fails closed — missing, malformed, or `false` keep
+the escalation. The packaged floor ships `false`, so the gate is on unless an
+operator turns it off; see the skill README's "Admission gate: reviewer policy
+files" section.
+
+Note that the operator's config is not in any repository, so no PR can edit it.
+The packaged `config.toml` is, and it is still part of the policy path set for
+exactly that reason: it carries the gate's shipped default.
 
 **Base and head refresh (closes the stale-base AND stale-head risks).** Reviewing
 against a stale base is worse in an unattended loop than manually: a PR can be
@@ -1538,10 +1544,10 @@ one repo's toolchain would be installable in exactly one repo.
 The one place a command name is unavoidable is the engine tool allowlist:
 headless engines run under `--permission-mode dontAsk` with an *exact*
 permission list, never a glob (see *Permission mode for headless Claude*), so
-the operator declares the verification commands their repo actually uses in
-`config.toml` under `[engine] verify_tools`. That list is a permission grant,
+the operator declares the verification commands their repo actually uses as
+`verify_tools`, per target where they differ. That list is a permission grant,
 not an instruction — the prompt still defers to the repo's own guides for what
-to run and in what order. The shipped default is the Python triple, because a
+to run and in what order. The shipped floor is the Python triple, because a
 default that grants nothing makes a fresh install fail its first dispatch with
 a permission denial rather than a legible message.
 
@@ -1554,6 +1560,70 @@ are pipeline concerns and are identical for every target.
 `ANTHROPIC_BASE_URL` in the dispatch env. The reviewer's model is pinned
 explicitly in the dispatch argv, because `--ignore-user-config` discards the
 operator's `config.toml` defaults.
+
+### Configuration ownership
+
+**Configuration is authored by the operator and read from outside both the
+install and the target repository:** `~/.claude/pr-pipeline/config.toml`
+(`$CLAUDE_CONFIG_DIR` relocates it; `$PR_PIPELINE_CONFIG` names it outright for
+tests).
+
+Two independent reasons put it there, and only the first is load-bearing on its
+own. A plugin install lands at
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/`, and `/plugin update`
+installs the next version at a *different* hash — so an install-relative config
+is silently discarded on every upgrade. That settles the location regardless of
+any threat model. Separately, config committed to the *target* would be config
+the pull request under review supplies, since the reviewer and fixer check that
+tree out.
+
+The second reason is a placement decision, not a security boundary. Moving
+configuration outside the target tree stops a PR from **supplying** policy; it
+does not stop a PR from **overwriting** it, because a granted verification
+command such as `npm test` executes scripts the PR controls in a process holding
+the operator's filesystem access. Containing that belongs to the engine and model
+layer — process and filesystem isolation — not to a config-location rule. What
+*is* enforced, and tested: no configuration layer is ever read from inside a
+target repository or an engine worktree.
+
+**One resolver owns the layering.** `pipeline.resolve_config` returns the
+effective configuration for one resolved target and every Python caller reads it;
+no caller reads a raw table, so two callers cannot disagree. Layers, later
+overriding earlier: the packaged floor, `[defaults]`, `[repos."owner/name"]`,
+environment, explicit CLI flags. Lists replace wholesale — an operator who cannot
+narrow a grant for one target cannot use a permission list properly.
+
+**The packaged `config.toml` is layer 1 and only layer 1.** It is the shipped
+floor: read-only, carrying the conservative default for every per-target setting,
+and no operator value may land there (the resolver reports an `[operator]`,
+`[repos.*]` or `[scan]` table in it as a configuration error). Its `[target]`
+table is a deprecated remnant, read only so an install configured before the move
+survives it, and removed when the target is resolved from the git remote.
+
+**Fail-closed is scoped to the settings that have a safe direction.**
+`allow_touching` resolves to the restrictive reading and warns. `base_ref`,
+`permission_mode`, `[operator] login`, `verify_tools`, `checklist_paths` and
+`[scan] repos` have no value that is both conservative and the one the operator
+wrote — there is no restrictive branch name and no identity that usefully trusts
+nobody — so a malformed one is a startup error naming the key and the tick exits
+3. A malformed `verify_tools` is deliberately not an empty one: read as empty it
+composes with "dispatch anyway on an empty grant" into an engine that verifies
+nothing and a PR promoted regardless. `checklist_paths` runs the other way —
+these are files to *block*, so empty is the permissive state — and a malformed
+value keeps every usable path any layer named while the tick refuses.
+
+**The empty state of a permission list is an operator decision, and nothing
+underneath it may override that.** `verify_tools = []` under a repository
+section grants no verification command at all; the shipped Python stack lives
+in the packaged floor, as layer 1, and not as a fallback in the dispatch code
+that an operator would have no way to narrow.
+
+**The operator config is located from the environment, never from the working
+directory.** `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must be absolute; a
+relative value is a startup error. The tick chdirs to the repository root after
+import, and an engine's cwd is a checkout of the PR head, so a cwd-relative
+config path is one process reading two configurations — or a PR supplying the
+policy it is judged under.
 
 ## Skill structure
 
@@ -1584,7 +1654,7 @@ skills/
     SKILL.md                    # /pr-pipeline:tick — invocation stub (thin)
     README.md                   # operator guide: usage, observability, knobs
     DEBUG.md                    # invariants, diagnostics, recovery
-    config.toml                 # operator config: [target], [policy], [engine]
+    config.toml                 # the packaged config floor, read-only (layer 1)
     review-schema.json          # Codex reviewer output schema (verdict + findings)
     preflight.sh                # one-time live verification gate
     preflight-probe-schema.json # typed schema for the read-only sandbox probe
@@ -1614,8 +1684,9 @@ iteration counting, base/head-SHA drift, dispatch-liveness, idempotent replay) a
 tested functions behind a thin CLI, so an unattended loop behaves identically every
 run. `lib/` is stdlib-only — it takes no dependency on any target repo's
 toolchain, which is what makes it installable against an arbitrary repository.
-The config artifacts are the operator's `config.toml` and the two JSON Schemas
-(`review-schema.json`, `preflight-probe-schema.json`).
+The config artifacts are the packaged `config.toml` floor and the two JSON Schemas
+(`review-schema.json`, `preflight-probe-schema.json`). The operator's own settings
+are not in this tree at all — see *Configuration ownership* below.
 
 ## Usage
 
@@ -1810,10 +1881,12 @@ token is.
 
 Known gaps, in the order they block adoption:
 
-1. **Standalone install.** The trusted-reviewer gate and the status dashboard
-   still resolve their target from pinned constants rather than operator
-   configuration, so a fresh install cannot yet point itself at an arbitrary
-   repository without editing source.
+1. **Standalone install.** Operator settings now live outside the install (see
+   *Configuration ownership*), but the *target repository* is still read from the
+   packaged file's deprecated `[target] repo` — which the status dashboard also
+   parses — so pointing a fresh install at a repository still means editing a file
+   inside the install. Resolving the target from the working directory's git
+   remote closes this and deletes that remnant.
 2. **Process-level install proof.** No test yet proves the *installed* plugin
    behaves identically to an in-repo copy; that needs a shim harness driving the
    shipped entry points from outside the checkout.

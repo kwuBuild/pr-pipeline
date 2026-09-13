@@ -12,11 +12,11 @@ This is **not** operational documentation — see `SKILL.md` and `README.md` in
 |---|---|---|---|
 | Binary | `claude -p` | `claude -p` | `codex exec` (via `engine_wrapper.py`) |
 | Permission mode | `--permission-mode dontAsk` | `--permission-mode dontAsk` | `-s read-only` (sandbox) |
-| Tool restriction | `--allowedTools` ([tick.py:745–872][impl-tools]) | `--allowedTools` ([tick.py:745–872][impl-tools]) | None (read-only sandbox enforces) |
+| Tool restriction | `--allowedTools` ([tick.py:755–893][impl-tools]) | `--allowedTools` ([tick.py:755–893][impl-tools]) | None (read-only sandbox enforces) |
 | Model (default) | whatever `claude` resolves (no `--model` flag) | whatever `claude` resolves / `deepseek-v4-pro[1m]` (claude-ds) | operator's `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`), else `gpt-5.5` |
 | Model override | `--model` flag from tick CLI | `--model` flag from tick CLI | `--review-model` flag from tick CLI |
 | Reasoning effort | Not set (claude default) | Not set (claude default) | operator's codex config, else `high`; `--review-effort` overrides |
-| Env isolation | Full parent env via `_engine_env()` ([tick.py:465–476][engine-env]) | Full parent env via `_engine_env()` ([tick.py:465–476][engine-env]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([tick.py:9184–9191][scrub]) |
+| Env isolation | Full parent env via `_engine_env()` ([tick.py:475–486][engine-env]) | Full parent env via `_engine_env()` ([tick.py:475–486][engine-env]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([tick.py:9205–9212][scrub]) |
 | Prompt source | `lib/prompts/implementer.txt` | `lib/prompts/fixer.txt` | `lib/prompts/reviewer.txt` |
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
 | Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | none — the wrapper discards engine output; stall cost bounded by the 20 min timeout |
@@ -28,7 +28,7 @@ This is **not** operational documentation — see `SKILL.md` and `README.md` in
 ### Implementer
 
 Default model: whatever the `claude` CLI resolves. With no override,
-`_launch_claude_engine` omits `--model` entirely ([tick.py:966][launch-model]).
+`_launch_claude_engine` omits `--model` entirely ([tick.py:987][launch-model]).
 Pinning a model here would silently override the operator's configured default,
 which is the one thing the default is meant to honor.
 
@@ -42,21 +42,21 @@ a run must be pinned independent of the branch.
 
 When `--impl-engine claude-ds` is active, the model resolves to
 `deepseek-v4-pro[1m]` by default. The `_resolve_engine` function
-([tick.py:479–551][resolve]) sets `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
+([tick.py:489–561][resolve]) sets `ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`,
 `ANTHROPIC_DEFAULT_SONNET_MODEL`, and `CLAUDE_CODE_SUBAGENT_MODEL` to the resolved
 model, routing Claude Code's internal model selection through the DeepSeek API
 gateway.
 
-The tick CLI accepts `--model <model>` ([tick.py:12630][cli-model]) which overrides
+The tick CLI accepts `--model <model>` ([tick.py:12710][cli-model]) which overrides
 the per-engine default for both the `--model` flag and `ANTHROPIC_MODEL`.
 
 Reasoning effort is not explicitly set. Claude Code uses its own default.
-For claude-ds, `CLAUDE_CODE_EFFORT_LEVEL=max` is set ([tick.py:549][ds-effort]).
+For claude-ds, `CLAUDE_CODE_EFFORT_LEVEL=max` is set ([tick.py:559][ds-effort]).
 
 ### Fixer
 
 Same as the implementer — the operator's own model (claude) or
-`deepseek-v4-pro[1m]` (claude-ds). Model resolution at [tick.py:10414–10422][fix-model].
+`deepseek-v4-pro[1m]` (claude-ds). Model resolution at [tick.py:10442–10450][fix-model].
 Uses `_launch_claude_engine` with the same `--model` handling and env construction.
 
 ### Reviewer
@@ -80,7 +80,7 @@ forwards the result as `--model <m>` and `-c 'model_reasoning_effort="<e>"'`.
 
 The reviewer cannot inherit the config the way the claude engines inherit their
 environment. It runs under `env -i` isolation with `HOME`/`CODEX_HOME` pointed
-at a per-PR scrub dir, *and* `--ignore-user-config` ([tick.py:9256][ignore-config]).
+at a per-PR scrub dir, *and* `--ignore-user-config` ([tick.py:9277][ignore-config]).
 Dropping that flag would not help — `$CODEX_HOME/config.toml` does not exist in
 the scrub dir. So the tick, as the trusted parent, reads the file and passes the
 values explicitly.
@@ -119,18 +119,18 @@ harness is about to execute a `Bash(...)` tool call, matching patterns like
 **None of these hooks fire for any engine.** The mechanism:
 
 - **Implementer and fixer** run as `claude -p` subprocesses spawned via
-  `subprocess.Popen` ([tick.py:975–987][popen-impl]). They are headless processes
+  `subprocess.Popen` ([tick.py:996–1008][popen-impl]). They are headless processes
   with no interactive harness. PreToolUse hooks are a feature of the Claude Code
   interactive harness that interposes on tool calls *within the harness* — a
   subprocess does not load or evaluate them.
 
-- **Reviewer** runs as `codex exec` ([tick.py:9244][codex-exec]), also spawned via
-  `subprocess.Popen` ([tick.py:9274–9282][popen-rev]). Codex CLI is a separate
+- **Reviewer** runs as `codex exec` ([tick.py:9265][codex-exec]), also spawned via
+  `subprocess.Popen` ([tick.py:9295–9303][popen-rev]). Codex CLI is a separate
   binary with its own execution model; it does not load Claude Code's
   `settings.local.json` hooks.
 
 - **`gh pr create` in the tick** runs via `subprocess.run(["gh", ...])` in the
-  Python tick process ([tick.py:1004–1027][gh-helper]), not through Claude Code's
+  Python tick process ([tick.py:1025–1048][gh-helper]), not through Claude Code's
   `Bash(...)` tool. PreToolUse hooks only intercept tool calls within the harness,
   not arbitrary subprocesses.
 
@@ -144,11 +144,11 @@ The pre-PR hooks are a quality gate for the interactive workflow only.
 
 Each engine runs with `cwd` set to an isolated git worktree:
 - Implementer: worktree at `origin/main` tip
-  ([tick.py:9635][impl-wt])
+  ([tick.py:9663][impl-wt])
 - Fixer: worktree at the PR's head branch
-  ([tick.py:10287–10288][fix-wt])
+  ([tick.py:10315–10316][fix-wt])
 - Reviewer: worktree at the PR's head SHA (detached)
-  ([tick.py:9119–9120][rev-wt])
+  ([tick.py:9140–9141][rev-wt])
 
 **Implementer and fixer** (Claude Code, `claude -p`): Claude Code auto-loads the
 nearest `CLAUDE.md` up the directory tree from `cwd`. This is guaranteed context.
@@ -202,77 +202,87 @@ or explicitly apply any checklist ([reviewer.txt:1][reviewer-prompt]).
 ### Policy gate: `touches_review_policy`
 
 The reviewer dispatch checks whether the PR's diff modifies any file that governs
-the reviewer's own behaviour ([tick.py:9098][policy-call]). If so, the PR is
+the reviewer's own behaviour ([tick.py:9138][policy-call]). If so, the PR is
 escalated to human review instead of being auto-reviewed.
 
-The gate is operator-configurable: `[policy] allow_touching = true` in
-`skills/tick/config.toml` lets policy-editing PRs flow to
-auto-review anyway (the operator accepts that the review runs under instructions
-the PR itself supplies). Missing config, malformed TOML, or `false` keep the
-escalation — the gate fails closed. The committed config ships `false`, because
-an install inherits it and the opt-out is a trust decision only the operator can
-make; see the skill README's "Admission gate: reviewer policy files" section.
+The gate is operator-configurable: `allow_touching = true` under `[defaults]` or
+`[repos."owner/name"]` in `~/.claude/pr-pipeline/config.toml` lets policy-editing
+PRs flow to auto-review anyway (the operator accepts that the review runs under
+instructions the PR itself supplies). Missing config, malformed TOML, or `false`
+keep the escalation — the gate fails closed. The packaged floor ships `false`,
+because an install inherits it and the opt-out is a trust decision only the
+operator can make; see the skill README's "Admission gate: reviewer policy
+files" section.
 
-The gate function `touches_review_policy` ([pipeline.py:1595–1632][policy-fn])
+The gate function `touches_review_policy` ([pipeline.py:2272–2318][policy-fn])
 matches changed paths against:
 
 **Basenames** (matched at any directory level, because both Claude Code and Codex
 load governing files from the nearest match up the tree) — `_POLICY_BASENAMES`
-([pipeline.py:160][basenames]):
+([pipeline.py:167][basenames]):
 - `CLAUDE.md`
 - `AGENTS.md`
 
-**Operator-declared paths** — `[policy] checklist_paths` in `config.toml`, read
-by `_reviewer_checklist_paths` ([pipeline.py][paths]). Repo-relative, matched
-exactly, and empty by default: a target repo's own review checklists are the
-target's to name, so the pipeline ships none. Plus the suffix set below:
+**Operator-declared paths** — the resolved `checklist_paths`, read from
+`resolve_config` ([pipeline.py][paths]). Repo-relative, matched exactly, and
+empty by default: a target repo's own review checklists are the target's to name,
+so the pipeline ships none. Plus the suffix set below:
 
 **Path suffixes** (matched per path segment, so the rule is one rule at every
 install depth — `.claude/skills/` in a host repo, `skills/` in the pipeline's
 own repository, or a plugin root) — `_POLICY_PATH_SUFFIXES`
-([pipeline.py:180–187][path-suffixes]):
-- `skills/tick/config.toml` — the file that toggles the
-  gate itself; a PR flipping `allow_touching` is escalated to a human rather
-  than auto-reviewed (a merged flip would otherwise disable the gate for every
-  future policy-editing PR)
+([pipeline.py:183–190][path-suffixes]):
+- `skills/tick/config.toml` — the packaged floor, which is where the
+  gate's shipped default lives; a PR flipping its `allow_touching` is escalated
+  to a human rather than auto-reviewed (a merged flip would otherwise disable
+  the gate for every future policy-editing PR). The operator's own config is
+  outside every repository, so no PR can edit it
 - `skills/tick/lib/pipeline.py` and `lib/tick.py` — the
-  gate's own implementation; a PR that rewrites `_policy_touching_allowed` to
-  return `True` unconditionally, or removes the gate call from the reviewer
+  gate's own implementation; a PR that rewrites `touches_review_policy` to
+  return `False` unconditionally, or removes the gate call from the reviewer
   dispatch, is the same silent-disable vector, so pipeline-code PRs escalate to
   a human while the gate is enabled
 
 Rationale: a PR that edits these files supplies instructions the reviewer itself
 would follow — "untrusted input controls the validator." The gate prevents the
 reviewer from auto-approving a PR that modifies the very rules used to evaluate it
-([pipeline.py:154–159][policy-comment]).
+([pipeline.py:155–166][policy-comment]).
 
 ## 5. Security posture per engine
 
 ### Implementer and fixer
 
 Permission model: `--permission-mode dontAsk` + `--allowedTools`
-([tick.py:745–872][impl-tools], [tick.py:959–967][launch-flags]).
+([tick.py:755–893][impl-tools], [tick.py:980–988][launch-flags]).
 
 The `--allowedTools` allowlist is a named security boundary
-([tick.py:745–872][impl-tools]):
+([tick.py:755–893][impl-tools]):
 ```
 Read Edit Write
 Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *)
 Bash(git log *) Bash(git push origin HEAD)
-<one Bash(...) entry per [engine] verify_tools value in config.toml>
+<one Bash(...) entry per resolved verify_tools value>
 ```
 
 The verification entries are the operator's, not the pipeline's: `_engine_verify_tools`
-wraps each configured value in `Bash(...)` and drops any that contains a parenthesis
-or newline, which would close the entry early and turn the rest of the string into
-extra permissions.
+wraps each resolved value in `Bash(...)`. An entry containing a parenthesis or a
+newline would close its entry early and turn the rest of the string into extra
+permissions, so the resolver reports it and startup refuses — dropping it here
+instead would hand the engine a narrower grant than the operator wrote, and an
+all-invalid list would arrive as the deliberate empty one. The same check is
+repeated at the argv builder for the one path startup cannot cover: the config
+file is re-read per dispatch, so an edit landing afterwards would otherwise
+reach `--allowedTools` unexamined. Nothing sits underneath the resolved list — `verify_tools = []`
+composes no entries at all, and the shipped Python stack reaches an engine only as
+layer 1 of the resolution order. A fallback here would be a grant the operator
+narrowed away and got back.
 
 This restricts the git surface to commit + fast-forward push of the engine's own
 branch. No force-push, remote-branch deletion, or arbitrary refspec push is
 possible. The design contract is `--permission-mode dontAsk` + this explicit list —
 never `--dangerously-skip-permissions`.
 
-Environment contract: `_engine_env()` ([tick.py:465–476][engine-env]) preserves
+Environment contract: `_engine_env()` ([tick.py:475–486][engine-env]) preserves
 the operator's complete parent environment. Implementers and fixers are trusted
 local engines running with the same ambient credentials and capabilities as the
 terminal that launched the tick. This keeps dispatch terminal-agnostic: cmux
@@ -523,7 +533,7 @@ and no workflow or security decision consumes these telemetry fields.
 
 ### Reviewer
 
-Permission model: `-s read-only` (read-only sandbox) ([tick.py:9254][sandbox]).
+Permission model: `-s read-only` (read-only sandbox) ([tick.py:9275][sandbox]).
 
 The reviewer runs via `codex exec`, which is non-interactive by design. A review
 only reads the worktree and emits structured JSON (the tick posts the review comment
@@ -539,14 +549,14 @@ running the reviewer in an externally sandboxed environment. Until then, two
 dispatch-time gates are the primary controls:
 
 1. **Trusted-candidate gate** (`pipeline.trusted_review_candidate`,
-   [tick.py:8866–8870][trusted-candidate]): the tick only dispatches a review for
+   [tick.py:8900–8904][trusted-candidate]): the tick only dispatches a review for
    PRs from a trusted author against a trusted repo. This is the primary trust
    boundary — untrusted PRs never reach the reviewer engine.
 2. **Policy-file gate** (`pipeline.touches_review_policy`,
-   [tick.py:9098][policy-call]): if the PR's diff modifies files that govern the
+   [tick.py:9138][policy-call]): if the PR's diff modifies files that govern the
    reviewer's own behaviour (`CLAUDE.md`, `AGENTS.md`, review checklists — see
    section 4), the PR is escalated to human review unless the operator opts out
-   via `config.toml` `[policy] allow_touching = true` (the shipped config sets
+   via `allow_touching = true` in their own config (the packaged floor sets
    `false`, per section 4). When active, it prevents a trusted author from
    (accidentally or otherwise) auto-approving changes to the review policy
    itself.
@@ -555,11 +565,11 @@ Additional flags:
 - `--ephemeral` — no persistent state across runs
 - `--ignore-user-config` — blocks `~/.codex/config.toml` (see section 6)
 - `--ignore-rules` — blocks project-level `.rules` from the PR head worktree
-  ([tick.py:9259][ignore-rules])
+  ([tick.py:9280][ignore-rules])
 - `--output-schema` — constrains output to the review JSON schema
-  ([tick.py:9246–9248][schema])
+  ([tick.py:9267–9269][schema])
 
-Env isolation: scrub-dir pattern ([tick.py:9184–9191][scrub]). `HOME` and
+Env isolation: scrub-dir pattern ([tick.py:9205–9212][scrub]). `HOME` and
 `CODEX_HOME` are redirected to a tick-owned `pr-{N}-scrub/` directory alongside
 the worktree under `WT_ROOT`, not inside it. Only
 `auth.json` is symlinked from the real `~/.codex/` directory. The inherited env
@@ -599,11 +609,11 @@ its own session.
 | Worktree isolation | Yes | Yes |
 | Process group isolation | Yes (`start_new_session`) | Yes (`os.setpgrp()`) |
 | Trusted-candidate gate | N/A | Yes (`trusted_review_candidate`) |
-| Residual read+exfil risk | Accepted within the operator-equivalent local trust boundary | Accepted; trusted-candidate + policy gates are primary controls (policy gate currently opted out via `config.toml`, see section 4) |
+| Residual read+exfil risk | Accepted within the operator-equivalent local trust boundary | Accepted; trusted-candidate + policy gates are primary controls (policy gate opt-out available via `allow_touching`, see section 4) |
 
 ## 6. Reviewer `--ignore-user-config` rationale
 
-The `--ignore-user-config` flag ([tick.py:9256][ignore-config]) prevents Codex from
+The `--ignore-user-config` flag ([tick.py:9277][ignore-config]) prevents Codex from
 loading `~/.codex/config.toml`. Without it, user configuration could:
 
 - **Spawn MCP servers or plugins** that open network connections, listen on ports,
@@ -618,11 +628,90 @@ Codex falls back to its built-in defaults (historically `codex-auto-review` /
 
 Model and effort are the deliberate exception to the blanket discard, and they
 are re-admitted by a different route: the tick reads those two keys itself and
-forwards them as flags ([tick.py:9266][rev-model]). That keeps the review
+forwards them as flags ([tick.py:9287][rev-model]). That keeps the review
 tracking the operator's chosen model — the usual reason to touch that file —
 without letting anything else in the file cross into the engine. Nothing above
 this line is relaxed: MCP servers, plugins, hooks, and sandbox/approval keys
 stay discarded, and the two values that do cross are shape-checked first.
+
+---
+
+## 7. Operator configuration resolution
+
+`resolve_config` ([pipeline.py:2005][resolver]) is the only reader. Every Python
+caller takes its `ResolvedConfig`; nothing reads a raw table, so two callers
+cannot disagree about what the operator configured.
+
+Exactly two files are read, both through `_read_toml`:
+
+1. the install's `skills/tick/config.toml` — the shipped floor
+2. `~/.claude/pr-pipeline/config.toml` — `$CLAUDE_CONFIG_DIR` relocates it,
+   `$PR_PIPELINE_CONFIG` names it outright
+
+Neither path is cwd-dependent, which is the property that matters at runtime: an
+engine's working directory is a checkout of the pull request's own head, so a
+config read relative to the cwd would be a PR supplying the policy it is judged
+under. A test asserts the read set and fails loudly if a third path appears.
+
+That property is enforced, not merely intended: `_operator_config_location`
+refuses a relative `$PR_PIPELINE_CONFIG` or `$CLAUDE_CONFIG_DIR` with a startup
+error and reads no operator file at all. `main` chdirs to the repository root
+*after* this module is imported, so a relative override would otherwise have one
+process resolve its identity from one file and its policy from another.
+
+Layers, later overriding earlier: floor → `[defaults]` → `[repos."owner/name"]`
+→ environment (`PIPELINE_TRUSTED_AUTHOR`) → CLI overrides. Presence decides, not
+truthiness, so `verify_tools = []` for one repository beats a non-empty default —
+lists replace wholesale rather than merging, because an operator who cannot
+*narrow* a grant per target cannot use a permission list properly.
+
+The login the tick reviews under is the one each tick resolves, threaded into
+`dispatch_reviewers` rather than read from the import-time
+`TRUSTED_REVIEW_AUTHOR`. A `--loop` process outlives a config edit, and
+validating the file's current login while admitting candidates against a stale
+one would authorize under an identity the operator had already replaced.
+
+`[operator] login` sits outside that layering deliberately: it is an identity,
+not a per-target setting, and a per-repository override would mean reviewing PRs
+as somebody else on one repo. Beneath it is the packaged file's deprecated
+`[target] trusted_author`, read only so an install configured before the move to
+the operator's home survives the change.
+
+Malformation splits two ways:
+
+- **Has a safe direction** (`allow_touching`) — resolves to the conservative
+  reading and appends to `ResolvedConfig.warnings`. The tick logs
+  `startup_config_warning` and runs.
+- **Has none** (`base_ref`, `permission_mode`, `[operator] login`,
+  `verify_tools`, `checklist_paths`, `[scan] repos`) — appends to
+  `ResolvedConfig.errors`. The tick logs `startup_config_invalid` and exits 3,
+  naming the key. So does a container declared as something other than a table:
+  `[[defaults]]` read as absent would replace every setting under it with the
+  shipped floor, and `[[scan]]` read as absent would turn a declared scope into
+  an unrestricted one.
+
+`checklist_paths` sits in the second group for the opposite reason to the rest.
+These are paths to *block*, so `()` is the permissive reading, not the
+conservative one; on malformation the resolver keeps every usable string any
+layer declared (`_every_usable_entry`) so that a bad per-repository override
+cannot erase a valid `[defaults]` list, and still errors so the tick stops.
+
+A malformed `verify_tools` is therefore not an empty one. Read as empty it would
+compose with the dispatch-anyway rule into an engine that verifies nothing and a
+PR promoted to `ai:ready-for-human` regardless — a hole neither rule has alone.
+"Malformed" covers the entries as well as the container: a value that cannot be
+a `Bash(...)` permission body is reported here rather than filtered at dispatch,
+because filtering turns one typo into a silently narrower grant and an
+all-invalid list into exactly the empty state this paragraph exists to prevent.
+`[scan] repos` splits the same way: absent or `[]` is unrestricted because both
+are things the operator wrote, while a malformed value resolves to the empty
+*restrictive* set, so even a caller that ignores errors cannot read a typo as
+"every repository is eligible".
+
+The resolver never raises. `tick.py` resolves at import to seed
+`TRUSTED_HEAD_REPO`/`TRUSTED_REVIEW_AUTHOR`, and an exception there would turn a
+config typo into a traceback from whichever CLI helper imported the module first.
+The startup gate is the single enforcement point.
 
 ---
 
@@ -636,41 +725,42 @@ stay discarded, and the two values that do cross are shape-checked first.
      inline `tick.py:N` citations in the prose above are part of this set and
      move with it. -->
 
-[impl-tools]: ../../skills/tick/lib/tick.py#L745-L872
-[launch-model]: ../../skills/tick/lib/tick.py#L966
-[launch-flags]: ../../skills/tick/lib/tick.py#L959-L967
-[engine-env]: ../../skills/tick/lib/tick.py#L465-L476
-[resolve]: ../../skills/tick/lib/tick.py#L479-L551
-[ds-effort]: ../../skills/tick/lib/tick.py#L549
-[popen-impl]: ../../skills/tick/lib/tick.py#L975-L987
-[rev-model]: ../../skills/tick/lib/tick.py#L9266
-[rev-effort]: ../../skills/tick/lib/tick.py#L9267
-[ignore-config]: ../../skills/tick/lib/tick.py#L9256
-[ignore-rules]: ../../skills/tick/lib/tick.py#L9259
-[schema]: ../../skills/tick/lib/tick.py#L9246-L9248
-[sandbox]: ../../skills/tick/lib/tick.py#L9254
-[codex-exec]: ../../skills/tick/lib/tick.py#L9244
-[popen-rev]: ../../skills/tick/lib/tick.py#L9274-L9282
-[scrub]: ../../skills/tick/lib/tick.py#L9184-L9191
-[policy-call]: ../../skills/tick/lib/tick.py#L9098
-[impl-wt]: ../../skills/tick/lib/tick.py#L9635
-[fix-wt]: ../../skills/tick/lib/tick.py#L10287-L10288
-[rev-wt]: ../../skills/tick/lib/tick.py#L9119-L9120
-[impl-timeout]: ../../skills/tick/lib/tick.py#L212
+[impl-tools]: ../../skills/tick/lib/tick.py#L755-L893
+[launch-model]: ../../skills/tick/lib/tick.py#L987
+[launch-flags]: ../../skills/tick/lib/tick.py#L980-L988
+[engine-env]: ../../skills/tick/lib/tick.py#L475-L486
+[resolve]: ../../skills/tick/lib/tick.py#L489-L561
+[ds-effort]: ../../skills/tick/lib/tick.py#L559
+[popen-impl]: ../../skills/tick/lib/tick.py#L996-L1008
+[rev-model]: ../../skills/tick/lib/tick.py#L9287
+[rev-effort]: ../../skills/tick/lib/tick.py#L9288
+[ignore-config]: ../../skills/tick/lib/tick.py#L9277
+[ignore-rules]: ../../skills/tick/lib/tick.py#L9280
+[schema]: ../../skills/tick/lib/tick.py#L9267-L9269
+[sandbox]: ../../skills/tick/lib/tick.py#L9275
+[codex-exec]: ../../skills/tick/lib/tick.py#L9265
+[popen-rev]: ../../skills/tick/lib/tick.py#L9295-L9303
+[scrub]: ../../skills/tick/lib/tick.py#L9205-L9212
+[policy-call]: ../../skills/tick/lib/tick.py#L9138
+[impl-wt]: ../../skills/tick/lib/tick.py#L9663
+[fix-wt]: ../../skills/tick/lib/tick.py#L10315-L10316
+[rev-wt]: ../../skills/tick/lib/tick.py#L9140-L9141
+[impl-timeout]: ../../skills/tick/lib/tick.py#L211
 [fix-timeout]: ../../skills/tick/lib/tick.py#L212
-[fix-model]: ../../skills/tick/lib/tick.py#L10414-L10422
+[fix-model]: ../../skills/tick/lib/tick.py#L10442-L10450
 [rev-timeout]: ../../skills/tick/lib/tick.py#L154
-[cli-model]: ../../skills/tick/lib/tick.py#L12630
-[gh-helper]: ../../skills/tick/lib/tick.py#L1004-L1027
+[cli-model]: ../../skills/tick/lib/tick.py#L12710
+[gh-helper]: ../../skills/tick/lib/tick.py#L1025-L1048
 [hook-impl]: ../../.claude/hooks/pre-pr-review-implementation.sh
 [hook-docs]: ../../.claude/hooks/pre-pr-review-documentation.sh
 [skill-trust]: ../../skills/tick/SKILL.md#trust-domain-and-sandbox-posture
-[policy-fn]: ../../skills/tick/lib/pipeline.py#L1676-L1717
-[basenames]: ../../skills/tick/lib/pipeline.py#L168
-[paths]: ../../skills/tick/lib/pipeline.py#L1630-L1641
-[path-suffixes]: ../../skills/tick/lib/pipeline.py#L184-L191
+[resolver]: ../../skills/tick/lib/pipeline.py#L2005-L2202
+[policy-fn]: ../../skills/tick/lib/pipeline.py#L2272-L2318
+[basenames]: ../../skills/tick/lib/pipeline.py#L167
+[paths]: ../../skills/tick/lib/pipeline.py#L2005-L2202
+[path-suffixes]: ../../skills/tick/lib/pipeline.py#L183-L190
 [policy-comment]: ../../skills/tick/lib/pipeline.py#L155-L166
-[trusted-candidate]: ../../skills/tick/lib/tick.py#L8866-L8870
+[trusted-candidate]: ../../skills/tick/lib/tick.py#L8900-L8904
 [design-reviewer-ctx]: ../architecture.md
 [design-sandbox-scope]: ../architecture.md
 [reviewer-prompt]: ../../skills/tick/lib/prompts/reviewer.txt#L1

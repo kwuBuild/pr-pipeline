@@ -61,6 +61,12 @@ The examples are unquoted for readability; quote `"$PR_PIPELINE_HOME/..."`
 yourself if your install path contains spaces. Under `watch '...'` the variable
 must be exported, not just set.
 
+**Where your settings live.** `~/.claude/pr-pipeline/config.toml`, outside both
+the install and every target repository — see [Configuration](#configuration).
+Do not edit the install's `skills/tick/config.toml`: it is the
+shipped floor, and a plugin upgrade installs the next version at a different
+path, silently discarding anything written there.
+
 ```bash
 # 1. One-time: verify the Codex binary and schema (required before first reviewer dispatch)
 bash $PR_PIPELINE_HOME/skills/tick/preflight.sh
@@ -108,6 +114,104 @@ Codex (`engine_wrapper.py`); implementers and fixers run via Claude (`claude -p`
 All three stages support targeted mode (`pr:N` / `'#N'`). The orchestrator also
 supports in-process `--loop` mode with a tick mutex, self-paced cadence,
 edge-triggered wake nudges, quiescence stop, and terminal-label notifications.
+
+## Configuration
+
+Operator configuration lives in **`~/.claude/pr-pipeline/config.toml`** —
+`$CLAUDE_CONFIG_DIR/pr-pipeline/config.toml` when that variable is set, and
+`$PR_PIPELINE_CONFIG` names the file outright (that override exists for tests
+and one-off runs).
+
+It is outside the install because a plugin install lands at
+`~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/` and `/plugin update`
+installs the next version at a *different* hash: a config in the install is
+silently discarded on every upgrade, verification grants included. It is outside
+the target repository because config committed there is config the pull request
+under review can author.
+
+```toml
+[operator]
+login = "your-github-login"   # whose PRs the AI reviewer will review
+
+[defaults]                    # operator-wide; every key is overridable per repo
+allow_touching  = false       # auto-review PRs that edit reviewer-governing files
+checklist_paths = []          # the target's own review checklists, repo-relative
+verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
+base_ref        = ""          # "" = the interim default, main
+permission_mode = "dontAsk"   # engine --permission-mode
+
+[scan]
+repos = []                    # empty or absent = unrestricted
+
+[repos."owner/notes-app"]     # overrides any [defaults] key, for one target
+base_ref     = "master"
+verify_tools = ["<that repo's test command> *"]
+```
+
+The verification commands are whatever the target repository's own
+`CLAUDE.md`/`AGENTS.md` prescribe — the pipeline never names a toolchain, it only
+grants permission to run the one the operator declares. A trailing ` *` allows
+arguments; without it only the bare command is permitted.
+
+Layers, later overriding earlier:
+
+1. the packaged `skills/tick/config.toml` — the shipped floor,
+   read-only; **do not put your settings here**
+2. `[defaults]`
+3. `[repos."owner/name"]`
+4. environment variables (`PIPELINE_TRUSTED_AUTHOR`)
+5. explicit CLI flags (`--permission-mode`)
+
+Lists replace wholesale rather than merging, so a repository can *narrow* a
+grant the defaults widen — the direction that matters for a permission list.
+
+How a bad value behaves depends on whether the setting has a safe direction.
+`allow_touching` does: an unusable value resolves to the conservative gate,
+warns on stderr and in the tick log, and the tick runs. Every other setting is
+a startup error naming the key, and the tick exits 3:
+
+- `base_ref`, `permission_mode` and `[operator] login` have no restrictive
+  reading — there is no conservative branch name, no safe permission mode, and
+  no identity that usefully trusts nobody.
+- A malformed `verify_tools` is deliberately **not** the same state as an empty
+  one: read as empty it would dispatch an engine with no verification and still
+  promote the result. An *explicitly* empty one grants nothing, which is what
+  it says; nothing is substituted underneath it. An entry that cannot be a
+  `Bash(...)` permission body — it contains a parenthesis or a newline — is
+  malformed too, rather than being dropped at dispatch: dropping it would
+  narrow the grant the operator wrote, and drop an all-invalid list into the
+  empty state above.
+- `checklist_paths` is a list of files to **block**, so its empty state is the
+  permissive one. A malformed value keeps every usable path any layer named —
+  including a valid `[defaults]` list a bad per-repo override would otherwise
+  replace — so the gate does not weaken while the tick refuses.
+- A malformed `[scan] repos` resolves to the empty *restrictive* set:
+  "unrestricted" has to be something the operator wrote.
+
+A container declared as something other than a table (`[[defaults]]` for
+`[defaults]`, say) is a startup error too. Read as absent it would hand back
+the shipped floor in place of the settings the operator wrote, silently.
+
+A blank `base_ref` is not malformed; it is the documented "resolve the target's
+default branch", and until that resolution lands the dispatch uses `main`. It
+is the only setting for which blank means something — a blank
+`permission_mode` is an error like any other unusable value.
+
+`$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must name an **absolute**
+location. A relative one is refused with a startup error rather than resolved:
+the tick chdirs to the repository root after startup, so a relative path would
+mean one process reading two different configurations — and an engine's cwd is
+a checkout of the pull request's own head.
+
+The operator login is resolved per tick like every other setting, so a
+`--loop` process picks up a change on its next tick and refuses to run at all
+once the login is blank. It is the identity the reviewer admission gate
+compares against; issue *pickup* is not filtered by it yet (issue #14).
+
+The target repository is still read from the deprecated `[target] repo` key in
+the packaged file (`PIPELINE_REPO` overrides it), which is also what the
+dashboard parses. That remnant goes away when the target is resolved from the
+working directory's git remote.
 
 ## Invocation
 
@@ -578,33 +682,37 @@ codex's own built-in defaults.
 Each dispatch logs the values it resolved (`action=model_resolved`) so a
 review's provenance survives a later config edit.
 
-### Admission gate: reviewer policy files (`config.toml`)
+### Admission gate: reviewer policy files (`allow_touching`)
 
 A PR whose diff edits files that govern the reviewer itself — `CLAUDE.md`,
 `AGENTS.md` (at any directory depth), or the review checklists under
 `.claude/hooks/` — is normally escalated to `ai:needs-human-decision` instead
 of auto-reviewed: the reviewer runs inside the PR's own worktree, so it would
 review under instructions the PR itself supplied. The operator can accept that
-trust boundary for the whole gate in
-`$PR_PIPELINE_HOME/skills/tick/config.toml`:
+trust boundary for the whole gate in their own config
+(`~/.claude/pr-pipeline/config.toml`, see [Configuration](#configuration)):
 
 ```toml
-[policy]
+[defaults]
+allow_touching = true
+
+# or for one target only
+[repos."owner/name"]
 allow_touching = true
 ```
 
 `true` lets policy-editing PRs flow to auto-review anyway. Missing config,
 malformed TOML, or `false` (or an absent key) all keep the conservative
-escalation — the gate fails closed. **The shipped `config.toml` sets `false`.**
-That is deliberate: an install inherits whatever is committed here, so shipping
+escalation — the gate fails closed. **The packaged floor sets `false`.**
+That is deliberate: an install inherits whatever the floor declares, so shipping
 the opt-out would make a trust decision on the adopter's behalf. Setting `true`
-is an act the operator performs on their own copy. The human merge gate after
+is an act the operator performs in their own config. The human merge gate after
 `ai:ready-for-human` is unaffected either way.
 
-`config.toml` itself is part of the policy path set, as are the gate's own
-implementation files (`lib/pipeline.py`, `lib/tick.py`): a PR that flips
-`allow_touching`, rewrites `_policy_touching_allowed` to return `True`
-unconditionally, or removes the gate call from the reviewer dispatch is
+The packaged `config.toml` itself is part of the policy path set, as are the
+gate's own implementation files (`lib/pipeline.py`, `lib/tick.py`): a PR that
+flips the floor's `allow_touching`, rewrites `touches_review_policy` to return
+`False` unconditionally, or removes the gate call from the reviewer dispatch is
 escalated to a human (while the gate is enabled) instead of auto-reviewed —
 otherwise a merged change would silently disable the gate for every future
 policy-editing PR. Those three are matched by path *suffix*
@@ -828,7 +936,7 @@ best-effort. Today's outcomes:
 | transient retries exhausted → `ai:needs-human-decision` | yes, and bounded | label held; the failure burns an attempt, so repeated failure walks into the cap |
 | hold beside a completed result → in-flight label released, hold retained | yes, bounded by the hold itself | nothing moves; marker, result, scratch, and attempts retained, retried next tick |
 | dispatch setup failure → `ai:needs-human-decision` | yes, and bounded | label held at the pickup label and the scratch removed — no engine ran, and a retained lease would be reconciled to the terminal label next tick; the failure burns an attempt |
-| PR touches reviewer policy → `ai:needs-human-decision` (configurable via `config.toml` `[policy] allow_touching`, see "Admission gate" above) | yes, and bounded | same |
+| PR touches reviewer policy → `ai:needs-human-decision` (configurable via `allow_touching`, see "Admission gate" above) | yes, and bounded | same |
 | ambiguous marker → `ai:needs-human-decision` | yes, and bounded | label held, but the scratch is **retained** — this path cannot prove the marker safe to clear; dispatch stays blocked either way |
 | attempt cap → `ai:needs-human-decision` | **no — best effort** | label lands unexplained; logged `escalation_comment_failed` |
 | transient attempt-counter write failure → `ai:needs-human-decision` | **no — best effort** | same |

@@ -49,7 +49,7 @@ import re
 import tempfile
 import time
 import tomllib
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
@@ -163,8 +163,7 @@ LOOP_QUIESCENT_STOP_AFTER = 3
 # paths are the target's to name — the pipeline drives a repository it does not
 # own, so hard-coding one repo's checklist paths here would both miss every
 # other repo's and carry a dead entry into every install. They are declared by
-# the operator in ``config.toml`` under ``[policy] checklist_paths``; see
-# :func:`_reviewer_checklist_paths`.
+# the operator under ``checklist_paths``; see :func:`resolve_config`.
 _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 
 # The pipeline's own files are review policy too, matched by path *suffix* rather
@@ -172,7 +171,7 @@ _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 # allow_touching to true must be escalated to a human, not auto-reviewed —
 # otherwise a merged flip would silently disable the gate for every future
 # policy-editing PR. The gate's implementation is the same vector: a PR that
-# rewrites _policy_touching_allowed to return True unconditionally (pipeline.py),
+# rewrites touches_review_policy to return False unconditionally (pipeline.py),
 # or removes the gate call from the reviewer dispatch (tick.py), disables the
 # gate exactly like a config flip.
 #
@@ -190,11 +189,22 @@ _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     )
 )
 
-# Operator config for admission gates, read at call time so a config change
-# takes effect on the next tick without a redeploy. Resolved via __file__ so it
-# is cwd-independent (the tick and its CLI helpers run from different cwds).
-# A missing or malformed file falls back to the conservative default.
-_POLICY_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
+# The shipped floor: layer 1 of the resolution order, and the only config the
+# install directory contributes. Resolved via __file__ so it is cwd-independent
+# (the tick and its CLI helpers run from different cwds). It is read-only from
+# the runtime's point of view — no operator-set value may land here, because a
+# plugin install lands at ~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/
+# and `/plugin update` installs the next version at a *different* hash, which
+# would discard it silently. Operator values live in :func:`operator_config_path`.
+_PACKAGED_CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.toml"
+
+# Where the operator's own config lives, highest-precedence location first.
+# $PR_PIPELINE_CONFIG names one file outright and exists so tests and one-off
+# runs never write into the operator's real home; $CLAUDE_CONFIG_DIR relocates
+# the Claude home as a whole.
+_OPERATOR_CONFIG_ENV = "PR_PIPELINE_CONFIG"
+_CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+_OPERATOR_CONFIG_RELATIVE = ("pr-pipeline", "config.toml")
 
 # Logical verdict sentinels the harvest acts on (see design "Sentinel tokens").
 SENTINEL_NO_BLOCKERS = "NO_BLOCKERS_READY_FOR_HUMAN"
@@ -1554,105 +1564,744 @@ def decide_review_harvest(
     }
 
 
-def read_operator_config() -> dict[str, object]:
-    """Return the operator's ``config.toml``, or an empty mapping.
+# --- Operator configuration ---
 
-    Read at call time rather than import time so a config change takes effect on
-    the next tick without a redeploy. A missing file or malformed TOML
-    (including invalid UTF-8, which ``tomllib`` surfaces as
-    ``UnicodeDecodeError``) reads as empty, which every caller must treat as the
-    conservative case — the gates built on this fail closed, and the startup
-    probe refuses to run a tick with no target configured.
+# The per-target settings an operator may set in [defaults] and override in
+# [repos."owner/name"]. Every one appears in both tables: a key expressible at
+# only one layer is a key an operator cannot set at the layer they need it.
+# A key outside this set is a typo, and a silently ignored typo is exactly the
+# failure this file's layering exists to make impossible, so it is reported.
+_CONFIG_KEYS = (
+    "allow_touching",
+    "checklist_paths",
+    "verify_tools",
+    "base_ref",
+    "permission_mode",
+)
+
+# The engine `--permission-mode` values the dispatch supports (see tick.py).
+_PERMISSION_MODES = ("dontAsk", "auto")
+
+# A verification grant as it appears inside `Bash(...)` on `--allowedTools`.
+# The flag takes a space-separated list of `Tool(body)` entries, so a closing
+# parenthesis inside a body ends its entry early and everything after it is
+# parsed as a *new* permission — a config typo would widen the exact boundary
+# the allowlist exists to be. Spaces are legal and load-bearing
+# (`uv run pytest *`), so they cannot be the delimiter check.
+#
+# This is checked in the resolver, not filtered at dispatch: dropping a bad
+# entry there would hand the engine a narrower grant than the operator wrote,
+# and an all-invalid list would arrive as the deliberate empty grant.
+VERIFY_TOOL_BODY_RE = re.compile(r"\A[^()\r\n]+\Z")
+
+# A GitHub login: alphanumerics with interior single hyphens, 39 characters max.
+# Shape is checked because the login is a trust boundary compared for equality
+# against an author — a value with a stray space or quote matches nobody, which
+# reads as "every PR escalated" rather than as the config error it is.
+_LOGIN_RE = re.compile(r"\A[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}\Z")
+
+# ``owner/name`` exactly as ``gh`` reports it. The two halves have different
+# grammars and must not share one: an owner starts with an alphanumeric, but a
+# repository name need not — GitHub's own organization-profile repository is
+# named `.github`. Rejecting it would stop the tick for every *other* target
+# too, because every `[repos.*]` key is validated at startup. `.` and `..` are
+# excluded: GitHub forbids both, and they are the path segments that walk out
+# of any directory a resolved target is joined into.
+_CONFIG_REPO_RE = re.compile(
+    r"\A[A-Za-z0-9][A-Za-z0-9._-]*/(?!\.\.?\Z)[A-Za-z0-9._-]+\Z"
+)
+
+# A base branch name conservative enough to hand to `git fetch origin <ref>`
+# and `gh pr create --base <ref>`: git ref-name characters only, no leading
+# dash or slash (option or refspec ambiguity). This is the operator's own
+# branch name, not an untrusted PR head ref — tick's _valid_push_head_ref
+# guards that separate case, where the value is templated into a *permission*.
+_BASE_REF_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
+
+
+@dataclass(frozen=True)
+class ResolvedConfig:
+    """The effective configuration for one resolved target.
+
+    The single result every Python caller reads. Callers never read a raw
+    table: the layering, the fail-closed reads and the hard errors all happen
+    once, here, so two callers cannot disagree about what the operator
+    configured.
+
+    Attributes:
+        login: The operator's GitHub login — the identity the trust gates are
+            written against. ``""`` when unset, which the tick's startup gate
+            refuses to run on.
+        allow_touching: Whether PRs editing reviewer-governing files may be
+            auto-reviewed. Fails closed to ``False``.
+        checklist_paths: Repo-relative paths naming the target's own review
+            checklists.
+        verify_tools: Bash permission bodies the engines may run for
+            verification. Empty is a deliberate operator choice, distinct from
+            a malformed value, which lands in :attr:`errors` instead.
+        base_ref: The pinned base branch name. ``""`` means "resolve the
+            target's default branch" and is not malformed.
+        permission_mode: The engine ``--permission-mode`` value.
+        scan_repos: ``None`` when repository scope is unrestricted (the key is
+            absent or an empty list — both operator-written states). A tuple
+            restricts scope to exactly those repositories; a malformed value
+            yields the empty *restrictive* tuple plus an entry in
+            :attr:`errors`, so a typo can never read as unrestricted.
+        legacy_target_repo: The deprecated ``[target] repo`` remnant in the
+            packaged file, kept only so an install configured before the move
+            to the operator's home keeps working across this change. The
+            canonical-target issue removes it.
+        errors: Hard configuration errors, each naming the key. A caller that
+            is about to act on the configuration must refuse to start.
+        warnings: Fail-closed coercions and ignored keys, for the tick log.
+    """
+
+    login: str
+    allow_touching: bool
+    checklist_paths: tuple[str, ...]
+    verify_tools: tuple[str, ...]
+    base_ref: str
+    permission_mode: str
+    scan_repos: tuple[str, ...] | None
+    legacy_target_repo: str
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+
+def _operator_config_location() -> tuple[Path, str]:
+    """Resolve the operator config path, refusing a cwd-relative override.
+
+    ``$PR_PIPELINE_CONFIG`` names the file outright and outranks everything
+    else — it is the explicit testing override, so a test never writes into a
+    real home. Otherwise the file sits under the Claude home,
+    ``$CLAUDE_CONFIG_DIR`` when set and ``~/.claude`` when not.
+
+    Either variable may only name an *absolute* location. A relative one is
+    not a config path, it is a config path per working directory: the tick
+    chdirs to the repository root after this module is imported, so the
+    identity resolved at import and the policy resolved per tick would come
+    from two different files — and an engine's cwd is a checkout of the pull
+    request's own head, which is the one directory a PR could use to supply
+    the policy it is judged under. There is no safe anchor to pick on the
+    operator's behalf, so it is refused rather than guessed at.
 
     Returns:
-        The parsed config, or ``{}`` when it is absent or unreadable.
+        ``(path, problem)``. On a problem the path is the default Claude-home
+        location and the caller must not read it: it is not what was named.
+    """
+    default = Path.home() / ".claude" / Path(*_OPERATOR_CONFIG_RELATIVE)
+    explicit = os.environ.get(_OPERATOR_CONFIG_ENV, "").strip()
+    if explicit:
+        if not Path(explicit).is_absolute():
+            return default, (
+                f"${_OPERATOR_CONFIG_ENV}: {explicit!r} is relative — name the "
+                "file by absolute path, or a change of working directory "
+                "changes which config is read"
+            )
+        return Path(explicit), ""
+    config_dir = os.environ.get(_CLAUDE_CONFIG_DIR_ENV, "").strip()
+    if config_dir:
+        if not Path(config_dir).is_absolute():
+            return default, (
+                f"${_CLAUDE_CONFIG_DIR_ENV}: {config_dir!r} is relative — name "
+                "the directory by absolute path, or a change of working "
+                "directory changes which config is read"
+            )
+        return Path(config_dir).joinpath(*_OPERATOR_CONFIG_RELATIVE), ""
+    return default, ""
+
+
+def operator_config_path() -> Path:
+    """Return the path to the operator's own ``config.toml``.
+
+    The result is independent of the working directory by construction — see
+    :func:`_operator_config_location`, which is where that is enforced. A
+    refused override reports the default location here; the problem itself
+    surfaces as a startup error from :func:`resolve_config`.
+
+    Returns:
+        The operator config path, which need not exist.
+    """
+    return _operator_config_location()[0]
+
+
+def _read_toml(path: Path) -> tuple[dict[str, object], str]:
+    """Read one TOML file, reporting malformation rather than raising.
+
+    The single funnel for every configuration read in the pipeline, so the
+    "nothing is read from the install, the target repo, or an engine worktree"
+    invariant has exactly one place to hold and one place to test.
+
+    Read at call time rather than import time, so a config change takes effect
+    on the next tick without a redeploy.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        ``(parsed, error)``. A missing file is ``({}, "")`` — absent is not an
+        error. Malformed TOML, invalid UTF-8 (which ``tomllib`` surfaces as
+        ``UnicodeDecodeError``), an unreadable file, or a document that is not
+        a table is ``({}, <reason>)``: callers still see the conservative empty
+        config *and* a reportable reason, so the gates built on this fail
+        closed whether or not the caller acts on the error.
     """
     try:
-        with open(_POLICY_CONFIG_PATH, "rb") as fh:
+        with open(path, "rb") as fh:
             config = tomllib.load(fh)
-    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
-        return {}
-    return config if isinstance(config, dict) else {}
+    except FileNotFoundError:
+        return {}, ""
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        return {}, f"unreadable: {exc}"
+    if not isinstance(config, dict):
+        return {}, "not a TOML table"
+    return config, ""
 
 
-def _config_section(name: str) -> dict[str, object]:
-    """Return one top-level table from the operator config.
-
-    Args:
-        name: The table name (``policy``, ``target``, ``engine``).
-
-    Returns:
-        The table, or ``{}`` when it is absent or not a table.
-    """
-    section = read_operator_config().get(name)
-    return section if isinstance(section, dict) else {}
-
-
-def config_string(section: str, key: str) -> str:
-    """Return a stripped string setting, or ``""`` when unusable.
-
-    A valid-but-wrong-shape value (number, list, table) reads as absent rather
-    than raising, so a typo in the operator's config surfaces as the
-    unconfigured case — which the caller fails closed on — instead of a
-    tick-level exception.
+def _table(config: Mapping[str, object], name: str) -> dict[str, object]:
+    """Return one top-level table, or ``{}`` when absent or not a table.
 
     Args:
-        section: The table name.
-        key: The key within that table.
+        config: A parsed TOML document.
+        name: The table name.
 
     Returns:
-        The configured string, or ``""``.
+        The table, or ``{}``.
     """
-    value = _config_section(section).get(key)
-    return value.strip() if isinstance(value, str) else ""
+    section = config.get(name)
+    return dict(section) if isinstance(section, dict) else {}
 
 
-def config_string_list(section: str, key: str) -> tuple[str, ...]:
-    """Return a list-of-strings setting, dropping unusable entries.
+def _declared_table(
+    config: Mapping[str, object], name: str, label: str = "",
+) -> tuple[dict[str, object], str]:
+    """Return one top-level table, distinguishing absent from malformed.
+
+    ``[[defaults]]`` instead of ``[defaults]`` is valid TOML and an easy slip,
+    and every per-key validator in this module runs *inside* the table — so a
+    container read as ``{}`` means the keys the operator wrote are never seen.
+    Silently, in the direction that widens: the shipped grants come back in
+    place of their ``verify_tools``, and a declared ``[scan]`` scope becomes
+    unrestricted. Absence and malformation have to be two different answers.
 
     Args:
-        section: The table name.
-        key: The key within that table.
+        config: A parsed TOML document.
+        name: The table name.
+        label: Prefix naming the file, for the message. Empty means the
+            operator's own config.
 
     Returns:
-        The configured entries, stripped and with blanks and non-strings
-        dropped. ``()`` when the key is absent or is not a list.
+        ``({}, "")`` when absent, ``(table, "")`` when a table, and
+        ``({}, <reason>)`` when declared as something else.
     """
-    value = _config_section(section).get(key)
-    if not isinstance(value, list):
-        return ()
-    return tuple(
-        entry.strip() for entry in value
-        if isinstance(entry, str) and entry.strip()
+    if name not in config:
+        return {}, ""
+    section = config[name]
+    if isinstance(section, dict):
+        return dict(section), ""
+    where = f"{label} " if label else ""
+    return {}, (
+        f"{where}[{name}]: expected a table, got {type(section).__name__}"
     )
 
 
-def _reviewer_checklist_paths() -> tuple[str, ...]:
-    """Return the target repo's reviewer-governing checklist paths.
+def _pick(
+    layers: Sequence[tuple[str, Mapping[str, object]]], key: str,
+) -> tuple[str, object] | None:
+    """Return the highest layer that *declares* ``key``, with its label.
 
-    Repo-relative paths declared by the operator under ``[policy]
-    checklist_paths``. Empty is the correct default: ``CLAUDE.md`` and
-    ``AGENTS.md`` are matched by basename regardless, so a repo with no extra
-    checklists needs no configuration and gets no dead entries.
+    Presence, not truthiness, decides. That is what lets a repository narrow a
+    default to nothing: ``verify_tools = []`` under ``[repos."owner/name"]``
+    has to beat a non-empty ``[defaults]`` list, because a permission grant an
+    operator cannot narrow per target is the wrong direction for a permission
+    grant.
 
-    Returns:
-        The configured paths, or ``()``.
-    """
-    return config_string_list("policy", "checklist_paths")
-
-
-def _policy_touching_allowed() -> bool:
-    """Return whether the operator has opted out of the reviewer-policy gate.
-
-    Reads ``allow_touching`` from the ``[policy]`` section. Anything other than
-    an explicit ``true`` — a missing file, malformed TOML, a wrong-shaped value
-    — keeps the conservative gate, so failures fail closed.
+    Args:
+        layers: ``(label, table)`` pairs, lowest precedence first.
+        key: The setting name.
 
     Returns:
-        ``True`` only when the operator's config explicitly allows PRs that
-        edit reviewer-governing files to be auto-reviewed.
+        ``(label, value)`` from the highest layer declaring it, else ``None``.
     """
-    return _config_section("policy").get("allow_touching") is True
+    found: tuple[str, object] | None = None
+    for label, table in layers:
+        if key in table:
+            found = (label, table[key])
+    return found
+
+
+def _resolve_str_list(
+    picked: tuple[str, object] | None, key: str,
+) -> tuple[tuple[str, ...], str]:
+    """Resolve a list-of-strings setting, reporting an unusable shape.
+
+    Blank entries are dropped rather than reported: a trailing comma is not a
+    statement about policy. A non-list, or a non-string entry, is a shape the
+    operator cannot have meant and is reported to the caller.
+
+    The string entries that *are* usable come back alongside the problem. For a
+    list of files to block, the empty set is the permissive direction, so
+    discarding the whole list on one bad entry would quietly weaken a gate; the
+    caller decides whether partial entries are the safe reading for its key.
+
+    Args:
+        picked: The ``(label, value)`` pair from :func:`_pick`, or ``None``.
+        key: The setting name, for the message.
+
+    Returns:
+        ``(entries, problem)``, where ``problem`` is ``""`` when the value was
+        usable and ``entries`` holds every usable string either way.
+    """
+    if picked is None:
+        return (), ""
+    label, value = picked
+    if not isinstance(value, list):
+        return (), (
+            f"{label} {key}: expected a list of strings, "
+            f"got {type(value).__name__}"
+        )
+    problem = ""
+    for entry in value:
+        if not isinstance(entry, str):
+            problem = (
+                f"{label} {key}: every entry must be a string, "
+                f"got {entry!r}"
+            )
+            break
+    entries = tuple(
+        e.strip() for e in value if isinstance(e, str) and e.strip()
+    )
+    return entries, problem
+
+
+def _verify_tool_body_problem(
+    picked: tuple[str, object] | None, entries: Sequence[str],
+) -> str:
+    """Report the first ``verify_tools`` entry that is not a permission body.
+
+    Each entry is templated into ``Bash(<entry>)`` on the engine's
+    ``--allowedTools``, so an entry that cannot be a body does not describe the
+    permission the operator typed. Reporting it — rather than dropping it at
+    dispatch — is what keeps a typo from becoming a silently narrower grant,
+    and an all-invalid list from becoming the unconfigured empty grant that
+    dispatches unverified work and still awards ai:ready-for-human.
+
+    Args:
+        picked: The ``(label, value)`` pair the entries came from, for the
+            message. ``None`` when no layer set the key.
+        entries: The usable string entries, already stripped.
+
+    Returns:
+        The problem, or ``""`` when every entry is a usable body.
+    """
+    if picked is None:
+        return ""
+    label, _ = picked
+    for entry in entries:
+        if not VERIFY_TOOL_BODY_RE.match(entry):
+            return (
+                f"{label} verify_tools: {entry!r} is not a permission body "
+                "(no parentheses or newlines)"
+            )
+    return ""
+
+
+def _every_usable_entry(
+    layers: Sequence[tuple[str, Mapping[str, object]]], key: str,
+) -> tuple[str, ...]:
+    """Return every usable string entry for ``key``, across all layers.
+
+    The recovery reading for a list whose empty state is the *permissive* one,
+    used only once the resolved value has already been reported as malformed.
+    Layering answers "which value did the operator choose"; it has no answer
+    for a value they did not manage to write, and for a gate the safe move
+    there is to keep every path any layer named.
+
+    Args:
+        layers: ``(label, table)`` pairs, lowest precedence first.
+        key: The setting name.
+
+    Returns:
+        The entries, deduplicated, in lowest-to-highest layer order.
+    """
+    seen: dict[str, None] = {}
+    for _, table in layers:
+        value = table.get(key)
+        if not isinstance(value, list):
+            continue
+        for entry in value:
+            if isinstance(entry, str) and entry.strip():
+                seen[entry.strip()] = None
+    return tuple(seen)
+
+
+def _resolve_string(
+    picked: tuple[str, object] | None,
+    key: str,
+    default: str,
+    valid: Callable[[str], bool],
+    *,
+    blank_means: str = "",
+) -> tuple[str, str]:
+    """Resolve a string setting that has no conservative fallback.
+
+    ``base_ref``, ``permission_mode`` and ``[operator] login`` cannot fail
+    closed — there is no restrictive branch name, no safe permission mode, and
+    no identity that trusts nobody usefully. So a wrong type or a value outside
+    the accepted shape is reported for the caller to refuse startup on, rather
+    than coerced into a value the operator did not write.
+
+    Blank acceptance is per key, not universal. ``base_ref = ""`` means
+    "resolve the target's default branch" and ``[operator] login = ""`` is the
+    unconfigured state the startup gate names; ``permission_mode = ""`` means
+    nothing at all, and accepting it walks a value the engine launch rejects
+    past startup and into a crash that has already taken a dispatch lease.
+
+    Args:
+        picked: The ``(label, value)`` pair from :func:`_pick`, or ``None``.
+        key: The setting name, for the message.
+        default: The value when no layer declares the key.
+        valid: Shape predicate applied to a declared, non-empty value.
+        blank_means: What a declared blank value means for this key. Empty —
+            the default — makes blank invalid like any other unusable value.
+
+    Returns:
+        ``(value, problem)``. On a problem the value is ``default``.
+    """
+    if picked is None:
+        return default, ""
+    label, value = picked
+    if not isinstance(value, str):
+        return default, (
+            f"{label} {key}: expected a string, got {type(value).__name__}"
+        )
+    stripped = value.strip()
+    if not stripped and not blank_means:
+        return default, (
+            f"{label} {key}: blank is not one of its values"
+        )
+    if stripped and not valid(stripped):
+        return default, f"{label} {key}: {value!r} is not a valid {key}"
+    return stripped, ""
+
+
+def _valid_base_ref(value: str) -> bool:
+    """Return whether ``value`` is a branch name safe to pass to git and gh.
+
+    Conservative git ref-name shape plus the ref-format rules a regex cannot
+    express (``..``, ``//``, and a trailing ``/``, ``.`` or ``.lock``). A blank
+    ``base_ref`` never reaches here: it is the documented "resolve the target's
+    default branch" value, not a malformed one.
+
+    Args:
+        value: The configured branch name.
+
+    Returns:
+        Whether it is usable as a base ref.
+    """
+    if not _BASE_REF_RE.match(value):
+        return False
+    if ".." in value or "//" in value:
+        return False
+    return not value.endswith(("/", ".", ".lock"))
+
+
+def _resolve_scan_repos(
+    scan: Mapping[str, object],
+) -> tuple[tuple[str, ...] | None, list[str]]:
+    """Resolve ``[scan] repos`` into unrestricted, restricted, or an error.
+
+    Two states and no third. Absent, or an empty list, is unrestricted — both
+    are things the operator wrote. Anything else must be a list of
+    ``owner/name`` strings; a malformed value is an error naming the key and
+    resolves to the empty *restrictive* set rather than to unrestricted,
+    because "unrestricted" must never be something a typo produced.
+
+    Args:
+        scan: The operator's ``[scan]`` table, already type-checked by
+            :func:`_declared_table` — a malformed *container* is the caller's
+            error to report, and reaches here as an empty table only after the
+            caller has made the scope restrictive.
+
+    Returns:
+        ``(scope, problems)``, where ``scope`` is ``None`` when unrestricted and
+        otherwise the restricted repository set.
+    """
+    if "repos" not in scan:
+        return None, []
+    value = scan["repos"]
+    if not isinstance(value, list):
+        return (), [
+            '[scan] repos: expected a list of "owner/name" strings, '
+            f"got {type(value).__name__}"
+        ]
+    if not value:
+        return None, []
+    resolved: list[str] = []
+    problems: list[str] = []
+    for entry in value:
+        name = entry.strip() if isinstance(entry, str) else entry
+        if not isinstance(name, str) or not _CONFIG_REPO_RE.match(name):
+            problems.append(
+                f'[scan] repos: {entry!r} is not an "owner/name" repository'
+            )
+            continue
+        resolved.append(name)
+    if problems and not resolved:
+        return (), problems
+    return tuple(resolved), problems
+
+
+def resolve_config(
+    repo: str = "", *, cli_overrides: Mapping[str, str] | None = None,
+) -> ResolvedConfig:
+    """Return the effective configuration for one resolved target.
+
+    Layers, each overriding the ones before it:
+
+    1. the packaged ``config.toml`` — the shipped floor, and the only thing the
+       install directory contributes;
+    2. ``[defaults]`` in the operator's config;
+    3. ``[repos."owner/name"]`` for ``repo``;
+    4. environment variables (``PIPELINE_TRUSTED_AUTHOR``);
+    5. ``cli_overrides`` — a flag typed on one run is the most specific
+       statement of intent there is.
+
+    Lists replace wholesale; they never merge. Settings with a safe direction
+    fail closed and record a warning; settings without one record an error in
+    :attr:`ResolvedConfig.errors` for the caller to refuse startup on.
+
+    Args:
+        repo: The resolved target as ``owner/name``. Empty selects no
+            per-repository layer, which is the correct read for the pure-logic
+            CLI helpers that are not operating a specific target.
+        cli_overrides: Per-invocation flag values, keyed by setting name.
+            Validated exactly like a config value, so a bad flag is reported
+            rather than silently dropped.
+
+    Returns:
+        The resolved configuration, including any errors and warnings.
+    """
+    errors: list[str] = []
+    warnings: list[str] = []
+
+    packaged, packaged_problem = _read_toml(_PACKAGED_CONFIG_PATH)
+    if packaged_problem:
+        errors.append(f"packaged config.toml: {packaged_problem}")
+    # A refused override is not read from at all: the fallback location holds
+    # somebody's real settings, and answering with those would be answering a
+    # question nobody asked.
+    operator_path, location_problem = _operator_config_location()
+    if location_problem:
+        errors.append(location_problem)
+        operator: dict[str, object] = {}
+    else:
+        operator, operator_problem = _read_toml(operator_path)
+        if operator_problem:
+            errors.append(f"{operator_path}: {operator_problem}")
+
+    # The packaged file is layer 1 and *only* layer 1. An operator-set table
+    # landing there would be discarded on the next `/plugin update`, which
+    # installs at a different path — so it is an error, not a silent read.
+    for owned in ("operator", "repos", "scan"):
+        if owned in packaged:
+            errors.append(
+                f"packaged config.toml: [{owned}] is operator configuration "
+                "and must not ship in the install"
+            )
+
+    # `[target]` is read from the packaged file only, and only until the
+    # canonical-target issue deletes it. An operator who writes it in their own
+    # config has to be told, or their target looks configured and is not.
+    if "target" in operator:
+        warnings.append(
+            "[target] is not read from the operator's config — the deprecated "
+            "remnant lives in the packaged config.toml; use PIPELINE_REPO for "
+            "a one-off target"
+        )
+
+    # Every container the operator may declare is type-checked before its keys
+    # are read. A container read as absent when it is merely malformed hands
+    # the shipped floor back in place of the operator's settings, and turns a
+    # declared [scan] scope into an unrestricted one, with nothing reported.
+    declared: dict[str, dict[str, object]] = {}
+    for name in ("defaults", "operator", "repos", "scan"):
+        table, problem = _declared_table(operator, name)
+        if problem:
+            errors.append(problem)
+        declared[name] = table
+    packaged_defaults, problem = _declared_table(
+        packaged, "defaults", "packaged config.toml",
+    )
+    if problem:
+        errors.append(problem)
+
+    # A malformed [scan] container resolves restrictive, for the same reason a
+    # malformed `repos` value does: "unrestricted" must never be something a
+    # typo produced.
+    scan_repos: tuple[str, ...] | None
+    if "scan" in operator and not isinstance(operator["scan"], dict):
+        scan_repos, scan_problems = (), []  # the container error stands alone
+    else:
+        scan_repos, scan_problems = _resolve_scan_repos(declared["scan"])
+    errors.extend(scan_problems)
+    repos_table = declared["repos"]
+    for name in sorted(repos_table):
+        if not isinstance(repos_table[name], dict):
+            errors.append(f"[repos.\"{name}\"]: expected a table")
+        elif not _CONFIG_REPO_RE.match(name):
+            errors.append(
+                f"[repos.\"{name}\"]: not an \"owner/name\" repository"
+            )
+        elif scan_repos is not None and name not in scan_repos:
+            errors.append(
+                f"[repos.\"{name}\"]: names a repository absent from "
+                "[scan] repos"
+            )
+
+    layers: list[tuple[str, Mapping[str, object]]] = [
+        ("the packaged floor [defaults]", packaged_defaults),
+        ("[defaults]", declared["defaults"]),
+    ]
+    if repo:
+        section = repos_table.get(repo)
+        if isinstance(section, dict):
+            layers.append((f"[repos.\"{repo}\"]", section))
+    if cli_overrides:
+        layers.append(("the command line", dict(cli_overrides)))
+    for label, table in layers:
+        for key in table:
+            if key not in _CONFIG_KEYS:
+                warnings.append(f"{label} {key}: unknown setting, ignored")
+
+    allow_picked = _pick(layers, "allow_touching")
+    allow_touching = False
+    if allow_picked is not None:
+        label, raw = allow_picked
+        if isinstance(raw, bool):
+            allow_touching = raw
+        else:
+            warnings.append(
+                f"{label} allow_touching: expected true or false, got "
+                f"{type(raw).__name__} — keeping the conservative gate"
+            )
+
+    # checklist_paths names files to *block*, so the empty set is the
+    # permissive direction — the opposite of every other list here. An unusable
+    # value therefore keeps the entries that are usable (a typo must not
+    # silently unprotect the paths the operator did name, nor let a per-repo
+    # override erase a valid [defaults] list) *and* refuses the tick: there is
+    # no reading of a malformed gate that is the one the operator wrote.
+    checklist_paths, problem = _resolve_str_list(
+        _pick(layers, "checklist_paths"), "checklist_paths",
+    )
+    if problem:
+        errors.append(problem)
+        # "Lists replace wholesale" is the contract for a value the operator
+        # wrote; a malformed one is not that. Falling through to every layer's
+        # usable entries keeps the widest gate the configuration describes, so
+        # a bad per-repo override cannot unprotect a valid [defaults] list.
+        checklist_paths = _every_usable_entry(layers, "checklist_paths")
+
+    # verify_tools has none. An empty list is a deliberate operator choice that
+    # dispatches with a warning; a list that failed to parse must not collapse
+    # into that same state, or one typo silently becomes an unverified PR
+    # promoted to ai:ready-for-human.
+    picked_verify_tools = _pick(layers, "verify_tools")
+    verify_tools, problem = _resolve_str_list(
+        picked_verify_tools, "verify_tools",
+    )
+    if not problem:
+        problem = _verify_tool_body_problem(picked_verify_tools, verify_tools)
+    if problem:
+        errors.append(problem)
+        verify_tools = ()
+
+    base_ref, problem = _resolve_string(
+        _pick(layers, "base_ref"), "base_ref", "", _valid_base_ref,
+        blank_means="the target's default branch",
+    )
+    if problem:
+        errors.append(problem)
+
+    permission_mode, problem = _resolve_string(
+        _pick(layers, "permission_mode"), "permission_mode",
+        _PERMISSION_MODES[0], lambda v: v in _PERMISSION_MODES,
+    )
+    if problem:
+        errors.append(problem)
+
+    login, problem, warning = _resolve_login(packaged, declared["operator"])
+    if problem:
+        errors.append(problem)
+    if warning:
+        warnings.append(warning)
+
+    legacy_target = _table(packaged, "target").get("repo")
+    legacy_target_repo = legacy_target.strip() if isinstance(legacy_target, str) else ""
+
+    return ResolvedConfig(
+        login=login,
+        allow_touching=allow_touching,
+        checklist_paths=checklist_paths,
+        verify_tools=verify_tools,
+        base_ref=base_ref,
+        permission_mode=permission_mode,
+        scan_repos=scan_repos,
+        legacy_target_repo=legacy_target_repo,
+        errors=tuple(errors),
+        warnings=tuple(warnings),
+    )
+
+
+def _resolve_login(
+    packaged: Mapping[str, object],
+    operator_table: Mapping[str, object],
+) -> tuple[str, str, str]:
+    """Resolve the operator's login across its three layers.
+
+    ``[operator] login`` sits outside the ``[defaults]`` / ``[repos.*]``
+    layering on purpose: it is an identity, not a per-target setting. One
+    operator drives every target, so a per-repository override would mean the
+    pipeline reviewing PRs as somebody else on one repo — a trust boundary
+    change wearing a configuration key's clothes.
+
+    Beneath it is the packaged file's deprecated ``[target] trusted_author``,
+    read only so an install configured before the move to the operator's home
+    keeps working across this change. It keeps its old lenient reading (a
+    wrong-typed value warns and reads as unset, which the startup gate refuses
+    on) because it is a remnant the canonical-target issue deletes, not a key
+    an operator should still be setting. ``[operator] login`` itself is strict.
+
+    Args:
+        packaged: The packaged floor's parsed config.
+        operator_table: The operator's ``[operator]`` table, already
+            type-checked by :func:`_declared_table`.
+
+    Returns:
+        ``(login, problem, warning)``; each of the latter two is ``""`` when
+        there is nothing to report.
+    """
+    warning = ""
+    legacy = _table(packaged, "target").get("trusted_author")
+    if legacy is not None and not isinstance(legacy, str):
+        warning = (
+            "the packaged floor [target] trusted_author: expected a string, "
+            f"got {type(legacy).__name__} — reading no operator login"
+        )
+        legacy = ""
+    floor = legacy.strip() if isinstance(legacy, str) else ""
+
+    login, problem = _resolve_string(
+        _pick([("[operator]", operator_table)], "login"),
+        "login", floor, lambda v: bool(_LOGIN_RE.match(v)),
+        blank_means="no operator configured, which the startup gate refuses",
+    )
+    if problem:
+        return floor, problem, warning
+
+    env = os.environ.get("PIPELINE_TRUSTED_AUTHOR", "").strip()
+    return (env or login), "", warning
 
 
 def _ends_with_policy_suffix(path: str) -> bool:
@@ -1673,7 +2322,7 @@ def _ends_with_policy_suffix(path: str) -> bool:
     return any(segments[-len(s):] == s for s in _POLICY_PATH_SUFFIXES)
 
 
-def touches_review_policy(changed_paths: list[str]) -> bool:
+def touches_review_policy(changed_paths: list[str], repo: str = "") -> bool:
     """Return whether a diff modifies any file that governs the reviewer.
 
     The reviewer runs inside the candidate's checked-out worktree and is told to
@@ -1688,23 +2337,27 @@ def touches_review_policy(changed_paths: list[str]) -> bool:
     match by path suffix instead, so the self-protection holds at every install
     depth rather than only where the skills were incubated.
 
-    The operator may opt out via ``config.toml`` ``[policy] allow_touching``
-    (see :func:`_policy_touching_allowed`) when they accept that the review
-    runs under instructions the PR itself supplies.
+    The operator may opt out via the resolved ``allow_touching`` (see
+    :func:`resolve_config`) when they accept that the review runs under
+    instructions the PR itself supplies.
 
     Args:
         changed_paths: Repo-relative paths from ``git diff --name-only`` (blank
             lines are ignored).
+        repo: The resolved target as ``owner/name``, so a per-repository
+            ``allow_touching`` or ``checklist_paths`` override applies. Empty
+            resolves the operator-wide defaults only.
 
     Returns:
         ``True`` if any changed path is a reviewer-governing policy file,
-        unless the operator's config explicitly opts out.
+        unless the effective config explicitly opts out.
     """
-    if _policy_touching_allowed():
+    # Resolve once: a diff can carry thousands of paths, and each resolution
+    # re-parses both config files.
+    config = resolve_config(repo)
+    if config.allow_touching:
         return False
-    # Read once: a diff can carry thousands of paths, and each read re-parses
-    # the whole config file.
-    checklist_paths = _reviewer_checklist_paths()
+    checklist_paths = config.checklist_paths
     for path in changed_paths:
         path = path.strip()
         if not path:
@@ -3406,9 +4059,11 @@ def _cmd_atomic_write(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_touches_review_policy(_args: argparse.Namespace) -> int:
+def _cmd_touches_review_policy(args: argparse.Namespace) -> int:
     paths = sys.stdin.read().splitlines()
-    print(json.dumps({"touches_policy": touches_review_policy(paths)}))
+    print(json.dumps({
+        "touches_policy": touches_review_policy(paths, args.repo),
+    }))
     return 0
 
 
@@ -3721,6 +4376,10 @@ def main(argv: list[str] | None = None) -> int:
     p_policy = sub.add_parser(
         "touches-review-policy",
         help="Report whether stdin paths include a reviewer-governing file",
+    )
+    p_policy.add_argument(
+        "--repo", default="",
+        help="Resolved target as owner/name, for its config layer",
     )
     p_policy.set_defaults(func=_cmd_touches_review_policy)
 

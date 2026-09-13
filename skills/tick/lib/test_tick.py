@@ -2512,7 +2512,9 @@ def test_main_loop_mode_uses_locked_loop_runner(
         with mock.patch("tick._run_single_tick_locked") as run_single:
             assert main(loop=True) == 0
 
-    run_loop.assert_called_once_with(None, "claude", "", "", "", "dontAsk")
+    # permission_mode is forwarded unresolved: each tick resolves the config
+    # for itself, so an edit mid-loop applies on the next tick.
+    run_loop.assert_called_once_with(None, "claude", "", "", "", "")
     run_single.assert_not_called()
 
 
@@ -19571,26 +19573,190 @@ def test_main_refuses_to_tick_without_a_configured_target(tmp_path: Path) -> Non
     assert "tick-state: status=FAILED" in output
 
 
-def test_main_refuses_to_tick_without_a_trusted_author(tmp_path: Path) -> None:
+def test_main_refuses_to_tick_without_a_trusted_author(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     """An unconfigured trusted author stops the tick too.
 
     It is the reviewer admission gate's whole input: unset, `validate_review_candidate`
     matches nobody and every PR escalates to a human — a pipeline that looks
     like it is running while silently reviewing nothing.
+
+    Configured the way an operator configures it — by what is in the file this
+    tick reads — rather than by patching the import-time constant, because the
+    file is what the gate is there to check.
     """
     from tick import main  # type: ignore[import-untyped]
 
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[defaults]\nallow_touching = false\n", encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
     with mock.patch("tick.git") as git_mock:
         git_mock.return_value = str(tmp_path)
-        with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", ""):
-            with mock.patch("tick._startup_probe"):
+        with mock.patch("tick._startup_probe"):
+            import io
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = main()
+
+    assert result == 3
+    assert "[operator] login" in stderr.getvalue()
+
+
+def test_main_ticks_under_the_login_the_config_now_names(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A `--loop` process reviews as whoever the *current* config says it is.
+
+    Every other setting is resolved per tick so an edit takes effect on the
+    next one. The identity may not be the exception: validating the new login
+    at startup and then admitting candidates against the one this module
+    resolved when it was imported would authorize under an identity the
+    operator has already replaced — and, when they blank it, under one they
+    have removed.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[operator]\nlogin = "new-user"\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "old-user"):
+                with mock.patch("tick._run_tick_body", return_value=0) as body:
+                    result = main()
+
+    assert result == 0
+    assert body.call_args.kwargs["trusted_author"] == "new-user"
+
+
+def test_main_refuses_a_login_removed_from_the_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Blanking the login stops the next tick rather than reusing the old one."""
+    from tick import main  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[operator]\nlogin = ""\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "old-user"):
+                with mock.patch("tick._run_tick_body", return_value=0) as body:
+                    import io
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        result = main()
+
+    assert result == 3
+    assert "[operator] login" in stderr.getvalue()
+    body.assert_not_called()
+
+
+def test_main_refuses_a_blank_permission_mode_before_any_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A blank engine permission mode is refused at startup, not at launch.
+
+    Accepted, it passes the startup gate and raises inside the engine launch —
+    after a dispatch lease and worktree exist, leaving a ``state="launching"``
+    marker for the crash-recovery path to clean up. That is a legible config
+    error wearing a tick crash's clothes.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[operator]\nlogin = "userA"\n\n[defaults]\npermission_mode = ""\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick._run_tick_body", return_value=0) as body:
                 import io
                 stderr = io.StringIO()
                 with mock.patch("sys.stderr", stderr):
                     result = main()
 
+    output = stderr.getvalue()
     assert result == 3
-    assert "[target] trusted_author" in stderr.getvalue()
+    assert "permission_mode" in output
+    assert "invalid configuration" in output
+    body.assert_not_called()
+
+
+def test_main_refuses_to_tick_on_an_invalid_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A setting with no conservative reading stops the tick, naming the key.
+
+    ``verify_tools`` is the sharp case: coerced to empty it would dispatch an
+    engine with no verification permission, and the reviewer would still award
+    ai:ready-for-human on the unverified result. Nothing about that errors, so
+    it has to error here instead.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[defaults]\nverify_tools = "uv run pytest"\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            import io
+            stderr = io.StringIO()
+            with mock.patch("sys.stderr", stderr):
+                result = main()
+
+    output = stderr.getvalue()
+    assert result == 3
+    assert "verify_tools" in output
+    assert "invalid configuration" in output
+
+
+def test_main_reports_a_fail_closed_config_warning_and_still_ticks(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A setting that *has* a safe direction warns rather than stopping the tick.
+
+    ``allow_touching`` resolves to the conservative gate on an unusable value,
+    so refusing to run would trade a working pipeline for a stricter one that
+    does nothing. The operator still has to be told, or a config typo silently
+    escalates every policy-editing PR forever.
+    """
+    from tick import main  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[operator]\nlogin = "userA"\n'
+        '\n[defaults]\nallow_touching = "yes"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick.TRUSTED_HEAD_REPO", "owner/name"):
+                with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "userA"):
+                    with mock.patch("tick._run_tick_body", return_value=0) as body:
+                        import io
+                        stderr = io.StringIO()
+                        with mock.patch("sys.stderr", stderr):
+                            result = main()
+
+    assert result == 0
+    assert "allow_touching" in stderr.getvalue()
+    body.assert_called_once()
 
 
 def test_main_crash_emits_tick_state(tmp_path: Path) -> None:

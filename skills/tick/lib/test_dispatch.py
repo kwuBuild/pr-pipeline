@@ -80,6 +80,7 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
         "authoritative_in_flight": authoritative,
         "review_model": "",
         "review_effort": "",
+        "trusted_author": "",
     }
     assert di.call_args.kwargs["target"] == ("issue", 462)
     assert di.call_args.kwargs["authoritative_in_flight"] is authoritative
@@ -1292,6 +1293,52 @@ def test_dispatch_one_implementer_escalates_on_base_fetch_failure(
     relabel_mock.assert_called_once_with(
         "issue", 461, "ai:available", "ai:needs-human-decision",
     )
+
+
+def test_dispatch_one_implementer_branches_from_the_configured_base_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The implementer must branch from the operator's configured base_ref.
+
+    Not every repository's trunk is called ``main``. A hard-coded one silently
+    branches a ``master``/``trunk`` repository from a ref that does not exist —
+    the fetch fails and every issue escalates — or, worse on a repo that has
+    both, builds the PR on a stale branch nobody merges to.
+    """
+    from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[defaults]\nbase_ref = "trunk"\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    fetched: list[tuple[str, ...]] = []
+
+    def git_side_effect(*args: str) -> str:
+        if args == ("rev-parse", "--show-toplevel"):
+            return str(repo_root)
+        if "fetch" in args:
+            fetched.append(args)
+            raise subprocess.CalledProcessError(1, ["git", "fetch"])
+        raise AssertionError(f"unexpected git call: {args!r}")
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)):
+        with mock.patch("tick.git") as git_mock:
+            git_mock.side_effect = git_side_effect
+            with mock.patch("tick.gh", side_effect=allow_escalation_comment()):
+                with mock.patch("tick.relabel"):
+                    _dispatch_one_implementer(
+                        issue_number=461,
+                        issue_title="PWA icons",
+                        tick_log=None,
+                    )
+
+    assert fetched == [
+        ("-C", str(repo_root), "fetch", "--quiet", "origin", "trunk"),
+    ]
 
 
 def test_dispatch_one_fixer_escalates_on_worktree_creation_failure(
@@ -2877,16 +2924,15 @@ def test_touches_review_policy_catches_every_configured_checklist(
     inversion — a gate that reads only one entry would auto-review a PR that
     rewrote the others.
     """
-    import pipeline as pipeline_mod
     from pipeline import touches_review_policy
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        "[policy]\nchecklist_paths = ["
+        "[defaults]\nchecklist_paths = ["
         '".ci/review-checklist.md", ".ci/review-checklist-frontend.md"]\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 
     assert touches_review_policy([".ci/review-checklist.md"]) is True
     assert touches_review_policy([".ci/review-checklist-frontend.md"]) is True
@@ -4409,10 +4455,16 @@ def test_reviewer_dispatch_includes_unattended_flags(
 
 
 def test_parse_cli_args_reads_permission_mode_flag() -> None:
-    """--permission-mode parses in both forms and defaults to dontAsk."""
+    """--permission-mode parses in both forms; absent stays absent.
+
+    Absent must not become ``"dontAsk"`` here. The flag is the top layer of the
+    configuration order, so a default applied at parse time would look like an
+    explicit choice on every invocation and shadow the operator's configured
+    ``permission_mode`` entirely. ``main`` resolves the empty case.
+    """
     from tick import parse_cli_args  # type: ignore[import-untyped]
 
-    assert parse_cli_args([])["permission_mode"] == "dontAsk"
+    assert parse_cli_args([])["permission_mode"] == ""
     spaced = parse_cli_args(["--permission-mode", "auto"])
     assert spaced["permission_mode"] == "auto"
     equals = parse_cli_args(["--permission-mode=auto"])
@@ -4490,7 +4542,7 @@ def test_parse_cli_args_reads_review_model_and_effort_flags() -> None:
     assert parse_cli_args([]) == {
         "target": None, "impl_engine": "claude", "model": "",
         "review_model": "", "review_effort": "",
-        "permission_mode": "dontAsk", "loop": False,
+        "permission_mode": "", "loop": False,
     }
 
     spaced = parse_cli_args(
@@ -5810,20 +5862,83 @@ def codex_positionals(codex_argv: list[str]) -> list[str]:
 # --- Operator-configured verification permissions ---
 
 
-def test_engine_verify_tools_default_to_the_shipped_stack() -> None:
-    """With no config, the engine still gets a usable verification grant.
+def test_engine_verify_tools_default_to_the_shipped_stack(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """With no operator config, the packaged floor supplies the grant.
 
     An empty default would make a fresh install fail its *first* dispatch on a
     permission denial, which reads to the engine as a broken repository rather
     than as a missing grant — the engine has no way to tell the difference and
-    escalates for the wrong reason.
+    escalates for the wrong reason. The floor is the only place that default
+    lives: a second copy in the code could not be overridden.
     """
+    import pipeline
     import tick
+
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "absent.toml"))
+    # The suite points the floor at a nonexistent file for hermeticity; this
+    # test is specifically about what ships, so it reads the real one.
+    monkeypatch.setattr(
+        pipeline, "_PACKAGED_CONFIG_PATH",
+        Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+    )
 
     tools = tick._engine_verify_tools()
 
-    assert tools == tuple(f"Bash({entry})" for entry in tick._DEFAULT_VERIFY_TOOLS)
+    assert tools == tuple(
+        f"Bash({entry})" for entry in pipeline.resolve_config().verify_tools
+    )
+    assert any("pytest" in entry for entry in tools)
     assert all(entry.startswith("Bash(") and entry.endswith(")") for entry in tools)
+
+
+def test_engine_verify_tools_honour_an_explicitly_empty_grant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``verify_tools = []`` grants nothing — it does not reopen the floor.
+
+    Narrowing a permission grant for one target is the direction that matters
+    for a permission grant, and a fallback beneath the resolved value is
+    exactly the thing an operator cannot override.
+    """
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[defaults]\nverify_tools = ["cargo test *"]\n'
+        '\n[repos."owner/name"]\nverify_tools = []\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    assert tick._engine_verify_tools("owner/name") == ()
+    assert tick._engine_verify_tools("owner/other") == ("Bash(cargo test *)",)
+
+
+def test_engine_allowed_tools_invents_no_grant_the_operator_removed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The launch argv is where an over-wide grant would actually do harm.
+
+    Resolving the empty list correctly is not the contract; what reaches
+    ``--allowedTools`` is. This is the consumer, so it is tested at the
+    consumer — with no double space where the absent grant used to sit.
+    """
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text("[defaults]\nverify_tools = []\n", encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    allowed = tick._engine_allowed_tools(tick._IMPLEMENTER_PUSH_PERMISSION)
+
+    assert "pytest" not in allowed
+    assert "npm" not in allowed
+    assert "  " not in allowed
+    assert allowed == (
+        f"{tick._ENGINE_ALLOWED_TOOLS_BASE} {tick._IMPLEMENTER_PUSH_PERMISSION}"
+    )
 
 
 def test_engine_verify_tools_come_from_operator_config(
@@ -5835,15 +5950,14 @@ def test_engine_verify_tools_come_from_operator_config(
     grants, not merely add to them: the allowlist is a security boundary, and a
     grant nobody needs is a grant nobody audits.
     """
-    import pipeline as pipeline_mod
     import tick
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        '[engine]\nverify_tools = ["cargo test *", "cargo clippy *"]\n',
+        '[defaults]\nverify_tools = ["cargo test *", "cargo clippy *"]\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 
     tools = tick._engine_verify_tools()
 
@@ -5851,54 +5965,83 @@ def test_engine_verify_tools_come_from_operator_config(
     assert not any("pytest" in entry for entry in tools)
 
 
-def test_engine_verify_tools_drop_entries_that_escape_the_allowlist(
+def test_engine_verify_tools_refuse_an_entry_that_escapes_the_allowlist(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """An entry containing a parenthesis must never reach ``--allowedTools``.
+    """An entry containing a parenthesis is a startup error, not a filter.
 
     The flag takes a space-separated list of ``Tool(body)`` entries, so a ``)``
     inside a body closes its entry early and every character after it is parsed
-    as a *new* permission. ``rm -rf /) Bash(git push --force`` in a config file
-    would otherwise widen the exact boundary the allowlist exists to be. Bad
-    entries are dropped individually rather than rejecting the whole list, so
-    one typo cannot strip an engine of every verification permission it has.
+    as a *new* permission. Dropping the bad entry and dispatching on what is
+    left would hand the engine a narrower grant than the operator wrote and
+    surface as an unexplained permission denial mid-run, so the resolver
+    reports it and the tick refuses to start.
     """
-    import pipeline as pipeline_mod
+    import pipeline
     import tick
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        "[engine]\n"
+        "[defaults]\n"
         'verify_tools = ["cargo test *", "rm -rf /) Bash(git push --force"]\n',
         encoding="utf-8",
     )
-    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    config = pipeline.resolve_config()
+
+    assert any("verify_tools" in e for e in config.errors)
+    assert tick._engine_verify_tools() == ()
+
+
+def test_engine_verify_tools_refuse_when_every_entry_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An all-invalid list is refused, not read as a deliberate empty grant.
+
+    ``verify_tools = []`` is an operator saying "verify nothing". A list whose
+    every entry was rejected says only that the file has a typo, and resolving
+    the two to the same state dispatches unverified work that can still be
+    promoted to ai:ready-for-human.
+    """
+    import pipeline
+    import tick
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[defaults]\nverify_tools = ["bad)entry"]\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+    config = pipeline.resolve_config()
+
+    assert config.errors, "an all-invalid grant must not start the tick"
+    assert tick._engine_verify_tools() == ()
+
+
+def test_engine_verify_tools_guard_a_body_that_appears_after_startup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The argv builder never templates an unvalidated body, validated or not.
+
+    The config file is re-read per dispatch, so an operator edit landing after
+    the startup check would otherwise reach ``--allowedTools`` unexamined. The
+    allowlist is the security boundary; the last word on it belongs next to the
+    argv rather than to a check that ran earlier.
+    """
+    from types import SimpleNamespace
+
+    import pipeline
+    import tick
+
+    escaped = "rm -rf /) Bash(git push --force"
+    monkeypatch.setattr(
+        pipeline, "resolve_config",
+        lambda *a, **k: SimpleNamespace(verify_tools=("cargo test *", escaped)),
+    )
 
     tools = tick._engine_verify_tools()
 
     assert tools == ("Bash(cargo test *)",)
     assert not any("--force" in entry for entry in tools)
-
-
-def test_engine_verify_tools_fall_back_when_every_entry_is_rejected(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """An all-invalid list falls back rather than granting nothing.
-
-    Granting nothing is indistinguishable to the engine from a repo whose test
-    command is broken, and it fails at dispatch time on a paid engine rather
-    than at config time. The default is the legible outcome.
-    """
-    import pipeline as pipeline_mod
-    import tick
-
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('[engine]\nverify_tools = ["bad)entry"]\n', encoding="utf-8")
-    monkeypatch.setattr(pipeline_mod, "_POLICY_CONFIG_PATH", cfg)
-
-    assert tick._engine_verify_tools() == tuple(
-        f"Bash({entry})" for entry in tick._DEFAULT_VERIFY_TOOLS
-    )
 
 
 def test_engine_allowed_tools_carries_the_verification_grant() -> None:

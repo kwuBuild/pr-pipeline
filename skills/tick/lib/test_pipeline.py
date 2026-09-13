@@ -946,12 +946,10 @@ def test_touches_review_policy_true_for_configured_review_checklist(
     basename or prefix here would escalate unrelated files in the same
     directory.
     """
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(
-        '[policy]\nchecklist_paths = [".ci/review-checklist.md"]\n',
-        encoding="utf-8",
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nchecklist_paths = [".ci/review-checklist.md"]\n',
     )
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
     assert pipeline.touches_review_policy([".ci/review-checklist.md"]) is True
     assert pipeline.touches_review_policy([".ci/review-checklist-v2.md"]) is False
     assert pipeline.touches_review_policy(["docs/review-checklist.md"]) is False
@@ -964,7 +962,7 @@ def test_touches_review_policy_ships_no_checklist_paths() -> None:
     would make the adopter's gate look configured when it is not. CLAUDE.md and
     AGENTS.md still gate by basename with no configuration at all.
     """
-    assert pipeline._reviewer_checklist_paths() == ()
+    assert pipeline.resolve_config().checklist_paths == ()
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
 
 
@@ -1011,12 +1009,10 @@ def test_touches_review_policy_ignores_blank_lines() -> None:
 def test_touches_review_policy_config_allow_touching_true(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """config.toml [policy] allow_touching = true must let a PR that edits
-    reviewer policy files flow to auto-review — the operator has explicitly
-    accepted the trust boundary (the reviewer runs on the PR's own worktree)."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text("[policy]\nallow_touching = true\n", encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    """allow_touching = true must let a PR that edits reviewer policy files
+    flow to auto-review — the operator has explicitly accepted the trust
+    boundary (the reviewer runs on the PR's own worktree)."""
+    operator_config(monkeypatch, tmp_path, "[defaults]\nallow_touching = true\n")
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is False
     assert pipeline.touches_review_policy(["app/AGENTS.md"]) is False
     assert pipeline.touches_review_policy(["app/foo.py"]) is False
@@ -1026,21 +1022,21 @@ def test_touches_review_policy_config_conservative_by_default(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Missing, false, or malformed config must keep the conservative gate."""
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", tmp_path / "nope.toml")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "nope.toml"))
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
-    cfg = tmp_path / "config.toml"
-    cfg.write_text("[policy]\nallow_touching = false\n", encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    cfg = operator_config(
+        monkeypatch, tmp_path, "[defaults]\nallow_touching = false\n",
+    )
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
     cfg.write_text("not toml [", encoding="utf-8")
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
-    # A valid-but-wrong-shape [policy] value must not crash the gate — it
+    # A valid-but-wrong-shape [defaults] value must not crash the gate — it
     # fails closed like every other non-true value.
-    cfg.write_text('policy = "allow"\n', encoding="utf-8")
+    cfg.write_text('defaults = "allow"\n', encoding="utf-8")
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
     # Invalid UTF-8 bytes raise UnicodeDecodeError (not TOMLDecodeError) from
     # tomllib.load — the gate must fail closed, never crash the tick.
-    cfg.write_bytes(b"\xff\xfe[policy]\nallow_touching = true\n")
+    cfg.write_bytes(b"\xff\xfe[defaults]\nallow_touching = true\n")
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
 
 
@@ -3705,6 +3701,47 @@ def test_cli_tick_log_tail_returns_entries_json(
 # --- Helpers ---
 
 
+def operator_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str,
+) -> Path:
+    """Write ``text`` as the operator's config and point the resolver at it.
+
+    Uses ``$PR_PIPELINE_CONFIG`` — the documented testing override — so no test
+    can reach the real ``~/.claude/pr-pipeline/config.toml``.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        tmp_path: The test's temporary directory.
+        text: The TOML to write.
+
+    Returns:
+        The path written, so a test can corrupt it afterwards.
+    """
+    cfg = tmp_path / "operator-config.toml"
+    cfg.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    return cfg
+
+
+def packaged_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str,
+) -> Path:
+    """Write ``text`` as the packaged floor and point the resolver at it.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        tmp_path: The test's temporary directory.
+        text: The TOML to write.
+
+    Returns:
+        The path written.
+    """
+    cfg = tmp_path / "packaged-config.toml"
+    cfg.write_text(text, encoding="utf-8")
+    monkeypatch.setattr(pipeline, "_PACKAGED_CONFIG_PATH", cfg)
+    return cfg
+
+
 def classify(*, now: float, deadline: float, alive: bool, result: bool) -> str:
     """Thin wrapper over classify_dispatch to keep assertion lines readable."""
     return pipeline.classify_dispatch(
@@ -5019,76 +5056,925 @@ def test_stage_pickup_labels_cover_every_in_flight_stage() -> None:
     assert set(pipeline.STAGE_ENTITIES) == set(pipeline.STAGE_IN_FLIGHT_LABELS)
 
 
-# --- Operator config accessors ---
+# --- Operator config location ---
 
 
-def test_config_string_reads_a_table_value(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+def test_operator_config_path_defaults_to_the_claude_home(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A configured string is returned stripped."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('[target]\nrepo = "  owner/name  "\n', encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    """With nothing exported, the operator's config lives in their Claude home.
 
-    assert pipeline.config_string("target", "repo") == "owner/name"
-
-
-def test_config_string_reads_wrong_shapes_as_absent(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """A wrong-typed value must read as unconfigured, never raise.
-
-    Everything built on these accessors fails closed on the empty string — the
-    startup gate refuses the tick, the policy gate escalates. A typed crash
-    instead would surface as a tick-level exception with no useful message, and
-    on the `--loop` path it would take down a run mid-flight.
+    Not in the install: a plugin install lands at
+    ``~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/`` and
+    ``/plugin update`` installs the next version at a *different* hash, so an
+    install-relative operator config is silently discarded on every upgrade.
     """
-    cfg = tmp_path / "config.toml"
-    cfg.write_text("[target]\nrepo = 42\n", encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    monkeypatch.delenv("PR_PIPELINE_CONFIG", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
-    assert pipeline.config_string("target", "repo") == ""
-    assert pipeline.config_string("target", "absent") == ""
-    assert pipeline.config_string("absent", "repo") == ""
-
-
-def test_config_string_list_drops_unusable_entries(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """Blank and non-string entries are dropped, the rest survive.
-
-    Dropping per entry rather than rejecting the list is deliberate: these
-    lists carry security-relevant grants, and one bad line silently emptying
-    the whole list is a worse failure than one bad line being ignored.
-    """
-    cfg = tmp_path / "config.toml"
-    cfg.write_text(
-        '[engine]\nverify_tools = ["  a  ", "", 7, "b"]\n', encoding="utf-8",
+    assert pipeline.operator_config_path() == (
+        Path.home() / ".claude" / "pr-pipeline" / "config.toml"
     )
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
-
-    assert pipeline.config_string_list("engine", "verify_tools") == ("a", "b")
 
 
-def test_config_string_list_reads_a_non_list_as_absent(
+def test_operator_config_path_honours_claude_config_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """A scalar where a list belongs reads as unconfigured."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text('[engine]\nverify_tools = "uv run pytest"\n', encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    """``$CLAUDE_CONFIG_DIR`` relocates the whole Claude home, config included."""
+    monkeypatch.delenv("PR_PIPELINE_CONFIG", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
 
-    assert pipeline.config_string_list("engine", "verify_tools") == ()
+    assert pipeline.operator_config_path() == (
+        tmp_path / "cfg" / "pr-pipeline" / "config.toml"
+    )
 
 
-def test_read_operator_config_is_empty_when_the_file_is_malformed(
+def test_operator_config_path_prefers_the_explicit_override(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Unparseable TOML reads as empty rather than raising."""
-    cfg = tmp_path / "config.toml"
-    cfg.write_text("[policy\nallow_touching = tru", encoding="utf-8")
-    monkeypatch.setattr(pipeline, "_POLICY_CONFIG_PATH", cfg)
+    """``$PR_PIPELINE_CONFIG`` names one file and outranks the Claude home.
 
-    assert pipeline.read_operator_config() == {}
-    # And the gate it feeds stays closed.
+    This is the testing override, and it is the highest-precedence location so
+    a test (or a one-off run) never has to write into the operator's real home.
+    """
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "explicit.toml"))
+
+    assert pipeline.operator_config_path() == tmp_path / "explicit.toml"
+
+
+def test_operator_config_path_is_independent_of_the_working_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """No configuration layer may be read from the target repo or a worktree.
+
+    The tick, its CLI helpers and the engines all run from different working
+    directories — an engine's cwd is a checkout of the pull request's own head.
+    A config path that moved with the cwd would let a PR supply the policy it
+    is judged under, which is the whole reason this file lives in the
+    operator's home.
+    """
+    monkeypatch.delenv("PR_PIPELINE_CONFIG", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    worktree = tmp_path / "target-repo"
+    worktree.mkdir()
+
+    from_home = pipeline.operator_config_path()
+    monkeypatch.chdir(worktree)
+
+    assert pipeline.operator_config_path() == from_home
+
+
+def test_operator_config_path_refuses_a_relative_explicit_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A relative ``$PR_PIPELINE_CONFIG`` is refused, not resolved per cwd.
+
+    The tick chdirs to the repository root after this module is imported, so a
+    relative override would have one process read identity from one file and
+    policy from another — and an engine's cwd is a checkout of the pull
+    request's own head, which is the one place a config must never come from.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", "settings/pr-pipeline/config.toml")
+    before = pipeline.operator_config_path()
+    worktree = tmp_path / "engine-worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+
+    assert before.is_absolute()
+    assert pipeline.operator_config_path() == before
+    assert any(
+        "PR_PIPELINE_CONFIG" in e for e in pipeline.resolve_config("owner/name").errors
+    )
+
+
+def test_operator_config_path_refuses_a_relative_claude_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``$CLAUDE_CONFIG_DIR`` carries the same cwd hazard and the same refusal."""
+    monkeypatch.delenv("PR_PIPELINE_CONFIG", raising=False)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "settings")
+    before = pipeline.operator_config_path()
+    worktree = tmp_path / "engine-worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+
+    assert before.is_absolute()
+    assert pipeline.operator_config_path() == before
+    assert any(
+        "CLAUDE_CONFIG_DIR" in e for e in pipeline.resolve_config("owner/name").errors
+    )
+
+
+def test_resolve_config_reads_nothing_through_a_relative_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A refused override reads no operator config at all, and fails closed.
+
+    Falling back to the Claude home would answer with a *different* operator's
+    settings than the variable named, which is exactly the confusion the
+    refusal exists to prevent.
+    """
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    cfg = tmp_path / "relative.toml"
+    cfg.write_text("[defaults]\nallow_touching = true\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", "relative.toml")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.allow_touching is False
+    assert config.errors != ()
+
+
+# --- Operator config: layering ---
+
+
+def test_resolve_config_reads_the_packaged_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """With no operator config at all, the packaged floor is the answer.
+
+    The install ships a floor so a fresh adopter's first dispatch has a
+    verification grant and a conservative gate rather than a permission denial.
+    """
+    packaged_floor(
+        monkeypatch, tmp_path,
+        '[defaults]\nverify_tools = ["uv run pytest *"]\nallow_touching = false\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.verify_tools == ("uv run pytest *",)
+    assert config.allow_touching is False
+    assert config.errors == ()
+
+
+def test_resolve_config_defaults_override_the_packaged_floor(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``[defaults]`` in the operator's own config beats the shipped floor."""
+    packaged_floor(
+        monkeypatch, tmp_path, '[defaults]\nverify_tools = ["uv run pytest *"]\n',
+    )
+    operator_config(
+        monkeypatch, tmp_path, '[defaults]\nverify_tools = ["npm test *"]\n',
+    )
+
+    assert pipeline.resolve_config("owner/name").verify_tools == ("npm test *",)
+
+
+def test_resolve_config_repo_section_overrides_defaults(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``[repos."owner/name"]`` beats ``[defaults]``, and only for that repo.
+
+    One operator drives many repositories, and the settings that differ per
+    target are exactly the ones a single flat table cannot express.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\n'
+        'verify_tools = ["uv run pytest *"]\n'
+        'base_ref = "main"\n'
+        '\n'
+        '[repos."owner/notes-app"]\n'
+        'verify_tools = ["npm test *"]\n'
+        'base_ref = "master"\n',
+    )
+
+    notes = pipeline.resolve_config("owner/notes-app")
+    other = pipeline.resolve_config("owner/other")
+
+    assert notes.verify_tools == ("npm test *",)
+    assert notes.base_ref == "master"
+    assert other.verify_tools == ("uv run pytest *",)
+    assert other.base_ref == "main"
+
+
+def test_resolve_config_lists_replace_and_never_merge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A repository's list replaces the default wholesale, empty included.
+
+    Merging would mean an operator could never *narrow* a grant for one
+    target, which is the wrong direction for a permission list. So presence,
+    not truthiness, decides: an explicit empty list has to win.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\n'
+        'verify_tools = ["uv run pytest *", "uv run ruff *"]\n'
+        '\n'
+        '[repos."owner/narrow"]\n'
+        'verify_tools = ["uv run pytest *"]\n'
+        '\n'
+        '[repos."owner/none"]\n'
+        'verify_tools = []\n',
+    )
+
+    assert pipeline.resolve_config("owner/narrow").verify_tools == (
+        "uv run pytest *",
+    )
+    assert pipeline.resolve_config("owner/none").verify_tools == ()
+
+
+def test_resolve_config_cli_overrides_outrank_every_file_layer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A flag typed on one run is the most specific statement of intent."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\npermission_mode = "dontAsk"\n'
+        '\n[repos."owner/name"]\npermission_mode = "dontAsk"\n'
+        '\n[scan]\nrepos = ["owner/name"]\n',
+    )
+
+    config = pipeline.resolve_config(
+        "owner/name", cli_overrides={"permission_mode": "auto"},
+    )
+
+    assert config.permission_mode == "auto"
+    assert config.errors == ()
+
+
+def test_resolve_config_reports_an_unusable_cli_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A bad flag value is reported like a bad config value, never dropped."""
+    operator_config(monkeypatch, tmp_path, '[defaults]\npermission_mode = "auto"\n')
+
+    config = pipeline.resolve_config(
+        "owner/name", cli_overrides={"permission_mode": "yolo"},
+    )
+
+    assert any(
+        "permission_mode" in e and "the command line" in e for e in config.errors
+    )
+
+
+def test_resolve_config_blank_repo_reads_defaults_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """No resolved target selects no per-repository layer.
+
+    The pure-logic CLI helpers are not operating a specific target, so they
+    must not silently inherit one repository's overrides.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nbase_ref = "main"\n'
+        '\n[repos."owner/name"]\nbase_ref = "master"\n',
+    )
+
+    assert pipeline.resolve_config().base_ref == "main"
+
+
+def test_resolve_config_warns_on_an_unknown_setting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A misspelled key is reported, because a silently ignored one is the bug.
+
+    ``verify_tool`` grants nothing and looks configured. The pipeline would
+    then dispatch with no verification permission and still promote the PR.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[defaults]\nverify_tool = ["uv run pytest *"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("verify_tool" in w for w in config.warnings)
+    assert config.errors == ()
+
+
+# --- Operator config: the operator's login ---
+
+
+def test_resolve_config_reads_the_operator_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``[operator] login`` is the identity the trust gates are written against."""
+    operator_config(monkeypatch, tmp_path, '[operator]\nlogin = "  userA  "\n')
+
+    assert pipeline.resolve_config("owner/name").login == "userA"
+
+
+def test_resolve_config_login_is_not_per_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A ``login`` under ``[repos.*]`` is not an override — it is a typo.
+
+    It is an identity, not a per-target setting: a per-repository override
+    would mean the pipeline reviewing PRs as somebody else on one repo, a
+    trust boundary change wearing a configuration key's clothes.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[operator]\nlogin = "userA"\n'
+        '\n[repos."owner/name"]\nlogin = "userB"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.login == "userA"
+    assert any("login" in w for w in config.warnings)
+
+
+def test_resolve_config_env_overrides_the_operator_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``PIPELINE_TRUSTED_AUTHOR`` keeps overriding the configured login."""
+    operator_config(monkeypatch, tmp_path, '[operator]\nlogin = "userA"\n')
+    monkeypatch.setenv("PIPELINE_TRUSTED_AUTHOR", "userB")
+
+    assert pipeline.resolve_config("owner/name").login == "userB"
+
+
+def test_resolve_config_login_falls_back_to_the_deprecated_remnant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An install configured before this change keeps working across the merge.
+
+    ``[target] trusted_author`` in the packaged file is a deprecated remnant,
+    read only so an operator who filled it in does not lose their pipeline on
+    the merge that moves configuration to their home. The canonical-target
+    issue deletes it.
+    """
+    packaged_floor(
+        monkeypatch, tmp_path,
+        '[target]\nrepo = "owner/name"\ntrusted_author = "userA"\n',
+    )
+    operator_config(monkeypatch, tmp_path, "")  # nothing has moved home yet
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.login == "userA"
+    assert config.legacy_target_repo == "owner/name"
+    assert config.errors == ()
+
+
+def test_resolve_config_warns_when_target_is_set_in_the_operator_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """`[target]` in the operator's own config is read by nothing.
+
+    It is the obvious place to put a target, and it is the wrong one until the
+    canonical-target issue lands — so an operator who writes it there would
+    otherwise watch the tick refuse to start with no idea why the value they
+    just set is being ignored.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[target]\nrepo = "owner/name"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.legacy_target_repo == ""
+    assert any("[target]" in w for w in config.warnings)
+
+
+def test_resolve_config_operator_login_beats_the_deprecated_remnant(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The new key wins, so a migrated operator is not shadowed by the floor."""
+    packaged_floor(monkeypatch, tmp_path, '[target]\ntrusted_author = "old"\n')
+    operator_config(monkeypatch, tmp_path, '[operator]\nlogin = "new"\n')
+
+    assert pipeline.resolve_config("owner/name").login == "new"
+
+
+# --- Operator config: settings with no conservative fallback ---
+
+
+def test_resolve_config_reports_a_malformed_login(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A login that matches nobody is an error, not "escalate every PR".
+
+    The login is compared for equality against a PR author. Coerced to empty,
+    a typo reads as "no author is trusted" — a pipeline that silently stops
+    reviewing rather than one that says why.
+    """
+    for bad in ("login = 42", 'login = "user A"', 'login = "owner/name"'):
+        operator_config(monkeypatch, tmp_path, f"[operator]\n{bad}\n")
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any("login" in e for e in config.errors), bad
+        assert config.login == "", bad
+
+
+def test_resolve_config_reports_a_malformed_base_ref(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``base_ref`` has no restrictive value, so a bad one is a hard error.
+
+    It reaches ``git fetch origin <ref>`` and ``gh pr create --base <ref>``.
+    There is no conservative branch to fall back to: silently picking one
+    would target a branch the operator never named.
+    """
+    for bad in ("base_ref = 7", 'base_ref = "--upload-pack=x"',
+                'base_ref = "a..b"', 'base_ref = "feature/"'):
+        operator_config(monkeypatch, tmp_path, f"[defaults]\n{bad}\n")
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any("base_ref" in e for e in config.errors), bad
+
+
+def test_resolve_config_blank_base_ref_is_not_malformed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A blank ``base_ref`` is the documented "resolve the default branch"."""
+    operator_config(monkeypatch, tmp_path, '[defaults]\nbase_ref = ""\n')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.base_ref == ""
+    assert config.errors == ()
+
+
+def test_resolve_config_reports_a_malformed_permission_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An unsupported permission mode is an error, not a silent downgrade.
+
+    Coercing it would either widen the engine's permissions past what the
+    operator wrote, or narrow them and fail the run on a denial that reads to
+    the engine as a broken repository.
+    """
+    operator_config(monkeypatch, tmp_path, '[defaults]\npermission_mode = "yolo"\n')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("permission_mode" in e for e in config.errors)
+
+
+def test_resolve_config_reports_a_blank_permission_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Blank is a documented value for ``base_ref`` only, never for this key.
+
+    Accepted here it passes the startup gate and reaches the engine launch,
+    which raises *after* a dispatch lease and worktree exist — a tick crash
+    and a recovery path instead of a legible refusal.
+    """
+    for blank in ('""', '"   "'):
+        operator_config(
+            monkeypatch, tmp_path, f"[defaults]\npermission_mode = {blank}\n",
+        )
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any("permission_mode" in e for e in config.errors), blank
+
+
+def test_resolve_config_malformed_verify_tools_is_not_empty_verify_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """These are different states and they must not collapse into one.
+
+    An empty list is a deliberate operator choice that dispatches with a
+    warning. A list that failed to parse, read as empty, would silently become
+    an unverified PR promoted to ai:ready-for-human.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[defaults]\nverify_tools = "uv run pytest"\n',
+    )
+    malformed = pipeline.resolve_config("owner/name")
+
+    operator_config(monkeypatch, tmp_path, "[defaults]\nverify_tools = []\n")
+    empty = pipeline.resolve_config("owner/name")
+
+    assert any("verify_tools" in e for e in malformed.errors)
+    assert empty.verify_tools == ()
+    assert empty.errors == ()
+
+
+def test_resolve_config_reports_a_non_string_verify_tools_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """One unusable entry in a permission grant is an error, not a filter.
+
+    Dropping it would hand the engine a narrower grant than the operator wrote
+    and surface as an unexplained permission denial mid-run.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nverify_tools = ["uv run pytest *", 7]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("verify_tools" in e for e in config.errors)
+
+
+def test_resolve_config_reports_a_verify_tools_entry_that_is_not_a_body(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A grant that cannot be a `Bash(...)` body is malformed, not droppable.
+
+    ``--allowedTools`` takes ``Tool(body)`` entries, so a parenthesis or a
+    newline inside a body does not describe the permission the operator typed.
+    Dropping such an entry downstream would turn a one-character typo into a
+    silently narrower grant, and an all-invalid list into the unconfigured
+    empty grant that dispatches unverified work to ai:ready-for-human.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nverify_tools = ["uv run pytest *", "cargo test)"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("verify_tools" in e for e in config.errors)
+    assert config.verify_tools == ()
+
+
+def test_resolve_config_reports_an_all_invalid_verify_tools_list(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An all-invalid list must not arrive as a deliberate empty grant.
+
+    ``verify_tools = []`` is an operator choice that dispatches with a warning.
+    A list whose every entry was rejected is a file to fix, and the two must
+    not resolve to the same state.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[defaults]\nverify_tools = ["cargo test)"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.verify_tools == ()
+    assert any("verify_tools" in e for e in config.errors)
+
+
+def test_resolve_config_drops_blank_list_entries_without_reporting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A blank entry is a trailing comma, not a statement about policy."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nverify_tools = ["  uv run pytest *  ", ""]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.verify_tools == ("uv run pytest *",)
+    assert config.errors == ()
+
+
+# --- Operator config: fail-closed settings ---
+
+
+def test_resolve_config_allow_touching_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A non-boolean gate keeps the conservative gate and says so.
+
+    This setting *has* a safe direction, so it is warned about rather than
+    refused: a tick that still runs with the gate closed is strictly better
+    than one that will not run at all.
+    """
+    operator_config(monkeypatch, tmp_path, '[defaults]\nallow_touching = "yes"\n')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.allow_touching is False
+    assert any("allow_touching" in w for w in config.warnings)
+    assert config.errors == ()
+
+
+def test_resolve_config_checklist_paths_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An unusable ``checklist_paths`` yields no paths, and refuses the tick.
+
+    CLAUDE.md and AGENTS.md still gate by basename with no configuration at
+    all, so the gate does not disappear — but the paths the operator *named*
+    are protection, and running on without them is running with a weaker gate
+    than the one they wrote. There is nothing conservative to fall back to, so
+    this is a startup error rather than a warning.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[defaults]\nchecklist_paths = "docs/x.md"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.checklist_paths == ()
+    assert any("checklist_paths" in e for e in config.errors)
+
+
+def test_resolve_config_malformed_checklist_paths_keeps_the_valid_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """One bad entry must not strip the gate of the paths that *are* valid.
+
+    ``checklist_paths`` is a list of files to **block**, so the empty set is
+    the permissive direction: discarding the list on a typo would let a PR
+    that rewrites the reviewer's own checklist walk into automatic review.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nchecklist_paths = ["docs/review.md", 7]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.checklist_paths == ("docs/review.md",)
+    assert any("checklist_paths" in e for e in config.errors)
+    assert pipeline.touches_review_policy(["docs/review.md"], "owner/name") is True
+
+
+def test_resolve_config_malformed_repo_checklist_paths_still_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A malformed per-repo override may not silently unprotect valid defaults.
+
+    Lists replace wholesale, so a bad ``[repos."owner/name"]`` value would
+    otherwise erase a perfectly good ``[defaults]`` list for that one target.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nchecklist_paths = ["docs/review.md"]\n'
+        '\n[repos."owner/name"]\nchecklist_paths = "docs/review.md"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("checklist_paths" in e for e in config.errors)
+    assert pipeline.touches_review_policy(["docs/review.md"], "owner/name") is True
+
+
+def test_resolve_config_reports_a_malformed_defaults_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A declared-but-not-a-table ``[defaults]`` is an error, not an absence.
+
+    ``[[defaults]]`` is valid TOML and an easy slip. Read as absent, every
+    setting under it — verification grants included — is silently replaced by
+    the shipped floor with nothing said.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[[defaults]]\nverify_tools = ["cargo test *"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("defaults" in e for e in config.errors)
+
+
+def test_resolve_config_reports_a_malformed_operator_or_repos_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The identity and per-repository containers get the same type check."""
+    for text, key in (
+        ('[[operator]]\nlogin = "userA"\n', "operator"),
+        ('[[repos]]\nname = "owner/name"\n', "repos"),
+    ):
+        operator_config(monkeypatch, tmp_path, text)
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any(key in e for e in config.errors), text
+
+
+def test_resolve_config_reports_malformed_toml_and_still_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An unparseable config is reported *and* reads conservatively.
+
+    Both halves matter: the error is what refuses the tick, and the empty read
+    is what keeps the gate shut for any caller that does not act on errors.
+    """
+    cfg = operator_config(monkeypatch, tmp_path, "")
+    cfg.write_text("[defaults\nallow_touching = tru", encoding="utf-8")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.errors != ()
+    assert config.allow_touching is False
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
+
+
+# --- Operator config: [scan] repos ---
+
+
+def test_resolve_config_scan_repos_absent_or_empty_is_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Two states and no third: absent and empty both mean unrestricted.
+
+    Both are things the operator wrote, which is the point — see the malformed
+    case, which must not land here.
+    """
+    operator_config(monkeypatch, tmp_path, '[operator]\nlogin = "userA"\n')
+    assert pipeline.resolve_config("owner/name").scan_repos is None
+
+    operator_config(monkeypatch, tmp_path, "[scan]\nrepos = []\n")
+    assert pipeline.resolve_config("owner/name").scan_repos is None
+
+
+def test_resolve_config_scan_repos_restricts_when_non_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A non-empty list is the eligible set, exactly as written."""
+    operator_config(
+        monkeypatch, tmp_path, '[scan]\nrepos = ["owner/one", " owner/two "]\n',
+    )
+
+    assert pipeline.resolve_config().scan_repos == ("owner/one", "owner/two")
+
+
+def test_resolve_config_malformed_scan_repos_never_reads_as_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A typo must be an error, never silently coerced to either state.
+
+    "Unrestricted" must be something the operator wrote. A malformed value
+    resolves to the empty *restrictive* set, so even a caller that ignores the
+    error cannot read it as "every repository is eligible".
+    """
+    for bad in ('repos = "owner/name"', "repos = [7]", 'repos = ["not-a-repo"]'):
+        operator_config(monkeypatch, tmp_path, f"[scan]\n{bad}\n")
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any("[scan] repos" in e for e in config.errors), bad
+        assert config.scan_repos == (), bad
+
+
+def test_resolve_config_malformed_scan_container_never_reads_as_unrestricted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``[[scan]]`` is a declared scope, not an absent one.
+
+    Read as absent it resolves to unrestricted with nothing reported — the one
+    state that must only ever come from something the operator wrote.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[[scan]]\nrepos = ["owner/only"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("scan" in e for e in config.errors)
+    assert config.scan_repos == ()
+
+
+def test_resolve_config_reports_a_repo_section_outside_a_restricted_scan(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Settings for a repository the operator excluded are a config error.
+
+    Silently keeping them would leave an operator convinced they had
+    configured a target the pipeline will never look at.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[scan]\nrepos = ["owner/one"]\n'
+        '\n[repos."owner/two"]\nbase_ref = "main"\n',
+    )
+
+    config = pipeline.resolve_config("owner/one")
+
+    assert any('"owner/two"' in e and "[scan] repos" in e for e in config.errors)
+
+
+def test_resolve_config_reports_a_malformed_repos_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A ``[repos.*]`` key must be ``owner/name`` exactly as ``gh`` reports it.
+
+    Anything else can never match a resolved target, so its settings would
+    never apply and nothing would say why.
+    """
+    operator_config(
+        monkeypatch, tmp_path, '[repos."notes-app"]\nbase_ref = "main"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("notes-app" in e for e in config.errors)
+
+
+def test_resolve_config_accepts_a_repository_named_dot_github(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``owner/.github`` is a real repository, and every section is validated.
+
+    GitHub's organization profile lives in a repository literally named
+    ``.github``. Applying the owner half's leading-alphanumeric rule to the
+    name half rejects it, and because every ``[repos.*]`` key is checked at
+    startup, one such section stops ticks against every *other* target too.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[repos."owner/.github"]\nbase_ref = "main"\n'
+        '\n[scan]\nrepos = ["owner/.github", "owner/name"]\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.errors == ()
+    assert pipeline.resolve_config("owner/.github").base_ref == "main"
+
+
+def test_resolve_config_reports_a_repository_named_only_dots(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``.`` and ``..`` are path traversal, not repository names.
+
+    Accepting GitHub's name grammar must not accept the two names GitHub
+    itself forbids: they are the path segments that walk out of whatever
+    directory a resolved target is joined into.
+    """
+    for name in (".", ".."):
+        operator_config(
+            monkeypatch, tmp_path, f'[repos."owner/{name}"]\nbase_ref = "main"\n',
+        )
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any("owner/" in e for e in config.errors), name
+
+
+# --- Operator config: the packaged floor is layer 1 and only layer 1 ---
+
+
+def test_resolve_config_refuses_operator_tables_in_the_packaged_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """An operator value in the install is reported, never read.
+
+    A plugin install lands at a hash-named path and ``/plugin update``
+    installs the next version at a *different* hash, so a value written there
+    is discarded on upgrade — including verification grants, which means the
+    next dispatch runs with no verification and still awards
+    ai:ready-for-human. Nothing would error. This does.
+    """
+    for table in ('[operator]\nlogin = "userA"\n', "[scan]\nrepos = []\n",
+                  '[repos."owner/name"]\nbase_ref = "main"\n'):
+        packaged_floor(monkeypatch, tmp_path, table)
+
+        config = pipeline.resolve_config("owner/name")
+
+        assert any(
+            "must not ship in the install" in e for e in config.errors
+        ), table
+
+
+def test_resolve_config_reads_no_config_from_the_install_or_a_worktree(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Exactly two files are read, and neither sits in a repository checkout.
+
+    This is the property section 2 of the design says gets a test: no
+    configuration layer is ever read from inside a target repository or an
+    engine worktree. It must fail loudly if a later convenience override
+    reintroduces such a path — a reviewer runs with its cwd inside a checkout
+    of the pull request's own head, so a config read from there is a PR
+    supplying the policy it is judged under.
+    """
+    read: list[Path] = []
+    real_read_toml = pipeline._read_toml
+
+    def recording(path: Path) -> tuple[dict[str, object], str]:
+        read.append(path)
+        return real_read_toml(path)
+
+    monkeypatch.setattr(pipeline, "_read_toml", recording)
+    monkeypatch.setattr(pipeline, "_PACKAGED_CONFIG_PATH", tmp_path / "floor.toml")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "home" / "config.toml"))
+    worktree = tmp_path / "engine-worktree"
+    worktree.mkdir()
+    monkeypatch.chdir(worktree)
+
+    pipeline.resolve_config("owner/name")
+
+    assert read == [tmp_path / "floor.toml", tmp_path / "home" / "config.toml"], (
+        "resolve_config read a configuration file it must not read"
+    )
+    assert not any(p.is_relative_to(worktree) for p in read)
+
+
+def test_operator_config_path_is_never_inside_the_install(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The operator's file must not resolve into the install directory.
+
+    The packaged floor is install-relative by design and is the only thing
+    that may be. If a later change ever points the operator's own config back
+    into the install — the shape this issue exists to remove — every setting is
+    silently discarded by the next ``/plugin update``.
+    """
+    monkeypatch.delenv("PR_PIPELINE_CONFIG", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    install_root = Path(pipeline.__file__).resolve().parent.parent
+
+    assert not pipeline.operator_config_path().is_relative_to(install_root)

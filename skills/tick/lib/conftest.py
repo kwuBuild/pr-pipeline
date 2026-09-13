@@ -15,15 +15,21 @@ import pytest
 
 # The target repo and trusted author every test runs against.
 #
-# `tick.py` resolves both at import time (env first, then `[target]` in
-# `config.toml`), and the shipped config leaves them blank on purpose — a
-# pinned default would point a fresh install at somebody else's repository.
-# Blank is also what `main` refuses to start on, so the suite has to declare a
-# target the way an operator does. Set here, before the first `import tick`
-# anywhere in the session, so every test agrees on one value rather than each
-# patching the module constant.
-os.environ.setdefault("PIPELINE_REPO", "test-owner/test-repo")
-os.environ.setdefault("PIPELINE_TRUSTED_AUTHOR", "test-owner")
+# `tick.py` resolves both at import time — the repo from `PIPELINE_REPO` else
+# the packaged file's deprecated `[target] repo`, the login from
+# `PIPELINE_TRUSTED_AUTHOR` else the resolved `[operator] login` — and nothing
+# that ships fills either in, on purpose: a pinned default would point a fresh
+# install at somebody else's repository. Blank is also what `main` refuses to
+# start on, so the suite has to declare a target the way an operator does. Set
+# here, before the first `import tick` anywhere in the session, so every test
+# agrees on one value rather than each patching the module constant.
+#
+# These stay in the environment for the whole session; the per-test
+# `isolate_operator_config` fixture clears `PIPELINE_TRUSTED_AUTHOR` again
+# so config-resolution tests are not steered by it after import.
+TRUSTED_AUTHOR = "test-owner"
+os.environ.setdefault("PIPELINE_REPO", f"{TRUSTED_AUTHOR}/test-repo")
+os.environ.setdefault("PIPELINE_TRUSTED_AUTHOR", TRUSTED_AUTHOR)
 
 # A PR body that satisfies `tick._pr_body_matches_guidelines` for issue #7 — the
 # shape a fixer's replacement body has to reach before the harvest will publish
@@ -447,21 +453,46 @@ def _no_github_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
-def isolate_review_policy_config(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep gate tests hermetic against the operator's committed config.toml.
+def isolate_operator_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Keep every test hermetic against both configuration layers.
 
-    ``touches_review_policy`` reads ``[policy] allow_touching`` from the skill
-    dir's ``config.toml``, whose committed value is an operator choice (it may
-    be ``true``). Unit tests assert the gate's pure logic, so every test here
-    starts with the config pointed at a nonexistent file (conservative
-    default). Tests that exercise the opt-out set their own
-    ``_POLICY_CONFIG_PATH`` via monkeypatch, which overrides this default.
+    Two files feed ``resolve_config``: the packaged floor committed in this
+    repo, and — far more dangerous for a test suite — whatever the developer
+    running pytest has in their own ``~/.claude/pr-pipeline/config.toml``. A
+    suite that read the latter would pass or fail depending on whose laptop it
+    ran on, so both are pointed at nonexistent files here and every test starts
+    from the conservative default.
+
+    Tests that exercise a configured value set ``PR_PIPELINE_CONFIG`` (for
+    operator settings) or ``_PACKAGED_CONFIG_PATH`` (for the shipped floor),
+    either of which overrides this default.
+
+    ``CLAUDE_CONFIG_DIR`` is cleared too: it relocates the Claude home, so a
+    developer who exports it would otherwise reintroduce the real file the
+    moment a test cleared ``PR_PIPELINE_CONFIG``.
+
+    The one value the stand-in file *does* declare is the operator login. The
+    tick resolves the identity it reviews under per tick and refuses to start
+    without one, and ``PIPELINE_TRUSTED_AUTHOR`` is cleared here so that
+    resolution is exercised from a file rather than from the environment the
+    suite happens to be run in. It has to name the same operator
+    :data:`TRUSTED_AUTHOR` does, or every test that reaches the startup gate
+    would be running as somebody the pipeline does not trust.
     """
     import pipeline
 
     monkeypatch.setattr(
-        pipeline, "_POLICY_CONFIG_PATH", Path("/nonexistent/config.toml")
+        pipeline, "_PACKAGED_CONFIG_PATH", Path("/nonexistent/config.toml")
     )
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("PIPELINE_TRUSTED_AUTHOR", raising=False)
+    cfg = tmp_path_factory.mktemp("operator-config") / "config.toml"
+    cfg.write_text(
+        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n', encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 
 
 # --- Helpers ---
