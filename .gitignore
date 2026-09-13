@@ -25,6 +25,9 @@ env/
 # OS
 .DS_Store
 
+# Local agent tooling state
+.omc/
+
 # Project
 .pr-pipeline/
 .worktrees/

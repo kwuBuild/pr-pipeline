@@ -1,9 +1,9 @@
 """Tests for the PR-pipeline DISPATCH phase (Step 10).
 
-Co-located with ``tick.py`` so the whole ``pr-pipeline-tick/lib`` directory lifts
+Co-located with ``tick.py`` so the whole ``tick/lib`` directory lifts
 out cleanly. Run with::
 
-    uv run pytest .claude/skills/pr-pipeline-tick/lib/test_dispatch.py
+    uv run pytest .claude/skills/tick/lib/test_dispatch.py
 """
 
 from __future__ import annotations
@@ -2915,18 +2915,18 @@ def test_touches_review_policy_guards_the_gate_at_any_install_depth() -> None:
 
     for prefix in ("", ".claude/", "vendor/pr-pipeline/"):
         for tail in (
-            "skills/pr-pipeline-tick/config.toml",
-            "skills/pr-pipeline-tick/lib/pipeline.py",
-            "skills/pr-pipeline-tick/lib/tick.py",
+            "skills/tick/config.toml",
+            "skills/tick/lib/pipeline.py",
+            "skills/tick/lib/tick.py",
         ):
             assert touches_review_policy([prefix + tail]) is True, (
                 f"gate self-protection missed {prefix + tail}"
             )
 
     # The suffix must stay a path-segment match, not a substring one.
-    assert touches_review_policy(["docs/skills/pr-pipeline-tick/config.toml"]) is True
-    assert touches_review_policy(["other-skills/pr-pipeline-tick/config.toml"]) is False
-    assert touches_review_policy(["skills/pr-pipeline-tick/lib/README.md"]) is False
+    assert touches_review_policy(["docs/skills/tick/config.toml"]) is True
+    assert touches_review_policy(["other-skills/tick/config.toml"]) is False
+    assert touches_review_policy(["skills/tick/lib/README.md"]) is False
 
 
 # --- Adversarial review: reviewer codex exec argv ---
@@ -4079,9 +4079,9 @@ def test_dispatch_one_fixer_prompt_shapes_the_published_declaration(
 ) -> None:
     """A replacement must publish reasoning the next reviewer can size.
 
-    Stating a rationale is not enough on its own — PR #614's round-one revision
-    justified rejecting the reviewer's shape and still cost two more rounds,
-    because what was missing was the audit of the substitute. Each decision
+    Stating a rationale is not enough on its own — a round-one revision that
+    justified rejecting the reviewer's shape still cost two more rounds, because
+    what was missing was the audit of the substitute. Each decision
     therefore carries both halves in a fixed format, and it sits *inside* the
     block of the finding it belongs to: one run-wide declaration cannot say
     which finding was replaced, so a mixed run publishes one argument the next

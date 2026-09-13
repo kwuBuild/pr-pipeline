@@ -3,7 +3,7 @@
 # Read-only status dashboard for the PR pipeline. Safe to run continuously in a
 # watch loop in a separate terminal pane:
 #
-#   watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
+#   watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'
 #
 # It makes no writes to pipeline state: it never edits labels, dispatches
 # engines, or touches markers. (The two Python calls below invoke a resolved
@@ -42,11 +42,11 @@ if [ -z "$REPO" ]; then
   # Scoped to the [target] table: an unscoped match would read a `repo` key
   # from whichever table happened to declare one first.
   REPO="$(sed -n '/^\[target\]/,/^\[/ s/^[[:space:]]*repo[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$SKILL_DIR/../pr-pipeline-tick/config.toml" 2>/dev/null | head -1)"
+    "$SKILL_DIR/../tick/config.toml" 2>/dev/null | head -1)"
 fi
 if [ -z "$REPO" ]; then
   echo "status: no target repo configured. Set [target] repo in" >&2
-  echo "  skills/pr-pipeline-tick/config.toml, or export PIPELINE_REPO." >&2
+  echo "  skills/tick/config.toml, or export PIPELINE_REPO." >&2
   exit 2
 fi
 # Anchor on the git common dir, not --show-toplevel: run from inside a linked
@@ -60,7 +60,7 @@ WT_ROOT="$ROOT/.claude/worktrees"
 # STATE (WT_ROOT, TICK_LOG_DIR) stays repo-relative — it belongs to the repo
 # being operated on. Conflating the two is what makes a moved dashboard report
 # a busy pipeline as idle.
-TICK_LIB="$SKILL_DIR/../pr-pipeline-tick/lib"
+TICK_LIB="$SKILL_DIR/../tick/lib"
 NOW=$(date +%s)
 
 # Resolve an interpreter that can actually run the lib. Bare `python3` is NOT a
@@ -185,7 +185,7 @@ gh issue list --repo "$REPO" --state open --json number,title,labels --limit 100
 # --- LAST TICK LOG SUMMARY ------------------------------------------------------
 echo
 echo "LAST TICK AUDIT LOG"
-PIPELINE="$SKILL_DIR/../pr-pipeline-tick/lib/pipeline.py"
+PIPELINE="$SKILL_DIR/../tick/lib/pipeline.py"
 TICK_LOG_DIR="$ROOT/.claude/worktrees/.tick-log"
 if entries=$("$PY" "$PIPELINE" tick-log-tail --log-dir "$TICK_LOG_DIR" 2>/dev/null) \
    && [ "$(printf '%s' "$entries" | jq 'length' 2>/dev/null)" -gt 0 ]; then

@@ -281,7 +281,7 @@ pipeline custody — that is, whether it holds a dispatch marker.
 
 | Actor | May move labels on | Notes |
 |---|---|---|
-| `pr-pipeline-tick` | Any item holding a dispatch marker | Owns every stage transition on marker-owned work: both the dispatch flip and the harvest flip |
+| `pr-pipeline:tick` | Any item holding a dispatch marker | Owns every stage transition on marker-owned work: both the dispatch flip and the harvest flip |
 | A human | Any item, at any time | Normal workflow transitions on items with no dispatch marker, **plus** an emergency hold on marker-owned work — see below |
 | An interactive agent working by hand | Any item with no dispatch marker | This is how work enters the queue; the commands under [Transitions](#transitions) are written for this actor |
 | A dispatched engine (implementer, fixer, reviewer) | Nothing | Reports its outcome through the completion sentinel in its prompt |
@@ -357,9 +357,9 @@ An issue being actively implemented MUST carry `ai:implementing`. The label tran
 | `ai:revised` | Fixes pushed, awaiting re-review | Reviewer looks again |
 | `ai:ready-for-human` | Passed AI review | Human merges |
 
-### Pipeline automation states (pr-pipeline-tick)
+### Pipeline automation states (pr-pipeline:tick)
 
-The `pr-pipeline-tick` skill (`docs/architecture.md`) introduces
+The `pr-pipeline:tick` skill (`docs/architecture.md`) introduces
 four labels the human workflow does not need. They mark "an engine is dispatched"
 (transient work the human convention treats as happening *between* labels) and two
 escalation terminals with no human-workflow equivalent. A human reviewing manually
@@ -389,7 +389,7 @@ Dispatch markers live on the dispatching machine's disk, so a missing marker
 proves nothing — every tick on every other machine sees exactly that, and so does
 every tick looking at your manual pickup. Reconciliation therefore **never** acts
 on a markerless in-flight item. The item stays where it is and appears in the
-`pr-pipeline-status` dashboard, grouped by `ai:` label.
+`pr-pipeline:status` dashboard, grouped by `ai:` label.
 
 The consequence is deliberate: an engine that dies without writing a result
 leaves its item at an in-flight label until the owner clears it by hand. The
@@ -397,7 +397,7 @@ dashboard makes that item visible, but it does not identify it — it reads shar
 GitHub labels plus only the local machine's markers, so an in-flight label with
 no engine row is equally consistent with another machine's live dispatch and
 with your own manual pickup. Confirm with the dispatch host before relabelling
-anything; the runbook is in the `pr-pipeline-tick` skill README under
+anything; the runbook is in the `pr-pipeline:tick` skill README under
 "Markerless in-flight items". Stranding is still cheaper than the alternative,
 which relabelled healthy work and burned down the
 credibility of `ai:needs-human-decision` — the label every custody escalation in

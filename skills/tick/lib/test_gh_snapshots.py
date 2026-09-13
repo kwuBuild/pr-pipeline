@@ -7,7 +7,7 @@ changes) before they cause silent failures in production.
 Tests are skipped when ``gh`` is not authenticated or there is no network.
 Run with::
 
-    uv run pytest .claude/skills/pr-pipeline-tick/lib/test_gh_snapshots.py -v
+    uv run pytest .claude/skills/tick/lib/test_gh_snapshots.py -v
 """
 
 from __future__ import annotations

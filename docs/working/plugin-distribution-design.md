@@ -27,7 +27,7 @@ The target is an ordinary plugin install:
 /plugin marketplace add kwuBuild/pr-pipeline
 /plugin install pr-pipeline
 /pr-pipeline-setup          # once: confirm login, name repos, confirm verify commands
-/pr-pipeline-tick           # run from repo B, C, or D
+/pr-pipeline:tick           # run from repo B, C, or D
 ```
 
 One operator (call them A), one install, many target repositories (B, C, D). A
@@ -93,7 +93,7 @@ for the upgrade-safety reason given in section 2.
 Resolution order, later layers overriding earlier ones:
 
 1. **Packaged defaults** — the install's existing
-   `skills/pr-pipeline-tick/config.toml`, now read-only and treated as the
+   `skills/tick/config.toml`, now read-only and treated as the
    shipped floor.
 2. **`[defaults]`** — operator-wide settings in A's config.
 3. **`[repos."owner/name"]`** — per-repository overrides.
@@ -757,16 +757,22 @@ skips that repository with a tick-log entry rather than blocking on input.
   `source: "./"` — the repository is its own marketplace, so
   `/plugin marketplace add kwuBuild/pr-pipeline` works with no separate registry.
 
-The existing layout is already plugin-shaped: `skills/pr-pipeline-tick/` and
-`skills/pr-pipeline-status/` with name/description frontmatter is what a plugin's
-`skills` entry points at.
+The existing layout is already plugin-shaped: the skill directories with
+name/description frontmatter are what a plugin's `skills` entry points at.
 
-**Invocation names change.** Plugin skills are namespaced by plugin, so the
-current directory names yield `/pr-pipeline:pr-pipeline-tick` rather than
-`/pr-pipeline-tick`. Either the skills are renamed to `tick`, `status`, and
-`setup` for `/pr-pipeline:tick`, or the stutter is accepted. Every invocation
-example in the docs, and the `test_skill_contract.py` assertions that pin them,
-follow whichever is chosen. See open question 12.4.
+**Invocation names change, and the directory is what changes them.** Plugin
+skills are namespaced by plugin, so the original directory names would have
+yielded `/pr-pipeline:pr-pipeline-tick`. They were renamed to `tick` and
+`status` — 12.4, decided below — for `/pr-pipeline:tick` and
+`/pr-pipeline:status`, with `setup` reserved for section 8's skill.
+
+The claim that the frontmatter `name` rather than the directory determines the
+command was **measured and is false**. A user-level skill whose `SKILL.md`
+declares `name: gstack` from a directory named `.gstack-bak` is offered as
+`.gstack-bak`; a second copy of the same file under `_gstack-command` is offered
+as `_gstack-command`. The directory wins, so the rename was load-bearing rather
+than cosmetic. `test_each_published_skill_is_invoked_by_its_directory_name`
+keeps the two equal so the ordering stops mattering.
 
 ### `$PR_PIPELINE_HOME` → `${CLAUDE_PLUGIN_ROOT}`
 
@@ -786,11 +792,11 @@ a blanket substitution breaks the second:
    correct here.
 2. **Commands an operator or agent reads out of `README.md` / `DEBUG.md` and runs
    in a shell** — including the documented dashboard loop,
-   `watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'`
-   (`README.md:44`, `:914`). These files are read as plain text, by a human in a
-   separate terminal or by an agent via `Read`; nothing substitutes them and
-   nothing exports the variable. Written against `${CLAUDE_PLUGIN_ROOT}` the
-   command resolves to `/skills/pr-pipeline-status/status.sh` and fails.
+   `watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'`. These files are
+   read as plain text, by a human in a separate terminal or by an agent via
+   `Read`; nothing substitutes them and nothing exports the variable. Written
+   against `${CLAUDE_PLUGIN_ROOT}` the command resolves to
+   `/skills/status/status.sh` and fails.
 
 So the standalone surface gets a real entrypoint rather than a placeholder:
 
@@ -806,14 +812,18 @@ So the standalone surface gets a real entrypoint rather than a placeholder:
   with a message naming the setup step — never silently resolve a root-relative
   path.
 
-`test_skill_contract.py:279` and `:302` assert the literal
+The `test_skill_contract.py` assertions that pinned the literal
 `uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py`, and the
-path-shape check at `:1418` encodes the same prefix. Those assertions move with
-the contract.
+path-shape check that encoded the same prefix, moved with the contract: the
+skill-body assertions now pin `${CLAUDE_PLUGIN_ROOT}`, the path-shape regex
+accepts either root, and `test_skill_bodies_resolve_the_install_through_the_plugin_root`
+makes the split itself the invariant rather than a convention.
 
-Caveat to document: a session already running holds a stale
+Caveat, documented in `DEBUG.md` under "The install path resolves in two
+different places": a session already running holds a stale
 `CLAUDE_PLUGIN_ROOT` after `/plugin marketplace update` installs a new cache
-version.
+version, so it keeps executing the previous version's code with no error and no
+version mismatch to notice.
 
 ### `review-response-hygiene`
 
@@ -852,20 +862,34 @@ procedure ("restore the skill doc on the PR branch, usually by rebasing"), which
 stops being the recovery. Updating them is part of phase 1, not a follow-up —
 see section 14.
 
-**Where it lands is not settled by "move it to `skills/`".** With
+**Where it lands: under `skills/`, published as a command.** With
 `"skills": "./skills"` in the manifest, anything under that directory becomes a
 namespaced, user-invocable plugin skill whose description loads into every
-session's context. `review-response-hygiene` is consumed as a doc path by an
-engine that has `Read` and no `Skill` tool — it is not meant to be invocable, and
-publishing it as a command is a side effect nobody asked for. Two options, to be
-decided with the naming question in 12.4:
+session's context — so this is a decision about what the plugin publishes, not
+about where a file is filed. The alternative considered and rejected was
+`resources/review-response-hygiene/`, kept out of the manifest and bound by path
+only.
 
-- Keep it outside the manifest's `skills` entry — `resources/review-response-hygiene/`
-  or similar — and bind the path there. Preferred: it says what the file is for.
-- Leave it under `skills/` and accept a fourth invocable command.
+The owner's decision is `skills/`, on the grounds that the guidance these
+documents carry is worth invoking directly and not only at the moment a fixer is
+dispatched. The cost is real and accepted: one more description in every
+session's context, and a command an operator can invoke in a state where it does
+not apply.
 
-L1 (section 10) asserts the resulting skill count, so whichever is chosen is
-observable rather than assumed.
+`definition-of-done` ships on the same grounds and by the same route.
+
+**One premise in that decision does not hold for dispatched engines, and the
+binding is what makes it not matter.** `_ENGINE_ALLOWED_TOOLS_BASE` grants
+`Read Edit Write` plus an exact `Bash` set — there is no `Skill` tool on it — so
+a dispatched implementer or fixer cannot invoke a published skill by name no
+matter where the file sits. Publishing reaches *interactive* sessions; the
+engines reach it the way they already do, as a doc path the controller binds
+into the prompt. Making an engine invoke one of these by name would mean
+widening the engine allowlist, which is a separate decision from this one and is
+not taken here.
+
+L1 (section 10) asserts the resulting skill set as an equality, so an unintended
+command is observable rather than assumed.
 
 Open question for implementation, to be answered by a real engine run rather than
 by a stub: the engine allowlist carries `Read` and no `Skill` tool, which is why
@@ -912,13 +936,15 @@ environmental, not code defects.
 `/plugin marketplace add <clone>`, `/plugin install`, then confirm:
 `${CLAUDE_PLUGIN_ROOT}` resolves inside a skill body; the dashboard runs **in an
 unrelated repository** and reports an empty queue rather than crashing; and the
-invocable skills are **exactly** the intended set — tick, status, setup, under
-their real namespaced names, plus `review-response-hygiene` if and only if
-section 9 chose to leave it under `skills/`.
+invocable skills are **exactly** the intended set under their real namespaced
+names — `/pr-pipeline:tick`, `/pr-pipeline:status`,
+`/pr-pipeline:definition-of-done`, plus `/pr-pipeline:setup` and
+`/pr-pipeline:review-response-hygiene` once those land.
 
-Exactly, not at-least: an unintended fourth command is the observable symptom of
-the packaging question in section 9, and an assertion that only checks presence
-cannot see it.
+Exactly, not at-least: an unintended command is the observable symptom of a
+misplaced file, and an assertion that only checks presence cannot see it.
+`test_published_skill_set_is_exactly_the_intended_commands` is the static half
+of this, so between the two a drift is caught before the install.
 
 ### L2 — stubbed tick, controller only
 
@@ -1019,12 +1045,19 @@ published.
    auto-approve may deny, may prompt into nothing, or may hang. Section 8's probe
    measures the pass case; this question is what the failure case *is*, per route.
    It bounds how much of section 7's empty-`verify_tools` decision is load-bearing.
-4. **Skill naming and placement under the plugin namespace** (section 9): rename
-   to `tick`/`status`/`setup`, or accept `/pr-pipeline:pr-pipeline-tick`; and
-   whether `review-response-hygiene` lives under the manifest's `skills` entry
-   (invocable) or outside it (a resource the fixer prompt binds by path). The two
-   are one decision because both are answers to "what does this plugin publish as
-   a command."
+4. **Skill naming and placement under the plugin namespace** (section 9).
+   **Answered.** The skills are renamed to `tick`, `status`, and `setup`, for
+   `/pr-pipeline:tick` and siblings; the *directory* name is what the harness
+   namespaces, which was measured rather than assumed (section 9). And
+   `review-response-hygiene` lives **under** the manifest's `skills` entry as a
+   published command, as does `definition-of-done` — the owner's call, on the
+   grounds that the guidance is worth invoking directly. The cost accepted is one
+   description per skill in every session's context.
+
+   What the decision does *not* buy: a dispatched engine still cannot invoke
+   them. The engine allowlist carries no `Skill` tool, so the controller binds
+   these documents by path either way, and publishing them reaches interactive
+   sessions only.
 5. Whether `[scan] repos` belongs in this change or is deferred until an operator
    wants the restriction. The unrestricted default ships either way.
 

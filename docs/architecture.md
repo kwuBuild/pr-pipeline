@@ -5,8 +5,8 @@ which component owns each decision, and *why* each boundary sits where it does.
 It is the doc to read before changing dispatch, harvest, custody, or cadence.
 
 It is not the operator manual. For invocation, flags, and troubleshooting see
-[`skills/pr-pipeline-tick/README.md`](../skills/pr-pipeline-tick/README.md) and
-[`DEBUG.md`](../skills/pr-pipeline-tick/DEBUG.md); for the internal call-site
+[`skills/tick/README.md`](../skills/tick/README.md) and
+[`DEBUG.md`](../skills/tick/DEBUG.md); for the internal call-site
 map see [`docs/working/pr-pipeline-internals.md`](working/pr-pipeline-internals.md).
 
 ## Problem Statement
@@ -52,7 +52,7 @@ Each tick runs two fast phases. Engines run *between* ticks, not during them.
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  /pr-pipeline-tick  (dynamic self-paced loop)    │
+│  /pr-pipeline:tick  (dynamic self-paced loop)    │
 │                                                  │
 │  HARVEST phase:                                  │
 │    For each .claude/worktrees/{issue,pr}-*/             │
@@ -311,7 +311,7 @@ dispatch marker}` and folds the current label into a single tested decision
   on that basis: markers are machine-local, so a missing one is equally
   consistent with another machine's live dispatch and with a human's manual
   pickup, and escalating on it mass-relabelled healthy work. Reconciliation
-  leaves every markerless item alone; the `pr-pipeline-status` dashboard lists
+  leaves every markerless item alone; the `pr-pipeline:status` dashboard lists
   every open PR and issue by `ai:` label, so a genuinely stranded item is
   visible there for the operator to clear by hand. See
   [Why custody is not inferred, and not yet proven](#why-custody-is-not-inferred-and-not-yet-proven).
@@ -715,7 +715,7 @@ used to log an accurate retention.
 
 **What is given up.** An engine that dies without writing a result leaves its
 item at an in-flight label indefinitely. Nothing reaps it automatically. It is
-visible in `pr-pipeline-status` (in-flight label, no live engine) and the
+visible in `pr-pipeline:status` (in-flight label, no live engine) and the
 operator clears it with one `gh issue edit`. At the observed rate of zero, that
 is the cheaper side of the trade.
 
@@ -735,7 +735,7 @@ lost bookkeeping.
 
 **Implementer (Claude):**
 
-The implementer engine is selectable via `--impl-engine` on `/pr-pipeline-tick`:
+The implementer engine is selectable via `--impl-engine` on `/pr-pipeline:tick`:
 
 - `claude` (default): runs `claude -p` against the Anthropic API with no
   `--model` flag, so the CLI resolves the operator's own configured model.
@@ -860,13 +860,13 @@ The engine runs with its working directory set to the PR worktree (no `-C`
 flag; the wrapper is launched with `cwd` at the worktree root):
 
 ```bash
-uv run python .claude/skills/pr-pipeline-tick/engine_wrapper.py run \
+uv run python .claude/skills/tick/engine_wrapper.py run \
   --marker-path .claude/worktrees/pr-<N>/dispatch.json \
   --result-path .claude/worktrees/pr-<N>/review.json \
   --envelope-path .claude/worktrees/pr-<N>/completion.json \
   ... \
   -- codex exec \
-    --output-schema .claude/skills/pr-pipeline-tick/review-schema.json \
+    --output-schema .claude/skills/tick/review-schema.json \
     -s read-only \
     --ephemeral \
     --ignore-user-config \
@@ -1567,10 +1567,18 @@ a host repo it sits at `.claude/skills/`, and under a plugin install outside the
 repo entirely — which is why nothing here resolves a pipeline path by counting
 directories.
 
+`skills/` is the plugin's published command surface, not a convenient place to
+keep files: `"skills": "./skills"` in the manifest makes every directory under
+it a namespaced command whose description loads into every session's context.
+Anything the pipeline needs but does not mean to publish belongs outside it.
+
 ```
+.claude-plugin/
+  plugin.json                   # the plugin: name, metadata, "skills": "./skills"
+  marketplace.json              # the repository as its own marketplace, source "./"
 skills/
-  pr-pipeline-tick/
-    SKILL.md                    # /pr-pipeline-tick — invocation stub (thin)
+  tick/
+    SKILL.md                    # /pr-pipeline:tick — invocation stub (thin)
     README.md                   # operator guide: usage, observability, knobs
     DEBUG.md                    # invariants, diagnostics, recovery
     config.toml                 # operator config: [target], [policy], [engine]
@@ -1587,10 +1595,13 @@ skills/
       prompts/                  # implementer / reviewer / fixer templates
       README.md                 # CLI reference + pinned Codex version
       test_*.py                 # unit, dispatch, and executable-contract suites
-  pr-pipeline-status/
-    SKILL.md                    # /pr-pipeline-status — read-only dashboard
+  status/
+    SKILL.md                    # /pr-pipeline:status — read-only dashboard
     status.sh                   # the dashboard implementation
     test_status.py              # dashboard rendering tests
+  definition-of-done/
+    SKILL.md                    # the bar a change clears before green counts as proof
+    references/why.md           # the failure shapes each step was built from
 ```
 
 The skills compose `gh`, `git`, `claude -p`, and `codex exec` directly. The decisions
@@ -1623,12 +1634,12 @@ The config artifacts are the operator's `config.toml` and the two JSON Schemas
 
 **Manual tick (the runnable behaviour today):**
 ```
-/pr-pipeline-tick
+/pr-pipeline:tick
 ```
 
 **Looped (self-paced):**
 ```
-/pr-pipeline-tick, then paste the SKILL.md recurring prompt into /loop
+/pr-pipeline:tick, then paste the SKILL.md recurring prompt into /loop
 ```
 No fixed interval. Each tick schedules its own next wake from pipeline state
 (see Loop and cadence): ~270s while engines are in-flight, ~1800s when idle,
@@ -1636,7 +1647,7 @@ and it stops once the pipeline reaches quiescence.
 
 **Status check (optional):**
 ```
-/pr-pipeline-status
+/pr-pipeline:status
 ```
 Most of what you'd want is already on GitHub — `gh pr list --label ai:...` (or
 the web UI) shows every pipeline stage, since labels are the source of truth.
@@ -1650,10 +1661,10 @@ pipeline.
 **Workflow from the developer's perspective:**
 
 1. Write issues describing work, label them `ai:available`
-2. Run `/pr-pipeline-tick`; for self-paced operation, paste its compact
+2. Run `/pr-pipeline:tick`; for self-paced operation, paste its compact
    recurring prompt into `/loop`
 3. Tick implements, reviews, fixes, re-reviews — all via label transitions
-4. Check `/pr-pipeline-status` to see which PRs are `ai:ready-for-human`
+4. Check `/pr-pipeline:status` to see which PRs are `ai:ready-for-human`
 5. Review those final diffs, merge manually
 
 The developer only touches PRs at `ai:ready-for-human`.

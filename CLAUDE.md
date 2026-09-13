@@ -1,21 +1,22 @@
 # pr-pipeline
 
-An unattended control plane that drives GitHub issues through implement → review → fix → re-review using AI engines (Claude Code, Codex). It ships as two Claude Code skills under `skills/`; GitHub labels are the only source of truth for what stage a work item is in.
+An unattended control plane that drives GitHub issues through implement → review → fix → re-review using AI engines (Claude Code, Codex). It ships as a Claude Code plugin, published from this repository as its own marketplace (`.claude-plugin/`); every directory under `skills/` becomes one namespaced command — `/pr-pipeline:tick`, `/pr-pipeline:status`, `/pr-pipeline:definition-of-done`. GitHub labels are the only source of truth for what stage a work item is in.
 
 ## Document Map
 
-- `skills/pr-pipeline-tick/SKILL.md` — the operator SOP. Lean by contract; read it first to run anything.
-- `skills/pr-pipeline-tick/README.md` — usage, observability, and the tuning knobs.
-- `skills/pr-pipeline-tick/DEBUG.md` — invariants, failure diagnostics, and recovery.
+- `skills/tick/SKILL.md` — the operator SOP. Lean by contract; read it first to run anything.
+- `skills/tick/README.md` — usage, observability, and the tuning knobs.
+- `skills/tick/DEBUG.md` — invariants, failure diagnostics, and recovery.
 - `docs/working/pr-pipeline-internals.md` — how the runtime actually behaves, with line-anchored links into the source.
 - `docs/architecture.md` — the architecture reference: what owns each decision and why each boundary sits where it does. Read before changing dispatch, harvest, custody, or cadence.
-- `docs/working/plugin-distribution-design.md` — design for shipping the pipeline as an installable Claude Code plugin: operator-owned config, issue-author trust, and the staged independence validation. Not yet implemented.
+- `skills/definition-of-done/SKILL.md` — the bar a change has to clear before green stands in as proof it works. Shipped with the plugin so it travels to every target repository.
+- `docs/working/plugin-distribution-design.md` — design for shipping the pipeline as an installable Claude Code plugin: operator-owned config, issue-author trust, and the staged independence validation. Partially implemented — the manifests and skill naming have landed; section 14 tracks the rest.
 - `docs/working/commit-guidelines.md` — Commit format rules. Read before committing.
 - `docs/working/pr-guidelines.md` — PR body template, issue template, workflow labels, AI review posting. Read before raising a PR, creating an issue, or reviewing.
 
 ## Architecture in one paragraph
 
-One deterministic orchestrator, many disposable engines. `skills/pr-pipeline-tick/lib/tick.py` is a single Python process: each invocation runs HARVEST (collect finished engines, archive evidence, apply the transition their sentinel earned) and then DISPATCH (admit eligible work under a concurrency cap and launch an engine for it). `skills/pr-pipeline-tick/lib/pipeline.py` holds the deterministic primitives it composes — label vocabulary, marker validation, verdict parsing, policy gates. The **engines** (`claude --print` / `codex exec`) are subprocesses with fresh context per dispatch, each in its own `git worktree`, and they never move an `ai:` label — they report through a completion sentinel and the harvest relabels. Pipeline *code* resolves from the install; pipeline *state* (`.claude/worktrees/`) lives in the repository being operated on.
+One deterministic orchestrator, many disposable engines. `skills/tick/lib/tick.py` is a single Python process: each invocation runs HARVEST (collect finished engines, archive evidence, apply the transition their sentinel earned) and then DISPATCH (admit eligible work under a concurrency cap and launch an engine for it). `skills/tick/lib/pipeline.py` holds the deterministic primitives it composes — label vocabulary, marker validation, verdict parsing, policy gates. The **engines** (`claude --print` / `codex exec`) are subprocesses with fresh context per dispatch, each in its own `git worktree`, and they never move an `ai:` label — they report through a completion sentinel and the harvest relabels. Pipeline *code* resolves from the install; pipeline *state* (`.claude/worktrees/`) lives in the repository being operated on.
 
 ## Tech Stack
 
@@ -29,7 +30,7 @@ One deterministic orchestrator, many disposable engines. `skills/pr-pipeline-tic
 
 Tasks are tracked as GitHub Issues and PRs with workflow labels. The full label set and transition rules live in `docs/working/pr-guidelines.md` under [Workflow labels](docs/working/pr-guidelines.md#workflow-labels) — read that doc before picking up, raising, reviewing, or revising any work.
 
-**If you were dispatched by `pr-pipeline-tick`, every label instruction in this
+**If you were dispatched by `pr-pipeline:tick`, every label instruction in this
 file and in `pr-guidelines.md` is not for you.** The tick owns both ends of your
 stage's label transitions. Do not add, remove, or change any `ai:` label on any
 issue or PR; report your outcome through the completion sentinel named in your

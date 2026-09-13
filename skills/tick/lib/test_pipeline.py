@@ -1,9 +1,9 @@
 """Tests for the PR-pipeline review-stage helper logic.
 
-Co-located with ``pipeline.py`` so the whole ``pr-pipeline-tick/lib`` directory lifts
+Co-located with ``pipeline.py`` so the whole ``tick/lib`` directory lifts
 out cleanly against any target repository. Run with::
 
-    uv run pytest .claude/skills/pr-pipeline-tick/lib/test_pipeline.py
+    uv run pytest .claude/skills/tick/lib/test_pipeline.py
 """
 
 from __future__ import annotations
@@ -974,7 +974,7 @@ def test_touches_review_policy_true_for_gate_config() -> None:
     disable the gate for every future policy-editing PR after a human merge."""
     assert (
         pipeline.touches_review_policy(
-            [".claude/skills/pr-pipeline-tick/config.toml"]
+            [".claude/skills/tick/config.toml"]
         )
         is True
     )
@@ -986,13 +986,13 @@ def test_touches_review_policy_true_for_gate_implementation() -> None:
     tick.py:9007 call) is the same silent-disable vector as a config flip."""
     assert (
         pipeline.touches_review_policy(
-            [".claude/skills/pr-pipeline-tick/lib/pipeline.py"]
+            [".claude/skills/tick/lib/pipeline.py"]
         )
         is True
     )
     assert (
         pipeline.touches_review_policy(
-            [".claude/skills/pr-pipeline-tick/lib/tick.py"]
+            [".claude/skills/tick/lib/tick.py"]
         )
         is True
     )

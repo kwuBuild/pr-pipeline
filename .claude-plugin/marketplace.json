@@ -1,0 +1,31 @@
+{
+  "name": "pr-pipeline",
+  "owner": {
+    "name": "Keith Wu",
+    "url": "https://github.com/kwuBuild"
+  },
+  "metadata": {
+    "description": "The pr-pipeline control plane, published from its own repository so no separate registry has to be stood up or kept in step with releases."
+  },
+  "plugins": [
+    {
+      "name": "pr-pipeline",
+      "source": "./",
+      "description": "Drive GitHub issues through implement, review, fix, and re-review with Claude Code and Codex engines, unattended.",
+      "author": {
+        "name": "Keith Wu"
+      },
+      "homepage": "https://github.com/kwuBuild/pr-pipeline",
+      "repository": "https://github.com/kwuBuild/pr-pipeline",
+      "license": "MIT",
+      "category": "workflow",
+      "keywords": [
+        "automation",
+        "code-review",
+        "github",
+        "orchestration",
+        "unattended"
+      ]
+    }
+  ]
+}

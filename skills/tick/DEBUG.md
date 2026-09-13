@@ -184,7 +184,7 @@ Debugging notes:
   that was merely never disproved. The entry carries that `identity` field for
   exactly this reason — check it before trusting the row.
 - **The dashboard shows the same verdict, not its own.**
-  `pr-pipeline-status` shells out to `tick.py engine-progress --wt-root PATH`
+  `pr-pipeline:status` shells out to `tick.py engine-progress --wt-root PATH`
   rather than re-deriving one in bash, which could prove neither process
   identity nor the thresholds. That call takes no pipeline lock and makes no
   pipeline state transition, so it is safe against a live tick — though `uv run`
@@ -193,7 +193,7 @@ Debugging notes:
   not reporting a healthy engine. Reproduce it by hand with:
 
   ```bash
-  uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py engine-progress \
+  uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py engine-progress \
     --wt-root .claude/worktrees
   ```
 
@@ -431,17 +431,32 @@ Scope: the tick process and its children, not the entire session.
 
 ## Permission requirements for unattended runs
 
-Add these to `.claude/settings.local.json` (`permissions.allow`):
+Add these to `.claude/settings.local.json` (`permissions.allow`), **with the
+install's absolute path substituted for `<INSTALL>`**:
 
 ```jsonc
 // The tick itself — one uv run for one-shot or --loop mode
-"Bash(uv run python $PR_PIPELINE_HOME/skills/pr-pipeline-tick/lib/tick.py *)",
+"Bash(uv run python <INSTALL>/skills/tick/lib/tick.py *)",
 // Preflight check after install or Codex version change
-"Bash(bash $PR_PIPELINE_HOME/skills/pr-pipeline-tick/preflight.sh)",
+"Bash(bash <INSTALL>/skills/tick/preflight.sh)",
 ```
 
 Without these, a one-shot tick triggers a permission prompt and unattended loops
 stall.
+
+**A permission rule is matched against the command text, and neither `<INSTALL>`
+nor a variable expands inside one.** `SKILL.md` hands the agent a command in
+which `${CLAUDE_PLUGIN_ROOT}` has *already* been replaced with the install's
+absolute path, so that absolute path is what the rule has to contain. A rule
+written as `Bash(uv run python $PR_PIPELINE_HOME/...)` matches nothing once the
+skill is invoked from a plugin install — it is not an error, it just silently
+fails to grant, and the symptom is a permission prompt on every tick rather than
+anything in the tick log.
+
+Get the path from `/pr-pipeline:tick` itself: run the skill and read the
+resolved path out of the command it gives you. After `/plugin marketplace
+update` installs a new cache version the path changes, so the rules need
+updating with it — see "The install path resolves in two different places".
 
 ## Reviewer sandbox posture
 
@@ -474,6 +489,30 @@ A `startup_probe_failed` entry exits with code 3 before HARVEST. If the tick log
 is empty or missing, the process never reached `main()`; check OS-level spawn
 failures such as E2BIG, a missing Python executable, or broken `uv`.
 
+### The install path resolves in two different places
+
+`SKILL.md` anchors its commands at `${CLAUDE_PLUGIN_ROOT}`, which is substituted
+into plugin skill *content* as Claude loads it — the agent reads an absolute
+path and never sees the variable. This file and `README.md` deliberately keep
+`$PR_PIPELINE_HOME` instead, because nothing substitutes them: they are read as
+plain text by a human in a separate terminal or by an agent via `Read`, and
+`CLAUDE_PLUGIN_ROOT` is *not* exported into a Bash tool call's environment
+(verified on CLI `2.1.270`). Written here it would expand to nothing and resolve
+`/skills/tick/lib/tick.py` against the filesystem root.
+
+Two failure shapes follow from that split:
+
+- **A command that runs against `/skills/...`** was copied out of a skill body
+  into a shell, or out of this file into a context that never set
+  `PR_PIPELINE_HOME`. The install root is empty; export it, or use the absolute
+  path.
+- **A session that is already running holds a stale `CLAUDE_PLUGIN_ROOT`.**
+  The substitution happened once, when the session loaded the skill, so after
+  `/plugin marketplace update` installs a new cache version that session keeps
+  running the *previous* version's `tick.py` — with no error and no version
+  mismatch to notice. Restart the session (or reinvoke the skill in a fresh
+  one) before concluding that an upgrade did not take effect.
+
 ## Debugging pointers
 
 | What | Where |
@@ -483,7 +522,7 @@ failures such as E2BIG, a missing Python executable, or broken `uv`.
 | Process control | `lib/process_control.py` |
 | Tick audit trail | `.claude/worktrees/.tick-log/tick-*.jsonl` |
 | Engine or wrapper stderr | Per-worktree `stderr.log`; reviewer has bounded sanitized wrapper diagnostics only, while implementer/fixer engine stderr remains available |
-| Dashboard | `/pr-pipeline-status` or `bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh` |
+| Dashboard | `/pr-pipeline:status` or `bash $PR_PIPELINE_HOME/skills/status/status.sh` |
 | Startup failures | First two entries of the latest tick log (see above) |
 | OS-level spawn failures | `dmesg` for E2BIG, `ulimit -a` for arg limits |
 

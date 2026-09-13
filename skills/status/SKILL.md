@@ -1,14 +1,14 @@
 ---
-name: pr-pipeline-status
+name: status
 description: Show a read-only PR-pipeline dashboard — in-flight review/fix engines (PID, stage, time-to-deadline) plus every open PR/issue grouped by ai: pipeline label. Use to see pipeline state at a glance without touching it. Safe to run while a tick/loop is running.
 ---
 
 # PR Pipeline Status
 
-Read-only dashboard for the PR pipeline driven by the `pr-pipeline-tick` skill. It
+Read-only dashboard for the PR pipeline driven by the `pr-pipeline:tick` skill. It
 makes **no writes** — it never edits labels, dispatches engines, or touches markers —
 so it is safe to run at any time, including in a `watch` pane while a tick or
-`/loop /pr-pipeline-tick` is running.
+`/loop /pr-pipeline:tick` is running.
 
 It reads only the state sources the pipeline externalizes:
 
@@ -20,7 +20,7 @@ It reads only the state sources the pipeline externalizes:
    other machine launched. An in-flight label with no engine row is therefore not
    custody proof — it reads identically for another machine's healthy dispatch,
    for a manual `ai:implementing` pickup, and for a dead engine. Never relabel
-   from that reading; see the `pr-pipeline-tick` README, "Markerless in-flight
+   from that reading; see the `pr-pipeline:tick` README, "Markerless in-flight
    items".
 3. **Tick logs** (`.claude/worktrees/.tick-log/tick-*.jsonl`) — the most recent
    tick's durable decision trail.
@@ -28,29 +28,32 @@ It reads only the state sources the pipeline externalizes:
 ## Run
 
 Run with the **target repository** as the working directory: the dashboard reads
-pipeline *state* from there, while `$PR_PIPELINE_HOME` — the absolute path of
-this pipeline's install — is where its *code* lives.
+pipeline *state* from there, while `${CLAUDE_PLUGIN_ROOT}` — already resolved to
+the absolute path of this pipeline's install — is where its *code* lives.
 
 ```bash
-export PR_PIPELINE_HOME=/absolute/path/to/pr-pipeline
-bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh
+bash ${CLAUDE_PLUGIN_ROOT}/skills/status/status.sh
 ```
 
 Liveness uses `kill -0 "$pid"`, so — like the tick — run it in the **same trust
 domain that launched the engines (sandbox off)**; a sandbox that blocks process
 introspection makes every live engine read as dead.
 
-Continuous view in a separate terminal pane:
+Continuous view in a separate terminal pane. These run in a shell that this
+skill's text never reaches, so paste the install path the command above resolved
+to rather than either variable — nothing outside skill content substitutes
+`${CLAUDE_PLUGIN_ROOT}`, and an unset variable silently makes the path
+root-relative:
 
 ```bash
 # Primary (Linux / watch installed):
-watch -n 5 'bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh'
+watch -n 5 'bash /absolute/path/to/install/skills/status/status.sh'
 
 # Fallback (macOS / no watch):
-while true; do clear; bash $PR_PIPELINE_HOME/skills/pr-pipeline-status/status.sh; sleep 5; done
+while true; do clear; bash /absolute/path/to/install/skills/status/status.sh; sleep 5; done
 ```
 
-The repo comes from `[target] repo` in `skills/pr-pipeline-tick/config.toml`,
+The repo comes from `[target] repo` in `skills/tick/config.toml`,
 the same value the tick uses; override for one run with
 `PIPELINE_REPO=<owner/repo>`. With neither set the dashboard exits 2 rather
 than rendering some other repository's queue.
@@ -68,7 +71,7 @@ Implement/fix rows carry a progress column next to the result column:
 | `quiet-Nm` | N minutes since the engine's last output. Before the first output event N counts from dispatch instead. Not by itself a health verdict: this is also what a stall *exclusion* renders (a reused PID, an already-overdue engine), so a long `quiet-Nm` means "no stall claim", not "working normally". |
 | `STALLED-Nm` | Live engine, no output for N minutes, past the 30-minute threshold. |
 | `-` | No progress contract: the reviewer stage (its wrapper discards engine output), or a marker with no usable clock. |
-| `?` | No verdict for this row. Either the report could not be produced at all (the `pr-pipeline-tick` lib is unreachable), or it was produced without a line for this marker — a marker created between the report call and the render, or one Python skipped as malformed while bash's own parse succeeded. Not a claim either way. |
+| `?` | No verdict for this row. Either the report could not be produced at all (the `pr-pipeline:tick` lib is unreachable), or it was produced without a line for this marker — a marker created between the report call and the render, or one Python skipped as malformed while bash's own parse succeeded. Not a claim either way. |
 
 The verdict is not derived here. This script shells out to
 `tick.py engine-progress`, the same code the tick and its stall watcher run, so the
@@ -84,4 +87,4 @@ transition, so it stays safe in a `watch` pane against a live tick.
 `STALLED` is **advisory**: nothing is killed, relabelled, or requeued because of
 it, and the engine keeps its full deadline. It is a prompt to look at the engine's
 `stderr` in its worktree, not a state transition. The same condition appears as an
-`engine_stalled` entry in the tick log — see the `pr-pipeline-tick` DEBUG.md.
+`engine_stalled` entry in the tick log — see the `pr-pipeline:tick` DEBUG.md.

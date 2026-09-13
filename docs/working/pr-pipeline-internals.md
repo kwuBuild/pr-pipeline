@@ -1,8 +1,8 @@
 # PR Pipeline Internals
 
-Reference document for the `pr-pipeline-tick` skill's internal mechanisms.
+Reference document for the `pr-pipeline:tick` skill's internal mechanisms.
 This is **not** operational documentation — see `SKILL.md` and `README.md` in
-`skills/pr-pipeline-tick/` for how to run the tick.
+`skills/tick/` for how to run the tick.
 
 ---
 
@@ -206,7 +206,7 @@ the reviewer's own behaviour ([tick.py:9007][policy-call]). If so, the PR is
 escalated to human review instead of being auto-reviewed.
 
 The gate is operator-configurable: `[policy] allow_touching = true` in
-`skills/pr-pipeline-tick/config.toml` lets policy-editing PRs flow to
+`skills/tick/config.toml` lets policy-editing PRs flow to
 auto-review anyway (the operator accepts that the review runs under instructions
 the PR itself supplies). Missing config, malformed TOML, or `false` keep the
 escalation — the gate fails closed. The committed config ships `false`, because
@@ -231,11 +231,11 @@ target's to name, so the pipeline ships none. Plus the suffix set below:
 install depth — `.claude/skills/` in a host repo, `skills/` in the pipeline's
 own repository, or a plugin root) — `_POLICY_PATH_SUFFIXES`
 ([pipeline.py:157–164][path-suffixes]):
-- `skills/pr-pipeline-tick/config.toml` — the file that toggles the
+- `skills/tick/config.toml` — the file that toggles the
   gate itself; a PR flipping `allow_touching` is escalated to a human rather
   than auto-reviewed (a merged flip would otherwise disable the gate for every
   future policy-editing PR)
-- `skills/pr-pipeline-tick/lib/pipeline.py` and `lib/tick.py` — the
+- `skills/tick/lib/pipeline.py` and `lib/tick.py` — the
   gate's own implementation; a PR that rewrites `_policy_touching_allowed` to
   return `True` unconditionally, or removes the gate call from the reviewer
   dispatch, is the same silent-disable vector, so pipeline-code PRs escalate to
@@ -497,7 +497,7 @@ one. That identity check *refutes* liveness rather than confirming it:
 `_classify_marker` records `identity: "unknown"` when the process table cannot
 be read and still counts the marker live, so a reported stall can rest on
 liveness that was merely never disproved — which is why the log entry carries
-the `identity` field. `pr-pipeline-status` renders the same verdict by
+the `identity` field. `pr-pipeline:status` renders the same verdict by
 shelling out to `tick.py engine-progress` rather than re-deriving it in bash —
 the dashboard cannot verify process identity and would otherwise raise alarms
 the tick log never confirms.
@@ -631,42 +631,42 @@ stay discarded, and the two values that do cross are shape-checked first.
 <!-- Anchors for inline references. Line numbers are approximate and should be
      verified against the current source when the document is updated. -->
 
-[impl-tools]: ../../skills/pr-pipeline-tick/lib/tick.py#L591-L663
-[launch-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L749
-[launch-flags]: ../../skills/pr-pipeline-tick/lib/tick.py#L741-L750
-[engine-env]: ../../skills/pr-pipeline-tick/lib/tick.py#L311-L322
-[resolve]: ../../skills/pr-pipeline-tick/lib/tick.py#L325-L397
-[ds-effort]: ../../skills/pr-pipeline-tick/lib/tick.py#L395
-[popen-impl]: ../../skills/pr-pipeline-tick/lib/tick.py#L757-L769
-[rev-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L6140
-[rev-effort]: ../../skills/pr-pipeline-tick/lib/tick.py#L6141
-[ignore-config]: ../../skills/pr-pipeline-tick/lib/tick.py#L6130
-[ignore-rules]: ../../skills/pr-pipeline-tick/lib/tick.py#L6133
-[schema]: ../../skills/pr-pipeline-tick/lib/tick.py#L6120-L6122
-[sandbox]: ../../skills/pr-pipeline-tick/lib/tick.py#L6128
-[codex-exec]: ../../skills/pr-pipeline-tick/lib/tick.py#L6118
-[popen-rev]: ../../skills/pr-pipeline-tick/lib/tick.py#L6148-L6156
-[scrub]: ../../skills/pr-pipeline-tick/lib/tick.py#L6047-L6065
-[policy-call]: ../../skills/pr-pipeline-tick/lib/tick.py#L9074
-[impl-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6449
-[fix-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L6855-L6856
-[rev-wt]: ../../skills/pr-pipeline-tick/lib/tick.py#L5784-L5785
-[impl-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L187
-[fix-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L188
-[fix-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L7063-L7068
-[rev-timeout]: ../../skills/pr-pipeline-tick/lib/tick.py#L130
-[cli-model]: ../../skills/pr-pipeline-tick/lib/tick.py#L9185
-[gh-helper]: ../../skills/pr-pipeline-tick/lib/tick.py#L786-L809
+[impl-tools]: ../../skills/tick/lib/tick.py#L591-L663
+[launch-model]: ../../skills/tick/lib/tick.py#L749
+[launch-flags]: ../../skills/tick/lib/tick.py#L741-L750
+[engine-env]: ../../skills/tick/lib/tick.py#L311-L322
+[resolve]: ../../skills/tick/lib/tick.py#L325-L397
+[ds-effort]: ../../skills/tick/lib/tick.py#L395
+[popen-impl]: ../../skills/tick/lib/tick.py#L757-L769
+[rev-model]: ../../skills/tick/lib/tick.py#L6140
+[rev-effort]: ../../skills/tick/lib/tick.py#L6141
+[ignore-config]: ../../skills/tick/lib/tick.py#L6130
+[ignore-rules]: ../../skills/tick/lib/tick.py#L6133
+[schema]: ../../skills/tick/lib/tick.py#L6120-L6122
+[sandbox]: ../../skills/tick/lib/tick.py#L6128
+[codex-exec]: ../../skills/tick/lib/tick.py#L6118
+[popen-rev]: ../../skills/tick/lib/tick.py#L6148-L6156
+[scrub]: ../../skills/tick/lib/tick.py#L6047-L6065
+[policy-call]: ../../skills/tick/lib/tick.py#L9074
+[impl-wt]: ../../skills/tick/lib/tick.py#L6449
+[fix-wt]: ../../skills/tick/lib/tick.py#L6855-L6856
+[rev-wt]: ../../skills/tick/lib/tick.py#L5784-L5785
+[impl-timeout]: ../../skills/tick/lib/tick.py#L187
+[fix-timeout]: ../../skills/tick/lib/tick.py#L188
+[fix-model]: ../../skills/tick/lib/tick.py#L7063-L7068
+[rev-timeout]: ../../skills/tick/lib/tick.py#L130
+[cli-model]: ../../skills/tick/lib/tick.py#L9185
+[gh-helper]: ../../skills/tick/lib/tick.py#L786-L809
 [hook-impl]: ../../.claude/hooks/pre-pr-review-implementation.sh
 [hook-docs]: ../../.claude/hooks/pre-pr-review-documentation.sh
-[skill-trust]: ../../skills/pr-pipeline-tick/SKILL.md#trust-domain-and-sandbox-posture
-[policy-fn]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1653-L1694
-[basenames]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L145
-[paths]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L1607-L1618
-[path-suffixes]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L161-L168
-[policy-comment]: ../../skills/pr-pipeline-tick/lib/pipeline.py#L132-L143
-[trusted-candidate]: ../../skills/pr-pipeline-tick/lib/tick.py#L5719-L5730
+[skill-trust]: ../../skills/tick/SKILL.md#trust-domain-and-sandbox-posture
+[policy-fn]: ../../skills/tick/lib/pipeline.py#L1653-L1694
+[basenames]: ../../skills/tick/lib/pipeline.py#L145
+[paths]: ../../skills/tick/lib/pipeline.py#L1607-L1618
+[path-suffixes]: ../../skills/tick/lib/pipeline.py#L161-L168
+[policy-comment]: ../../skills/tick/lib/pipeline.py#L132-L143
+[trusted-candidate]: ../../skills/tick/lib/tick.py#L5719-L5730
 [design-reviewer-ctx]: ../architecture.md
 [design-sandbox-scope]: ../architecture.md
-[reviewer-prompt]: ../../skills/pr-pipeline-tick/lib/prompts/reviewer.txt#L1
-[wrapper-setpgrp]: ../../skills/pr-pipeline-tick/engine_wrapper.py#L69
+[reviewer-prompt]: ../../skills/tick/lib/prompts/reviewer.txt#L1
+[wrapper-setpgrp]: ../../skills/tick/engine_wrapper.py#L69
