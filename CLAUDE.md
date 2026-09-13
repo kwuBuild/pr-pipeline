@@ -20,7 +20,7 @@ One deterministic orchestrator, many disposable engines. `skills/tick/lib/tick.p
 
 ## Tech Stack
 
-- Python 3.11+, **standard library only** (`tomllib` is the 3.11 floor). CI proves this on `{ubuntu, macos} × {3.11, 3.13}` with nothing but pytest installed — an accidental third-party import must fail there, not on an adopter's machine.
+- Python 3.11+, **standard library only** (`tomllib` is the 3.11 floor). CI proves this on `{ubuntu, macos} × {3.11, 3.14}` with nothing but pytest installed: the floor, and the newest interpreter `resolve-python.sh` will pick. An accidental third-party import must fail there, not on an adopter's machine.
 - pytest (no plugins; `unittest.mock` for doubles)
 - `gh` CLI (GitHub I/O), `git worktree` (per-task isolation)
 - Claude Code and Codex CLIs as dispatched engines
@@ -143,11 +143,16 @@ Only use Bash for commands that genuinely require shell execution (running tests
 There is no packaging manifest and no dependency install — the suite is stdlib + pytest, run against an interpreter that is actually 3.11 or newer:
 
 ```bash
-python3.13 -m pytest skills/ -q        # or any python >= 3.11
-uv run --python 3.13 --with pytest pytest skills/ -q
+python3.13 -m pytest skills/ -q        # or any python >= 3.11 that has pytest
+
+# If pytest is not installed for that interpreter, give it one (.venv is ignored):
+python3.13 -m venv .venv && .venv/bin/pip install -q pytest
+.venv/bin/python -m pytest skills/ -q
 ```
 
 Do **not** use bare `python3`: it resolves to 3.9 on a stock macOS box and under Anaconda, and collection fails on `tomllib`. This is a PATH-precedence problem, so "install a newer Python" does not fix it. CI runs `python -m pytest skills/ -q` on a pinned matrix for the same reason.
+
+`uv run --python 3.13 --with pytest pytest skills/ -q` used to be documented here and is **not** reliable: `--python` selects the interpreter, but the bare `pytest` console script is still resolved from `PATH`, so an Anaconda install wins and the suite runs under its 3.9 — collection dies inside `pipeline.py`'s floor guard with no test having run (`--isolated` does not change this). Invoke an interpreter you named, as above.
 
 The suite also needs `gh`, `git`, and `codex` on PATH — the tick's startup probe exits 3 without them. Every real invocation is mocked; only resolution is required.
 

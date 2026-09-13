@@ -38,6 +38,9 @@ denial probe remains model-reported and explicitly unverified.
 
 ```bash
 PIPELINE=$PR_PIPELINE_HOME/skills/tick/lib/pipeline.py
+# The same resolver tick.sh, preflight.sh, and the dashboard use: pipeline.py
+# needs 3.11+ for `tomllib`, and a bare `python3` is a 3.9 on a stock macOS box.
+PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 
 # Decide a finished review's outcome (prints a decision JSON object).
 # --comments accepts the bare array (gh ... -q .comments) or the {"comments": [...]} object.
@@ -51,7 +54,7 @@ PIPELINE=$PR_PIPELINE_HOME/skills/tick/lib/pipeline.py
 # review and the decision is a discard, even when every SHA is unchanged. The
 # pinned name is also part of the comment's idempotency token, so a post-retarget
 # round with an identical SHA triple still posts its own comment.
-uv run python "$PIPELINE" harvest-review \
+"$PY" "$PIPELINE" harvest-review \
   --review review.json --comments comments.json \
   --pinned-base <sha> --current-base <sha> \
   --diff-base-sha <sha> \
@@ -77,13 +80,13 @@ uv run python "$PIPELINE" harvest-review \
 # values are `pipeline._BODY_REVISION_INPUTS` — every state the classifier
 # returns — and `harvest-fix --help` prints the current set rather than this
 # comment restating it.
-uv run python "$PIPELINE" harvest-fix \
+"$PY" "$PIPELINE" harvest-fix \
   --result result.json [--pre-label ai:changes-requested] \
   [--pinned-head <sha> --current-head <sha>] \
   [--body-revision <state>]
 
 # Validate a review.json against the schema (prints verdict; exit 1 + "INVALID" if not).
-uv run python "$PIPELINE" validate-review --review review.json
+"$PY" "$PIPELINE" validate-review --review review.json
 
 # Classify a dispatch's liveness (prints {"state": ...}). State ∈
 # complete|live|stale|hung|launching. `complete` requires the PID to have exited (a
@@ -91,23 +94,23 @@ uv run python "$PIPELINE" validate-review --review review.json
 # `launching` lease marker (no published PID) reports `launching`, not `stale`, so
 # reconcile fails closed instead of re-dispatching. The marker's own `state` field is
 # read from --dispatch.
-uv run python "$PIPELINE" classify-dispatch \
+"$PY" "$PIPELINE" classify-dispatch \
   --dispatch dispatch.json --now <epoch> --pid-alive 0|1 --result-exists 0|1
 
 # Atomically write stdin to a file (temp-then-rename).
-printf '%s' "$json" | uv run python "$PIPELINE" atomic-write --path dispatch.json
+printf '%s' "$json" | "$PY" "$PIPELINE" atomic-write --path dispatch.json
 
 # Report whether a diff touches a reviewer-governing file (CLAUDE.md/AGENTS.md at
 # any level, or a path listed under [policy] checklist_paths). Reads paths
 # from stdin; prints
 # {"touches_policy": true|false}. Dispatch escalates a true result to a human.
-git diff --name-only <base>...<head> | uv run python "$PIPELINE" touches-review-policy
+git diff --name-only <base>...<head> | "$PY" "$PIPELINE" touches-review-policy
 
 # Enforce the shipped credential boundary before worktree/auth exposure. Reads the
 # gh pr view JSON object from stdin; only the exact owner-authored same-repo shape
 # prints {"trusted": true}. Missing or mismatched metadata fails closed.
 gh pr view 100 --json author,headRepository,isCrossRepository \
-  | uv run python "$PIPELINE" validate-review-candidate \
+  | "$PY" "$PIPELINE" validate-review-candidate \
       --trusted-author "$PIPELINE_TRUSTED_AUTHOR" --trusted-repo "$PIPELINE_REPO"
 
 # Report whether a dispatch marker is structurally valid for a given PR/stage
@@ -125,7 +128,7 @@ gh pr view 100 --json author,headRepository,isCrossRepository \
 # a malformed value or the field on an implement/fix marker is rejected. The
 # tick runs this BEFORE classify so a corrupt or mis-targeted marker fails closed
 # (treated as absent) instead of driving an incorrect liveness/revert decision.
-uv run python "$PIPELINE" validate-marker \
+"$PY" "$PIPELINE" validate-marker \
   --dispatch dispatch.json --pr 100 [--stage review]
 
 # Decide HARVEST's action for one in-flight review by folding the PR's current
@@ -146,29 +149,29 @@ uv run python "$PIPELINE" validate-marker \
 # machine's markers, so an absent engine row is not custody proof for an operator
 # either. Recovery needs out-of-band confirmation. See
 # docs/architecture.md -> "Why custody is not inferred, and not yet proven".
-uv run python "$PIPELINE" reconcile-dispatch \
+"$PY" "$PIPELINE" reconcile-dispatch \
   --dispatch dispatch.json --pr 100 [--stage review] --current-label ai:reviewing \
   --classify-state complete|live|stale|hung|launching \
   [--dispatch-attempts 0] [--attempt-threshold 3]
 
 # Stop a just-spawned reviewer within bounded TERM/KILL grace periods. Exit zero and
 # {"stopped": true} only after death is confirmed; otherwise preserve PID ownership.
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/process_control.py terminate \
+"$PY" $PR_PIPELINE_HOME/skills/tick/lib/process_control.py terminate \
   --pid <pid> --grace 5 --kill-grace 2 --poll 0.1
 
 # --- Tick log helpers (structured per-tick audit log) ---
 
 # Open a new tick log file (prunes old ones, prints path). Call once per tick, before Phase 1.
-uv run python "$PIPELINE" tick-log-open \
+"$PY" "$PIPELINE" tick-log-open \
   --log-dir .claude/worktrees/.tick-log [--keep 50]
 
 # Append one decision entry to the tick log. Non-fatal wrapper: || true.
-uv run python "$PIPELINE" tick-log-write \
+"$PY" "$PIPELINE" tick-log-write \
   --log-path <path> \
   --entry '{"ts":1234567890,"pr":123,"phase":"harvest","stage":"review","action":"revert","reason":"stale"}'
 
 # Print all entries from the latest tick log as a JSON array. Used by pr-pipeline:status.
-uv run python "$PIPELINE" tick-log-tail \
+"$PY" "$PIPELINE" tick-log-tail \
   --log-dir .claude/worktrees/.tick-log
 ```
 

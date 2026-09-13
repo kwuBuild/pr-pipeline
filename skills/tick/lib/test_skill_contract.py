@@ -44,6 +44,8 @@ README = Path(__file__).parent.parent / "README.md"
 DEBUG = Path(__file__).parent.parent / "DEBUG.md"
 LIB_README = Path(__file__).parent / "README.md"
 PREFLIGHT = Path(__file__).parent.parent / "preflight.sh"
+TICK_SH = Path(__file__).parent.parent / "tick.sh"
+RESOLVE_SH = Path(__file__).parent.parent / "resolve-python.sh"
 STATUS_SKILL = Path(__file__).parent.parent.parent / "status" / "SKILL.md"
 PROMPTS = Path(__file__).parent / "prompts"
 STATUS_SCRIPT = Path(__file__).parent.parent.parent / "status" / "status.sh"
@@ -313,7 +315,56 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
 def test_skill_md_references_tick_py_invocation() -> None:
     """SKILL.md must reference the new Python orchestrator entry point."""
     text = SKILL.read_text()
-    assert f"uv run python {PLUGIN_ROOT_VAR}/skills/tick/lib/tick.py" in text
+    assert f"bash {PLUGIN_ROOT_VAR}/skills/tick/tick.sh" in text
+
+
+def test_no_operator_surface_runs_the_pipeline_through_uv() -> None:
+    """Running the pipeline must not require a package manager nothing declares.
+
+    The runtime contract is stdlib-only on Python >= 3.11, and CI proves it on a
+    bare matrix — then a doc that says ``uv run python`` tells the operator to
+    install a package manager to satisfy a contract that has no dependencies.
+    The indirection was not reliably correct either: ``uv run --python 3.13``
+    has been observed resolving an interpreter without ``tomllib``.
+
+    This is about running the *pipeline's own code*. ``uv run pytest`` is a
+    contributor's test command, not an interpreter invocation, and ``[engine]
+    verify_tools`` may name uv because that is the *target* repo's toolchain,
+    not this one's — neither is in scope here.
+
+    Scope is deliberately "lines someone copies and runs": command lines inside
+    fenced code blocks, and non-comment lines of the shell scripts. Prose that
+    names the old form to say it was removed is the documentation working, not
+    failing. The cost is that a regression re-introduced as inline code inside a
+    sentence would not be caught; a doc that wants an operator to run something
+    puts it in a code block, so that is the surface worth policing.
+    """
+    # Every surface that shows someone how to run this pipeline, not just the
+    # install-portable subset: `architecture.md` carries a runnable engine
+    # command, and the launcher scripts are read as documentation of themselves.
+    surfaces = (
+        *_INSTALL_PORTABLE_DOCS,
+        REPO_ROOT / "docs/architecture.md",
+        TICK_SH,
+        RESOLVE_SH,
+    )
+    # `uv run python` is the exact literal that was documented, but the defect
+    # is the indirection, not the spelling: `uv run --python 3.13 python …` and
+    # `uv run --with … python …` reintroduce it while dodging a fixed string.
+    # Anything running an interpreter through uv is what this forbids; `uv run
+    # pytest` and friends are not interpreter invocations and stay legal.
+    offender = re.compile(r"\buv\s+run\b[^\n`'\"]*?\bpython\b")
+    violations: list[str] = []
+    for surface in surfaces:
+        for number, line in enumerate(runnable_lines(surface), start=1):
+            if line is not None and offender.search(line):
+                violations.append(f"{surface.name}:{number}: {line.strip()!r}")
+
+    assert not violations, (
+        "operator surfaces run the pipeline through uv; resolve an interpreter "
+        "directly instead (tick.sh, or resolve-python.sh):\n"
+        + "\n".join(violations)
+    )
 
 
 def test_skill_md_is_lean_operator_sop() -> None:
@@ -336,7 +387,7 @@ def test_skill_md_loop_section_has_paste_ready_iteration_prompt() -> None:
     assert "Paste this prompt into /loop" in text
     assert f"Do not invoke /{PLUGIN_NAME}:tick" in text
     assert "dangerouslyDisableSandbox: true" in text
-    assert f"uv run python {PLUGIN_ROOT_VAR}/skills/tick/lib/tick.py" in text
+    assert f"bash {PLUGIN_ROOT_VAR}/skills/tick/tick.sh" in text
     assert ".claude/worktrees/.tick-log" in text
     assert "tick-cadence:" in text
     assert "ScheduleWakeup" in text
@@ -2283,3 +2334,35 @@ def normalize_prose(text: str) -> str:
     """
     stripped = text.lower().replace("*", "").replace("`", "")
     return " ".join(stripped.split())
+
+
+def runnable_lines(surface: Path) -> list[str | None]:
+    """Yield each line of ``surface``, blanked to ``None`` unless it is runnable.
+
+    "Runnable" means a line an operator would copy and execute: a non-comment
+    line inside a fenced code block for markdown, or a non-comment line of a
+    shell script. Prose that merely names a command — including inline code
+    inside a sentence — is a description, and a doc that describes a command it
+    tells you *not* to run must not read as prescribing it.
+
+    The list keeps one entry per source line so callers can report the real line
+    number of a violation.
+
+    Args:
+        surface: A markdown document or shell script to scan.
+
+    Returns:
+        One entry per line: the line itself when runnable, otherwise ``None``.
+    """
+    is_markdown = surface.suffix == ".md"
+    in_fence = not is_markdown
+    lines: list[str | None] = []
+    for line in surface.read_text().splitlines():
+        if is_markdown and line.lstrip().startswith("```"):
+            in_fence = not in_fence
+            lines.append(None)
+            continue
+        stripped = line.lstrip()
+        runnable = in_fence and not stripped.startswith(("#", "//"))
+        lines.append(line if runnable else None)
+    return lines

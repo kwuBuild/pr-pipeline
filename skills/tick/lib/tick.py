@@ -1,16 +1,41 @@
 """PR-pipeline tick orchestrator.
 
 Imported by the ``pr-pipeline:tick`` skill's thinned SKILL.md. A single
-``uv run python lib/tick.py`` call replaces 25 bash ``Bash`` tool invocations
-with one long-lived Python process that imports ``pipeline`` and
-``process_control`` directly — no subprocess round-trips for decision logic.
+``tick.sh`` call replaces 25 bash ``Bash`` tool invocations with one long-lived
+Python process that imports ``pipeline`` and ``process_control`` directly — no
+subprocess round-trips for decision logic.
 
 Stdlib only: the directory installs against a target repo it does not own, so
-it runs under a bare ``python3`` (3.11+) and takes no dependency on any
-target's toolchain.
+it takes no dependency on any target's toolchain and needs nothing but an
+interpreter at or above the 3.11 floor. ``tick.sh`` resolves one; the guard
+below is what an operator sees if something else did not.
 """
 
 from __future__ import annotations
+
+import sys
+
+# Must precede `import tomllib` below, which is where a too-old interpreter
+# actually breaks. `ModuleNotFoundError: tomllib` reads as a broken install and
+# sends an operator to reinstall, but the cause is almost always PATH
+# precedence — a 3.9 on `python3` while a 3.13 sits right there — and a
+# reinstall cannot fix that. Name the requirement instead.
+#
+# The floor is a named constant rather than an inline tuple so a type checker
+# configured for an older Python cannot fold the comparison to a constant and
+# mark everything below as unreachable — which silently drops the whole module
+# from analysis on exactly the misconfigured box this guard exists for.
+_PYTHON_FLOOR = (3, 11)
+if sys.version_info < _PYTHON_FLOOR:  # pragma: no cover - not reached above the floor
+    raise SystemExit(
+        "pr-pipeline requires Python >= 3.11 (tomllib); this interpreter is "
+        f"{'.'.join(str(part) for part in sys.version_info[:3])} "
+        f"at {sys.executable}.\n"
+        "Run the tick through "
+        "`bash $PR_PIPELINE_HOME/skills/tick/tick.sh`, which "
+        "resolves one, or export PR_PIPELINE_PYTHON with the path to a "
+        ">= 3.11 interpreter."
+    )
 
 import datetime as dt
 import fcntl
@@ -23,7 +48,6 @@ import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 import tomllib

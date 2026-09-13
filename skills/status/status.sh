@@ -63,31 +63,19 @@ WT_ROOT="$ROOT/.claude/worktrees"
 TICK_LIB="$SKILL_DIR/../tick/lib"
 NOW=$(date +%s)
 
-# Resolve an interpreter that can actually run the lib. Bare `python3` is NOT a
-# safe substitute for `uv run python`: tick.py/pipeline.py need 3.11+ for
-# `tomllib`, and the ambient `python3` is whatever PATH resolves (3.9 on a stock
-# macOS box, and on Anaconda installs). This is about PRECEDENCE, not
-# availability: a box can have 3.13 installed and still resolve `python3` to a
-# 3.9. Set PR_PIPELINE_PYTHON to pin one explicitly. A too-old interpreter would
-# fail every render into `?` — a dashboard reporting false idle, which is exactly
-# the signal an operator uses to decide the pipeline is safe to touch.
-resolve_python() {
-  local candidate
-  for candidate in ${PR_PIPELINE_PYTHON:+"$PR_PIPELINE_PYTHON"} \
-                   python3.14 python3.13 python3.12 python3.11 python3; do
-    if command -v "$candidate" >/dev/null 2>&1 \
-      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-        >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
-PY="$(resolve_python || true)"
+# Resolve an interpreter that can actually run the lib — the same resolution the
+# tick itself uses, so the dashboard cannot report on a tick it could not run.
+# A too-old interpreter would fail every render into `?` — a dashboard reporting
+# false idle, which is exactly the signal an operator uses to decide the
+# pipeline is safe to touch. Unlike the tick, this is a warning and not an
+# abort: the label sections below need no interpreter at all, and a dashboard
+# that still shows the queue is worth more than one that refuses to start.
+# shellcheck source=../tick/resolve-python.sh
+. "$SKILL_DIR/../tick/resolve-python.sh"
+PY="$(pr_pipeline_resolve_python || true)"
 if [[ -z "$PY" ]]; then
-  echo "WARN: no Python >= 3.11 on PATH (needed for tomllib);" >&2
-  echo "      engine-progress and tick-log columns will render as '?'." >&2
+  pr_pipeline_python_requirement_error WARN
+  echo "      Until then, engine-progress and tick-log columns render as '?'." >&2
 fi
 
 # Progress verdicts, one `name<TAB>label` line per marker, from the same code

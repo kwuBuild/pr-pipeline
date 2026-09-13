@@ -187,19 +187,21 @@ Debugging notes:
   `pr-pipeline:status` shells out to `tick.py engine-progress --wt-root PATH`
   rather than re-deriving one in bash, which could prove neither process
   identity nor the thresholds. That call takes no pipeline lock and makes no
-  pipeline state transition, so it is safe against a live tick — though `uv run`
-  may sync the project venv, so it is not literally write-free. A `?` in its
-  progress column means the call failed — the dashboard is declining to guess,
-  not reporting a healthy engine. Reproduce it by hand with:
+  pipeline state transition, and needs no package manager to sync a venv behind
+  it, so it is safe against a live tick and is genuinely write-free. A `?` in
+  its progress column means the call failed — the dashboard is declining to
+  guess, not reporting a healthy engine. Reproduce it by hand with:
 
   ```bash
-  uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py engine-progress \
+  bash $PR_PIPELINE_HOME/skills/tick/tick.sh engine-progress \
     --wt-root .claude/worktrees
   ```
 
-  Run it through `uv`, not a bare `python3`: tick.py needs 3.11+ for `tomllib`
-  and the ambient `python3` may be older (macOS ships 3.9), which fails the
-  call and renders `?` on every row.
+  Run it through `tick.sh`, not a bare `python3`: tick.py needs 3.11+ for
+  `tomllib` and the ambient `python3` may be older (macOS ships 3.9), which
+  fails the call and renders `?` on every row. `tick.sh` and the dashboard share
+  one resolver (`resolve-python.sh`), so reproducing by hand cannot land on a
+  different interpreter than the dashboard used.
 
 - Seeing `engine_stalled` for engines that finish fine? The threshold is below
   the longest legitimate silence for your workload. Raise
@@ -435,8 +437,8 @@ Add these to `.claude/settings.local.json` (`permissions.allow`), **with the
 install's absolute path substituted for `<INSTALL>`**:
 
 ```jsonc
-// The tick itself — one uv run for one-shot or --loop mode
-"Bash(uv run python <INSTALL>/skills/tick/lib/tick.py *)",
+// The tick itself — one launcher call for one-shot or --loop mode
+"Bash(bash <INSTALL>/skills/tick/tick.sh *)",
 // Preflight check after install or Codex version change
 "Bash(bash <INSTALL>/skills/tick/preflight.sh)",
 ```
@@ -487,7 +489,19 @@ Every tick log starts with:
 
 A `startup_probe_failed` entry exits with code 3 before HARVEST. If the tick log
 is empty or missing, the process never reached `main()`; check OS-level spawn
-failures such as E2BIG, a missing Python executable, or broken `uv`.
+failures such as E2BIG. Code 3 with no tick log at all and a message naming
+Python >= 3.11 is `tick.sh` refusing to launch: no interpreter on PATH satisfies
+the floor, so nothing ran. That is a PATH-precedence problem more often than a
+missing install — a box can have 3.13 and still resolve `python3` to a 3.9 —
+so export `PR_PIPELINE_PYTHON` with the path to a >= 3.11 interpreter rather
+than reinstalling Python.
+
+A `WARN: PR_PIPELINE_PYTHON (...) is not a usable Python >= 3.11` on a tick that
+then runs normally means the pin was discarded and the interpreter came from
+`PATH` instead — a typo'd path and a pin below the floor both land here. The
+tick is not wrong, but the setting is not doing what it was set to do: fix the
+path or unset it, or the next box where `PATH` resolves differently runs on an
+interpreter nobody chose.
 
 ### The install path resolves in two different places
 

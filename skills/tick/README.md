@@ -72,18 +72,18 @@ watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'
 while true; do clear; bash $PR_PIPELINE_HOME/skills/status/status.sh; sleep 5; done
 
 # 3. Run one tick (full HARVEST + DISPATCH loop)
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh
 
 # 4. Run a targeted tick (single PR or issue)
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py pr:468
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh pr:468
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh '#439'
 
 # 5. Verify the dispatch landed (use find to avoid bare-glob errors in zsh)
 find .claude/worktrees -maxdepth 2 -name dispatch.json -path '*/issue-*' \
   -exec jq '{engine, stage, pid}' {} \;
 
 # 6. Loop in-process (autonomous polling with mutex + quiescence stop)
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --loop
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh --loop
 ```
 
 ## Document split
@@ -111,14 +111,15 @@ edge-triggered wake nudges, quiescence stop, and terminal-label notifications.
 
 ## Invocation
 
-The orchestrator is a single Python process: `uv run python lib/tick.py`. The
-`/pr-pipeline:tick` skill now loads a lean SOP that tells the operator when to
-run `preflight.sh`, how to invoke the tick, and where to inspect outcomes.
+The orchestrator is a single Python process: `tick.sh` resolves a Python >= 3.11
+interpreter and runs `lib/tick.py` under it. The `/pr-pipeline:tick` skill loads
+a lean SOP that tells the operator when to run `preflight.sh`, how to invoke the
+tick, and where to inspect outcomes.
 
 ### Basic
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh
 ```
 
 Runs one full tick: HARVEST all three stages (review → implement → fix) with full
@@ -129,8 +130,8 @@ success, 1 when reconciliation failed and dispatch was skipped.
 ### Targeted (single issue/PR)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py pr:468   # PR #468 only
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'   # issue #439 only
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh pr:468   # PR #468 only
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh '#439'   # issue #439 only
 ```
 
 `pr:N` stays direct PR scope for reviewer and fixer work; it does not switch to
@@ -164,7 +165,7 @@ global, so a targeted loop never mistakes a saturated pipeline for a quiet one.
 ### Looped (autonomous polling)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --loop
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh --loop
 ```
 
 Runs ticks inside one Python process. `--loop` keeps the same HARVEST →
@@ -507,7 +508,7 @@ nor a wedged cap caused by a human holding an engine can go unexplained.
 ### Engine selection (`--impl-engine`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --impl-engine claude-ds
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh --impl-engine claude-ds
 ```
 
 Controls whether the implementer and fixer engines use `claude` (default) or
@@ -516,7 +517,7 @@ Controls whether the implementer and fixer engines use `claude` (default) or
 ### Model override (`--model`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --model claude-sonnet-4-6
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh --model claude-sonnet-4-6
 ```
 
 Overrides the model used by implementer and fixer engines. When not given, the
@@ -536,7 +537,7 @@ and additionally sets `ANTHROPIC_MODEL` for `claude-ds`.
 ### Reviewer model and effort (`--review-model`, `--review-effort`)
 
 ```bash
-uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py --review-model gpt-6 --review-effort xhigh
+bash $PR_PIPELINE_HOME/skills/tick/tick.sh --review-model gpt-6 --review-effort xhigh
 ```
 
 The reviewer is a separate provider from the implementer/fixer engines, so it
@@ -1302,7 +1303,7 @@ a failed lookup or malformed response leaves the label unchanged either way.
 
 ## Worked example
 
-You run `uv run python $PR_PIPELINE_HOME/skills/tick/lib/tick.py '#439'` with issue #439 at `ai:available`.
+You run `bash $PR_PIPELINE_HOME/skills/tick/tick.sh '#439'` with issue #439 at `ai:available`.
 
 **Dashboard** (after dispatch):
 ```
@@ -1359,9 +1360,11 @@ a reviewer (Codex).
    Python process (`lib/tick.py`). Variables are normal Python locals that live for
    the duration of `main()`. No state re-establishment between blocks.
 
-2. ~~**UV cache cross-contamination.**~~ **RESOLVED.** 47 `uv run python` calls per
-   tick reduced to 1. `pipeline.py` and `process_control.py` are imported directly
-   — no subprocess round-trips for decision logic.
+2. ~~**UV cache cross-contamination.**~~ **RESOLVED.** 47 per-tick `uv` subprocess
+   calls reduced to none: `pipeline.py` and `process_control.py` are imported
+   directly — no subprocess round-trips for decision logic — and the one
+   remaining process is launched by `tick.sh`, which resolves an interpreter
+   itself rather than going through `uv` at all.
 
 3. ~~**Shell dialect mismatch.**~~ **RESOLVED.** No bash at all. `pathlib` for globs,
    `json.loads()` for parsing, Python iteration — no `shopt` vs zsh, no `for` vs

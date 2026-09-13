@@ -40,7 +40,7 @@ install and the target repository.**
 
 ### Why it cannot stay in the install
 
-`pipeline.py:174` resolves `_POLICY_CONFIG_PATH` install-relative. A plugin
+`pipeline.py:197` resolves `_POLICY_CONFIG_PATH` install-relative. A plugin
 install lands in `~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/`, and
 `/plugin update` installs the next version at a *different* hash. An
 install-relative config is therefore silently discarded on every upgrade.
@@ -85,7 +85,7 @@ later convenience override reintroduces the path.
 `~/.claude/pr-pipeline/config.toml`, honouring `$CLAUDE_CONFIG_DIR` when set,
 with `$PR_PIPELINE_CONFIG` as an explicit override for testing.
 
-This replaces the install-relative `_POLICY_CONFIG_PATH` (`pipeline.py:174`)
+This replaces the install-relative `_POLICY_CONFIG_PATH` (`pipeline.py:197`)
 for the upgrade-safety reason given in section 2.
 
 ### Layers
@@ -190,9 +190,9 @@ The reviewer runs with its working directory inside a checkout of the PR's own
 head, and Codex loads `AGENTS.md` from there automatically — which in this
 repository routes to `CLAUDE.md`. So a PR that edits those files edits the
 instructions its own reviewer runs under. `touches_review_policy`
-(`pipeline.py:1653`) covers `CLAUDE.md`, `AGENTS.md`, the operator's
+(`pipeline.py:1676`) covers `CLAUDE.md`, `AGENTS.md`, the operator's
 `checklist_paths`, and the pipeline's own `config.toml`/`pipeline.py`/`tick.py`
-by path suffix; `tick.py:9074` routes a matching PR to a human instead of
+by path suffix; `tick.py:9098` routes a matching PR to a human instead of
 auto-reviewing it.
 
 `allow_touching = true` turns that routing off, and **that is the shipped
@@ -210,8 +210,8 @@ not separately; section 4 records the two as one change.
 The runtime reads five keys today across three tables, each through its own
 accessor: `[target] repo`, `[target] trusted_author`, `[policy] allow_touching`,
 `[policy] checklist_paths`, `[engine] verify_tools`. A sixth setting,
-`permission_mode`, has no config key at all — it is CLI-only (`tick.py:12609`,
-defaulted to `dontAsk` at `:12675`), and section 8 requires an operator's
+`permission_mode`, has no config key at all — it is CLI-only (`tick.py:12633`,
+defaulted to `dontAsk` at `:12699`), and section 8 requires an operator's
 per-route choice to be recorded rather than re-typed on every invocation, so it
 acquires one here. Layering new tables beside the existing ones produces two
 disagreeing configurations, so the mapping is part of the change, not a
@@ -287,7 +287,7 @@ removed — that check is what confines an install to a single repository.
 Removing it is not sufficient on its own, because repository identity is
 currently split across three mechanisms:
 
-- `gh()` (`tick.py:980`) forwards its arguments verbatim and most call sites,
+- `gh()` (`tick.py:1004`) forwards its arguments verbatim and most call sites,
   including relabels, pass no `--repo` — so they resolve against whatever the
   working directory happens to be.
 - Other call sites use an explicit trusted-head-repo value.
@@ -306,7 +306,7 @@ without an interpreter, per the carve-out above.
 `[scan] repos = []` means unrestricted, which is the shipped default. A non-empty
 list restricts which repositories are eligible.
 
-`trusted_review_candidate` (`pipeline.py:2485`) separately matches the PR's
+`trusted_review_candidate` (`pipeline.py:2508`) separately matches the PR's
 *head* repository to reject cross-repository fork PRs. That mechanism stays; it
 derives from the resolved target rather than from config.
 
@@ -330,7 +330,7 @@ own repositories, which is what phase 1 is for.
 
 ### What changes
 
-The available-issue query requests `--json number,title` (`tick.py:9409`) — no
+The available-issue query requests `--json number,title` (`tick.py:9433`) — no
 author is fetched at all, so this is new behaviour rather than a toggle over
 existing logic. It needs:
 
@@ -349,7 +349,7 @@ That single decision is what keeps this section small. A client-side predicate
 over one page would have to answer for the scan limit
 (`_ACTIONABLE_QUEUE_SCAN_LIMIT`, 200): other authors' issues would consume the
 budget and hide eligible work behind it, and `_queue_page_has_dispatchable`
-(`tick.py:11986`) treats a full page as possibly-actionable, so a queue of
+(`tick.py:12010`) treats a full page as possibly-actionable, so a queue of
 skipped issues would hold `--loop` awake indefinitely. With a bounded single
 author, the page contains only the operator's own issues and neither failure has
 a way to occur.
@@ -410,15 +410,15 @@ confirms it once.
 ### The change
 
 Engines default to `--permission-mode auto` instead of `dontAsk`. `auto` is
-already implemented and accepted at `tick.py:928`; it is currently opt-in and
+already implemented and accepted at `tick.py:952`; it is currently opt-in and
 documented as experimental.
 
 ### Why it fits the rest of this design
 
 Under `dontAsk` an undeclared command is not prompted for. The comment at
-`tick.py:736` records the consequence: "a denial mid-run reads to the engine as a
+`tick.py:760` records the consequence: "a denial mid-run reads to the engine as a
 broken repo, not a missing grant." That is why `_DEFAULT_VERIFY_TOOLS`
-(`tick.py:742`) ships a Python stack today — an empty default would have made a
+(`tick.py:766`) ships a Python stack today — an empty default would have made a
 fresh install fail its first dispatch on an illegible denial.
 
 Section 7 empties that default. Under `auto` an undeclared command reaches the
@@ -438,7 +438,7 @@ different route.
 Two facts about the launcher make the headless case genuinely unestablished
 rather than merely unproven:
 
-- `build_engine_cmd` (`tick.py:935-940`) passes `-p`, `--permission-mode`, and
+- `build_engine_cmd` (`tick.py:959-964`) passes `-p`, `--permission-mode`, and
   `--allowedTools`, and nothing else bearing on prompting.
 - `claude --help` on `2.1.270` documents `--permission-prompts`, defaulting to
   `host`: with `--print` and no SDK host or `--permission-prompt-tool`, *"anything
@@ -463,8 +463,8 @@ accepted, and open question 12.3 owns the prompting semantics, alongside
 
 ### The operator's deny list is the floor
 
-`_engine_env()` (`tick.py:441`) returns `dict(os.environ)` for implementer and
-fixer engines, and the engine command (`tick.py:935`) passes no `--settings` and
+`_engine_env()` (`tick.py:465`) returns `dict(os.environ)` for implementer and
+fixer engines, and the engine command (`tick.py:959`) passes no `--settings` and
 no `CLAUDE_CONFIG_DIR` redirect. Those engines therefore resolve A's normal
 settings hierarchy, and A's `~/.claude/settings.json` deny rules apply — deny
 outranks allow, in `auto` as in `dontAsk`. No new mechanism is required.
@@ -492,7 +492,7 @@ before the flip ships (open question 12.2), not inferred from the flag's name.
 
 Because engine `cwd` is a checkout of the PR's own head, every file in that tree
 that Claude Code or Codex reads as configuration is PR-authored. The policy gate
-covers very little of that surface: `_POLICY_BASENAMES` (`pipeline.py:145`) is
+covers very little of that surface: `_POLICY_BASENAMES` (`pipeline.py:168`) is
 `{CLAUDE.md, AGENTS.md}`, and `_POLICY_PATH_SUFFIXES` covers only the pipeline's
 own `config.toml`, `pipeline.py`, and `tick.py`.
 
@@ -530,12 +530,12 @@ SHA, re-run `trusted_review_candidate`. It is removed, for two reasons that
 arrived from different directions.
 
 **The premise was wrong.** The concern was that the reviewer pins `headRefOid`
-(`tick.py:8967`, `:9096`) while the fixer checks out `origin/<head_ref>`
-(`tick.py:10262-10264`), so a commit landing between review harvest and fixer
+(`tick.py:8991`, `:9120`) while the fixer checks out `origin/<head_ref>`
+(`tick.py:10286-10288`), so a commit landing between review harvest and fixer
 dispatch leaves the fixer working from findings that describe an earlier commit.
 Most of that window does not exist: review harvest already pins the reviewed SHA
 and discards the review outright when the head moved under it (`head_advanced`,
-`pipeline.py:1087`; the discard branch reverts to `pre_label` and posts nothing).
+`pipeline.py:1110`; the discard branch reverts to `pre_label` and posts nothing).
 What remains is the gap between harvest labelling the PR and dispatch admitting
 it — usually the same tick, seconds apart.
 
@@ -557,7 +557,7 @@ standalone issue:
   change or an escalation.
 - A legal "nothing to push" completion. `decide_fix_harvest` treats a success
   claim with an unchanged head as contradictory output and escalates
-  (`pipeline.py:2389-2390`), which is right for a fixer that failed to push and
+  (`pipeline.py:2412-2413`), which is right for a fixer that failed to push and
   wrong for one that correctly found nothing to do. The two are distinguishable
   by whether every finding carries an explicit no-change decision.
 
@@ -567,7 +567,7 @@ per-stage gate given operator-only authorship.
 
 ### Tradeoff, recorded
 
-`_ENGINE_ALLOWED_TOOLS_BASE` (`tick.py:721`) describes itself as "a named
+`_ENGINE_ALLOWED_TOOLS_BASE` (`tick.py:745`) describes itself as "a named
 security boundary for unattended operation: no force-push, remote-branch
 deletion, or arbitrary refspec push." Under `auto`, those reach the classifier
 rather than being refused. A deny rule is the mitigation and the setup flow
@@ -583,8 +583,8 @@ the fourth fails silently, which is worse.
 
 ### Default branch
 
-`base_ref` is hardcoded to `"main"` at `tick.py:9584` for issue dispatch, with a
-matching default at `tick.py:6777`. A repository on `master`, `trunk`, or
+`base_ref` is hardcoded to `"main"` at `tick.py:9608` for issue dispatch, with a
+matching default at `tick.py:6801`. A repository on `master`, `trunk`, or
 anything else either fails to fetch or branches from the wrong ref. The resolved
 value comes from the repository's actual default branch, with a
 `[repos."owner/name"] base_ref` override.
@@ -645,7 +645,7 @@ the remote name, and `status.sh`'s independent config parse.
 
 ## 7. `verify_tools` ships empty
 
-`_DEFAULT_VERIFY_TOOLS` (`tick.py:742`) currently ships `uv run pytest`,
+`_DEFAULT_VERIFY_TOOLS` (`tick.py:766`) currently ships `uv run pytest`,
 `uv run ruff`, `uv run pyright`, and an `npm --prefix frontend` entry. For a
 plugin pointed at a repository we have never seen, those are a guess about
 someone else's toolchain — and a wrong guess is worse than none, because the
@@ -672,7 +672,7 @@ award `ai:ready-for-human` with no operator-defined acceptance check having run.
 *happened* — and per section 5 it does not reliably decide even that, since a
 classifier denial fails the run. And `verify_tools` is only a permission grant — the prompts tell the
 engine to run the verification commands the target's own `CLAUDE.md`/`AGENTS.md`
-prescribe (`tick.py:727`), so on a target with no such documentation, configuring
+prescribe (`tick.py:751`), so on a target with no such documentation, configuring
 `verify_tools` does not by itself cause anything to be run.
 
 Given the decision to dispatch anyway, the warning has to be durable evidence
@@ -828,8 +828,8 @@ version mismatch to notice.
 ### `review-response-hygiene`
 
 The fixer prompt binds `.claude/skills/review-response-hygiene/SKILL.md`, and
-`_bound_skills_resolve` (`tick.py:8451`) probes for it **inside the fixer's
-worktree** via `skill_doc_path` (`tick.py:399`) against `SKILL_DOC_ROOT =
+`_bound_skills_resolve` (`tick.py:8475`) probes for it **inside the fixer's
+worktree** via `skill_doc_path` (`tick.py:423`) against `SKILL_DOC_ROOT =
 ".claude/skills"`.
 
 This is the coupling that makes the current pipeline non-independent, and it is
@@ -910,6 +910,16 @@ During exploration, `uv run --python 3.13` also resolved an interpreter without
 The tick commands resolve a ≥ 3.11 interpreter the way `status.sh` already does.
 `uv` remains a fine way for a contributor to run the suite; it stops being a
 requirement for an operator to run the pipeline.
+
+**Shipped.** `skills/tick/resolve-python.sh` is the single definition of a
+usable interpreter, sourced by `tick.sh`, `preflight.sh`, and `status.sh` so the
+three cannot disagree about which Python the pipeline runs on. `tick.sh` is the
+documented operator entry point — `bash ${CLAUDE_PLUGIN_ROOT}/skills/tick/tick.sh
+[args]`, the same shape `preflight.sh` and `status.sh` already had — and it exits
+`3` (the existing "required tool missing, nothing ran" code) with a message
+naming the ≥ 3.11 requirement and `PR_PIPELINE_PYTHON`. `tick.py` and
+`pipeline.py` carry the same requirement as a guard ahead of `import tomllib`,
+for the invocation that did not come through a launcher.
 
 ## 10. Validating the independence claim
 
@@ -1069,14 +1079,14 @@ An independent review by Codex (`gpt-6-astra`) against the first draft was
 verified claim by claim against the source. Confirmed by direct inspection and
 incorporated above:
 
-- `base_ref` hardcoded to `"main"` (`tick.py:9584`, default at `:6777`).
+- `base_ref` hardcoded to `"main"` (`tick.py:9608`, default at `:6801`).
 - No `ai:` label provisioning anywhere in the tree.
 - `touches_review_policy` and `trusted_review_candidate` have one caller each,
   both reviewer-only; fixer dispatch rechecks neither. (The fourth round removed
   the section built on this — see below — but the observation itself held.)
 - `status.sh:44-45` `sed`-parses the install-relative `config.toml` for
   `[target] repo`, so deleting that key breaks the dashboard.
-- `gh()` (`tick.py:980`) forwards arguments with no `--repo`.
+- `gh()` (`tick.py:1004`) forwards arguments with no `--repo`.
 - Verification commands execute PR-controlled code, which is why section 2 makes
   no containment claim.
 - The policy gate's missing surface is far wider than two settings files.
@@ -1084,8 +1094,8 @@ incorporated above:
 
 Corrections accepted against the earlier draft:
 
-- `_DEFAULT_VERIFY_TOOLS` starts at `tick.py:742`, not 741; the issue query's
-  JSON fields are at `:9409`.
+- `_DEFAULT_VERIFY_TOOLS` starts at `tick.py:766`, not 741; the issue query's
+  JSON fields are at `:9433`.
 - "An adopter without `uv` cannot run a single command in the README" was false:
   `preflight.sh` and `status.sh` already resolve an interpreter directly.
 - Reviewers do not inherit `_engine_env()`; their credentials are scrubbed, so
@@ -1164,7 +1174,7 @@ each verified against the source before being accepted:
   docs.** `SKILL.md:24` says "a classifier denial fails the run"; `README.md:644`
   agrees. Reaching the classifier is not being permitted. Confirmed further
   against `claude --help` on `2.1.270`: `--permission-prompts` defaults to `host`
-  and `build_engine_cmd` (`tick.py:935-940`) supplies no host, so the headless
+  and `build_engine_cmd` (`tick.py:959-964`) supplies no host, so the headless
   failure path is unmeasured. Fixed by reducing the claim to "better for approved
   commands, no worse for the rest," strengthening section 8's probe into one that
   runs an unapproved command, and adding open question 12.3.
@@ -1175,8 +1185,8 @@ each verified against the source before being accepted:
   in phase 1 rather than leaving it to be discovered.
 
 Five majors were accepted and applied: `permission_mode` had no config key
-though section 8 requires recording one (confirmed CLI-only at `tick.py:12609`,
-`:12675`); section 3's fail-closed rule and section 7's dispatch-anyway decision
+though section 8 requires recording one (confirmed CLI-only at `tick.py:12633`,
+`:12699`); section 3's fail-closed rule and section 7's dispatch-anyway decision
 composed into a config typo silently producing an unverified
 `ai:ready-for-human`; the environment layer still named `PIPELINE_REPO` as
 overriding a key the design deletes; section 6 asserted in the present tense that
@@ -1185,7 +1195,7 @@ reconciled; and moving `review-response-hygiene` under `skills/` would publish i
 as a fourth invocable command, which is not what a doc-path binding wants.
 
 Six nits were applied: the header pointed at section 12 for the review history,
-`tick.py:11985` is a blank line, `status.sh:38` named a comment rather than the
+`tick.py:12009` is a blank line, `status.sh:38` named a comment rather than the
 `sed` parse, two review anchors were commits no published ref reaches, "sections
 9", and "four keys" introducing a list of five.
 
@@ -1214,7 +1224,7 @@ the earlier rounds had argued for.
   with the duplication.
 - **Fixer-dispatch revalidation is removed, not deferred.** Verified against the
   source: review harvest already discards a review whose head moved under it
-  (`head_advanced`, `pipeline.py:1087`), so the window the section described is
+  (`head_advanced`, `pipeline.py:1110`), so the window the section described is
   seconds wide rather than open-ended. The owner's framing settles the rest — the
   fixer should judge each finding against the code in front of it rather than
   execute the reviewer's list, which makes drift detection unnecessary. What
@@ -1258,7 +1268,7 @@ Everything required for A to install the plugin and drive B, C, and D:
   explicitly *not* in phase 1.
 - `auto` as the default permission mode, `permission_mode` as a config key, and
   the per-route fallback the probe may force (sections 3, 5, 8).
-- Interpreter resolution without `uv` (section 9).
+- ~~Interpreter resolution without `uv` (section 9).~~ **Done** — `tick.sh` and the shared `resolve-python.sh`.
 - A standalone entrypoint for the shell-run commands (section 9) — the plugin-root
   substitution covers skill bodies only.
 - Validation L0 through L4, **L3-adversarial excepted** (section 10). Phase 1's
@@ -1382,7 +1392,7 @@ it is cheaper to fix than to recover from.
 Required before publication:
 
 - **Audit first.** There are ~30 `LABEL_NEEDS_HUMAN` / `LABEL_MAX_ITERATIONS`
-  sites and 162 `reason=` call sites in `tick.py`. `pipeline.py:2012` carries an
+  sites and 162 `reason=` call sites in `tick.py`. `pipeline.py:2035` carries an
   `escalation_reason` on the fixer-run comment renderer, which establishes that
   at least one path does this and nothing about the other paths. The deliverable
   is the coverage map; closing the gaps is the follow-on.
@@ -1403,7 +1413,7 @@ a blocker finding.
 This is cheap because the plumbing exists. `dispatch.json` already pins
 `base_sha`, the merge-base the reviewer's diff is anchored to, and harvest
 already validates that anchor rather than silently falling back
-(`pipeline.py:2734`). Without it, the honest description of an unattended
+(`pipeline.py:2757`). Without it, the honest description of an unattended
 pipeline is that its acceptance gate can be satisfied by deleting the test that
 fails — which, given that this project's own headline is custody, is the
 inconsistency a hostile reader will find first.
