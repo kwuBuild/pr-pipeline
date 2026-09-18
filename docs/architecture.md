@@ -860,7 +860,10 @@ The engine runs with its working directory set to the PR worktree (no `-C`
 flag; the wrapper is launched with `cwd` at the worktree root):
 
 ```bash
-uv run python .claude/skills/tick/engine_wrapper.py run \
+# `python` is the tick's own `sys.executable`, inherited rather than
+# re-resolved: the wrapper must run on the same >= 3.11 interpreter the
+# tick does, and a second resolution could disagree with the first.
+python .claude/skills/tick/engine_wrapper.py run \
   --marker-path .claude/worktrees/pr-<N>/dispatch.json \
   --result-path .claude/worktrees/pr-<N>/review.json \
   --envelope-path .claude/worktrees/pr-<N>/completion.json \
@@ -1265,7 +1268,7 @@ there.
 1. Tick writes a `launching` lease (`dispatch.json` with `state: "launching"` and
    `dispatch_id` but no PID), spawns the engine, and *then* flips the label to
    `ai:reviewing`. The order is **lease → launch → relabel** in all three stages
-   (reviewer `tick.py:5918`→`5970`, implementer, fixer), not lease → relabel →
+   (reviewer `tick.py:5942`→`5994`, implementer, fixer), not lease → relabel →
    spawn. This is deliberate — a relabel that lands before a failed spawn strands
    the item at an in-flight label with nothing running — but it means **the label
    is not a pre-spend acquisition lock**. Two ticks that select the same item

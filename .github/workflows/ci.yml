@@ -16,22 +16,36 @@ jobs:
     # no project dependency install -- an accidental third-party import or a
     # 3.12+ syntax feature has to fail here rather than on an adopter's machine.
     #
-    # Why exactly 3.11 and 3.13, and nothing between:
+    # Why exactly 3.11 and 3.14, and nothing between:
     #   3.11 is the floor, and it is a hard one: tick.py and pipeline.py parse
     #        config.toml with `tomllib`, which is 3.11+. Below it the tool does
     #        not import at all.
-    #   3.13 is the newest release the pipeline claims to support, so it is
-    #        where a removed-in-3.13 stdlib API or a new DeprecationWarning
-    #        surfaces first.
+    #   3.14 is the newest *explicitly named* candidate in `resolve-python.sh`,
+    #        and the resolver prefers the newest it finds -- so the day an
+    #        operator installs it, it silently becomes the runtime with no
+    #        config change. The top leg must track that list, not lag it, or the
+    #        pipeline runs in production on a version nothing here proves.
+    #        The limit of that guarantee: the resolver's last candidate is a
+    #        bare `python3`, gated only on `>= 3.11`. On a box whose `python3`
+    #        is a 3.15, the pipeline runs on 3.15 -- above this bracket, and
+    #        invisible to the test that holds the two in step
+    #        (test_ci_proves_both_ends_of_the_range_the_resolver_will_pick),
+    #        which reads only the explicitly named minors. That fallback is the
+    #        escape hatch that makes the resolver work on machines whose `PATH`
+    #        nobody controls, so it stays; what this matrix promises is that
+    #        every version the resolver *names* is proven, not every version it
+    #        can end up on.
     # The two ends bracket the range: a syntax or stdlib feature that exists in
-    # neither cannot hide in 3.12, because anything 3.12 accepts and 3.11
-    # rejects already fails the floor leg. Adding 3.12 would double the matrix
+    # neither cannot hide in 3.12 or 3.13, because anything they accept and 3.11
+    # rejects already fails the floor leg. Adding either would grow the matrix
     # for no failure it can catch on its own.
+    # test_launcher.py asserts this matrix against the resolver's candidates, so
+    # widening that list without widening this one fails the suite.
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-        python-version: ["3.11", "3.13"]
+        python-version: ["3.11", "3.14"]
 
     runs-on: ${{ matrix.os }}
 
@@ -82,10 +96,16 @@ jobs:
         run: python -m pytest skills/ -q
 
   shellcheck:
-    # status.sh and preflight.sh carry real control-flow: interpreter
-    # resolution, path anchoring, and probe gating. They are shipped to other
-    # people's machines, so lint them rather than discovering a quoting bug in
-    # someone else's dashboard.
+    # Every shell script the pipeline ships carries real control-flow:
+    # interpreter resolution, path anchoring, probe gating, argument
+    # forwarding. They run on other people's machines, and the shell's failure
+    # mode is not an exception -- an unquoted path with a space resolves the
+    # wrong interpreter, or nothing at all. So lint them here rather than
+    # discovering the bug in someone else's dashboard.
+    #
+    # test_launcher.py holds this list to `git ls-files skills/*/*.sh`, so a new
+    # script that is not named below fails the suite instead of shipping
+    # unlinted.
     runs-on: ubuntu-latest
 
     steps:
@@ -93,12 +113,30 @@ jobs:
 
       - name: Syntax check
         run: |
+          bash -n skills/tick/resolve-python.sh
+          bash -n skills/tick/tick.sh
           bash -n skills/tick/preflight.sh
           bash -n skills/status/status.sh
 
+      # -x follows the `# shellcheck source=` directives in tick.sh,
+      # preflight.sh and status.sh into resolve-python.sh. Without it the
+      # sourced functions are unknown, the directives are decoration, and the
+      # resulting SC1091 sits below --severity=error where nothing sees it.
+      #
+      # --source-path=SCRIPTDIR is not optional decoration on top of -x: it is
+      # half the fix. ShellCheck resolves a `source=` path against the process's
+      # working directory, not the directory of the file being checked, and this
+      # job runs from the repository root -- so `source=resolve-python.sh` in
+      # tick.sh resolves to ./resolve-python.sh at the root, is not found, and
+      # SC1091 is emitted and then filtered exactly as it would be without -x.
+      # SCRIPTDIR resolves each directive relative to its own script, which is
+      # what the directives were written against (status.sh reaches the shared
+      # resolver as ../tick/resolve-python.sh). test_launcher.py holds this.
       - name: ShellCheck
         run: |
           sudo apt-get update && sudo apt-get install -y shellcheck
-          shellcheck --severity=error \
+          shellcheck --severity=error -x --source-path=SCRIPTDIR \
+            skills/tick/resolve-python.sh \
+            skills/tick/tick.sh \
             skills/tick/preflight.sh \
             skills/status/status.sh

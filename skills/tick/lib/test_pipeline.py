@@ -983,7 +983,7 @@ def test_touches_review_policy_true_for_gate_config() -> None:
 def test_touches_review_policy_true_for_gate_implementation() -> None:
     """The gate's implementation files are review policy too: a PR that
     rewrites _policy_touching_allowed to always return True (or removes the
-    tick.py:9007 call) is the same silent-disable vector as a config flip."""
+    tick.py:9031 call) is the same silent-disable vector as a config flip."""
     assert (
         pipeline.touches_review_policy(
             [".claude/skills/tick/lib/pipeline.py"]

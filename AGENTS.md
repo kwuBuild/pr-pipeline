@@ -63,8 +63,9 @@ will be read as a human hold that overrides the sentinel you finish with. See
 ## Running Tests
 
 - Stdlib + pytest only; there is no packaging manifest and nothing to install
-- Run against an interpreter that is actually >= 3.11: `python3.13 -m pytest skills/ -q`, or `uv run --python 3.13 --with pytest pytest skills/ -q`
+- Run against an interpreter that is actually >= 3.11: `python3.13 -m pytest skills/ -q`. If pytest is not installed for it, `python3.13 -m venv .venv && .venv/bin/pip install pytest`, then `.venv/bin/python -m pytest skills/ -q`
 - Never use bare `python3` — it resolves to 3.9 on stock macOS and under Anaconda, and collection fails on `tomllib`
+- Not `uv run --python 3.13 --with pytest pytest`: `--python` picks the interpreter but the bare `pytest` console script still resolves from `PATH`, so an Anaconda 3.9 runs the suite and collection dies in `pipeline.py`'s floor guard
 - `gh`, `git`, and `codex` must resolve on PATH or the tick's startup probe exits 3
 
 ## Project Overview

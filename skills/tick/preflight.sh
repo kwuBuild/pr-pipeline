@@ -22,32 +22,15 @@ PROBE_SCHEMA="$SKILL_DIR/preflight-probe-schema.json"
 LIB="$SKILL_DIR/lib/pipeline.py"
 MIN_VERSION="codex-cli 0.142.5"
 
-# Resolve an interpreter that can actually run the lib. `uv run python` is not
-# available outside a uv project, and bare `python3` is NOT a safe substitute:
-# tick.py/pipeline.py need 3.11+ for `tomllib`, while the ambient `python3` is
-# whatever PATH resolves (3.9 on a stock macOS box, and on Anaconda installs).
-# Note this is about PRECEDENCE, not availability: a box can have 3.13 installed
-# and still resolve `python3` to a 3.9 (Anaconda, pyenv shim, system Python).
-# Set PR_PIPELINE_PYTHON to pin an interpreter explicitly; otherwise probe
-# explicit minors first, then verify whatever `python3` resolves to. Fail loudly
-# rather than letting a 3.9 produce a confusing ImportError inside a probe.
-resolve_python() {
-  local candidate
-  for candidate in ${PR_PIPELINE_PYTHON:+"$PR_PIPELINE_PYTHON"} \
-                   python3.14 python3.13 python3.12 python3.11 python3; do
-    if command -v "$candidate" >/dev/null 2>&1 \
-      && "$candidate" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
-        >/dev/null 2>&1; then
-      printf '%s\n' "$candidate"
-      return 0
-    fi
-  done
-  return 1
-}
+# Resolve an interpreter that can actually run the lib — the same resolution the
+# tick and the dashboard use, so this gate cannot pass against a Python the tick
+# would then decline to run under. Fail loudly rather than letting a 3.9 produce
+# a confusing ImportError inside a probe.
+# shellcheck source=resolve-python.sh
+. "$SKILL_DIR/resolve-python.sh"
 
-if ! PY="$(resolve_python)"; then
-  echo "FAIL: no Python >= 3.11 found on PATH (needed for tomllib)." >&2
-  echo "      Tried: python3.14 python3.13 python3.12 python3.11 python3" >&2
+if ! PY="$(pr_pipeline_resolve_python)"; then
+  pr_pipeline_python_requirement_error
   exit 1
 fi
 

@@ -479,6 +479,9 @@ def install_status_script(tmp_path: Path) -> Path:
     The lib is copied rather than stubbed because the progress column is
     rendered from ``tick.py engine-progress``: the dashboard's verdict is only
     trustworthy if these tests exercise the same classifier the watcher uses.
+    The interpreter resolver comes along for the same reason — it is the tick
+    skill's file, sourced across the skill boundary, so an install that dropped
+    it would break the dashboard here rather than on an operator's box.
     """
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -486,7 +489,10 @@ def install_status_script(tmp_path: Path) -> Path:
     script_dst = repo / ".claude/skills/status/status.sh"
     script_dst.parent.mkdir(parents=True)
     shutil.copy(Path(__file__).with_name("status.sh"), script_dst)
-    lib_dst = repo / ".claude/skills/tick/lib"
+    tick_dst = repo / ".claude/skills/tick"
+    tick_dst.mkdir(parents=True)
+    shutil.copy(TICK_LIB.parent / "resolve-python.sh", tick_dst / "resolve-python.sh")
+    lib_dst = tick_dst / "lib"
     lib_dst.mkdir(parents=True)
     for name in os.listdir(TICK_LIB):
         if name.endswith(".py") and not name.startswith("test_"):
@@ -576,10 +582,10 @@ def run_status(
     ``gh`` returns empty JSON: the GitHub sections are not under test here.
     The classifier is *not* stubbed out — the progress column's whole contract
     is that it renders what the real ``tick.py`` reports, so a stub would prove
-    only that bash can print a literal. The shim does uv's one job in this
-    script, picking the interpreter, and pins it to the one running these tests
-    (tick.py needs 3.11+, which the ambient ``python3`` does not guarantee);
-    the marker classification underneath is production code.
+    only that bash can print a literal. ``PR_PIPELINE_PYTHON`` pins resolution
+    to the interpreter running these tests, which is known to satisfy the 3.11+
+    floor where the ambient ``python3`` is not; the resolver and the marker
+    classification underneath are both production code.
 
     ``cwd`` defaults to ``repo``; pass a linked worktree to exercise the
     marker-root anchoring.
@@ -587,14 +593,10 @@ def run_status(
     stub_bin = repo.parent / "bin"
     stub_bin.mkdir(exist_ok=True)
     write_stub(stub_bin / "gh", "#!/bin/sh\nprintf '[]'\n")
-    write_stub(
-        stub_bin / "uv",
-        # `uv run python ARGS...` -> `<interpreter> ARGS...`
-        f'#!/bin/sh\nshift 2\nexec "{sys.executable}" "$@"\n',
-    )
 
     env = os.environ.copy()
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
+    env["PR_PIPELINE_PYTHON"] = sys.executable
     return subprocess.run(
         ["bash", str(repo / ".claude/skills/status/status.sh")],
         cwd=cwd or repo,
