@@ -86,23 +86,15 @@ checklist_paths = []
 # approval beyond these grants reach the classifier under auto, or are denied
 # under dontAsk. Neither mode guarantees the repo's verification can complete.
 #
-# Replace this list wholesale for a non-Python stack. A trailing ` *` allows
-# arguments; without it only the bare command is permitted. An entry containing
-# a parenthesis or newline is a startup error — it would break out of the
-# allowlist entry and widen the grant. A value that is not a list of strings is a
-# startup error, which is deliberately *not* the same state as an empty list:
-# read as empty, one typo would dispatch an unverified PR and still promote it.
+# Add grants in operator-owned [defaults] or [repos."owner/name"]. A trailing
+# ` *` allows arguments; without it only the bare command is permitted.
+# Parentheses, newlines, or values other than a list of strings are startup
+# errors, not an empty configuration.
 #
-# This list is the *only* source of the shipped grants. An explicitly empty
-# `verify_tools` — in [defaults] or for one repository — grants nothing, because
-# a permission grant an operator cannot narrow to nothing is not a grant they
-# control.
-verify_tools = [
-    "uv run pytest *",
-    "uv run ruff *",
-    "uv run pyright",
-    "npm --prefix frontend *",
-]
+# The packaged floor grants no verification commands. Empty dispatches with a
+# tick-log warning, a durable PR-body warning, and an explicit completion waiver.
+# This does not waive the target's required checks or prove that any check ran.
+verify_tools = []
 
 # The base branch the implementer branches from and targets its PR at. Blank
 # means "resolve the target's default branch" from GitHub at issue dispatch.

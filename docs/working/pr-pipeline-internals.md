@@ -289,18 +289,32 @@ Bash(git log *) Bash(git push <remote> HEAD)
 `<remote>` is the validated remote selected at startup; the fixer uses the
 exact `HEAD:refs/heads/<head-ref>` refspec on that same remote.
 
-The verification entries are the operator's, not the pipeline's: `_engine_verify_tools`
-wraps each resolved value in `Bash(...)`. An entry containing a parenthesis or a
-newline would close its entry early and turn the rest of the string into extra
-permissions, so the resolver reports it and startup refuses — dropping it here
-instead would hand the engine a narrower grant than the operator wrote, and an
-all-invalid list would arrive as the deliberate empty one. The same check is
-repeated at the argv builder for the one path startup cannot cover: the config
-file is re-read per dispatch, so an edit landing afterwards would otherwise
-reach `--allowedTools` unexamined. Nothing sits underneath the resolved list — `verify_tools = []`
-composes no entries at all, and the shipped Python stack reaches an engine only as
-layer 1 of the resolution order. A fallback here would be a grant the operator
-narrowed away and got back.
+The verification entries are the operator's, not the pipeline's. The packaged
+floor is empty. Dispatch validates and resolves the grants, wraps each in
+`Bash(...)`, and passes that same tuple to the launcher while pinning
+`verification_unconfigured` in the implement/fix marker. A configuration edit
+between lease publication and launch cannot change those grants. The broader
+per-tick configuration snapshot remains issue #26.
+
+A malformed list (including parentheses/newlines in a permission body) is an
+error, never an empty grant. A valid empty list dispatches with a
+`verification_unconfigured` log entry and a prompt requiring the exact line
+`VERIFICATION_UNCONFIGURED_WAIVER` immediately before the success sentinel.
+Harvest validates that waiver against the marker and the same final sentinel
+occurrence that supplies the outcome, never against current config. No-change
+fixer completion requires the same waiver outside its finding-summary blocks.
+Legacy markers without the field retain their old completion contract.
+
+The controller prefixes `pipeline.VERIFICATION_WARNING` as a standalone opening
+paragraph at PR creation, outside engine-authored Markdown/HTML context, and
+preserves it on fixer body replacements even after grants change. Implementation
+handoff checks the live body/head/holds on both created and rediscovered PRs;
+missing warnings are added through the guarded body-write path before labels
+or cleanup, preserving progressed PR workflow state. An empty-grant fixer with
+no body replacement uses the same guarded warning path. Missing evidence or
+failed writes cannot advance that run without the warning. This is a waiver of
+missing grants, not proof of test execution or permission to skip the target's
+required checks.
 
 These grants cover commit + the stage's exact push. Under `dontAsk`, calls that
 would prompt are denied; under `auto`, calls beyond these grants can reach the

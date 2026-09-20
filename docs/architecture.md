@@ -1584,7 +1584,13 @@ they differ. Those entries are pre-approved tool grants, not instructions: the
 prompt still defers to the repo's guides for what to run and in what order.
 Under `dontAsk`, calls needing approval beyond the grants are denied; under the
 default `auto`, they reach the classifier. Approval is not guaranteed. The
-shipped floor still grants the Python triple; emptying it is a separate change.
+shipped floor is empty. Empty grants still dispatch, with a dispatch-log warning
+and an explicit waiver immediately before the authoritative success sentinel
+(including no-change fixer completion). The controller puts a visible warning
+at the start of the PR body before implementation handoff, including when it
+rediscovers an existing PR, and preserves it through later fixer revisions.
+Failed warning reads or writes retain custody. Grants and waivers describe
+permissions, never proof that repository checks ran.
 
 **The pipeline owns the control plane.** The label vocabulary
 (`docs/working/pr-guidelines.md`), the state machine, custody, and the cadence

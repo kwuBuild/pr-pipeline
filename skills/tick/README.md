@@ -212,6 +212,22 @@ Bad configuration exits 3 and names the offending key. The exception is
 the tick run. An explicitly empty grant is valid; a malformed grant is an error.
 Fix the named value rather than treating the error as an empty/default setting.
 
+Fresh installs ship `verify_tools = []`. Implementer and fixer dispatch still
+proceed, log `verification_unconfigured`, and pin that state in `dispatch.json`.
+Their successful completion must include `VERIFICATION_UNCONFIGURED_WAIVER`
+on the line immediately before the final success sentinel, including no-change
+fixer completion. Missing waivers escalate. This waives only the missing operator
+grants: failed or denied required checks still block completion, and an absent
+check is never evidence of a pass.
+
+Harvest puts a visible "Verification unconfigured" warning first in the PR body,
+including generated fallback bodies and rediscovered PRs. The handoff rechecks
+live head/body/holds and retains progressed PR labels. Fixer replacements preserve
+that history, even if grants are configured later; an empty-grant fixer with no
+replacement still adds the warning through the guarded body-write path. Failed
+reads or writes retain custody for retry. Configured grants do not prove that
+any check ran.
+
 A blank `base_ref` is not malformed; it is the documented "resolve the target's
 default branch". Issue dispatch reads it from the canonical target on GitHub and
 pins the selected branch for PR creation; failed discovery stops dispatch with an

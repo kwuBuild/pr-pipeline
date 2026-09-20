@@ -6114,17 +6114,10 @@ def codex_positionals(codex_argv: list[str]) -> list[str]:
 # --- Operator-configured verification permissions ---
 
 
-def test_engine_verify_tools_default_to_the_shipped_stack(
+def test_engine_verify_tools_default_to_empty(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """With no operator config, the packaged floor supplies the grant.
-
-    An empty default would make a fresh install fail its *first* dispatch on a
-    permission denial, which reads to the engine as a broken repository rather
-    than as a missing grant — the engine has no way to tell the difference and
-    escalates for the wrong reason. The floor is the only place that default
-    lives: a second copy in the code could not be overridden.
-    """
+    """Fresh installs grant no target-specific verification commands."""
     import pipeline
     import tick
 
@@ -6141,7 +6134,7 @@ def test_engine_verify_tools_default_to_the_shipped_stack(
     assert tools == tuple(
         f"Bash({entry})" for entry in pipeline.resolve_config().verify_tools
     )
-    assert any("pytest" in entry for entry in tools)
+    assert tools == ()
     assert all(entry.startswith("Bash(") and entry.endswith(")") for entry in tools)
 
 
