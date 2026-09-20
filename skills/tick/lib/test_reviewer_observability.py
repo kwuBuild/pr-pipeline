@@ -28,8 +28,10 @@ def test_successful_repo_skill_reference_is_observed() -> None:
 
     observation = observe_event_lines([event + b"\n"])
 
+    from engine_usage import codex_usage
+
     assert observation == {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "complete",
         "evidence_contract": "successful_command_referencing_skill_file",
         "explicit_invocation_events_supported": False,
@@ -40,6 +42,7 @@ def test_successful_repo_skill_reference_is_observed() -> None:
         "parse_errors": 0,
         "oversized_events_skipped": 0,
         "skills_truncated": 0,
+        "usage": codex_usage(None),
     }
     assert "private candidate output" not in json.dumps(observation)
 

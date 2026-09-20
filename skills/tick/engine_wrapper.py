@@ -16,7 +16,7 @@ guarantees the bare invocation cannot:
    result path. A partial or in-progress file is never visible as the final result.
 
 4. **Sanitized observability:** when requested, the wrapper drains Codex JSONL
-   stdout and persists only bounded normalized skill-file evidence. Raw events,
+   stdout and persists bounded skill-file evidence and terminal token usage. Raw events,
    prompts, commands, command output, and absolute paths are discarded.
 
 5. **Completion envelope:** after the atomic rename, the wrapper writes a

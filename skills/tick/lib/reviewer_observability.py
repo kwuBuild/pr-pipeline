@@ -1,4 +1,4 @@
-"""Bounded, sanitized observability for headless Codex reviewer events."""
+"""Bounded, sanitized skill and usage evidence for headless Codex reviewers."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import re
 from collections.abc import Iterable
 from os import PathLike
 from typing import BinaryIO
+
+from engine_usage import codex_usage, valid_codex_usage
 
 _SKILL_NAME_PATTERN = r"[A-Za-z0-9._-]{1,128}"
 _SKILL_NAME_RE = re.compile(_SKILL_NAME_PATTERN)
@@ -44,15 +46,23 @@ class _ObservationBuilder:
         self.oversized_events_skipped = 0
         self.skills_truncated = 0
         self.observed: dict[tuple[str, str], dict[str, str]] = {}
+        self.usage = codex_usage(None)
+        self.terminal_count = 0
 
     def observe(self, raw_line: bytes) -> None:
         self.event_count += 1
         try:
             event = json.loads(raw_line)
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except (UnicodeDecodeError, ValueError, RecursionError):
             self.parse_errors += 1
             return
-        if not isinstance(event, dict) or event.get("type") != "item.completed":
+        if not isinstance(event, dict):
+            return
+        if event.get("type") == "turn.completed":
+            self.terminal_count += 1
+            self.usage = codex_usage(event.get("usage"))
+            return
+        if event.get("type") != "item.completed":
             return
         item = event.get("item")
         if not isinstance(item, dict):
@@ -83,8 +93,11 @@ class _ObservationBuilder:
             or self.oversized_events_skipped > 0
             or self.skills_truncated > 0
         )
+        usage = dict(self.usage)
+        if (partial or self.terminal_count > 1) and usage["status"] == "complete":
+            usage["status"] = "partial"
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "partial" if partial else "complete",
             "evidence_contract": "successful_command_referencing_skill_file",
             "explicit_invocation_events_supported": False,
@@ -96,6 +109,7 @@ class _ObservationBuilder:
             "parse_errors": self.parse_errors,
             "oversized_events_skipped": self.oversized_events_skipped,
             "skills_truncated": self.skills_truncated,
+            "usage": usage,
         }
 
     def _record(self, source: str, name: str) -> None:
@@ -111,7 +125,7 @@ class _ObservationBuilder:
 
 
 def observe_event_lines(lines: Iterable[bytes]) -> dict[str, object]:
-    """Return sanitized skill-path references from Codex JSONL event lines.
+    """Return sanitized skill references and terminal usage from Codex JSONL.
 
     Args:
         lines: Raw JSONL lines emitted by ``codex exec --json``.
@@ -159,7 +173,7 @@ def observe_event_stream(
 def unavailable_observation() -> dict[str, object]:
     """Return the fixed payload used when no trustworthy summary is available."""
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "unavailable",
         "evidence_contract": "successful_command_referencing_skill_file",
         "explicit_invocation_events_supported": False,
@@ -168,6 +182,7 @@ def unavailable_observation() -> dict[str, object]:
         "parse_errors": 0,
         "oversized_events_skipped": 0,
         "skills_truncated": 0,
+        "usage": codex_usage(None),
     }
 
 
@@ -175,8 +190,12 @@ def load_observation(path: str | PathLike[str]) -> dict[str, object]:
     """Load only the exact sanitized observation shape used by HARVEST."""
     try:
         with open(path) as fh:
-            payload = json.load(fh)
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            # 64 skill names and one fixed usage record fit comfortably here.
+            raw = fh.read(32 * 1024 + 1)
+        if len(raw) > 32 * 1024:
+            return unavailable_observation()
+        payload = json.loads(raw)
+    except (OSError, ValueError, UnicodeDecodeError, RecursionError):
         return unavailable_observation()
     if not _valid_observation(payload):
         return unavailable_observation()
@@ -184,9 +203,15 @@ def load_observation(path: str | PathLike[str]) -> dict[str, object]:
 
 
 def _valid_observation(payload: object) -> bool:
-    if not isinstance(payload, dict) or set(payload) != _OBSERVATION_KEYS:
+    if not isinstance(payload, dict):
         return False
-    if payload.get("schema_version") != 1:
+    version = payload.get("schema_version")
+    if type(version) is not int or version not in (1, 2):
+        return False
+    keys = _OBSERVATION_KEYS | {"usage"} if version == 2 else _OBSERVATION_KEYS
+    if set(payload) != keys:
+        return False
+    if version == 2 and not valid_codex_usage(payload.get("usage")):
         return False
     if (
         payload.get("evidence_contract")
@@ -197,7 +222,7 @@ def _valid_observation(payload: object) -> bool:
         return False
 
     status = payload.get("status")
-    if status not in {"complete", "partial", "unavailable"}:
+    if not isinstance(status, str) or status not in {"complete", "partial", "unavailable"}:
         return False
     counters = (
         payload.get("event_count"),
@@ -231,7 +256,7 @@ def _valid_observation(payload: object) -> bool:
             or name in {".", ".."}
         ):
             return False
-        if source not in {"repository", "plugin"}:
+        if not isinstance(source, str) or source not in {"repository", "plugin"}:
             return False
         identity = (source, name)
         if identity in identities:
@@ -245,4 +270,10 @@ def _valid_observation(payload: object) -> bool:
         return False
     if status == "unavailable" and (observed or any(counters)):
         return False
+    if version == 2:
+        usage_status = payload["usage"]["status"]
+        if status == "unavailable" and usage_status != "unavailable":
+            return False
+        if status == "partial" and usage_status == "complete":
+            return False
     return True

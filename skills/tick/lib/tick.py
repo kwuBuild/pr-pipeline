@@ -57,6 +57,7 @@ from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import claude_stream_wrapper
+import engine_usage
 import labels
 import pipeline
 import process_control
@@ -1742,7 +1743,7 @@ def _engine_result_summary(
     """Build a redaction-safe summary of a harvested engine result."""
     try:
         result_obj: object = json.loads(result_raw)
-    except json.JSONDecodeError:
+    except (ValueError, RecursionError):
         result_obj = None
 
     details: dict[str, object] = {
@@ -1751,6 +1752,8 @@ def _engine_result_summary(
         "harvest_action": harvest_action,
         "harvest_label": harvest_label,
         "sentinel": harvest_result.get("sentinel"),
+        "usage": engine_usage.claude_usage(result_obj),
+        "reported_models": engine_usage.claude_models(result_obj),
     }
     if not isinstance(result_obj, dict):
         return details
@@ -1764,10 +1767,13 @@ def _engine_result_summary(
                 if isinstance(tool_name, str):
                     denial_tools.append(tool_name)
 
-    for key in ("is_error", "api_error_status", "stop_reason", "duration_ms", "num_turns"):
+    for key in ("is_error", "api_error_status", "stop_reason", "duration_ms"):
         value = result_obj.get(key)
         if isinstance(value, (str, int, float, bool)) or value is None:
             details[key] = value
+
+    turns = result_obj.get("num_turns")
+    details["num_turns"] = turns if type(turns) is int and 0 <= turns <= 2**63 - 1 else None
 
     details["result_excerpt"] = _result_excerpt(result_obj.get("result"))
     details["permission_denial_count"] = (
@@ -2113,6 +2119,9 @@ def _log_reviewer_skill_observation(
     observation = reviewer_observability.load_observation(
         os.path.join(wt_dir, "review-observation.json"),
     )
+    # Version 1 artifacts retain their skill evidence and honestly lack usage.
+    observation.setdefault("usage", engine_usage.codex_usage(None))
+    observation["schema_version"] = 2
     tick_log.log(
         pr=number,
         phase="harvest",
@@ -2137,6 +2146,7 @@ def _log_engine_result_summary(
     harvest_label: str,
     skills_used: list[str] | None = None,
     skill_usage_status: str = "unavailable",
+    engine: str = "",
 ) -> None:
     """Emit structured harvest result metadata without raw tool payloads."""
     if not tick_log:
@@ -2155,7 +2165,7 @@ def _log_engine_result_summary(
         stage=stage,
         action="engine_result_summary",
         reason=f"action={harvest_action}",
-        engine="",
+        engine=engine,
         dispatch_id=dispatch_id,
         details=details,
     )
@@ -6894,6 +6904,7 @@ def _harvest_one_implementer(
         harvest_label=harvest_label,
         skills_used=skills_used,
         skill_usage_status=skill_usage_status,
+        engine=engine,
     )
     skip_cleanup = False
     archive_dir = ""
@@ -7855,6 +7866,7 @@ def _harvest_one_fixer(
         harvest_label=harvest_label,
         skills_used=skills_used,
         skill_usage_status=skill_usage_status,
+        engine=engine,
     )
 
     fixer_body = (
@@ -9281,6 +9293,8 @@ def _dispatch_one_reviewer(
             action="model_resolved",
             reason=f"model={resolved_model} effort={resolved_effort}",
             engine="codex",
+            dispatch_id=dispatch_id,
+            details={"model": resolved_model, "effort": resolved_effort},
         )
 
     engine_cmd = [
@@ -9877,6 +9891,7 @@ def _dispatch_one_implementer(
             reason=f"pid={proc.pid}, title={issue_title[:60]}",
             engine=impl_engine,
             dispatch_id=dispatch_id,
+            details={"model": model or None, "effort": None},
         )
 
 
@@ -10590,7 +10605,7 @@ def _dispatch_one_fixer(
             reason=f"pid={proc.pid}",
             engine=impl_engine,
             dispatch_id=dispatch_id,
-            details={"head_sha": head_sha[:8]},
+            details={"head_sha": head_sha[:8], "model": model or None, "effort": None},
         )
 
 
