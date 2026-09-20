@@ -5202,6 +5202,24 @@ def test_resolve_config_reads_nothing_through_a_relative_override(
 # --- Operator config: layering ---
 
 
+@pytest.mark.parametrize("use_packaged_floor", [False, True])
+def test_resolve_config_defaults_permission_mode_to_auto(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_packaged_floor: bool,
+) -> None:
+    """An unconfigured repository gets classifier-gated Claude engines."""
+    operator_config(monkeypatch, tmp_path, "")
+    if use_packaged_floor:
+        monkeypatch.setattr(
+            pipeline, "_PACKAGED_CONFIG_PATH",
+            Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+        )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.permission_mode == "auto"
+    assert config.errors == ()
+
+
 def test_resolve_config_reads_the_packaged_floor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

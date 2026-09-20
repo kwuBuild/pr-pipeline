@@ -1695,8 +1695,8 @@ _CONFIG_KEYS = (
     "permission_mode",
 )
 
-# The engine `--permission-mode` values the dispatch supports (see tick.py).
-_PERMISSION_MODES = ("dontAsk", "auto")
+# Claude `--permission-mode` values; the first is the unconfigured default.
+_PERMISSION_MODES = ("auto", "dontAsk")
 
 # A verification grant as it appears inside `Bash(...)` on `--allowedTools`.
 # The flag takes a space-separated list of `Tool(body)` entries, so a closing

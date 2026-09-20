@@ -11,8 +11,8 @@ This is **not** operational documentation — see `SKILL.md` and `README.md` in
 | Property | Implementer | Fixer | Reviewer |
 |---|---|---|---|
 | Binary | `claude -p` | `claude -p` | `codex exec` (via `engine_wrapper.py`) |
-| Permission mode | `--permission-mode dontAsk` | `--permission-mode dontAsk` | `-s read-only` (sandbox) |
-| Tool restriction | `--allowedTools` ([tick.py:749–887][impl-tools]) | `--allowedTools` ([tick.py:749–887][impl-tools]) | None (read-only sandbox enforces) |
+| Permission mode | `--permission-mode auto` (config/CLI can select `dontAsk`) | `--permission-mode auto` (config/CLI can select `dontAsk`) | `-s read-only` (sandbox) |
+| Pre-approved tools | `--allowedTools` ([tick.py:749–887][impl-tools]); auto may approve more | `--allowedTools` ([tick.py:749–887][impl-tools]); auto may approve more | None (read-only sandbox enforces) |
 | Model (default) | whatever `claude` resolves (no `--model` flag) | whatever `claude` resolves / `deepseek-v4-pro[1m]` (claude-ds) | operator's `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`), else `gpt-5.5` |
 | Model override | `--model` flag from tick CLI | `--model` flag from tick CLI | `--review-model` flag from tick CLI |
 | Reasoning effort | Not set (claude default) | Not set (claude default) | operator's codex config, else `high`; `--review-effort` overrides |
@@ -167,8 +167,8 @@ a doc missing from the install is a packaging defect, and it logs
 `skill_unresolved` and escalates instead of running an engine that would
 silently read nothing.
 
-The fixer also gets two documents it has no way to fetch — it carries no `gh`
-and no web access — read by dispatch and substituted in: the **PR body** and the
+The fixer also gets two documents it has no pre-approved way to fetch — `gh`
+and web access are not granted — read by dispatch and substituted in: the **PR body** and the
 body of **every issue GitHub reports under `closingIssuesReferences`**. These are
 what `review-response-hygiene` rules 2 and 5 operate on, so without them the
 prompt demands a check the engine cannot perform. Both are authoritative reads
@@ -181,7 +181,7 @@ budget and leave a later issue with no heading at all.
 The same dispatch read also pins the marker's `pr_body` provenance block — the
 body's digest, the closure contract it declares, and whether the engine was shown
 all of it — which is what lets the fixer hand a **replacement PR body** back. It
-still runs no `gh`: after its final push it writes `.pr-body-revision.md` in its
+is instructed to leave `gh` writes to the controller: after its final push it writes `.pr-body-revision.md` in its
 worktree root under a two-line envelope (`pr-body-revision: <dispatch_id>`, then
 `pr-body-revision-head: <pushed OID>`), and the harvest checks the envelope, the
 closure contract, the sections, and the live body against the pinned digest, then
@@ -271,10 +271,11 @@ reviewer from auto-approving a PR that modifies the very rules used to evaluate 
 
 ### Implementer and fixer
 
-Permission model: `--permission-mode dontAsk` + `--allowedTools`
+Permission model: `--permission-mode auto` + `--allowedTools` by default;
+operator configuration or the CLI can select `dontAsk`
 ([tick.py:749–887][impl-tools], [tick.py:974–982][launch-flags]).
 
-The `--allowedTools` allowlist is a named security boundary
+The `--allowedTools` list supplies narrow pre-approved grants
 ([tick.py:749–887][impl-tools]):
 ```
 Read Edit Write
@@ -299,10 +300,15 @@ composes no entries at all, and the shipped Python stack reaches an engine only 
 layer 1 of the resolution order. A fallback here would be a grant the operator
 narrowed away and got back.
 
-This restricts the git surface to commit + fast-forward push of the engine's own
-branch. No force-push, remote-branch deletion, or arbitrary refspec push is
-possible. The design contract is `--permission-mode dontAsk` + this explicit list —
-never `--dangerously-skip-permissions`.
+These grants cover commit + the stage's exact push. Under `dontAsk`, calls that
+would prompt are denied; under `auto`, calls beyond these grants can reach the
+classifier. The list therefore does not forbid force-push, remote-branch
+deletion, or arbitrary refspec push under auto. Operator-owned deny rules are
+the mitigation; the launcher never passes `--dangerously-skip-permissions`.
+Classifier denial can fail the run, and flag acceptance is not proof of a
+route's capabilities. Setup (#18) owns probing and recording effective mode and
+fallback/refusal; tick uses the selected value without an automatic fallback.
+See [engine permission modes](../../skills/tick/README.md#engine-permission-modes).
 
 Environment contract: `_engine_env()` ([tick.py:469–480][engine-env]) preserves
 the operator's complete parent environment. Implementers and fixers are trusted
@@ -557,6 +563,13 @@ and no workflow or security decision consumes these telemetry fields.
 
 Permission model: `-s read-only` (read-only sandbox) ([tick.py:9274][sandbox]).
 
+Claude's `permission_mode` setting does not apply here. Codex 0.155.1 exposes
+`codex exec --approve-for-me` for automatic approval review, but that shortcut
+selects `workspace-write` and permits reviewed escalation. It would change the
+reviewer's read-only boundary, so dispatch does not use it. The deprecated
+`--full-auto` is a different workspace-write compatibility flag. See the
+[CLI investigation and limits](../../skills/tick/README.md#engine-permission-modes).
+
 The reviewer runs via `codex exec`, which is non-interactive by design. A review
 only reads the worktree and emits structured JSON (the tick posts the review comment
 at harvest, not the reviewer itself). The read-only sandbox blocks filesystem
@@ -622,8 +635,8 @@ its own session.
 
 | Control | Implementer/Fixer | Reviewer |
 |---|---|---|
-| Tool allowlist | Yes (`--allowedTools`) | N/A (read-only sandbox) |
-| Sandbox mode | None (relies on allowlist) | Read-only (`-s read-only`) |
+| Pre-approved tools | Narrow `--allowedTools`; auto may approve more, deny rules still apply | N/A (read-only sandbox) |
+| Sandbox mode | None imposed by tick (operator settings apply) | Read-only (`-s read-only`) |
 | Env scrub | None (trusted local engine inherits the parent env) | scrub-dir (`HOME`/`CODEX_HOME` redirect) |
 | User config blocked | No | Yes (`--ignore-user-config`) |
 | Project rules blocked | No | Yes (`--ignore-rules`) |
