@@ -1045,13 +1045,37 @@ recheck path archives no evidence and deletes the scratch that held `result.json
 so the comment is the run's only durable record of what was fixed. The fixer
 prompt states a summary budget (`pipeline.FIX_SUMMARY_BUDGET`, 3000 characters)
 and the excerpt limit is that budget plus headroom for the completion sentinel,
-so a summary written to the stated size — including the repair-or-replacement
-decision each finding's block carries — reaches the PR whole. Anything past the
+so a summary written to the stated size — including the repair, replacement, or
+no-change decision each finding's block carries — reaches the PR whole. Anything past the
 limit is truncated, and the excerpt is stripped of `<!--`, `-->`, fence, and
 `</details>` sequences so engine text cannot forge a pipeline marker or escape
 its rendered block. The attempt-cap and transient escalations publish no model
 output — they report a failed side effect and a spent retry budget, not an
 engine result.
+
+A fixer that finds every review finding already addressed or inapplicable can
+complete without a push. Each finding must have exactly three non-empty lines:
+`Finding: <name>`, `Decision: no-change`, and `Reason: <evidence>`. The summary
+ends with `NO_CHANGES_RECHECK_NEEDED`. Missing decisions or reasons, an
+over-budget summary, missing dispatch/head/original-review provenance, or a changed head
+escalate. An unchanged-head `FIXES_PUSHED_RECHECK_NEEDED` claim still escalates.
+
+The accepted no-change comment explicitly says that nothing was changed and
+requests re-review at `ai:revised`. The next reviewer receives the published
+reasoning and the exact originating review as context and decides independently.
+Fixer dispatch pins a fingerprint of that review; harvest publishes it, and
+reviewer dispatch resolves the matching body from the same comment snapshot.
+A missing or edited original, or a missing fingerprint, retains a no-change
+round without launching a reviewer. Restore the exact original comment or
+requeue a fresh review at `ai:implemented` to recover. The reviewer explicitly
+checks every original finding, including any omitted from the fixer summary.
+A token tied to that fixer run
+is pinned in the reviewer marker and included in its review identity. New
+no-change rounds count toward `MAX_ITERATIONS` even on the same commit;
+replaying one fixer result or review harvest does not create an extra round.
+The parser checks every reported block; it does not prove that the report
+covers every original finding or that a reason is correct. The prompt requires
+complete coverage, and the independent reviewer owns that judgement.
 
 A terminal transition that **reports an engine result, or fires before one was
 launched** posts a comment before the label moves. Every one of them is gated on

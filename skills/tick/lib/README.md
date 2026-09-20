@@ -54,12 +54,16 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 # review and the decision is a discard, even when every SHA is unchanged. The
 # pinned name is also part of the comment's idempotency token, so a post-retarget
 # round with an identical SHA triple still posts its own comment.
+# --fix-round carries dispatch.json's optional fix_round token after an accepted
+# no-change fixer; omit it for other reviews. Distinct no-change dispatches count
+# as new rounds at the same head, while replaying one dispatch counts once.
 "$PY" "$PIPELINE" harvest-review \
   --review review.json --comments comments.json \
   --pinned-base <sha> --current-base <sha> \
   --diff-base-sha <sha> \
   --pinned-head <sha> --current-head <sha> \
   [--pinned-base-ref <ref> --current-base-ref <ref>] \
+  [--fix-round <sha256-token>] \
   [--pre-label ai:implemented|ai:revised] [--threshold 5]
 
 # Decide a finished fixer's outcome (prints a decision JSON object). The
@@ -73,6 +77,11 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 # the comment-derived iteration count below the cap, looping reviewer+fixer spend
 # without a terminal state. Empty head values disable the check (markers that
 # predate push verification).
+# NO_CHANGES_RECHECK_NEEDED instead requires equal, non-empty head SHAs,
+# --dispatch-id and --review-sha256 from the fixer marker, and a bounded report
+# with Finding:, Decision: no-change, and Reason: for every reported finding.
+# Accepted no-change results also carry head_advanced=false, but request re-review.
+# The review fingerprint pins the original finding set for the coverage check.
 #
 # --body-revision reproduces the comment's PR-body line for a run in which the
 # fixer offered a replacement body (see the tick's `_fixer_body_revision`).
@@ -83,6 +92,7 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 "$PY" "$PIPELINE" harvest-fix \
   --result result.json [--pre-label ai:changes-requested] \
   [--pinned-head <sha> --current-head <sha>] \
+  [--dispatch-id <fixer-dispatch-id> --review-sha256 <original-review-sha256>] \
   [--body-revision <state>]
 
 # Validate a review.json against the schema (prints verdict; exit 1 + "INVALID" if not).
@@ -214,12 +224,12 @@ historical queries can read them.
 | `head_drift` | `true` if the PR head moved under the review (→ `discard`) |
 | `rounds` | prior recorded review rounds (iteration authority is the PR comments) |
 | `post_comment` | whether to post `comment_body` (`false` on an idempotent replay) |
-| `comment_body` | rendered review comment (marker + per-round diff-base:base-tip:head:base-ref token; empty when not posting) |
+| `comment_body` | rendered review comment (marker + per-round diff-base:base-tip:head:base-ref token, extended by `:no-change:<fix_round>` when supplied; empty when not posting) |
 
 Promotion is gated on the verdict **and** the findings: a `ready_for_human` verdict
 that still carries a blocker/major finding is routed to `request_changes`, never
 promoted. `post_comment` is `false` when a comment for this exact
-(diff base, base tip, head, base ref) round was already posted (replay safety), so a
+(diff base, base tip, head, base ref, optional no-change fixer token) round was already posted (replay safety), so a
 comment lands at most once per reviewed round — while a re-review of the same head
 against a *new* base still posts. The base branch *name* is part of the identity for
 the same reason it is part of the retarget check: a PR retargeted to a branch whose
@@ -228,6 +238,10 @@ not suppress the fresh round's post (the posted comment is the next fixer's
 handoff). Comments whose marker predates the `base_ref` key carry the legacy
 three-part token; the formats never match each other, so a crash-window replay
 across the upgrade re-posts at most one comment.
+The optional `--fix-round` extends the identity for unchanged-head no-change
+cycles: a new fixer dispatch earns a new review round, but duplicate publication
+or replay of that fixer result keeps the same token. Reviewer dispatch pins it;
+review harvest does not derive it from newer comments.
 
 ### `harvest-fix` decision keys
 
@@ -236,10 +250,10 @@ across the upgrade re-posts at most one comment.
 | `action` | `recheck` \| `escalate` \| `retry` |
 | `label` | GitHub label to set for `action` |
 | `sentinel` | extracted completion sentinel, or `null` if the engine emitted none |
-| `head_advanced` | present (and `false`) only for the contradictory `FIXES_PUSHED`-without-a-push escalate |
+| `head_advanced` | present (and `false`) for accepted `NO_CHANGES_RECHECK_NEEDED` recheck and contradictory `FIXES_PUSHED`-without-a-push escalation |
 | `failure_class` | present only on `retry` (`quota_or_limit`) |
 | `post_comment` | `true` on both terminal outcomes, absent on `retry` |
-| `comment_body` | rendered fixer comment (marker, head before → after, outcome, sentinel, a bounded engine excerpt; plus the escalation reason on `escalate`, and a `- PR body:` line whenever `--body-revision` is given) |
+| `comment_body` | rendered fixer comment (marker, head before → after, outcome, sentinel, a bounded engine excerpt; plus the escalation reason on `escalate`, and a `- PR body:` line whenever `--body-revision` is given). Accepted no-change completions include the dispatch-derived round token; `--review-sha256` records the original review fingerprint. |
 
 The tick posts `comment_body` **before** flipping the label and treats a failed
 post as a failed harvest: the label stays put and the marker + scratch survive for

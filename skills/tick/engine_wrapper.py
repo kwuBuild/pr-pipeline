@@ -302,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Base branch tip at dispatch (for drift detection)",
     )
     p_run.add_argument("--head-sha", required=True, help="Pinned head SHA")
+    p_run.add_argument("--fix-round", default="", help="Pinned no-change fixer round")
     p_run.add_argument("--pre-label", required=True, help="Pre-dispatch label")
     p_run.add_argument("engine_cmd", nargs=argparse.REMAINDER, help="Engine command after --")
 
@@ -327,6 +328,8 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.base_tip_sha:
         marker_template["base_tip_sha"] = args.base_tip_sha
+    if args.fix_round:
+        marker_template["fix_round"] = args.fix_round
 
     return run_engine(
         dispatch_id=args.dispatch_id,
