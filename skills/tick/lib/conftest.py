@@ -542,43 +542,23 @@ def allow_escalation_comment(
     return side_effect
 
 
-def materialize_engine_skill_docs(wt_dir: Path, names: tuple[str, ...]) -> None:
-    """Create the skill docs a dispatch probes inside an engine worktree.
-
-    A real ``git worktree add`` checks out the branch's whole tree, ``.claude/``
-    included, so a mock that only makes the directory models a worktree that
-    cannot exist. Dispatch resolves its prompt-bound skill docs against that
-    tree and fails closed when one is unreadable, so the mock has to reproduce
-    the checkout's contents for those paths.
-
-    Args:
-        wt_dir: The engine worktree directory the mock is creating.
-        names: The skill names dispatch will probe for.
-    """
-    import tick  # type: ignore[import-untyped]
-
-    wt_dir.mkdir(parents=True, exist_ok=True)
-    for name in names:
-        doc = wt_dir / tick.skill_doc_path(name)
-        doc.parent.mkdir(parents=True, exist_ok=True)
-        doc.write_text(f"# {name}\n")
-
-
 def fixer_git(repo_root: Path) -> Callable[..., str]:
     """Return a ``tick.git`` side effect that materializes fixer worktrees.
+
+    The bare directory is all a fixer dispatch needs from the checkout. The
+    skill docs its prompt binds are resolved from the pipeline install, not
+    from the PR head this worktree stands in for — a tree in a repository the
+    pipeline does not own and that has no reason to carry them.
 
     Args:
         repo_root: The checkout root every other ``git`` read resolves to.
 
     Returns:
-        A side effect that creates the worktree directory, complete with the
-        skill docs the fixer dispatch resolves before launch.
+        A side effect that creates the worktree directory.
     """
-    import tick  # type: ignore[import-untyped]
-
     def side_effect(*args: str) -> str:
         if "worktree" in args and "add" in args:
-            materialize_engine_skill_docs(Path(args[-2]), tick.FIXER_SKILLS)
+            Path(args[-2]).mkdir(parents=True, exist_ok=True)
         return str(repo_root)
 
     return side_effect

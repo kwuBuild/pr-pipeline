@@ -166,6 +166,53 @@ LOOP_QUIESCENT_STOP_AFTER = 3
 # the operator under ``checklist_paths``; see :func:`resolve_config`.
 _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 
+# Where the install keeps the things a dispatched engine is told to read. Both
+# are resolved from this module's own location — `lib/` is `skills/tick/lib/`,
+# so its grandparent is the published skills root — because the install is a
+# plugin cache directory outside every repository and the engines run with their
+# cwd inside a checkout of somebody else's PR head. Nothing here counts
+# directories from a *repository* root; the depth measured is the one this file
+# ships at, which is fixed by the package layout.
+_LIB_DIR = Path(__file__).resolve().parent
+_INSTALL_ROOT = _LIB_DIR.parents[2]
+INSTALL_SKILLS_ROOT = _INSTALL_ROOT / "skills"
+PROMPTS_DIR = _LIB_DIR / "prompts"
+
+# Discipline skills a dispatched engine's prompt binds by doc path. Skills are
+# discretionary reading unless the executed prompt names when they must run, so
+# each binding is a named constant substituted into the template (never
+# hardcoded in the .txt) — a later change can move the binding into config
+# without rewriting prompts.
+REVISION_HYGIENE_SKILL = "review-response-hygiene"
+
+# Every skill doc bound into a prompt, from every stage. This is the set the
+# policy gate derives its entries from, so a skill bound by a future stage is
+# protected by adding it here rather than by remembering to restate its path.
+BOUND_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
+
+
+def skill_doc_path(name: str) -> str:
+    """Return the absolute path of one installed skill's ``SKILL.md``.
+
+    The same string is both what the prompt tells the engine to read and what
+    dispatch probes before launching, so a rename can never leave the two
+    disagreeing about where the doc lives.
+
+    It resolves inside the *install*, not inside the engine's worktree. The
+    guidance ships with the pipeline, so the operator's installed copy is the
+    correct one for every target repository by construction, and a target that
+    has never heard of this skill still gets a fixer that can open it.
+
+    Args:
+        name: The skill directory name (e.g. ``"review-response-hygiene"``).
+
+    Returns:
+        The absolute path, e.g.
+        ``/path/to/install/skills/review-response-hygiene/SKILL.md``.
+    """
+    return str(INSTALL_SKILLS_ROOT / name / "SKILL.md")
+
+
 # The pipeline's own files are review policy too, matched by path *suffix* rather
 # than exact path. The file that toggles the gate is policy: a PR flipping
 # allow_touching to true must be escalated to a human, not auto-reviewed —
@@ -180,6 +227,15 @@ _POLICY_BASENAMES = frozenset({"CLAUDE.md", "AGENTS.md"})
 # the identical edit in the pipeline's own repository, where they live at
 # `skills/`, and under any plugin layout. Matching is per path segment, so
 # `other-skills/tick/config.toml` is not a hit.
+#
+# The instructions the install *supplies* to a dispatched engine — every bound
+# skill doc, and every prompt template — are the same class of file. Sourcing
+# them from the install already stops a PR from governing its own fixer; what
+# the gate adds is that a PR rewriting them for every *future* run is not
+# auto-reviewed under the rules it is changing. Their entries are derived from
+# the constants the runtime actually reads, so a skill bound by a future stage
+# or a prompt added for one is covered by landing in the runtime rather than by
+# being restated here.
 _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(suffix.split("/"))
     for suffix in (
@@ -187,6 +243,17 @@ _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
         "skills/tick/lib/pipeline.py",
         "skills/tick/lib/tick.py",
     )
+) + tuple(
+    Path(skill_doc_path(name)).relative_to(_INSTALL_ROOT).parts
+    for name in BOUND_SKILLS
+)
+
+# Directories whose every file is policy, matched the same way but against the
+# path's parent segments. The prompt templates are enumerated by what the
+# directory holds at render time, not by a list, so naming the directory is the
+# only way to gate a template that does not exist yet.
+_POLICY_DIR_SUFFIXES: tuple[tuple[str, ...], ...] = (
+    PROMPTS_DIR.relative_to(_INSTALL_ROOT).parts,
 )
 
 # The shipped floor: layer 1 of the resolution order, and the only config the
@@ -2305,7 +2372,10 @@ def _resolve_login(
 
 
 def _ends_with_policy_suffix(path: str) -> bool:
-    """Return whether ``path`` ends in one of the pipeline's own gate files.
+    """Return whether ``path`` is one of the pipeline's own policy files.
+
+    Matches either the pipeline's own gate files by full path suffix, or any
+    file inside one of the directories the install reads wholesale.
 
     Compares whole path segments so the match cannot straddle a segment
     boundary: ``other-skills/tick/config.toml`` is not a hit, while
@@ -2316,10 +2386,14 @@ def _ends_with_policy_suffix(path: str) -> bool:
 
     Returns:
         ``True`` when the path's trailing segments match a suffix in
-        :data:`_POLICY_PATH_SUFFIXES`.
+        :data:`_POLICY_PATH_SUFFIXES`, or when its parent directory's trailing
+        segments match one in :data:`_POLICY_DIR_SUFFIXES`.
     """
     segments = tuple(path.split("/"))
-    return any(segments[-len(s):] == s for s in _POLICY_PATH_SUFFIXES)
+    if any(segments[-len(s):] == s for s in _POLICY_PATH_SUFFIXES):
+        return True
+    parent = segments[:-1]
+    return any(parent[-len(d):] == d for d in _POLICY_DIR_SUFFIXES)
 
 
 def touches_review_policy(changed_paths: list[str], repo: str = "") -> bool:

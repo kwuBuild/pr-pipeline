@@ -78,7 +78,9 @@ PLUGIN_NAME = "pr-pipeline"
 # *any* directory under `skills/` a namespaced, user-invocable command whose
 # description loads into every session's context. An unintended command is the
 # observable symptom of a misplaced file, and a containment check cannot see it.
-_PUBLISHED_SKILLS = frozenset({"tick", "status", "definition-of-done"})
+_PUBLISHED_SKILLS = frozenset({
+    "tick", "status", "definition-of-done", "review-response-hygiene",
+})
 
 # How a skill body names the install root. `${CLAUDE_PLUGIN_ROOT}` is
 # substituted into plugin skill *content* as Claude loads it, so a command
@@ -735,10 +737,16 @@ def test_the_fixer_binds_a_skill_that_exists_and_a_tool_the_engine_carries() -> 
     *invoke* a skill, the bounded allowlist would deny it: engines get ``Read``
     and no ``Skill`` tool, which is why the binding is a doc path rather than a
     tool call. Both ends are pinned here so neither can drift silently.
+
+    The doc is the install's, so this asserts it ships under the published
+    ``skills/`` root rather than anywhere a checkout happens to carry it.
     """
     import tick  # type: ignore[import-untyped]
 
-    doc = REPO_ROOT / tick.skill_doc_path(tick.REVISION_HYGIENE_SKILL)
+    doc = Path(tick.skill_doc_path(tick.REVISION_HYGIENE_SKILL))
+    assert doc.parent.parent == SKILLS_ROOT, (
+        f"the fixer binds {doc}, which is not under the install's skills root"
+    )
     assert doc.is_file(), (
         f"the fixer prompt binds {doc}, which does not exist — every fixer "
         f"dispatch escalates on the pre-launch skill probe until it does"
