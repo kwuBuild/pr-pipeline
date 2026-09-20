@@ -147,16 +147,6 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
 _CARVE_OUT_OPENER = "If you were dispatched by `pr-pipeline:tick`"
 _CARVE_OUT_CLOSER = "#pipeline-label-authority)"
 
-# Carve-out clauses that only one root agent doc owes. `CLAUDE.md` reaches the
-# dispatched implementer and separately instructs `gh pr create` (skill routing
-# and PR Workflow), which the implementer prompt now forbids — the harvest opens
-# the PR from the engine's pr-body file. `AGENTS.md` owes no equivalent: the
-# reviewer is the only AGENTS.md-native dispatched engine and it creates no PRs.
-_AGENT_DOC_EXTRA_CARVE_OUTS: dict[str, list[str]] = {
-    "CLAUDE.md": ["`gh pr create`"],
-    "AGENTS.md": [],
-}
-
 # The scope the publish-before-relabel gate actually holds on: a transition that
 # reports an engine outcome, or one that fires before any engine was launched.
 # What the two clauses leave out is the middle — an engine was launched and the
@@ -1080,27 +1070,13 @@ def test_every_needs_human_transition_is_a_recorded_decision() -> None:
 def test_repo_agent_docs_exempt_dispatched_engines_from_label_workflow(
     agent_doc: str,
 ) -> None:
-    """Both root agent docs must carve dispatched engines out of the label workflow.
+    """Both entrypoints must deliver the same unbounded engine restrictions.
 
-    ``CLAUDE.md`` is loaded into a dispatched implementer's or fixer's context
-    automatically, and its Task Coordination and force-push sections instruct the
-    reader to move ``ai:`` labels. Those instructions are what an engine follows
-    when it labels its own work item mid-run. ``AGENTS.md`` carries the same
-    instruction for AGENTS.md-native engines and declares itself *authoritative*
-    for workflow over ``CLAUDE.md``, so a carve-out in one file and not the other
-    leaves the higher-priority doc teaching the behaviour this contract forbids.
-    These are the surfaces that actually reach the engine, so both are pinned
-    here rather than left to review.
-
-    The carve-out must cover *every* label instruction in its file, not a counted
-    subset. ``AGENTS.md`` originally scoped itself to "the two label instructions
-    below" while carrying four: two workflow bullets, a blanket pre-authorization
-    for "updating workflow labels", and a review-posting flow that runs
-    ``gh pr edit``. An engine that counts to two applies the carve-out to the
-    first pair and reads the rest as a standing grant, so the count is asserted
-    against — an unbounded scope is the only version that closes the hole.
+    Claude imports the shared guide, including on provider routes without native
+    AGENTS.md discovery. Check the effective instructions, not just the adapter.
+    A counted label exemption could leave a later workflow grant in force.
     """
-    text = (REPO_ROOT / agent_doc).read_text()
+    text = root_agent_guidance(agent_doc)
     assert _CARVE_OUT_OPENER in text, (
         f"{agent_doc} has no dispatched-engine carve-out at all"
     )
@@ -1108,7 +1084,7 @@ def test_repo_agent_docs_exempt_dispatched_engines_from_label_workflow(
     for contract_text in [
         "every label instruction",
         "completion sentinel",
-        *_AGENT_DOC_EXTRA_CARVE_OUTS[agent_doc],
+        "`gh pr create`",
     ]:
         assert contract_text in block, (
             f"{agent_doc} is missing the dispatched-engine carve-out: "
@@ -1529,6 +1505,7 @@ _OPERATOR_SPECIFIC_TOKENS = ("/Users/", "/home/", "sworn")
 # A backticked repo path in a root agent doc: at least one `/`, so a backticked
 # bare term (`pr-pipeline`, `gh`) is not mistaken for a file that must exist.
 _BACKTICKED_PATH_RE = re.compile(r"`([A-Za-z][\w.-]*(?:/[\w.-]*)+)`")
+_MARKDOWN_PATH_RE = re.compile(r"\]\(([^)#]+)(?:#[^)]*)?\)")
 
 # Paths the docs name that are created at runtime and gitignored by design, so
 # their absence from a clean checkout is correct rather than a broken reference.
@@ -1688,20 +1665,15 @@ def test_loop_prompt_is_not_bound_to_one_operators_checkout() -> None:
 
 @pytest.mark.parametrize("agent_doc", ["CLAUDE.md", "AGENTS.md"])
 def test_root_agent_docs_route_only_to_documents_that_exist(agent_doc: str) -> None:
-    """The authoritative guides must not route an agent to a missing document.
-
-    ``CLAUDE.md`` and ``AGENTS.md`` are the first thing a dispatched engine and a
-    new maintainer read, and both declare themselves the routing map for
-    everything else. A doc map naming files that were never landed does not
-    degrade gracefully: the reader either stops, or reconstructs the
-    architecture from a description of a system that does not exist.
-    """
-    text = (REPO_ROOT / agent_doc).read_text()
+    """Direct and imported guidance must route to existing local documents."""
+    text = root_agent_guidance(agent_doc)
+    paths = _BACKTICKED_PATH_RE.findall(text) + _MARKDOWN_PATH_RE.findall(text)
 
     missing = sorted({
         named
-        for named in _BACKTICKED_PATH_RE.findall(text)
-        if named.rstrip("/") not in _RUNTIME_CREATED_PATHS
+        for named in paths
+        if "://" not in named
+        and named.rstrip("/") not in _RUNTIME_CREATED_PATHS
         and not (REPO_ROOT / named.rstrip("/")).exists()
     })
 
@@ -1725,7 +1697,11 @@ def test_workflow_docs_use_the_label_vocabulary_the_tick_implements(
     ``ai:recheck`` was exactly that — the shipped re-review label is
     ``ai:revised``.
     """
-    text = (REPO_ROOT / workflow_doc).read_text()
+    text = (
+        root_agent_guidance(workflow_doc)
+        if workflow_doc in {"AGENTS.md", "CLAUDE.md"}
+        else (REPO_ROOT / workflow_doc).read_text()
+    )
 
     unknown = sorted({
         label
@@ -2316,15 +2292,25 @@ def walk_calls_with_enclosing_function(
     return pairs
 
 
+def root_agent_guidance(agent_doc: str) -> str:
+    """Resolve this repository's single shared guide through either entrypoint.
+
+    This checks the committed import contract, not Claude's runtime loader.
+    Reject extra adapter prose so a second policy source cannot grow unnoticed.
+    """
+    if agent_doc == "CLAUDE.md":
+        assert (REPO_ROOT / agent_doc).read_text().strip() == "@AGENTS.md"
+    return (REPO_ROOT / "AGENTS.md").read_text()
+
+
 def carve_out_block(text: str) -> str:
     """Return just the dispatched-engine carve-out from a root agent doc.
 
-    Both ``CLAUDE.md`` and ``AGENTS.md`` open the carve-out with the same
-    sentence and close it with the same link to the label-authority section, so
-    the block is delimited without depending on either file's paragraph shape.
+    The shared guide opens the carve-out with a fixed sentence and closes it
+    with the label-authority link, independently of paragraph wrapping.
 
     Args:
-        text: Raw contents of ``CLAUDE.md`` or ``AGENTS.md``.
+        text: Effective shared instructions from either entrypoint.
 
     Returns:
         The carve-out text, or the remainder of the file if the closing link is

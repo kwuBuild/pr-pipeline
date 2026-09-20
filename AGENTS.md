@@ -1,86 +1,109 @@
 # pr-pipeline Agent Guide
 
-## Startup Convention
+This file owns shared repository instructions for all engines. `CLAUDE.md`
+imports it for Claude sessions that cannot discover `AGENTS.md` directly.
+Start with the task's files and callers; use the routes below as needed.
 
-Before doing substantive work in this repository:
-
-1. Read `AGENTS.md`
-2. Read `CLAUDE.md`
-3. Read the relevant section of the design and internals docs `CLAUDE.md` routes to, by section or line range rather than wholesale
-4. Follow repo-specific guidance from those files unless it conflicts with higher-priority system, developer, or user instructions
-
-If both files apply:
-
-- `AGENTS.md` is the short operational guide
-- `CLAUDE.md` is the deeper project and architecture guide
-- For Codex and other AGENTS.md-native agents, `AGENTS.md` is authoritative for workflow, tooling, and runtime behavior
-- `CLAUDE.md` may contain Claude Code-specific overrides; those overrides do not apply to Codex unless `AGENTS.md` says they do
-- If they conflict, prefer `AGENTS.md` for workflow/tooling/runtime behavior and `CLAUDE.md` for project context unless the user says otherwise
-
-## Working Rules
+## Authority and workflow
 
 **If you were dispatched by `pr-pipeline:tick`, every label instruction in this
-file and in `pr-guidelines.md` is not for you** — not the workflow bullets
-below, not the blanket pre-authorization for updating workflow labels, and not
-the review-posting flow that runs `gh pr edit`. The scope is unbounded on
-purpose: it covers every label instruction in this file, present and future, not
-a counted subset you can read past. The tick owns both ends of your stage's
-label transitions. Do not add, remove, or change any `ai:` label on any issue or
-PR; report your outcome through the completion sentinel named in your prompt and
-let the harvest do the relabel. A label you set mid-run cannot be retracted and
-will be read as a human hold that overrides the sentinel you finish with. See
+file and linked guidance is not for you.** Do not add, remove, or change any
+`ai:` label on any issue or PR, and do not run `gh pr create`. Report through the
+completion sentinel in your dispatch prompt; the harvest owns PR creation and
+label transitions. An engine-set label becomes a human hold that can override
+its final result. See
 [Pipeline label authority](docs/working/pr-guidelines.md#pipeline-label-authority).
 
-- Start with the smallest relevant context instead of loading large project documents wholesale
-- Use `CLAUDE.md` as the routing map for project architecture and planning documents
-- Prefer focused reads by section or line range when a referenced document is large
-- Before using project-status guidance, verify your local base branch is current with the remote
-- When creating GitHub issues, read `docs/working/pr-guidelines.md` and follow its issue body template; every issue should explain why the work matters and what fails if it is skipped
-- When raising a PR manually, read `docs/working/pr-guidelines.md` and follow its required PR body structure
-- When picking up an issue, reviewing a PR, or revising after review, follow the workflow-label and AI-review-posting rules in `docs/working/pr-guidelines.md`
-- When reviewing a PR, issue, implementation proposal, design proposal, or plan, review the full change scope against the current live repo and adjacent contracts. Do not limit the review to newly edited lines, previously requested fixes, or the author's stated intent.
-- Treat proposal and documentation reviews with the same completeness standard as code reviews: verify that the content is executable, ordered correctly, and consistent with current code, tests, runtime contracts, and workflow docs.
-- Report the complete set of blocker and major findings you can identify in the current pass. Do not hold back issues to keep the comment short, and do not stop after finding the first valid blocker. The goal is to avoid repeated cycles where one issue is fixed only for the reviewer to surface another issue that was already discoverable.
-- GitHub workflow operations requested by the user or required by repo workflow are pre-authorized when they are non-destructive: creating issues, creating PRs, posting issue/PR/review comments, and updating workflow labels. Do not ask for per-item confirmation before running the matching `gh` command. This does not authorize destructive remote actions such as closing issues/PRs, deleting branches, merging, or force-pushing someone else's branch.
-- When preparing GitHub body text (issue bodies, PR bodies, review bodies, comments, or review replies), write body files to `tmp/` at the project root (gitignored, inside the sandbox write allowlist). Run `mkdir -p tmp` first.
+For interactive work:
+- Preserve existing user changes; use an isolated worktree when needed. Fetch
+  the remote base before branching or relying on project status/base comparisons.
+- Follow the issue/PR workflow in [PR guidelines](docs/working/pr-guidelines.md)
+  when picking up, publishing, reviewing, or revising work. Check pipeline custody
+  before changing labels. Keep author-led self-review, including subagent checks,
+  separate from independent PR approval: retain `ai:implemented` or `ai:revised`
+  until separate review or explicit owner direction advances it.
+- Non-destructive GitHub workflow operations within the requested task are
+  pre-authorized: issues, PRs, comments, and workflow labels. Do not ask for
+  per-item confirmation. Merges, closes, remote branch deletion, and force-pushing
+  someone else's branch remain owner-only.
+- Write GitHub bodies and commit messages under gitignored `tmp/`; run
+  `mkdir -p tmp` first. Follow the linked templates and commit rules at publication.
+  Keep internal task codes out of branch names, commits, and PRs.
 
-## Delivery Expectations
+## Read for the task
 
-- Use test-first development for implementation work
-- Do not write implementation code before a failing test exists
-- Keep changes minimal, verify locally, and review the diff thoroughly before presenting work — apply principal-engineer standards whether the change is code or documentation
-- Preserve existing user changes and do not revert unrelated modifications
+Read relevant sections, not whole reference documents. Follow a named symbol or
+contract into adjacent owners when needed; a wording fix needs no runtime tour.
 
-## Commit Rules
+| Task | Reference |
+|---|---|
+| Run the pipeline | [Tick operator SOP](skills/tick/SKILL.md) |
+| Operator commands, configuration, observability | [Tick README](skills/tick/README.md) |
+| Diagnose a failed run or recovery | [Tick diagnostics](skills/tick/DEBUG.md) |
+| Change dispatch, harvest, custody, or cadence | Relevant sections of [internals](docs/working/pr-pipeline-internals.md) and [architecture rationale](docs/architecture.md) |
+| Plugin distribution or migration work | Matching section of [distribution design](docs/working/plugin-distribution-design.md); verify status against live code/issues |
+| Runtime or workflow proof | [Definition of done](skills/definition-of-done/SKILL.md) |
+| Respond to review findings | [Review response hygiene](skills/review-response-hygiene/SKILL.md) |
+| Issues, PRs, review publication, labels | Relevant section of [PR guidelines](docs/working/pr-guidelines.md) |
+| Create a commit | [Commit guidelines](docs/working/commit-guidelines.md) |
 
-- Treat commit formatting as a hard requirement, not a preference
-- Before creating a commit, read `docs/working/commit-guidelines.md` and follow it exactly
-- Before opening a PR, read `docs/working/pr-guidelines.md` for branch surgery (squash, rebase, force-push)
-- One commit per task by default; squash before pushing a PR
-- Every task commit needs a body with `What:` and `Why:` sections — no subject-only commits
-- No internal task codes or AI tooling names in commit messages
+## Skills and context
 
-## Running Tests
+Use a skill when its specific workflow is needed or the user requests it.
+Generic process bundles, including Superpowers, are optional; do not automatically
+chain brainstorming, planning, execution, TDD, and review skills when these repo
+rules already cover the task. Repository routing takes precedence over generic
+plugin instructions to load every potentially relevant skill, subject to the
+host's instruction hierarchy. Dispatched engines follow their prompt-bound
+skills and authority rather than broadening them through discovery.
 
-- Stdlib + pytest only; there is no packaging manifest and nothing to install
-- Run against an interpreter that is actually >= 3.11: `python3.13 -m pytest skills/ -q`. If pytest is not installed for it, `python3.13 -m venv .venv && .venv/bin/pip install pytest`, then `.venv/bin/python -m pytest skills/ -q`
-- Never use bare `python3` — it resolves to 3.9 on stock macOS and under Anaconda, and collection fails on `tomllib`
-- Not `uv run --python 3.13 --with pytest pytest`: `--python` picks the interpreter but the bare `pytest` console script still resolves from `PATH`, so an Anaconda 3.9 runs the suite and collection dies in `pipeline.py`'s floor guard
-- `gh`, `git`, and `codex` must resolve on PATH or the tick's startup probe exits 3
+Do not reread unchanged guidance already in context. Search paths and symbols
+first, then read bounded relevant sections. Keep successful command output brief;
+retain long logs locally and inspect relevant failures. Create a separate design
+or implementation-plan document only when scope or sequencing needs one.
 
-## Project Overview
+## Implementation and verification
 
-This repository *is* the pipeline. Everything shipped lives under `skills/`:
+- For code behavior changes, write and run a failing test before implementation,
+  make it pass, then refactor. Add coverage for affected subprocess, GitHub, and
+  filesystem boundaries; green helper tests alone do not prove runtime behavior.
+  Doc/spec-only edits do not need an invented failing behavior test.
+- Run affected checks during iteration and required final verification before
+  handoff. After checks pass, rerun for relevant edits, failures, or unresolved
+  concerns; do not broaden testing without a concrete reason.
+- Review the full task diff and adjacent contracts against the current code,
+  issue requirements, and PR body. Apply the same standard to proposals/docs:
+  verify claims, ordering, executability, and current owners. Report all
+  discoverable blocker/major findings together. Verify review feedback before
+  applying it; disagreements need evidence.
+- Continue through the requested work, verification, correction of findings,
+  and authorized publication. Report actual blockers and distinguish local
+  changes, pushed commits, and PR state. Do not claim completion from CI alone.
 
-- **`skills/tick/`** — the control plane. `skills/tick/lib/tick.py` is one deterministic Python process that runs HARVEST then DISPATCH per invocation, `skills/tick/lib/pipeline.py` holds the primitives it composes (label vocabulary, marker validation, verdict parsing, policy gates), and `skills/tick/lib/prompts/` holds the engine prompts. `SKILL.md` is a lean operator SOP, not the orchestrator.
-- **`skills/status/`** — a read-only dashboard over the same state. It never writes.
+The runtime is Python 3.11+ and standard-library only. Tests need pytest; there
+is no packaging manifest or application dependency installation. Run from the
+repo root with an explicit supported interpreter:
 
-Dispatched engines (`claude --print` / `codex exec`) run in per-task `git worktree` checkouts with fresh context and report through a completion sentinel; the harvest owns every label transition.
+```bash
+python3.13 -m pytest skills/ -q
+# If that interpreter has no pytest:
+python3.13 -m venv .venv && .venv/bin/pip install pytest
+.venv/bin/python -m pytest skills/ -q
+```
 
-Read `skills/tick/SKILL.md` to run it, `docs/working/pr-pipeline-internals.md` for runtime behaviour, and `docs/architecture.md` for the design rationale.
+Never use bare `python3` or a bare `pytest` selected through `uv run --python`:
+PATH can resolve them to Python 3.9. `gh`, `git`, and `codex` must resolve on PATH
+for the startup probe; their real invocations are mocked in tests.
 
-## User Prompt Convention
+Keep fixtures first, tests next, and module-level helpers last under
+`# --- Helpers ---`; helper names have neither `_` nor `test_` prefixes.
 
-To activate this startup flow in a new session, the user should begin with:
+## Runtime orientation
 
-`Read AGENTS.md and CLAUDE.md first, then proceed.`
+Everything shipped lives under `skills/`. `skills/tick/lib/tick.py` runs HARVEST
+then DISPATCH; `skills/tick/lib/pipeline.py` owns the deterministic primitives.
+Engine prompts live under `skills/tick/lib/prompts/`. Engines run with fresh
+context in per-task worktrees and report via completion artifacts. The tick owns
+label transitions; `skills/status/` is read-only. Pipeline code comes from the
+install, while state lives in the target repository's worktrees. GitHub labels
+are the workflow source of truth.

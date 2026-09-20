@@ -150,9 +150,19 @@ Each engine runs with `cwd` set to an isolated git worktree:
 - Reviewer: worktree at the PR's head SHA (detached)
   ([tick.py:9139–9140][rev-wt])
 
-**Implementer and fixer** (Claude Code, `claude -p`): Claude Code auto-loads the
-nearest `CLAUDE.md` up the directory tree from `cwd`. This is guaranteed context.
-`AGENTS.md` is not auto-loaded by Claude Code.
+**Implementer and fixer** (Claude Code, `claude -p`): Claude Code loads
+`CLAUDE.md` files in the directory hierarchy above `cwd`. This repository's
+`CLAUDE.md` contains only `@AGENTS.md`, so its shared rules are included through
+the import rather than maintained twice.
+
+Claude Code 2.1.277+ also supports native `AGENTS.md` discovery by default when
+no project/local `CLAUDE.md` exists in `cwd` or its ancestors. That fallback is
+unavailable on third-party provider routes such as `claude-ds`, with telemetry
+disabled, and in some hook/configuration modes. The one-line import preserves
+compatibility with those routes and older clients; a qualifying ancestor
+`CLAUDE.md` can otherwise suppress the fallback in nested worktrees. See
+[Claude's instruction-loading documentation](https://code.claude.com/docs/en/memory#agentsmd).
+These are host discovery rules, not extra reads performed by the pipeline.
 
 The fixer additionally gets a **prompt-bound skill doc**: its prompt names the
 install's `skills/review-response-hygiene/SKILL.md` as an absolute path (from
@@ -194,12 +204,13 @@ the live body untouched and names its own reason in the fix comment. A hold or d
 final read defers the entire harvest instead. See the README's "The PR body the
 fixer hands back".
 
-**Reviewer** (Codex CLI, `codex exec`): Codex auto-loads the nearest `AGENTS.md`
-up the directory tree as its project doc. `AGENTS.md` routes to `CLAUDE.md`
-(line 8: "Read `CLAUDE.md`"), but `CLAUDE.md` is not auto-loaded — it is
-consulted at the reviewer's discretion, along with other standards docs
-(the target repo's review checklists, its architecture docs). Guaranteed context
-is `AGENTS.md` only ([design:388–399][design-reviewer-ctx]). The reviewer
+**Reviewer** (Codex CLI, `codex exec`): Codex loads applicable `AGENTS.md`
+instructions from the directory hierarchy as project guidance. This repository's
+shared guide routes directly to task-specific references; Codex does not need to
+read the Claude import adapter. Other target repositories can route differently.
+Further review checklists and architecture sections are consulted for the task,
+not injected as a mandatory reading stack. Guaranteed repository guidance is
+`AGENTS.md` ([design:388–399][design-reviewer-ctx]). The reviewer
 prompt itself is minimal (`Review PR #...`); it does not pin a reading list
 or explicitly apply any checklist ([reviewer.txt:1][reviewer-prompt]).
 
