@@ -217,7 +217,9 @@ DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 60 * 60
 TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
 MIN_CODEX_VERSION = "codex-cli 0.142.5"
 
-# Target identity is bound together at startup, before any GitHub access.
+# Target and operator identity are bound at startup, before any GitHub access.
+# The login remains fixed through the tick and its following loop observation;
+# a config edit is adopted at the next successful startup, never mid-tick.
 # Imports and read-only CLI helpers do not require a configured Git remote.
 _IMPORT_CONFIG = pipeline.resolve_config()
 TRUSTED_HEAD_REPO = ""
@@ -8805,11 +8807,9 @@ def dispatch_reviewers(
         review_effort: Reasoning-effort override for the reviewer engine.
             Empty means "resolve from the operator's codex config".
         trusted_author: The operator login this tick resolved and validated.
-            The tick always passes it, so the identity a tick *authorizes*
-            under is the identity its own startup gate checked — reading the
-            import-time constant here instead would validate one login and
-            admit under another for the lifetime of a ``--loop`` process.
-            Empty falls back to that constant, for direct callers.
+            The tick always passes it, so admission uses the identity startup
+            checked. Empty falls back to :data:`TRUSTED_REVIEW_AUTHOR`, bound
+            at successful startup, for direct callers.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     # Target type gate: only dispatch for pr targets.
@@ -8988,7 +8988,7 @@ def _dispatch_one_reviewer(
         review_effort: Resolved reviewer reasoning effort. Empty means
             "resolve from the operator config".
         trusted_author: The operator login this tick resolved. Empty falls
-            back to the import-time :data:`TRUSTED_REVIEW_AUTHOR`, for the
+            back to the active tick's :data:`TRUSTED_REVIEW_AUTHOR`, for the
             direct callers that are not running a tick.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
@@ -9442,6 +9442,60 @@ def _dispatch_one_reviewer(
         )
 
 
+def _log_filtered_issue_count(available: list[object], tick_log: TickLog) -> None:
+    """Surface excluded issues using one bounded number-only read.
+
+    A complete operator page lets us subtract identities even when the total
+    page truncates. If both pages truncate, zero is the only provable lower
+    bound: unseen operator issues must not be counted as other authors.
+    Failed, malformed, or detectably inconsistent reads produce no count.
+    """
+    try:
+        total = gh_json(
+            "issue", "list", "--label", pipeline.LABEL_AVAILABLE,
+            "--state", "open", "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
+            "--json", "number",
+        )
+    except (subprocess.CalledProcessError, ValueError):
+        return
+
+    def numbers(items: object) -> set[int] | None:
+        if not isinstance(items, list):
+            return None
+        result: set[int] = set()
+        for item in items:
+            n = item.get("number") if isinstance(item, dict) else None
+            if not isinstance(n, int) or isinstance(n, bool) or n <= 0 or n in result:
+                return None
+            result.add(n)
+        return result
+
+    owned_numbers = numbers(available)
+    total_numbers = numbers(total)
+    if owned_numbers is None or total_numbers is None:
+        return
+    if any(not pipeline.trusted_issue_candidate(
+        item, trusted_author=TRUSTED_REVIEW_AUTHOR,
+    ) for item in available):
+        return
+    capped = len(total_numbers) >= _ACTIONABLE_QUEUE_SCAN_LIMIT
+    if not capped and not owned_numbers <= total_numbers:
+        return
+    if len(owned_numbers) >= _ACTIONABLE_QUEUE_SCAN_LIMIT:
+        if not capped:
+            return
+        count = 0
+    else:
+        count = len(total_numbers - owned_numbers)
+    if count or capped:
+        qualifier = " or more" if capped else ""
+        tick_log.log(
+            pr=None, phase="dispatch", stage="implement",
+            action="issue_authors_filtered",
+            reason=f"{count}{qualifier} available issues not authored by the operator.",
+        )
+
+
 def dispatch_implementers(
     tick_log: TickLog | None = None,
     target: tuple[str, int] | None = None,
@@ -9453,7 +9507,7 @@ def dispatch_implementers(
 ) -> None:
     """Dispatch implementer engines for issues at ai:available.
 
-    Queries open issues with the ``ai:available`` label, checks the
+    Queries operator-authored open issues with the ``ai:available`` label, checks the
     admission cap, and launches an implementer engine for each eligible
     issue (respecting the optional target filter). Each engine runs
     ``claude -p`` inside a dedicated worktree. The issue is relabeled to
@@ -9493,27 +9547,43 @@ def dispatch_implementers(
         except (subprocess.CalledProcessError, ValueError):
             return
 
-    # Query available issues.
+    # Filter on the server so other authors cannot consume the scan budget.
+    # A targeted run reads its issue directly, including its author: the target
+    # may be older than the bounded queue page, but never bypasses trust.
     try:
-        available = gh_json(
-            "issue", "list",
-            "--label", pipeline.LABEL_AVAILABLE,
-            "--state", "open",
-            # Match the actionable-queue scan limit: held candidates now
-            # stay on their pre-dispatch label, so a default-size page
-            # they fill would starve eligible work beyond it.
-            "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
-            "--json", "number,title",
-        )
+        if target is not None:
+            candidate = gh_json(
+                "issue", "view", str(target[1]),
+                "--json", "number,title,author,state",
+            )
+            if not isinstance(candidate, dict) or candidate.get("state") != "OPEN":
+                return
+            available = [candidate]
+        else:
+            available = gh_json(
+                "issue", "list",
+                "--label", pipeline.LABEL_AVAILABLE,
+                "--state", "open",
+                "--author", TRUSTED_REVIEW_AUTHOR,
+                "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
+                "--json", "number,title,author",
+            )
     except (subprocess.CalledProcessError, ValueError):
         return
 
     if not isinstance(available, list):
         return
 
+    if target is None and tick_log is not None:
+        _log_filtered_issue_count(available, tick_log)
+
     dispatched = 0
     for item in available:
-        if not isinstance(item, dict):
+        if not pipeline.trusted_issue_candidate(
+            item, trusted_author=TRUSTED_REVIEW_AUTHOR,
+        ):
+            # No custody, body read, relabel, or escalation for other authors
+            # (or metadata that cannot prove authorship).
             continue
         n = item.get("number")
         title = item.get("title")
@@ -10964,7 +11034,7 @@ def _run_single_tick_locked(
     Returns:
         Process exit code (0, 1, 2, 3, or 4 — same semantics as ``main()``).
     """
-    global TRUSTED_HEAD_REPO, TARGET_REMOTE
+    global TRUSTED_HEAD_REPO, TARGET_REMOTE, TRUSTED_REVIEW_AUTHOR
 
     # Open tick log early (non-fatal) so startup diagnostics are captured.
     tick_log = None
@@ -11110,6 +11180,7 @@ def _run_single_tick_locked(
         sys.stderr.flush()
         return 3
 
+    TRUSTED_REVIEW_AUTHOR = trusted_author
     try:
         return _run_tick_body(
             tick_log, parsed_target, impl_engine, model,
@@ -12180,7 +12251,9 @@ def _queue_page_has_dispatchable(entity: str, label: str) -> bool:
     """Read one labeled queue page and report whether it has dispatchable work.
 
     Applies the same eligibility rule as dispatch pickup: items carrying a
-    human hold or an in-flight label do not count.
+    human hold or an in-flight label do not count. Issue queues are narrowed
+    to the operator on the server, so other authors cannot fill the page and
+    make a permanently undispatchable queue look truncated.
 
     Args:
         entity: ``"issue"`` or ``"pr"``.
@@ -12199,7 +12272,8 @@ def _queue_page_has_dispatchable(entity: str, label: str) -> bool:
         entity, "list", "--state", "open",
         "--label", label,
         "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
-        "--json", "labels",
+        *(("--author", TRUSTED_REVIEW_AUTHOR) if entity == "issue" else ()),
+        "--json", "labels,author" if entity == "issue" else "labels",
     )
     return _any_dispatchable_item(items, entity)
 
@@ -12299,7 +12373,7 @@ def _target_item_is_dispatchable(entity: str, number: int) -> bool:
     """
     payload = gh_json(
         entity, "view", str(number),
-        "--json", "labels,state",
+        "--json", "labels,state,author" if entity == "issue" else "labels,state",
     )
     if not isinstance(payload, dict):
         return True
@@ -12310,10 +12384,33 @@ def _target_item_is_dispatchable(entity: str, number: int) -> bool:
         # A merged or closed item is invisible to dispatch's open-state scans,
         # so a stale pre-label on it can never become work.
         return False
+    if entity == "issue":
+        trusted = _issue_author_trust(payload)
+        if trusted is not True:
+            return trusted is None
     labels = _pipeline_labels(payload)
     if labels is None:
         return True
     return bool(pipeline.resolve_pickup_eligibility(labels, entity=entity).label)
+
+
+def _issue_author_trust(metadata: object) -> bool | None:
+    """Adapt the issue trust predicate for cadence's unknown-stays-warm rule.
+
+    ``False`` means a known different author. ``None`` means unreadable author
+    metadata; dispatch refuses it but cadence must not claim quiescence.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    author = metadata.get("author")
+    if not isinstance(author, dict):
+        return None
+    login = author.get("login")
+    if not isinstance(login, str) or not login:
+        return None
+    return pipeline.trusted_issue_candidate(
+        metadata, trusted_author=TRUSTED_REVIEW_AUTHOR,
+    )
 
 
 def _any_dispatchable_item(items: object, entity: str) -> bool:
@@ -12326,7 +12423,8 @@ def _any_dispatchable_item(items: object, entity: str) -> bool:
     holds the loop short of its quiescent stop forever.
 
     Args:
-        items: Parsed JSON from ``gh ... list --json labels``.
+        items: Parsed JSON from ``gh ... list`` containing ``labels`` and,
+            for issues, ``author``.
         entity: ``"issue"`` or ``"pr"`` — which stage vocabulary applies.
 
     Returns:
@@ -12340,6 +12438,12 @@ def _any_dispatchable_item(items: object, entity: str) -> bool:
     if len(items) >= _ACTIONABLE_QUEUE_SCAN_LIMIT:
         return True
     for item in items:
+        if entity == "issue":
+            trusted = _issue_author_trust(item)
+            if trusted is None:
+                return True
+            if not trusted:
+                continue
         labels = _pipeline_labels(item)
         if labels is None:
             return True

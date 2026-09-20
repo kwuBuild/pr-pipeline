@@ -167,10 +167,10 @@ for the upgrade and trust rationale.
 
 ```toml
 [operator]
-login = "your-github-login"   # whose PRs the AI reviewer will review
+login = "your-github-login"   # whose issues are picked up and PRs reviewed
 
 [defaults]                    # operator-wide; every key is overridable per repo
-allow_touching  = false       # auto-review PRs that edit reviewer-governing files
+allow_touching  = true        # auto-review PRs that edit reviewer-governing files
 checklist_paths = []          # the target's own review checklists, repo-relative
 verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
 base_ref        = ""          # "" = the interim default, main
@@ -204,9 +204,10 @@ A blank `base_ref` currently uses `main`; automatic default-branch discovery is
 `permission_mode` is invalid. `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
 name absolute locations.
 
-The operator login is reloaded for each tick; a blank login stops the loop. It
-controls reviewer admission. Operator-only issue pickup remains
-[issue #14](https://github.com/kwuBuild/pr-pipeline/issues/14).
+The operator login is reloaded for each tick; a blank login stops the loop.
+Issue pickup and reviewer admission both compare against this identity. It
+stays fixed through dispatch and the following cadence observation, even if
+the config changes during a tick.
 
 The target repository and remote come from the main checkout's Git configuration,
 anchored by the common Git directory even when invoked from a linked worktree.
@@ -711,32 +712,49 @@ codex's own built-in defaults.
 Each dispatch logs the values it resolved (`action=model_resolved`) so a
 review's provenance survives a later config edit.
 
+### Admission gate: issue authors
+
+Only issues authored by the configured operator can enter implementation.
+Both dispatch and cadence filter issue queues server-side with
+`gh issue list --author <login> --limit 200`, then check returned author
+metadata. Other authors cannot consume the scan budget or keep an otherwise
+empty loop awake. A targeted run reads its issue directly and applies the same
+predicate; targeting does not grant trust. Unreadable authors are refused at
+dispatch but keep cadence warm because the queue state is unknown.
+
+Other authors' issues are skipped without relabeling or escalation. After an
+untargeted dispatch query, one additional number-only query (also capped at
+200) reports `N available issues not authored by the operator.` in the tick
+log under `issue_authors_filtered`. A saturated count read reports `N or more`.
+If the operator page also saturates, only `0 or more` is provable without more
+reads. Failed, malformed, or detectably inconsistent reads produce no count.
+There is no author-widening setting in this release.
+
 ### Admission gate: reviewer policy files (`allow_touching`)
 
 A PR whose diff edits files that govern the reviewer itself — `CLAUDE.md`,
-`AGENTS.md` (at any directory depth), or the review checklists under
-`.claude/hooks/` — is normally escalated to `ai:needs-human-decision` instead
-of auto-reviewed: the reviewer runs inside the PR's own worktree, so it would
-review under instructions the PR itself supplied. The operator can accept that
-trust boundary for the whole gate in their own config
+`AGENTS.md` (at any directory depth), or operator-declared `checklist_paths` —
+can steer the reviewer because it runs inside the PR's own worktree.
+With operator-only issue pickup and reviewer admission, the packaged default
+is `allow_touching = true`. To require human review for these edits, enable
+the policy gate in the operator's own config
 (`~/.claude/pr-pipeline/config.toml`, see [Configuration](#configuration)):
 
 ```toml
 [defaults]
-allow_touching = true
+allow_touching = false
 
 # or for one target only
 [repos."owner/name"]
-allow_touching = true
+allow_touching = false
 ```
 
-`true` lets policy-editing PRs flow to auto-review anyway. Missing config,
-malformed TOML, or `false` (or an absent key) all keep the conservative
-escalation — the gate fails closed. **The packaged floor sets `false`.**
-That is deliberate: an install inherits whatever the floor declares, so shipping
-the opt-out would make a trust decision on the adopter's behalf. Setting `true`
-is an act the operator performs in their own config. The human merge gate after
-`ai:ready-for-human` is unaffected either way.
+`false` escalates policy-editing PRs to `ai:needs-human-decision`. An absent
+operator setting inherits the packaged `true`; a missing packaged floor or
+mistyped `allow_touching` value falls back to `false`. Malformed operator TOML
+refuses startup. Widening issue authors must restore the packaged default to
+`false` in the same change. The human merge gate after `ai:ready-for-human`
+is unaffected either way.
 
 The packaged `config.toml` itself is part of the policy path set, as are the
 gate's own implementation files (`lib/pipeline.py`, `lib/tick.py`) and

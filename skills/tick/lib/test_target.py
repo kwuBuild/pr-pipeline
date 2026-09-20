@@ -374,7 +374,7 @@ with (Path(os.environ["TARGET_PROBE_ROOT"]) / "gh-calls.jsonl").open("a") as str
 if args[:2] == ["api", "repos/selected/project/labels?per_page=100"]:
     print(os.environ["TARGET_LABEL_VOCABULARY"])
 elif args[:2] == ["issue", "list"] and "ai:available" in args:
-    print(json.dumps([{"number": 11, "title": "Target", "labels": [{"name": "ai:available"}]}]))
+    print(json.dumps([{"number": 11, "title": "Target", "author": {"login": "test-owner"}, "labels": [{"name": "ai:available"}]}]))
 elif args[:2] == ["issue", "view"] and "labels" in args:
     print("ai:available" if "-q" in args else json.dumps({"labels": [{"name": "ai:available"}]}))
 elif args[:2] == ["issue", "view"] and "body" in args:

@@ -18,6 +18,7 @@ from unittest import mock
 import pytest
 
 from conftest import (  # type: ignore[import-untyped]
+    TRUSTED_AUTHOR,
     allow_escalation_comment,
     fixer_gh_json,
     fixer_git,
@@ -123,8 +124,8 @@ def test_dispatch_implementers_noop_when_no_available_issues() -> None:
     # Must have queried for available issues (comma-separated --json fields)
     gh_json_mock.assert_called_once_with(
         "issue", "list", "--label", "ai:available", "--state", "open",
-        "--limit", "200",
-        "--json", "number,title",
+        "--author", TRUSTED_AUTHOR, "--limit", "200",
+        "--json", "number,title,author",
     )
     # Must NOT have checked admission or dispatched — nothing to dispatch
     cdn_mock.assert_not_called()
@@ -137,7 +138,7 @@ def test_dispatch_implementers_skips_when_at_capacity() -> None:
     from tick import dispatch_implementers  # type: ignore[import-untyped]
 
     with mock.patch("tick.gh_json") as gh_json_mock:
-        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons"}]
+        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons", "author": {"login": TRUSTED_AUTHOR}}]
         with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
             queue="461", labels="ai:available", body="Issue body text",
         )):
@@ -179,7 +180,7 @@ def test_dispatch_implementers_skips_active_provider_cooldown(tmp_path: Path) ->
         with mock.patch("tick.time.time", return_value=1_000.0):
             with mock.patch(
                 "tick.gh_json",
-                return_value=[{"number": 461, "title": "PWA icons"}],
+                return_value=[{"number": 461, "title": "PWA icons", "author": {"login": TRUSTED_AUTHOR}}],
             ):
                 with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
                     queue="461", labels="ai:available", body="Issue body text",
@@ -214,7 +215,7 @@ def test_dispatch_implementers_launches_engine_for_available_issue() -> None:
     from tick import dispatch_implementers  # type: ignore[import-untyped]
 
     with mock.patch("tick.gh_json") as gh_json_mock:
-        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons"}]
+        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons", "author": {"login": TRUSTED_AUTHOR}}]
         with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
             queue="461", labels="ai:available", body="Issue body text",
         )):
@@ -248,7 +249,7 @@ def test_dispatch_implementers_skips_human_hold_candidate() -> None:
         return "Issue body text"
 
     with mock.patch("tick.gh_json") as gh_json_mock:
-        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons"}]
+        gh_json_mock.return_value = [{"number": 461, "title": "PWA icons", "author": {"login": TRUSTED_AUTHOR}}]
         with mock.patch("tick.gh_text", side_effect=gh_text_side_effect):
             with mock.patch("tick.can_dispatch_now") as cdn_mock:
                 cdn_mock.return_value = _pipeline.AdmissionResult(
@@ -293,10 +294,10 @@ def test_dispatch_implementers_respects_target_filter() -> None:
     from tick import dispatch_implementers  # type: ignore[import-untyped]
 
     with mock.patch("tick.gh_json") as gh_json_mock:
-        gh_json_mock.return_value = [
-            {"number": 461, "title": "PWA icons"},
-            {"number": 462, "title": "Other issue"},
-        ]
+        gh_json_mock.return_value = {
+            "number": 462, "title": "Other issue", "state": "OPEN",
+            "author": {"login": TRUSTED_AUTHOR},
+        }
         with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
             queue="461\n462", labels="ai:available", body="Body",
         )):
@@ -342,7 +343,7 @@ def test_dispatch_implementers_logs_skip_when_at_capacity() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         tick_log = TickLog.open(tmpdir)
         with mock.patch("tick.gh_json") as gh_json_mock:
-            gh_json_mock.return_value = [{"number": 461, "title": "PWA icons"}]
+            gh_json_mock.return_value = [{"number": 461, "title": "PWA icons", "author": {"login": TRUSTED_AUTHOR}}]
             with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
                 queue="461", labels="ai:available", body="Issue body text",
             )):
@@ -4592,7 +4593,10 @@ def test_dispatch_implementers_passes_permission_mode_through(
     from tick import dispatch_implementers  # type: ignore[import-untyped]
 
     with mock.patch("tick.gh_json") as gh_json_mock:
-        gh_json_mock.return_value = [{"number": 463, "title": "Auto opt-in"}]
+        gh_json_mock.return_value = {
+            "number": 463, "title": "Auto opt-in", "state": "OPEN",
+            "author": {"login": TRUSTED_AUTHOR},
+        }
         with mock.patch("tick.gh_text", side_effect=gh_text_for_queue(
             queue="463", labels="ai:available", body="Body",
         )):
@@ -5553,7 +5557,7 @@ def test_dispatch_candidates_escalate_ambiguous_marker_before_admission(
                     elif stage == "implement":
                         with mock.patch(
                             "tick.gh_json",
-                            return_value=[{"number": 42, "title": "Issue"}],
+                            return_value=[{"number": 42, "title": "Issue", "author": {"login": TRUSTED_AUTHOR}}],
                         ):
                             dispatch_implementers(authoritative_in_flight=[])
                     else:

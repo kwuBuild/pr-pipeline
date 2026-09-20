@@ -1401,10 +1401,10 @@ def test_main_honors_harvest_ordering() -> None:
 
 
 def test_dispatch_implementers_uses_comma_separated_json_fields() -> None:
-    """dispatch_implementers must query gh issue list --json number,title (comma-separated).
+    """dispatch_implementers must query gh issue list --json number,title,author (comma-separated).
 
     The gh CLI treats ``--json number title`` as two separate positional arguments
-    and rejects the call.  The correct form is ``--json number,title``.
+    and rejects the call.  The correct form is ``--json number,title,author``.
     """
     from tick import dispatch_implementers  # type: ignore[import-untyped]
 
@@ -1420,8 +1420,8 @@ def test_dispatch_implementers_uses_comma_separated_json_fields() -> None:
             found_call = True
             for i, a in enumerate(args):
                 if a == "--json" and i + 1 < len(args):
-                    assert args[i + 1] == "number,title", (
-                        f"Expected '--json number,title' (single comma-separated string), "
+                    assert args[i + 1] == "number,title,author", (
+                        f"Expected '--json number,title,author' (single comma-separated string), "
                         f"got '--json {args[i + 1]}'"
                     )
     assert found_call, "dispatch_implementers did not call gh_json for issue list"
@@ -1547,50 +1547,17 @@ _RUNTIME_CREATED_PATHS = frozenset({"tmp"})
 _AI_LABEL_RE = re.compile(r"ai:[a-z][a-z-]*")
 
 
-def test_shipped_config_ships_the_conservative_reviewer_policy_gate() -> None:
-    """The committed ``config.toml`` must not opt out of the policy gate.
+def test_shipped_floor_allows_policy_edits_with_operator_only_pickup() -> None:
+    """The policy default changes atomically with operator-only issue admission.
 
-    A candidate branch that edits ``CLAUDE.md``/``AGENTS.md`` supplies the very
-    instructions the reviewer deciding its promotion runs under. The gate that
-    escalates such a PR to a human is the only thing standing between an adopter
-    and that inversion, and ``config.toml`` is *copied into every install* — so
-    a shipped ``allow_touching = true`` silently opts every adopter out of it on
-    day one. An operator who accepts that trust boundary edits their own copy;
-    the default that ships cannot make the choice for them.
+    Runtime trust and cadence tests cover that boundary; broader issue authors
+    must restore the conservative default when they are introduced.
     """
     with open(POLICY_CONFIG, "rb") as fh:
         config = tomllib.load(fh)
 
-    allow_touching = config.get("policy", {}).get("allow_touching")
-
-    assert allow_touching is not True, (
-        "config.toml ships with the reviewer-policy admission gate disabled; "
-        "every adopter inherits the opt-out without choosing it"
-    )
-
-
-def test_shipped_floor_ships_the_conservative_reviewer_policy_gate() -> None:
-    """The same guard, on the table the resolver actually reads.
-
-    ``allow_touching`` moved from ``[policy]`` to ``[defaults]`` when
-    configuration became layered, and the guard above still watches the old
-    table — deliberately, because a later change reintroducing a ``[policy]``
-    remnant must not be able to smuggle an opt-out through it. This one watches
-    the live key, so the invariant survives the move rather than passing
-    vacuously after it.
-
-    The design argues for ``true``, and that argument holds — but only once
-    pickup is operator-only. Until then any author's ``ai:available`` issue is
-    still dispatchable, so a PR produced from an outsider's issue could edit the
-    instructions its own reviewer runs under and be auto-promoted.
-    """
-    with open(POLICY_CONFIG, "rb") as fh:
-        config = tomllib.load(fh)
-
-    assert config.get("defaults", {}).get("allow_touching") is False, (
-        "the packaged floor does not ship allow_touching = false; every "
-        "adopter inherits the reviewer-policy opt-out without choosing it"
-    )
+    assert config.get("defaults", {}).get("allow_touching") is True
+    assert "policy" not in config, "the legacy policy table must not return"
 
 
 def test_shipped_floor_carries_no_operator_owned_table() -> None:

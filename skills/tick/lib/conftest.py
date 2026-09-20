@@ -515,6 +515,7 @@ def isolate_target_resolution(request, monkeypatch):
 
     monkeypatch.setattr(tick, "TRUSTED_HEAD_REPO", f"{TRUSTED_AUTHOR}/test-repo")
     monkeypatch.setattr(tick, "TARGET_REMOTE", "origin")
+    monkeypatch.setattr(tick, "TRUSTED_REVIEW_AUTHOR", TRUSTED_AUTHOR)
     if request.node.get_closest_marker("real_target") is None:
         monkeypatch.setattr(tick, "resolve_target", lambda: pipeline.ResolvedTarget(
             f"{TRUSTED_AUTHOR}/test-repo", "origin",

@@ -268,7 +268,7 @@ def skill_doc_path(name: str) -> str:
 
 # The pipeline's own files are review policy too, matched by path *suffix* rather
 # than exact path. The file that toggles the gate is policy: a PR flipping
-# allow_touching to true must be escalated to a human, not auto-reviewed —
+# allow_touching to true must be escalated while the gate is enabled —
 # otherwise a merged flip would silently disable the gate for every future
 # policy-editing PR. The gate's implementation is the same vector: a PR that
 # rewrites touches_review_policy to return False unconditionally (pipeline.py),
@@ -3281,6 +3281,22 @@ def decide_fix_harvest(
         if transient is not None:
             return transient
     return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=True)
+
+
+def trusted_issue_candidate(metadata: object, *, trusted_author: str) -> bool:
+    """Accept only issues authored by the configured operator.
+
+    ``metadata`` is a ``gh issue list/view`` object containing ``author``.
+    Missing or mistyped metadata fails closed before any issue text can
+    become instructions for a credentialed implementer.
+    """
+    if not isinstance(metadata, dict):
+        return False
+    author = metadata.get("author")
+    if not isinstance(author, dict):
+        return False
+    login = author.get("login")
+    return isinstance(login, str) and bool(login) and login == trusted_author
 
 
 def trusted_review_candidate(
