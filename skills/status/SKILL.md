@@ -63,9 +63,17 @@ different push destination, exits 2 before any GitHub request. The dashboard
 does not enforce `[scan] repos` because it reads no TOML; the tick enforces that
 operator scope before doing any work.
 
-This dashboard is optional — `gh pr list --label ai:...` shows every pipeline stage
-since labels are the source of truth. Its only added value is the **in-flight,
-non-GitHub state** (which engines are live right now, with PID and time-to-deadline).
+The GitHub sections read every page of open issues and PRs, grouped by label.
+**PARKED ITEMS** separately lists items with one or more unknown `ai:` labels
+and no known workflow label. No dispatch query selects these items; deciding
+whether to change their labels belongs to the repository owner. Items also
+carrying a known label stay in the ordinary label sections.
+
+The known vocabulary comes from the installed `pipeline.py` constants through
+`labels.py vocabulary`. When Python cannot load it, raw label rows remain
+visible and parked-item classification says unavailable. A failed GitHub read
+also says unavailable, rather than reporting an empty pipeline. The dashboard
+never provisions, renames, or deletes labels.
 
 ## Progress column
 

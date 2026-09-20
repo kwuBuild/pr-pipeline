@@ -501,6 +501,19 @@ def isolate_target_resolution(request, monkeypatch):
         monkeypatch.setattr(pipeline, "validate_target_context", lambda *args, **kwargs: None)
 
 
+@pytest.fixture(autouse=True)
+def isolate_label_vocabulary(monkeypatch):
+    """Whole-tick tests start with a provisioned repo; guard tests override this.
+
+    Provisioning and pagination tests execute the installed CLI in a separate
+    process with a stateful gh double, so this seam cannot hide their I/O.
+    """
+    import labels
+    import pipeline
+
+    monkeypatch.setattr(labels, "read_labels", lambda repo: pipeline.WORKFLOW_LABELS)
+
+
 # --- Helpers ---
 
 

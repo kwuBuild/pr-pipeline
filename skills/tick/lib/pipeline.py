@@ -123,6 +123,11 @@ LABEL_MAX_ITERATIONS = "ai:max-iterations"
 LABEL_NEEDS_HUMAN = "ai:needs-human-decision"  # escalation terminal
 LABEL_BLOCKED = "ai:blocked"  # human-set: waiting on a dependency or decision
 
+# Provisioning, startup verification, and status share this complete vocabulary.
+WORKFLOW_LABELS = frozenset(
+    value for name, value in globals().copy().items() if name.startswith("LABEL_")
+)
+
 # Human holds. The tick never produces or targets ai:blocked, and it only pairs
 # ai:needs-human-decision with an in-flight label when its own harvest target is
 # that label — so either hold coexisting with pipeline custody is

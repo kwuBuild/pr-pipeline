@@ -19562,6 +19562,64 @@ def test_main_refuses_to_tick_without_a_resolvable_target(tmp_path: Path) -> Non
     gh.assert_not_called()
 
 
+@pytest.mark.parametrize("existing", [frozenset(), frozenset({"ai:available"})])
+def test_main_rejects_missing_vocabulary_before_harvest(tmp_path, capsys, existing):
+    import pipeline
+    import tick
+
+    with (
+        mock.patch("tick.repo_root", return_value=str(tmp_path)),
+        mock.patch("labels.read_labels", return_value=existing) as read,
+        mock.patch("tick._run_tick_body", return_value=0) as body,
+    ):
+        result = tick.main()
+
+    assert result == 3
+    read.assert_called_once_with("test-owner/test-repo")
+    body.assert_not_called()
+    stderr = capsys.readouterr().err
+    for name in pipeline.WORKFLOW_LABELS - existing:
+        assert name in stderr
+    assert "labels.py" in stderr and "provision" in stderr
+    assert "tick-state: status=FAILED" in stderr
+    entries = [json.loads(line) for path in Path(tick.TICK_LOG_DIR).glob("*.jsonl")
+               for line in path.read_text().splitlines()]
+    assert any(entry.get("action") == "startup_labels_invalid" for entry in entries)
+
+
+def test_main_rejects_unreadable_vocabulary_before_harvest(tmp_path, capsys):
+    import tick
+
+    with (
+        mock.patch("tick.repo_root", return_value=str(tmp_path)),
+        mock.patch("labels.read_labels", side_effect=ValueError("permission denied")),
+        mock.patch("tick._run_tick_body", return_value=0) as body,
+    ):
+        result = tick.main()
+
+    assert result == 3
+    body.assert_not_called()
+    assert "permission denied" in capsys.readouterr().err
+
+
+def test_main_checks_vocabulary_each_tick_and_accepts_unknown_labels(tmp_path):
+    import pipeline
+    import tick
+
+    with (
+        mock.patch("tick.repo_root", return_value=str(tmp_path)),
+        mock.patch("labels.read_labels", side_effect=[
+            pipeline.WORKFLOW_LABELS | {"ai:parked"}, frozenset(),
+        ]) as read,
+        mock.patch("tick._run_tick_body", return_value=0) as body,
+    ):
+        assert tick.main() == 0
+        assert tick.main() == 3
+
+    assert read.call_count == 2
+    assert body.call_count == 1
+
+
 def test_main_refuses_to_tick_without_a_trusted_author(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

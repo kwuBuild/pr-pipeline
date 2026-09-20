@@ -482,6 +482,13 @@ dispatch gate is the primary control.
 
 ## Startup failure diagnostics
 
+`startup_labels_invalid` exits 3 before HARVEST or DISPATCH when labels are
+missing or their GitHub read fails. For missing labels, run the provisioning
+command printed in stderr from the named target repository; it creates only
+missing vocabulary labels. For read errors, restore GitHub access and retry.
+The check repeats each tick, and `--loop` stops on failure. Unknown `ai:` labels
+do not block startup; inspect the dashboard's **PARKED ITEMS** section.
+
 Every tick log starts with:
 
 - `startup_context` — Python version, cwd, PATH directories, tick PID.

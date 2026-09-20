@@ -67,6 +67,30 @@ Do not edit the install's `skills/tick/config.toml`: it is the
 shipped floor, and a plugin upgrade installs the next version at a different
 path, silently discarding anything written there.
 
+**Provision each target repository before its first tick.** Run this from the
+target checkout, both at first-time installation and when adding a repository:
+
+```bash
+LABEL_PYTHON="$(bash "$PR_PIPELINE_HOME/skills/tick/resolve-python.sh")" &&
+  "$LABEL_PYTHON" "$PR_PIPELINE_HOME/skills/tick/lib/labels.py" provision
+```
+
+This setup primitive resolves the same canonical Git target as the tick and
+creates only missing `LABEL_*` labels from `pipeline.py`. Re-running it preserves
+existing labels, colors, and descriptions. It reports every unknown `ai:` label
+and explains that items carrying only unknown workflow labels are not selected
+by any dispatch query. It never deletes, renames, or updates a label. The
+interactive setup flow is separate; it can call this same command for each
+repository it adds.
+
+Every tick checks the complete vocabulary before HARVEST or DISPATCH. Missing
+labels, a failed read, or a malformed response exits 3 with
+`startup_labels_invalid`; missing-label errors name each label and print the
+provisioning command. A loop rechecks on every tick and stops on this startup
+failure. Unknown labels do not block a tick. The status dashboard's **PARKED
+ITEMS** section keeps items with only unknown `ai:` labels visible across all
+pages of open issues and PRs.
+
 ```bash
 # 1. One-time: verify the Codex binary and schema (required before first reviewer dispatch)
 bash $PR_PIPELINE_HOME/skills/tick/preflight.sh

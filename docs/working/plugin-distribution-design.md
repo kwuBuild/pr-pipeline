@@ -558,9 +558,9 @@ not what an invoked test script does.
 
 ## 6. Adoption prerequisites
 
-Four things a fresh target repository needs that nothing currently provides. The
-first three fail on the first tick against any repository that is not this one;
-the fourth fails silently, which is worse.
+Requirements for adopting the pipeline in a fresh target repository. Canonical
+target routing and label provisioning are implemented; the remaining setup flow
+must call these primitives for each repository it adds.
 
 ### Default branch
 
@@ -572,8 +572,10 @@ value comes from the repository's actual default branch, with a
 
 ### Label provisioning — part of installation
 
-There is no `gh label create` anywhere in the tree. The `ai:` vocabulary is
-assumed to exist, so on a fresh repository every transition fails.
+Implemented by `skills/tick/lib/labels.py provision`: resolve the canonical Git
+target and create only the missing `ai:` vocabulary, derived from `LABEL_*` in
+`pipeline.py`. Existing colors and descriptions remain untouched. The tick README
+documents how to run the installed command with a supported interpreter.
 
 Label creation is part of the installation flow. The mechanism is
 `pr-pipeline-setup` rather than `/plugin install` itself: a plugin install is a
@@ -583,9 +585,11 @@ is named, so that is where its labels are created — idempotently, from the
 `LABEL_*` constants in `pipeline.py`, at first-time install and again each time A
 adds a repository.
 
-The tick also verifies the set is present before its first transition, so an
+The tick verifies the set on every tick before HARVEST or DISPATCH, so an
 operator who adds a repository without running setup gets a legible error instead
-of a mid-dispatch failure.
+of a mid-dispatch failure. Missing labels or a failed vocabulary read exit 3
+with `startup_labels_invalid`; a missing-label error includes a provisioning
+command. This also stops `--loop`.
 
 ### Unknown `ai:` labels — reported, never deleted
 
@@ -614,10 +618,10 @@ So the fix is legibility at both ends, and deliberately not mutation:
   wrong: an unknown `ai:*` label is often a human's deliberate hold. Reconciling
   is the repository owner's decision, and setup's job ends at telling them it
   needs making.
-- **The dashboard surfaces the dark items.** `status.sh` grows a row for open
-  items whose only `ai:` label is outside the vocabulary, so a parked item is
-  visible as parked rather than absent. Without this, the reported-at-setup
-  warning is a one-time message about a permanent condition.
+- **The dashboard surfaces the dark items.** `status.sh` has a **PARKED ITEMS**
+  section for open issues and PRs with unknown `ai:` labels and no known workflow
+  label. Its paginated read includes older items too. GitHub or classification
+  failures say unavailable; raw label rows remain visible without Python.
 
 ### Repository routing
 

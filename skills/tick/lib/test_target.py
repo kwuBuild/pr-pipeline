@@ -371,7 +371,9 @@ from pathlib import Path
 args = sys.argv[1:]
 with (Path(os.environ["TARGET_PROBE_ROOT"]) / "gh-calls.jsonl").open("a") as stream:
     stream.write(json.dumps(args) + "\\n")
-if args[:2] == ["issue", "list"] and "ai:available" in args:
+if args[:2] == ["api", "repos/selected/project/labels?per_page=100"]:
+    print(os.environ["TARGET_LABEL_VOCABULARY"])
+elif args[:2] == ["issue", "list"] and "ai:available" in args:
     print(json.dumps([{"number": 11, "title": "Target", "labels": [{"name": "ai:available"}]}]))
 elif args[:2] == ["issue", "view"] and "labels" in args:
     print("ai:available" if "-q" in args else json.dumps({"labels": [{"name": "ai:available"}]}))
@@ -392,7 +394,10 @@ else:
     cfg.write_text('[operator]\nlogin="test-owner"\n')
     env = {**os.environ, "PATH": f"{stub_bin}:{os.environ['PATH']}",
            "PR_PIPELINE_CONFIG": str(cfg), "PR_PIPELINE_PYTHON": sys.executable,
-           "TARGET_PROBE_ROOT": str(repository)}
+           "TARGET_PROBE_ROOT": str(repository),
+           "TARGET_LABEL_VOCABULARY": json.dumps([
+               [{"name": name} for name in sorted(pipeline.WORKFLOW_LABELS)],
+           ])}
     result = subprocess.run(
         ["bash", str(Path(__file__).resolve().parents[1] / "tick.sh")],
         cwd=repository, env=env, text=True, capture_output=True, timeout=30,
@@ -403,8 +408,10 @@ else:
     assert not (repository / ".claude/worktrees/issue-11/dispatch.json").exists()
     calls = [json.loads(line) for line in (repository / "gh-calls.jsonl").read_text().splitlines()]
     assert calls
-    assert all(call[-2:] == ["--repo", "github.com/selected/project"] for call in calls)
-    assert all(call[1] in {"list", "view"} for call in calls)
+    assert calls[0] == ["api", "repos/selected/project/labels?per_page=100",
+                        "--hostname", "github.com", "--paginate", "--slurp"]
+    assert all(call[-2:] == ["--repo", "github.com/selected/project"] for call in calls[1:])
+    assert all(call[1] in {"list", "view"} for call in calls[1:])
     assert set(transport_log.read_text().splitlines()) == {"https://github.com/selected/project"}
 
 

@@ -57,6 +57,7 @@ from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import claude_stream_wrapper
+import labels
 import pipeline
 import process_control
 import reviewer_observability
@@ -11072,6 +11073,22 @@ def _run_single_tick_locked(
                 action="startup_probe_failed",
                 reason=msg,
             )
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
+        print(tick_state.format_line(), file=sys.stderr)
+        sys.stderr.flush()
+        return 3
+
+    # Harvest can relabel too. Verify before either phase, on every loop tick,
+    # without creating or modifying any repository labels here.
+    try:
+        labels.verify(TRUSTED_HEAD_REPO)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        msg = f"tick: label vocabulary check failed for {TRUSTED_HEAD_REPO}: {exc}"
+        print(msg, file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(pr=None, phase="startup", stage="",
+                         action="startup_labels_invalid", reason=msg)
         tick_state = pipeline.derive_tick_state(status="FAILED")
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)

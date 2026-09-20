@@ -430,21 +430,7 @@ def test_status_lists_open_issues_at_every_pipeline_label(tmp_path: Path) -> Non
         '"labels":[{"name":"ai:reviewing"}]},'
         '{"number":13,"title":"waiting","labels":[{"name":"ai:available"}]}]'
     )
-    stub_bin = repo.parent / "bin"
-    stub_bin.mkdir(exist_ok=True)
-    write_stub(
-        stub_bin / "gh",
-        "#!/bin/sh\n"
-        f"case \"$1\" in issue) printf '%s' '{issues}' ;; *) printf '[]' ;; esac\n",
-    )
-    write_stub(stub_bin / "uv", "#!/bin/sh\nprintf '[]'\n")
-    env = os.environ.copy()
-    env["PATH"] = f"{stub_bin}:{env['PATH']}"
-
-    result = subprocess.run(
-        ["bash", str(repo / ".claude/skills/status/status.sh")],
-        cwd=repo, env=env, check=False, capture_output=True, text=True,
-    )
+    result = run_status(repo, pages=[json.loads(issues)])
 
     assert result.returncode == 0
     assert re.search(r"ai:implementing\s+#11", result.stdout), result.stdout
@@ -460,8 +446,9 @@ def test_status_resolves_foreign_remote_without_config(tmp_path, monkeypatch):
     assert result.returncode == 0, result.stderr
     assert "elsewhere/project" in result.stdout
     calls = (repo.parent / "gh-calls").read_text().splitlines()
-    assert len(calls) == 2
-    assert all("--repo github.com/elsewhere/project" in call for call in calls)
+    assert len(calls) == 1
+    assert "--hostname github.com" in calls[0]
+    assert "repos/elsewhere/project/issues?" in calls[0]
 
 
 def test_status_rejects_mismatched_override_before_interpreter_or_github(tmp_path, monkeypatch):
@@ -475,6 +462,71 @@ def test_status_rejects_mismatched_override_before_interpreter_or_github(tmp_pat
     assert "upstream" in result.stderr
     assert "INTERPRETER_CALLED" not in result.stderr
     assert not (repo.parent / "gh-calls").exists()
+
+
+def test_status_identifies_parked_issues_and_prs_across_all_pages(tmp_path):
+    repo = install_status_script(tmp_path)
+    pages = [
+        [status_item(i, "unlabelled", []) for i in range(1, 101)],
+        [status_item(101, "parked issue", ["bug", "ai:parked"]),
+         status_item(102, "parked PR", ["ai:legacy", "ai:pause"], pr=True),
+         status_item(103, "still queued", ["ai:available", "ai:legacy"]),
+         status_item(104, "known hold", ["ai:blocked"], pr=True)],
+    ]
+
+    result = run_status(repo, pages=pages)
+
+    assert result.returncode == 0, result.stderr
+    assert "PARKED ITEMS" in result.stdout
+    parked = result.stdout.split("PARKED ITEMS", 1)[1].split("LAST TICK", 1)[0]
+    assert re.search(r"issue\s+#101\s+ai:parked", parked), parked
+    assert re.search(r"PR\s+#102\s+ai:legacy, ai:pause", parked), parked
+    assert "#103" not in parked and "#104" not in parked
+    assert "no dispatch query selects" in parked
+    calls = (repo.parent / "gh-calls").read_text().splitlines()
+    assert len(calls) == 1
+    assert "--paginate" in calls[0] and "--slurp" in calls[0]
+    assert "state=open" in calls[0]
+
+
+@pytest.mark.parametrize("failure", ["api", "malformed"])
+def test_status_reports_unavailable_items_instead_of_false_empty(tmp_path, failure):
+    repo = install_status_script(tmp_path)
+
+    result = run_status(repo, pages={"message": "bad shape"}, failure=failure)
+
+    assert "PARKED ITEMS" in result.stdout
+    parked = result.stdout.split("PARKED ITEMS", 1)[1].split("LAST TICK", 1)[0]
+    assert "unavailable" in parked
+    assert "(none)" not in parked
+    assert "GitHub" in result.stderr
+
+
+def test_status_keeps_raw_labels_when_python_cannot_classify_parked_items(tmp_path):
+    repo = install_status_script(tmp_path)
+    resolver = repo / ".claude/skills/tick/resolve-python.sh"
+    resolver.write_text(
+        "pr_pipeline_resolve_python() { return 1; }\n"
+        "pr_pipeline_python_requirement_error() { echo 'Python unavailable' >&2; }\n"
+    )
+
+    result = run_status(repo, pages=[[status_item(101, "parked issue", ["ai:parked"])]])
+
+    assert re.search(r"ai:parked\s+#101", result.stdout), result.stdout
+    assert "PARKED ITEMS" in result.stdout
+    parked = result.stdout.split("PARKED ITEMS", 1)[1].split("LAST TICK", 1)[0]
+    assert "unavailable" in parked and "Python" in parked
+
+
+def test_status_reports_unavailable_when_vocabulary_output_is_invalid(tmp_path):
+    repo = install_status_script(tmp_path)
+    (repo / ".claude/skills/tick/lib/labels.py").write_text('print("invalid json")\n')
+
+    result = run_status(repo, pages=[[status_item(101, "parked issue", ["ai:parked"])]])
+
+    parked = result.stdout.split("PARKED ITEMS", 1)[1].split("LAST TICK", 1)[0]
+    assert "unavailable" in parked
+    assert "(none)" not in parked
 
 
 # --- Helpers ---
@@ -611,11 +663,11 @@ def write_marker_with_heartbeat(
 
 
 def run_status(
-    repo: Path, *, cwd: Path | None = None,
+    repo: Path, *, cwd: Path | None = None, pages=None, failure=None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the dashboard with ``gh`` stubbed and ``uv`` shimmed to real Python.
+    """Run the dashboard with paginated ``gh`` responses and real Python.
 
-    ``gh`` returns empty JSON: the GitHub sections are not under test here.
+    ``gh`` returns the supplied pages, or an empty repository by default.
     The classifier is *not* stubbed out — the progress column's whole contract
     is that it renders what the real ``tick.py`` reports, so a stub would prove
     only that bash can print a literal. ``PR_PIPELINE_PYTHON`` pins resolution
@@ -628,12 +680,20 @@ def run_status(
     """
     stub_bin = repo.parent / "bin"
     stub_bin.mkdir(exist_ok=True)
-    write_stub(stub_bin / "gh", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$STATUS_GH_LOG"\nprintf "[]"\n')
+    write_stub(
+        stub_bin / "gh",
+        '#!/bin/sh\nprintf "%s\\n" "$*" >> "$STATUS_GH_LOG"\n'
+        + ('echo "GitHub unavailable" >&2\nexit 1\n' if failure == "api"
+           else 'cat "$STATUS_GH_PAYLOAD"\n'),
+    )
+    payload = repo.parent / "gh-payload.json"
+    payload.write_text(json.dumps(pages if pages is not None else [[]]))
 
     env = os.environ.copy()
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
     env["PR_PIPELINE_PYTHON"] = sys.executable
     env["STATUS_GH_LOG"] = str(repo.parent / "gh-calls")
+    env["STATUS_GH_PAYLOAD"] = str(payload)
     return subprocess.run(
         ["bash", str(repo / ".claude/skills/status/status.sh")],
         cwd=cwd or repo,
@@ -642,6 +702,13 @@ def run_status(
         capture_output=True,
         text=True,
     )
+
+
+def status_item(number, title, labels, *, pr=False):
+    item = {"number": number, "title": title, "labels": [{"name": name} for name in labels]}
+    if pr:
+        item["pull_request"] = {"url": f"https://api.github.com/repos/o/r/pulls/{number}"}
+    return item
 
 
 def in_flight_row(stdout: str, *, pr_number: int) -> str:
