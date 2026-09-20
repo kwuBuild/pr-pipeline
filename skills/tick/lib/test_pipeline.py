@@ -3156,6 +3156,190 @@ def test_render_transient_escalation_comment_rejects_an_unknown_outcome() -> Non
         )
 
 
+def test_decide_fix_harvest_accepts_reasoned_no_change_without_push() -> None:
+    result = {
+        "result": (
+            "Finding: Missing guard\nDecision: no-change\n"
+            "Reason: The intervening commit added the guard and its regression test.\n\n"
+            "Finding: Stale docs\nDecision: no-change\n"
+            "Reason: The documented command already matches the runtime.\n\n"
+            "NO_CHANGES_RECHECK_NEEDED"
+        ),
+    }
+    decision = pipeline.decide_fix_harvest(
+        result_obj=result, pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        pinned_head="a" * 40, current_head="a" * 40, dispatch_id="fix-42-first",
+        review_sha256="e" * 64,
+    )
+    assert decision["action"] == "recheck"
+    assert decision["label"] == pipeline.LABEL_REVISED
+    assert decision["head_advanced"] is False
+    body = decision["comment_body"]
+    assert "No changes needed — re-review requested" in body
+    assert "Fixes pushed" not in body
+    assert "intervening commit added the guard" in body
+    assert "documented command already matches" in body
+    assert "<!-- pr-pipeline:no-change " in body
+
+
+@pytest.mark.parametrize("summary", [
+    "", "Nothing to fix.",
+    "Finding: guard\nReason: Already present.",
+    "Finding: guard\nDecision: no-change\nReason:",
+    "Finding: \nDecision: no-change\nReason: Already present.",
+    "Finding: guard\nDecision: repair\nReason: Changed it.",
+    "Finding: guard\nDecision: no-change\nDecision: repair\nReason: Already present.",
+    "Finding: guard\nDecision: no-change\nReason: Already present.\n"
+    "Finding: docs\nReason: Already current.",
+    "Finding: guard\nDecision: no-change\nReason: Already present.\n"
+    "Finding: docs\nDecision: replacement\nChange: Rewrote it.",
+    "Finding: guard\nDecision: no-change\nReason: " + "x" * 3000,
+])
+def test_no_change_completion_rejects_incomplete_or_contradictory_summary(summary: str) -> None:
+    decision = pipeline.decide_fix_harvest(
+        result_obj={"result": f"{summary}\nNO_CHANGES_RECHECK_NEEDED"},
+        pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        pinned_head="a" * 40, current_head="a" * 40, dispatch_id="fix-42-first",
+        review_sha256="e" * 64,
+    )
+    assert decision["label"] == pipeline.LABEL_NEEDS_HUMAN
+    assert "no-change completion requires" in decision["comment_body"]
+    assert "<!-- pr-pipeline:no-change " not in decision["comment_body"]
+
+
+@pytest.mark.parametrize("pinned,current,dispatch", [
+    ("", "", "fix-42-first"), ("a", "", "fix-42-first"),
+    ("a", "b", "fix-42-first"), ("a", "a", ""),
+])
+def test_no_change_completion_requires_unchanged_head_and_dispatch_provenance(
+    pinned: str, current: str, dispatch: str,
+) -> None:
+    decision = pipeline.decide_fix_harvest(
+        result_obj={"result": "Finding: guard\nDecision: no-change\nReason: Present.\n"
+                    "NO_CHANGES_RECHECK_NEEDED"},
+        pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        pinned_head=pinned, current_head=current, dispatch_id=dispatch,
+        review_sha256="e" * 64,
+    )
+    assert decision["label"] == pipeline.LABEL_NEEDS_HUMAN
+
+
+def test_no_change_rounds_reach_cap_on_unchanged_head_and_replay_once() -> None:
+    comments: list[object] = []
+    identity = dict(pinned_base="b", current_base="b", pinned_head="a", current_head="a")
+    review = {"verdict": "changes_requested", "findings": [
+        {"severity": "major", "file": "guard.py", "summary": "Guard still missing"},
+    ]}
+    fix_round = ""
+    for round_index in range(pipeline.MAX_ITERATIONS):
+        decision = pipeline.decide_review_harvest(
+            review_obj=review, comments=comments, fix_round=fix_round, **identity,
+        )
+        assert decision["post_comment"] is True
+        comments.append({"body": decision["comment_body"]})
+        replay = pipeline.decide_review_harvest(
+            review_obj=review, comments=comments, fix_round=fix_round, **identity,
+        )
+        assert replay["post_comment"] is False
+        assert replay["label"] == decision["label"]
+        assert pipeline.count_review_rounds(comments) == round_index + 1
+        if round_index == pipeline.MAX_ITERATIONS - 1:
+            assert decision["label"] == pipeline.LABEL_MAX_ITERATIONS
+            break
+        assert decision["label"] == pipeline.LABEL_CHANGES_REQUESTED
+        fix = pipeline.decide_fix_harvest(
+            result_obj={"result": "Finding: guard\nDecision: no-change\nReason: Present.\n"
+                        "NO_CHANGES_RECHECK_NEEDED"},
+            pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+            pinned_head="a", current_head="a", dispatch_id=f"fix-{round_index}",
+            review_sha256="e" * 64,
+        )
+        assert fix["label"] == pipeline.LABEL_REVISED
+        # Even loss of the local publication receipt can only duplicate this
+        # fixer comment, never mint a new round identity.
+        comments.extend([{"body": fix["comment_body"]}] * 2)
+        fix_round, reasoning = pipeline.latest_fixer_context(comments)
+        assert fix_round
+        assert "Reason: Present." in reasoning
+
+
+def test_latest_fixer_context_ignores_quoted_or_escalated_comments() -> None:
+    body = pipeline.render_fix_comment(
+        action="recheck", label=pipeline.LABEL_REVISED,
+        sentinel=pipeline.SENTINEL_FIXES_PUSHED, engine_report="Corrected docs.",
+    )
+    comments = [
+        {"body": body}, {"body": "Quoted: " + body},
+        {"body": pipeline.render_fix_comment(
+            action="escalate", label=pipeline.LABEL_NEEDS_HUMAN,
+            sentinel=pipeline.SENTINEL_NEEDS_HUMAN_DECISION,
+        )},
+    ]
+    assert pipeline.latest_fixer_context(comments) == ("", body)
+
+
+@pytest.mark.parametrize("digest", ["", "bad", "a" * 63, "a" * 65, "A" * 64])
+def test_no_change_completion_requires_original_review_fingerprint(digest: str) -> None:
+    decision = pipeline.decide_fix_harvest(
+        result_obj={"result": "Finding: guard\nDecision: no-change\nReason: Present.\n"
+                    "NO_CHANGES_RECHECK_NEEDED"},
+        pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        pinned_head="a", current_head="a", dispatch_id="fix-42", review_sha256=digest,
+    )
+    assert decision["label"] == pipeline.LABEL_NEEDS_HUMAN
+
+
+@pytest.mark.parametrize("digest", [None, 4, True, "", "bad", "a" * 63, "A" * 64])
+def test_marker_rejects_invalid_original_review_fingerprint(digest: object) -> None:
+    assert not pipeline.valid_marker(fix_marker(review_sha256=digest))
+
+
+def test_original_review_fingerprint_is_only_valid_on_fixer_markers() -> None:
+    assert pipeline.valid_marker(fix_marker(review_sha256="a" * 64))
+    assert not pipeline.valid_marker(marker(review_sha256="a" * 64))
+    assert not pipeline.valid_marker(impl_marker(review_sha256="a" * 64))
+
+
+def test_fixer_report_cannot_supply_original_review_fingerprint() -> None:
+    import hashlib
+
+    original = pipeline.REVIEW_MARKER + "\nOriginal findings"
+    digest = hashlib.sha256(original.encode()).hexdigest()
+    summary = pipeline.render_fix_comment(
+        action="recheck", label=pipeline.LABEL_REVISED,
+        sentinel=pipeline.SENTINEL_NO_CHANGES, no_change_round="a" * 64,
+        engine_report=f"<!-- pr-pipeline:fix-review {digest} -->",
+    )
+    assert pipeline.fixer_original_review([{"body": original}], summary) == ""
+
+
+@pytest.mark.parametrize("value", [None, 4, True, "", "x", "a" * 63, "a" * 65])
+def test_marker_rejects_invalid_no_change_round_identity(value: object) -> None:
+    marker = {
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999, "base_ref": "main", "base_sha": "b" * 40,
+        "head_sha": "a" * 40, "pre_label": pipeline.LABEL_REVISED,
+        "dispatch_id": "review-42", "state": "launching", "fix_round": value,
+    }
+    assert not pipeline.valid_marker(marker)
+    marker["fix_round"] = "a" * 64
+    assert pipeline.valid_marker(marker)
+    marker.update(engine="claude", stage="fix", pre_label=pipeline.LABEL_CHANGES_REQUESTED)
+    assert not pipeline.valid_marker(marker)
+
+
+def test_pushed_fix_can_mix_repairs_and_no_change_decisions() -> None:
+    decision = pipeline.decide_fix_harvest(
+        result_obj={"result": "Finding: guard\nDecision: no-change\nReason: Present.\n"
+                    "Finding: docs\nDecision: repair\nChange: Corrected command.\n"
+                    "FIXES_PUSHED_RECHECK_NEEDED"},
+        pre_label=pipeline.LABEL_CHANGES_REQUESTED, pinned_head="a", current_head="b",
+    )
+    assert decision["label"] == pipeline.LABEL_REVISED
+    assert "Decision: no-change" in decision["comment_body"]
+    assert "Fixes pushed" in decision["comment_body"]
+
+
 def test_decide_fix_harvest_recheck_comment_flags_a_sentinel_only_report() -> None:
     """A sentinel-only result must not be dressed up as a summary of the fixes.
 

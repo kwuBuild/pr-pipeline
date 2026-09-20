@@ -288,6 +288,7 @@ pr:ai:changes-requested
 pr:ai:fixing
     ──[harvest: FIXES_PUSHED, head advanced]──▶ pr:ai:revised
     ──[harvest: FIXES_PUSHED, head unchanged]──▶ pr:ai:needs-human-decision  (contradictory claim)
+    ──[harvest: NO_CHANGES, all findings reasoned, head unchanged]──▶ pr:ai:revised
     ──[harvest: NEEDS_HUMAN]──▶ pr:ai:needs-human-decision
     ──[dead PID, no result]──▶ pr:ai:changes-requested   (revert + re-dispatch)
 
@@ -661,6 +662,42 @@ malformed point-read retains the marker for the next tick. Markers without a
 pinned head (pre-upgrade) skip the check — no contradiction can be proven
 without dispatch-time provenance.
 
+A fixer can instead finish with `NO_CHANGES_RECHECK_NEEDED`: every finding
+must have its own `Finding:`, `Decision: no-change`, and non-empty `Reason:`
+line, within the published summary budget. This requires a dispatch identity,
+the originating review's fingerprint, and an unchanged pinned head; missing or
+mixed decisions, missing reasons,
+and a moved head escalate. It never promotes a PR. The controller publishes
+the reasoning and a hidden `pr-pipeline:no-change` token derived from the
+fixer's dispatch ID before relabelling to `ai:revised`. Fixer dispatch pins
+the SHA-256 of the exact review body it handed the engine as `review_sha256`
+in both lease and published markers. Harvest carries that fingerprint into a
+`pr-pipeline:fix-review` header in the fixer comment.
+The parser validates every reported block. It cannot prove that a finding was
+not omitted altogether or that the stated reason is correct; the prompt
+requires full coverage and the independent reviewer checks that judgement.
+
+Reviewer dispatch reads the latest published recheck summary on revised PRs,
+resolves the originating review by that fingerprint from the same comment
+snapshot, and puts both complete bodies in the prompt as context for independent
+evaluation. The reviewer explicitly checks every original finding, including
+those omitted by the fixer, against the current code. For no-change rounds,
+a missing fingerprint or a deleted/edited original retains the PR for retry
+without launching or relabelling; it never substitutes a newer review.
+Operators must restore the exact original comment or requeue a fresh review
+at `ai:implemented`. Legacy fixer markers without this fingerprint cannot
+complete the no-change path; pushed-fix behavior remains compatible.
+The fingerprint binds content, not comment authorship (tracked separately).
+Reviewer dispatch pins the summary's no-change token as `fix_round` in the
+dispatch marker. The wrapper preserves
+that field. Review identity includes this pinned token alongside the existing
+base/head identity: a new no-change fixer run earns a new review comment even
+when the SHAs are unchanged. A replay of the same result, including duplicate
+fixer-comment publication after receipt loss, retains the same token. Only
+review comments count toward the cap; repeated rejected no-change cycles
+therefore terminate at `ai:max-iterations` without charging a retried harvest
+twice. Existing markers without `fix_round` retain their previous identity.
+
 ### Why custody is not inferred, and not yet proven
 
 **Decision (2026-08-02): reconciliation never acts on a
@@ -887,8 +924,9 @@ is gated on the verdict **and** the findings, not the verdict string alone: a
 `ready_for_human` verdict that still carries a blocker/major finding contradicts the
 schema's own definition and is routed to `changes_requested` rather than shipped to a
 human as clean. The review comment posted to the PR is rendered from the same typed
-`findings` array and embeds the reviewed (diff base, base tip, head, base ref)
-identity as an idempotency key, so a tick that crashes between posting the comment
+`findings` array and embeds the reviewed (diff base, base tip, head, base ref,
+optional no-change fixer token) identity as an idempotency key, so a tick that
+crashes between posting the comment
 and flipping the label never posts a duplicate (which would inflate the
 comment-derived iteration count) on replay — while a re-dispatch that changes any
 component (a legitimately different diff, base state, or base branch) is recognised
@@ -1049,7 +1087,8 @@ pinned tip the review is discarded and the PR re-dispatched rather than promoted
 it is what the reviewer's diff actually runs from — diffing from the tip itself
 would flag commits that landed on the base after the branch was cut. The posted
 review comment and its hidden idempotency token record the full
-(diff base, base tip, head, base ref) identity so the audit trail states honestly
+(diff base, base tip, head, base ref, optional no-change fixer token) identity
+so the audit trail states honestly
 which range was reviewed and against which base. If the `baseRefName` read fails, the
 PR is retained for the next tick — the base is never guessed as `<remote>/main`,
 because a stacked PR's base is another branch.
@@ -1130,7 +1169,9 @@ Each worktree contains pipeline state files:
 │                      # {engine, pid, start_time, pgid, stage, deadline, dispatch_id,
 │                      #  pr_number, base_ref, base_sha, head_sha, pre_label,
 │                      #  base_tip_sha (review only: base tip freshness anchor;
-│                      #  base_sha is then the merge-base diff anchor)}
+│                      #  base_sha is then the merge-base diff anchor),
+│                      #  fix_round (review only, after a no-change fixer),
+│                      #  review_sha256 (fix only: originating review fingerprint)}
 ├── completion.json    # Reviewer-only wrapper exit proof and HARVEST gate
 │                      # {dispatch_id, exit_status, wrapper_pid, start_time,
 │                      #  result_valid, error_class (required on failure only)}
@@ -1208,7 +1249,10 @@ ownership signal (a usable `pid` XOR a `launching` state). The optional
 `base_tip_sha` (review markers only; the two-SHA freshness anchor) is likewise
 validated as provenance when present — it must be a canonical 40-hex commit OID,
 since a malformed value would silently degrade the drift guard to the merge-base
-fallback. An invalid marker is treated as marker-less, and marker absence is
+fallback. The optional `fix_round` is also review-only and must be a lowercase
+64-hex token. The optional `review_sha256` is fix-only and must also be a
+lowercase 64-hex fingerprint; it pins the review handed to that fixer.
+An invalid marker is treated as marker-less, and marker absence is
 never evidence: reconciliation **retains** the `ai:reviewing` label and takes no
 action rather than driving an incorrect revert from a corrupt record. The one
 place a corrupt marker still escalates is *dispatch* — an item selected from a
@@ -1333,6 +1377,11 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   committed and pushed, or `NEEDS_HUMAN_DECISION` if blocked on scope/design
 
 **Review prompt:**
+- Latest published fixer recheck summary on `ai:revised`, including reasons
+  for `Decision: no-change`, plus the exact originating review identified by
+  the fixer's pinned fingerprint. Check every original finding, even when the
+  summary omits it. Failed reads or missing/edited originals on no-change rounds
+  retain the PR for retry
 - Instruction to self-scope the committed diff via `git diff`/`git log` against
   the pinned base SHA carried in the prompt (from `dispatch.json`, not a live ref)
 - Instruction that the final message must be ONLY a JSON object matching the
@@ -1365,15 +1414,21 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   no target repository needs a copy and no PR branch supplies the rules its own
   fixer runs under; a doc missing from the install is a packaging defect and
   escalates instead of launching
-- A repair-or-replacement declaration **per finding**, made before editing and
+- A repair, replacement, or no-change declaration **per finding**, made before
+  editing and
   re-checked against the pushed diff, published in that finding's own block of
-  the change summary. One run may mix repairs and replacements; each replacement
+  the change summary. One run may mix all three dispositions; each no-change
+  decision states its own evidence in `Reason:`, and each replacement
   states its own rejected shape, reasoning, replacing contract, and audited
   surfaces
 - **Sentinel instruction:** end with `FIXES_PUSHED_RECHECK_NEEDED` once
   revisions are committed and pushed *and* every finding addressed carries a
   decision matching the pushed diff — the three green commands are necessary but
   not sufficient — or `NEEDS_HUMAN_DECISION` if a finding is out of scope
+- **No-push completion:** if every finding needs no change and verification
+  passes, emit only the three-line no-change blocks and then
+  `NO_CHANGES_RECHECK_NEEDED`. Do not commit, push, or write a PR-body revision
+  on this path; the harvest publishes the reasoning for an independent review
 
 The fixer never runs `gh pr edit` itself — that would place an unretractable
 remote mutation mid-run, before the push it describes is verified. It writes a
@@ -1499,6 +1554,7 @@ logical verdicts below.
 | `NO_BLOCKERS_READY_FOR_HUMAN` | Reviewer (`review.json` verdict `ready_for_human`) | Clean review, no findings |
 | `BLOCKERS_FOUND` | Reviewer (`review.json` verdict `changes_requested`) | Review found issues |
 | `FIXES_PUSHED_RECHECK_NEEDED` | Fixer (literal in `result.json`) | Revisions committed and pushed (claim — cross-checked against the live head at harvest) |
+| `NO_CHANGES_RECHECK_NEEDED` | Fixer (literal in `result.json`) | Every finding explicitly needs no change, with a reason; unchanged pinned head required; re-review requested |
 | `NEEDS_HUMAN_DECISION` | Any | Scope/design question for the developer |
 
 When the expected signal is missing (no sentinel for a Claude engine; missing,
@@ -1644,7 +1700,8 @@ are not in this tree at all — see *Configuration ownership* below.
 > `result.json`, creates the PR labelled `ai:implemented`, dispatches the Codex
 > reviewer, harvests the typed verdict and transitions the label, dispatches a
 > Claude fixer for PRs at `ai:changes-requested`, harvests the
-> `FIXES_PUSHED_RECHECK_NEEDED` / `NEEDS_HUMAN_DECISION` sentinel, verifies a
+> `FIXES_PUSHED_RECHECK_NEEDED` / `NO_CHANGES_RECHECK_NEEDED` /
+> `NEEDS_HUMAN_DECISION` sentinel, verifies a
 > push claim against the PR's live head (an unchanged head escalates as
 > contradictory), flips to `ai:revised` for re-review, and bumps the iteration
 > cache. Self-paced cadence

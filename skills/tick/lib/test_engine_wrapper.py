@@ -429,6 +429,23 @@ def test_main_parses_base_tip_sha_into_published_marker(tmp_path: Path) -> None:
     assert marker.get("base_tip_sha") == tip_oid
 
 
+def test_main_preserves_no_change_round_in_published_marker(tmp_path: Path) -> None:
+    fix_round = "a" * 64
+    engine_wrapper.main([
+        "run", "--dispatch-id", "review-after-no-change",
+        "--marker-path", str(tmp_path / "dispatch.json"),
+        "--result-path", str(tmp_path / "review.json"),
+        "--envelope-path", str(tmp_path / "completion.json"),
+        "--engine", "codex", "--stage", "review", "--pr-number", "1",
+        "--deadline", "9999999999", "--base-ref", "main", "--base-sha", "b" * 40,
+        "--head-sha", "d" * 40, "--pre-label", "ai:revised",
+        "--fix-round", fix_round, "--", "true",
+    ])
+    marker = json.loads((tmp_path / "dispatch.json").read_text())
+    assert marker["fix_round"] == fix_round
+    assert engine_wrapper.pipeline.valid_marker(marker)
+
+
 def test_main_omits_base_tip_sha_from_marker_when_not_given(tmp_path: Path) -> None:
     """Without --base-tip-sha the published marker must not carry the key at all.
 

@@ -52,6 +52,7 @@ import threading
 import time
 import tomllib
 import traceback
+import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -6106,6 +6107,7 @@ def _harvest_one_reviewer(
             diff_base_sha=diff_base_sha,
             pinned_base_ref=base_ref,
             current_base_ref=current_base_ref,
+            fix_round=marker.get("fix_round", ""),
         )
     except Exception:
         # A persistent parse error in harvest_review would loop
@@ -7762,6 +7764,7 @@ def _harvest_one_fixer(
     dispatch_id = ""
     engine = "claude"
     pinned_head = ""
+    review_sha256 = ""
     provenance: PRBodyProvenance | None = None
     if os.path.isfile(dispatch_path):
         try:
@@ -7782,6 +7785,9 @@ def _harvest_one_fixer(
             mh = marker.get("head_sha")
             if isinstance(mh, str):
                 pinned_head = mh
+            review_digest = marker.get("review_sha256")
+            if isinstance(review_digest, str):
+                review_sha256 = review_digest
             # Body-revision provenance: the fingerprint and closure contract of
             # the body dispatch handed the engine. Absent on markers written
             # before the revision path, and on PRs whose body pinned nothing.
@@ -7790,9 +7796,9 @@ def _harvest_one_fixer(
     # Live-head point-read (push-verification authority). The FIXES_PUSHED
     # sentinel is the engine's claim, not proof: a fast-forward push always
     # advances the head, so decide_fix_harvest treats a success claim with an
-    # unchanged head as contradictory output and escalates — otherwise a
-    # no-op fixer re-enters an identical review round whose replay-suppressed
-    # comment freezes the iteration count below the cap (unbounded spend).
+    # unchanged head as contradictory output and escalates. The separate
+    # NO_CHANGES completion requires reasoned no-change blocks and carries a
+    # stable fixer token into the next review identity, keeping it countable.
     # Failed or malformed reads retain the marker for the next tick. Skipped
     # when the marker carries no pinned head (pre-upgrade markers): without
     # dispatch-time provenance no contradiction can be proven.
@@ -7839,6 +7845,8 @@ def _harvest_one_fixer(
             pinned_head=pinned_head,
             current_head=current_head,
             body_revision=revision_state,
+            dispatch_id=dispatch_id,
+            review_sha256=review_sha256,
         )
     except Exception:
         # Cap persistent parse errors to avoid infinite retries.
@@ -9107,6 +9115,29 @@ def _dispatch_one_reviewer(
         return
     pr_body: str = _raw_body
 
+    # Pin the published reasoning and its round token from one snapshot. A
+    # failed read must not launch a reviewer that never saw why nothing moved.
+    fix_round, fixer_summary, original_review = "", "", ""
+    if pre_label == pipeline.LABEL_REVISED:
+        try:
+            fix_comments = gh_json(
+                "pr", "view", str(pr_number), "--json", "comments", "-q", ".comments",
+            )
+        except (subprocess.CalledProcessError, ValueError):
+            return
+        if not isinstance(fix_comments, list):
+            return
+        fix_round, fixer_summary = pipeline.latest_fixer_context(fix_comments)
+        original_review = pipeline.fixer_original_review(fix_comments, fixer_summary)
+        if fix_round and not original_review:
+            if tick_log:
+                tick_log.log(
+                    pr=pr_number, phase="dispatch", stage="review", action="skip",
+                    reason="original no-change review missing or edited — retained for retry",
+                    engine="codex",
+                )
+            return
+
     # Fetch the PR head so head_sha is available in local objects. This is
     # required both for the policy gate diff and for creating the worktree.
     try:
@@ -9212,6 +9243,7 @@ def _dispatch_one_reviewer(
         "base_ref": base_ref,
         "base_sha": base_sha,        # merge-base: what Codex diffs against
         "base_tip_sha": base_tip_sha,  # main tip at dispatch: used for drift detection
+        **({"fix_round": fix_round} if fix_round else {}),
         "head_sha": head_sha,
         "pre_label": pre_label,
         "dispatch_id": dispatch_id,
@@ -9279,6 +9311,8 @@ def _dispatch_one_reviewer(
         "trusted_review_author": trusted_author,
         "pr_title": pr_title,
         "pr_body": pr_body,
+        "fixer_summary": fixer_summary or "No published fixer summary.",
+        "original_review": original_review or "No originating review available for this round.",
     })
 
     # Resolve model/effort on the trusted side and record what this review
@@ -9311,6 +9345,7 @@ def _dispatch_one_reviewer(
         "--base-ref", base_ref,
         "--base-sha", base_sha,
         "--base-tip-sha", base_tip_sha,
+        *(["--fix-round", fix_round] if fix_round else []),
         "--head-sha", head_sha,
         "--pre-label", pre_label,
         "--",
@@ -10310,7 +10345,7 @@ def _dispatch_one_fixer(
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
     """
     wt_dir = os.path.join(WT_ROOT, f"pr-{pr_number}")
-    dispatch_id = f"fix-{pr_number}-{int(time.time())}"
+    dispatch_id = f"fix-{pr_number}-{int(time.time())}-{uuid.uuid4().hex}"
 
     # Custody guard: never dispatch over an existing marker whose engine
     # may still be alive (crash window between marker publish and relabel).
@@ -10488,21 +10523,6 @@ def _dispatch_one_fixer(
     # corruption, not a legacy marker, and has to be rejected as a unit.
     if pr_context.body_provenance is not None:
         lease_marker["pr_body"] = pr_context.body_provenance.as_marker_field()
-    try:
-        pipeline.atomic_write(
-            os.path.join(wt_dir, "dispatch.json"),
-            json.dumps(lease_marker),
-        )
-    except (OSError, ValueError):
-        cleanup_scratch(wt_dir)
-        if tick_log:
-            tick_log.log(
-                pr=pr_number, phase="dispatch", stage="fix",
-                action="lease_write_failed",
-                reason="atomic_write of lease marker raised OSError",
-                engine=impl_engine,
-            )
-        return
 
     # Extract the pipeline review comment so the fixer has specific findings.
     review_body = ""
@@ -10536,6 +10556,25 @@ def _dispatch_one_fixer(
             tick_log=tick_log,
             cleanup_dir=wt_dir,
         )
+        return
+
+    # Bind the exact finding set before spawning. Its content fingerprint travels
+    # through harvest's comment so re-review cannot substitute a later review.
+    lease_marker["review_sha256"] = hashlib.sha256(review_body.encode()).hexdigest()
+    try:
+        pipeline.atomic_write(
+            os.path.join(wt_dir, "dispatch.json"),
+            json.dumps(lease_marker),
+        )
+    except (OSError, ValueError):
+        cleanup_scratch(wt_dir)
+        if tick_log:
+            tick_log.log(
+                pr=pr_number, phase="dispatch", stage="fix",
+                action="lease_write_failed",
+                reason="atomic_write of lease marker raised OSError",
+                engine=impl_engine,
+            )
         return
 
     # Build the fixer prompt with the actual review findings. The skill doc path

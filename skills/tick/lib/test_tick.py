@@ -14078,6 +14078,8 @@ def test_harvest_one_fixer_rechecks_and_relabels(
         pinned_head="def",
         current_head="a" * 40,
         body_revision="",
+        dispatch_id="d-12",
+        review_sha256="",
     )
     converge_mock.assert_called_once_with(
         "pr", 12, "ai:revised",

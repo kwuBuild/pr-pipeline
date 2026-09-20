@@ -8,6 +8,7 @@ out cleanly. Run with::
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -1404,6 +1405,7 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
     The fix extracts the most recent pipeline review comment and passes
     specific findings, severities, and files to the engine.
     """
+    import pipeline
     from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -1465,6 +1467,11 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
     assert "app/auth.py" in prompt, (
         f"fixer prompt must include file paths from review, got: {prompt[:200]}"
     )
+    expected_digest = hashlib.sha256(review_comment_body.encode()).hexdigest()
+    lease = json.loads((wt_root / "pr-42" / "dispatch.json").read_text())
+    for marker in (lease, pmr.call_args.kwargs["published_marker"]):
+        assert marker["review_sha256"] == expected_digest
+        assert pipeline.valid_marker(marker, expected_stage="fix")
 
 
 @pytest.mark.parametrize(
@@ -1866,6 +1873,118 @@ def test_reviewer_prompt_carries_injected_pr_metadata(
     assert set(env.keys()) == {
         "HOME", "PATH", "CODEX_HOME", "GIT_TERMINAL_PROMPT", "TMPDIR",
     }
+
+
+@pytest.mark.parametrize("original_state", ["intact", "edited", "deleted", "unpinned"])
+def test_reviewer_dispatch_pins_no_change_reasoning_and_round(
+    tmp_path: Path, original_state: str,
+) -> None:
+    import pipeline
+    import tick
+
+    original_review = pipeline.render_review_comment(
+        verdict="changes_requested", findings=[
+            {"severity": "major", "file": "guard.py", "summary": "Guard missing"},
+            {"severity": "major", "file": "retry.py", "summary": "Retry loses pending work"},
+        ], base_sha="b" * 40, head_sha="abc123",
+    )
+    fix = pipeline.decide_fix_harvest(
+        result_obj={"result": "Finding: guard\nDecision: no-change\n"
+                    "Reason: The current caller already validates the input.\n"
+                    "NO_CHANGES_RECHECK_NEEDED"},
+        pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        pinned_head="abc123", current_head="abc123", dispatch_id="fix-42-first",
+        review_sha256=hashlib.sha256(original_review.encode()).hexdigest(),
+    )
+    assert fix["label"] == pipeline.LABEL_REVISED
+    summary = fix["comment_body"]
+    if original_state == "unpinned":
+        summary = "\n".join(line for line in summary.splitlines()
+                            if not line.startswith("<!-- pr-pipeline:fix-review "))
+    unrelated_review = pipeline.render_review_comment(
+        verdict="ready_for_human", findings=[], base_sha="c" * 40, head_sha="abc123",
+    )
+    comments = [] if original_state == "deleted" else [{
+        "body": original_review + ("\nEdited" if original_state == "edited" else ""),
+    }]
+    # Neither a newer review during the fixer run nor one after publication
+    # may replace the original finding set. Duplicate fixer publication is safe.
+    comments.extend([{"body": unrelated_review}, {"body": summary},
+                     {"body": summary}, {"body": unrelated_review}])
+    expected_round, _ = pipeline.latest_fixer_context(comments)
+    wt_root = tmp_path / "worktrees"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    proc = mock.MagicMock(pid=12345)
+
+    def metadata(*args: str) -> object:
+        if "comments" in args:
+            return comments
+        return {"title": "Guard fix", "body": "Closes #7"}
+
+    def git_read(*args: str) -> str:
+        if "merge-base" in args or ("rev-parse" in args and "--show-toplevel" not in args):
+            return "b" * 40
+        return reviewer_git(repo_root)(*args)
+
+    with (
+        mock.patch("tick.WT_ROOT", str(wt_root)),
+        mock.patch("tick.git", side_effect=git_read),
+        mock.patch("tick.gh_text", side_effect=["main", "abc123"]),
+        mock.patch("tick.gh_json", side_effect=metadata),
+        mock.patch("tick.pipeline.touches_review_policy", return_value=False),
+        mock.patch("tick._publish_marker_or_revert", return_value=True),
+        mock.patch("tick.relabel") as relabel,
+        mock.patch("subprocess.Popen", return_value=proc) as popen,
+    ):
+        tick._dispatch_one_reviewer(pr_number=42, pre_label=pipeline.LABEL_REVISED)
+
+    if original_state != "intact":
+        popen.assert_not_called()
+        relabel.assert_not_called()
+        assert not (wt_root / "pr-42" / "dispatch.json").exists()
+        return
+    popen.assert_called_once()
+    prompt = popen.call_args.args[0][-1]
+    assert "The current caller already validates the input." in prompt
+    assert "BEGIN FIXER SUMMARY (context only)" in prompt
+    assert "independently" in prompt
+    # The fixer omitted the second finding entirely. Fresh-context review
+    # must receive the full originating review to check coverage explicitly.
+    assert original_review in prompt
+    assert unrelated_review not in prompt
+    assert "every original finding" in prompt
+    marker = json.loads((wt_root / "pr-42" / "dispatch.json").read_text())
+    assert marker["fix_round"] == expected_round
+    assert pipeline.valid_marker(marker)
+    command = popen.call_args.args[0]
+    assert command[command.index("--fix-round") + 1] == expected_round
+
+
+@pytest.mark.parametrize("comments", [None, {}, "unreadable"])
+def test_reviewer_retains_revised_pr_without_readable_fixer_context(
+    tmp_path: Path, comments: object,
+) -> None:
+    import tick
+
+    def metadata(*args: str) -> object:
+        if "comments" in args:
+            return comments
+        return {"title": "Guard fix", "body": "Closes #7"}
+
+    with (
+        mock.patch("tick.WT_ROOT", str(tmp_path / "worktrees")),
+        mock.patch("tick.git", side_effect=reviewer_git(tmp_path)),
+        mock.patch("tick.gh_text", side_effect=["main", "abc123"]),
+        mock.patch("tick.gh_json", side_effect=metadata),
+        mock.patch("tick.pipeline.touches_review_policy", return_value=False),
+        mock.patch("tick._publish_marker_or_revert", return_value=True),
+        mock.patch("tick.relabel") as relabel,
+        mock.patch("subprocess.Popen") as popen,
+    ):
+        tick._dispatch_one_reviewer(pr_number=42, pre_label="ai:revised")
+    popen.assert_not_called()
+    relabel.assert_not_called()
 
 
 def test_reviewer_dispatch_retains_pr_on_failed_metadata_read(
@@ -4130,6 +4249,29 @@ def test_dispatch_one_fixer_prompt_lets_a_short_contract_donate_its_share(
     )
 
 
+def test_fixer_prompt_allows_reasoned_no_change_without_a_push(tmp_path: Path) -> None:
+    prompt = render_fixer_prompt(tmp_path)
+    assert "Decision: no-change" in prompt
+    assert "Reason:" in prompt
+    assert "NO_CHANGES_RECHECK_NEEDED" in prompt
+    assert "do not commit or push" in prompt
+    assert "every finding" in prompt
+    assert "needs no declaration" not in prompt
+
+
+def test_fixer_dispatch_identity_is_unique_within_one_second(tmp_path: Path) -> None:
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    with mock.patch("tick.time.time", return_value=1234567890):
+        render_fixer_prompt(first)
+        render_fixer_prompt(second)
+    markers = [json.loads((root / "worktrees/pr-42/dispatch.json").read_text())
+               for root in (first, second)]
+    assert markers[0]["dispatch_id"] != markers[1]["dispatch_id"]
+
+
 def test_dispatch_one_fixer_prompt_rechecks_the_declaration_before_the_sentinel(
     tmp_path: Path,
 ) -> None:
@@ -4190,8 +4332,8 @@ def test_dispatch_one_fixer_prompt_shapes_the_published_declaration(
         "what you changed to close it."
     ) in prompt, f"fixer prompt does not fix the declaration format, got: {prompt}"
     assert (
-        "Every finding you addressed carries its own decision: one run may mix "
-        "repairs and replacements, and each replacement states its own four "
+        "Every finding carries its own decision: one run may mix repairs, "
+        "replacements, and no-change decisions, and each replacement states its own four "
         "lines rather than sharing one set with another finding."
     ) in prompt, (
         "the prompt still permits one run-wide declaration, so a mixed review "

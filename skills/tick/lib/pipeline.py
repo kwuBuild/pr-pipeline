@@ -42,6 +42,7 @@ if sys.version_info < _PYTHON_FLOOR:  # pragma: no cover - not reached above the
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import math
 import os
@@ -334,10 +335,13 @@ SENTINEL_BLOCKERS = "BLOCKERS_FOUND"
 # Implementer/fixer sentinel tokens emitted literally in result.json text.
 SENTINEL_IMPL_COMPLETE = "IMPLEMENTATION_COMPLETE"
 SENTINEL_FIXES_PUSHED = "FIXES_PUSHED_RECHECK_NEEDED"
+SENTINEL_NO_CHANGES = "NO_CHANGES_RECHECK_NEEDED"
 SENTINEL_NEEDS_HUMAN_DECISION = "NEEDS_HUMAN_DECISION"
 OUTCOME_UNRECOGNIZED = "unrecognized"
 _IMPLEMENTATION_SENTINELS = (SENTINEL_IMPL_COMPLETE, SENTINEL_NEEDS_HUMAN_DECISION)
-_FIXER_SENTINELS = (SENTINEL_FIXES_PUSHED, SENTINEL_NEEDS_HUMAN_DECISION)
+_FIXER_SENTINELS = (
+    SENTINEL_FIXES_PUSHED, SENTINEL_NO_CHANGES, SENTINEL_NEEDS_HUMAN_DECISION,
+)
 _HELD_COMPLETION_OUTCOMES = {
     "review": frozenset({VERDICT_READY, VERDICT_CHANGES, OUTCOME_UNRECOGNIZED}),
     "implement": frozenset({*_IMPLEMENTATION_SENTINELS, OUTCOME_UNRECOGNIZED}),
@@ -1104,6 +1108,7 @@ def _round_token(
     base_tip_sha: str,
     head_sha: str,
     base_ref: str = "",
+    fix_round: str = "",
 ) -> str:
     """Return the hidden idempotency token for one reviewed round.
 
@@ -1123,10 +1128,15 @@ def _round_token(
             three-part format for markers that predate the ref key (the two
             formats never match each other, so a cross-format replay re-posts
             at most once — the accepted one-time upgrade edge).
+        fix_round: Dispatch-derived token of the no-change fixer whose
+            published reasoning this reviewer received. Empty preserves the
+            existing SHA/ref identity; harvest retries reuse the pinned token.
     """
     identity = f"{diff_base_sha}:{base_tip_sha}:{head_sha}"
     if base_ref:
         identity = f"{identity}:{base_ref}"
+    if fix_round:
+        identity = f"{identity}:no-change:{fix_round}"
     return f"{_ROUND_MARKER_PREFIX}{identity} -->"
 
 # Default runaway-spend safety valve: crossing this many completed review rounds
@@ -1293,6 +1303,7 @@ def review_already_posted(
     *,
     base_tip_sha: str = "",
     base_ref: str = "",
+    fix_round: str = "",
 ) -> bool:
     """Return whether this exact round's review comment was already posted.
 
@@ -1317,6 +1328,7 @@ def review_already_posted(
             single pinned base was the tip and the diff anchor at once).
         base_ref: The base branch name pinned at dispatch. Empty matches only
             the legacy three-part token format (markers without ``base_ref``).
+        fix_round: No-change fixer identity pinned at reviewer dispatch.
 
     Returns:
         ``True`` if a marker-stamped comment carrying this round's token exists.
@@ -1324,7 +1336,7 @@ def review_already_posted(
     if not head_sha:
         return False
     token = _round_token(
-        base_sha, base_tip_sha or base_sha, head_sha, base_ref,
+        base_sha, base_tip_sha or base_sha, head_sha, base_ref, fix_round,
     )
     for comment in comments:
         if not isinstance(comment, dict):
@@ -1428,6 +1440,7 @@ def render_review_comment(
     head_sha: str,
     base_tip_sha: str = "",
     base_ref: str = "",
+    fix_round: str = "",
     marker: str = REVIEW_MARKER,
 ) -> str:
     """Render the PR review comment from the typed verdict and findings.
@@ -1454,6 +1467,7 @@ def render_review_comment(
             was the tip and the diff anchor at once.
         base_ref: The base branch name pinned at dispatch. Empty keeps the
             legacy token format and omits the ref from the audit line.
+        fix_round: No-change fixer identity pinned at reviewer dispatch.
         marker: The fixed header string; defaults to :data:`REVIEW_MARKER`.
 
     Returns:
@@ -1468,7 +1482,7 @@ def render_review_comment(
     ref_note = f"base `{base_ref}`, " if base_ref else ""
     lines = [
         marker,
-        _round_token(base_sha, tip_sha, head_sha, base_ref),
+        _round_token(base_sha, tip_sha, head_sha, base_ref, fix_round),
         "",
         (
             f"**Codex review** ({ref_note}diff base `{base_sha}`, "
@@ -1502,6 +1516,7 @@ def decide_review_harvest(
     diff_base_sha: str = "",
     pinned_base_ref: str = "",
     current_base_ref: str = "",
+    fix_round: str = "",
 ) -> dict[str, object]:
     """Decide the full outcome of harvesting one finished review.
 
@@ -1547,6 +1562,8 @@ def decide_review_harvest(
             even when every SHA matches.
         current_base_ref: The PR's live base branch name point-read at
             harvest; empty disables the check.
+        fix_round: No-change fixer token pinned with the reviewer's prompt.
+            Never derived from the harvest-time comment history.
 
     Returns:
         A decision mapping with keys: ``action`` (``"promote"`` |
@@ -1645,6 +1662,7 @@ def decide_review_harvest(
         base_tip_sha=pinned_base,
         head_sha=pinned_head,
         base_ref=pinned_base_ref,
+        fix_round=fix_round,
     )
 
     # Idempotency: a comment already posted for this round means it is already
@@ -1656,6 +1674,7 @@ def decide_review_harvest(
     already_posted = review_already_posted(
         comments, diff_base, pinned_head,
         base_tip_sha=pinned_base, base_ref=pinned_base_ref,
+        fix_round=fix_round,
     )
     rounds_after = rounds if already_posted else rounds + 1
 
@@ -2550,7 +2569,8 @@ def parse_fix_result(obj: object) -> str | None:
     """Extract the fixer sentinel from a ``claude -p --output-format json`` result.
 
     The fixer's ``result.json`` uses ``FIXES_PUSHED_RECHECK_NEEDED`` (code
-    committed and pushed, ready for re-review) or ``NEEDS_HUMAN_DECISION``
+    committed and pushed), ``NO_CHANGES_RECHECK_NEEDED`` (reasoned no-change
+    findings, ready for re-review), or ``NEEDS_HUMAN_DECISION``
     (blocked on a finding that is out of scope). Mirrors
     :func:`parse_implementation_result` with the fixer sentinel set.
 
@@ -2804,6 +2824,8 @@ def render_fix_comment(
     escalation_reason: str = "",
     engine_report: str = "",
     body_revision: str = "",
+    no_change_round: str = "",
+    review_sha256: str = "",
     marker: str = FIX_MARKER,
 ) -> str:
     """Render the PR comment recording one finished fixer run.
@@ -2832,6 +2854,9 @@ def render_fix_comment(
         body_revision: The outcome of the fixer's replacement PR body, keyed
             into :data:`_BODY_REVISION_NOTES`. Empty (the common run, where the
             fixer offered none) omits the line.
+        no_change_round: Stable dispatch-derived identity for an accepted
+            no-change completion. Empty for pushed fixes and escalations.
+        review_sha256: Fingerprint of the original review handed to the fixer.
         marker: The fixed header string; defaults to :data:`FIX_MARKER`.
 
     Returns:
@@ -2842,10 +2867,14 @@ def render_fix_comment(
         if action == "recheck"
         else "🚨 Escalated for a human decision."
     )
+    if action == "recheck" and no_change_round:
+        headline = "🔧 No changes needed — re-review requested."
     before = pinned_head or "unknown"
     after = current_head or "unknown"
     lines = [
         marker,
+        *([f"<!-- pr-pipeline:no-change {no_change_round} -->"] if no_change_round else []),
+        *([f"<!-- pr-pipeline:fix-review {review_sha256} -->"] if review_sha256 else []),
         "",
         f"**Fixer run** (head `{before}` → `{after}`)",
         "",
@@ -2859,7 +2888,9 @@ def render_fix_comment(
     body_note = _BODY_REVISION_NOTES.get(body_revision)
     if body_note:
         lines.append(f"- PR body: {body_note}")
-    if sentinel and engine_report.strip() == sentinel:
+    if sentinel == SENTINEL_NO_CHANGES and engine_report.strip() == sentinel:
+        lines.append("- Engine report: _the engine emitted no per-finding reasoning._")
+    elif sentinel and engine_report.strip() == sentinel:
         # The engine emitted its completion sentinel and nothing else. That is a
         # protocol-valid result even though the fixer prompt asks for a change
         # summary, so the comment has to stay honest: republishing the token
@@ -2882,6 +2913,45 @@ def render_fix_comment(
             "</details>",
         ])
     return "\n".join(lines)
+
+
+def latest_fixer_context(comments: list[object]) -> tuple[str, str]:
+    """Return the latest published recheck's no-change identity and reasoning.
+
+    The identity is authored by harvest from the fixer dispatch, not a comment
+    ID or a count: duplicate publication of one result cannot create a round.
+    Dispatch pins it alongside the prompt snapshot; harvest never re-derives it
+    from newer comments. Empty identity preserves legacy and pushed-fix tokens.
+    """
+    for comment in reversed(comments):
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if not isinstance(body, str) or not body.startswith(FIX_MARKER + "\n"):
+            continue
+        if f"- Outcome: `recheck` → `{LABEL_REVISED}`" not in body.splitlines():
+            continue
+        token = re.fullmatch(r"<!-- pr-pipeline:no-change ([a-f0-9]{64}) -->", body.splitlines()[1])
+        return (token.group(1) if token else "", body)
+    return "", ""
+
+
+def fixer_original_review(comments: list[object], fixer_summary: str) -> str:
+    """Resolve the exact review fingerprint pinned before the fixer launched.
+
+    Never substitute a newer review or an edited copy. Missing provenance or
+    a deleted/edited original returns empty so no-change review fails closed.
+    This binds content, not comment authorship (a separate trust boundary).
+    """
+    # Controller metadata precedes the blank line; engine report text cannot
+    # supply or override the review fingerprint.
+    header = fixer_summary.split("\n\n", 1)[0]
+    match = re.search(r"^<!-- pr-pipeline:fix-review ([a-f0-9]{64}) -->$", header, re.M)
+    if match is None:
+        return ""
+    for comment in comments:
+        body = comment.get("body") if isinstance(comment, dict) else None
+        if isinstance(body, str) and hashlib.sha256(body.encode()).hexdigest() == match[1]:
+            return body
+    return ""
 
 
 def render_cap_escalation_comment(
@@ -3153,6 +3223,13 @@ def _fix_escalation_reason(sentinel: str | None, *, head_advanced: bool) -> str:
     Returns:
         A single sentence naming the escalation cause.
     """
+    if sentinel == SENTINEL_NO_CHANGES:
+        return (
+            "a no-change completion requires an unchanged pinned head, a dispatch "
+            "identity, a pinned review fingerprint, and a bounded summary with an "
+            "explicit Decision: no-change "
+            "and non-empty Reason: for every Finding:."
+        )
     if not head_advanced:
         return (
             "the engine reported fixes were pushed, but the PR head did not "
@@ -3169,6 +3246,34 @@ def _fix_escalation_reason(sentinel: str | None, *, head_advanced: bool) -> str:
     )
 
 
+def _all_reported_findings_no_change(result_obj: object) -> bool:
+    """Require a complete, bounded Finding/Decision/Reason block per finding.
+
+    Parse the full result, never the truncated publication excerpt. Extra prose,
+    duplicate fields, missing decisions, and empty reasons are not implicit
+    no-change decisions. The no-push protocol deliberately has a narrow grammar.
+    Coverage of the input review and the truth of each reason remain reviewer
+    judgements; this parser checks the reported blocks, not their semantics.
+    """
+    if not isinstance(result_obj, dict):
+        return False
+    raw = result_obj.get("result")
+    if not isinstance(raw, str):
+        return False
+    summary, separator, tail = raw.strip().rpartition(SENTINEL_NO_CHANGES)
+    if not separator or tail.strip() or len(summary.strip()) > FIX_SUMMARY_BUDGET:
+        return False
+    lines = [line.strip() for line in summary.splitlines() if line.strip()]
+    if not lines or len(lines) % 3:
+        return False
+    return all(
+        finding.startswith("Finding:") and finding.removeprefix("Finding:").strip()
+        and decision == "Decision: no-change"
+        and reason.startswith("Reason:") and reason.removeprefix("Reason:").strip()
+        for finding, decision, reason in zip(lines[::3], lines[1::3], lines[2::3])
+    )
+
+
 def decide_fix_harvest(
     *,
     result_obj: object,
@@ -3176,6 +3281,8 @@ def decide_fix_harvest(
     pinned_head: str = "",
     current_head: str = "",
     body_revision: str = "",
+    dispatch_id: str = "",
+    review_sha256: str = "",
 ) -> dict[str, object]:
     """Decide the outcome of a finished fixer engine.
 
@@ -3193,6 +3300,12 @@ def decide_fix_harvest(
     replay token then suppresses the comment and the comment-derived
     iteration count freezes below :data:`MAX_ITERATIONS`, looping reviewer
     and fixer spend without a terminal state.
+
+    ``NO_CHANGES`` is a separate claim: every reported finding must carry a
+    reasoned no-change decision, with an unchanged pinned head, dispatch
+    identity, and original review fingerprint. Its published token makes the
+    next review a distinct round,
+    while retries of this fixer result retain the same token.
 
     Both terminal outcomes also carry ``post_comment`` and ``comment_body``:
     the harvest records the run on the PR before flipping the label, so the
@@ -3219,6 +3332,10 @@ def decide_fix_harvest(
             the other outcomes did not necessarily push the head the
             replacement describes, so the caller leaves the body alone and the
             comment says so.
+        dispatch_id: Fixer marker identity; required on the no-change path
+            so duplicate publication cannot mint another review round.
+        review_sha256: SHA-256 of the original review handed to the fixer;
+            required on the no-change path so re-review can check coverage.
 
     Returns:
         A decision mapping with keys: ``action`` (``"recheck"`` |
@@ -3226,13 +3343,14 @@ def decide_fix_harvest(
         ``sentinel`` (the extracted sentinel string, or ``None``),
         ``post_comment`` (bool), and ``comment_body`` (str, empty when no
         comment is due). When a ``FIXES_PUSHED`` claim was checked against the
-        live head, ``head_advanced`` reports the comparison (``False`` marks
-        the contradictory escalate).
+        live head, ``head_advanced`` reports an unchanged head as ``False``.
+        A valid no-change completion also carries ``head_advanced=False``.
     """
     sentinel = parse_fix_result(result_obj)
     report = _sanitize_engine_report(
         result_obj.get("result") if isinstance(result_obj, dict) else None
     )
+    no_change_round = ""
 
     def terminal(action: str, label: str, *, head_advanced: bool) -> dict[str, object]:
         """Build a terminal fixer decision with its PR-comment payload."""
@@ -3266,12 +3384,23 @@ def decide_fix_harvest(
                     if body_revision == "ready" and action != "recheck"
                     else body_revision
                 ),
+                no_change_round=no_change_round,
+                review_sha256=review_sha256,
             ),
         }
         if not head_advanced:
             decision["head_advanced"] = False
         return decision
 
+    if sentinel == SENTINEL_NO_CHANGES:
+        if (
+            dispatch_id and pinned_head and pinned_head == current_head
+            and re.fullmatch(r"[a-f0-9]{64}", review_sha256)
+            and _all_reported_findings_no_change(result_obj)
+        ):
+            no_change_round = hashlib.sha256(dispatch_id.encode()).hexdigest()
+            return terminal("recheck", LABEL_REVISED, head_advanced=False)
+        return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=True)
     if sentinel == SENTINEL_FIXES_PUSHED:
         if pinned_head and current_head and pinned_head == current_head:
             return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=False)
@@ -3354,7 +3483,8 @@ _REQUIRED_MARKER_FIELDS = frozenset(
 # set means the marker did not come from this pipeline's writer, so it is rejected
 # rather than partially trusted.
 _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
-    {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body"}
+    {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
+     "fix_round", "review_sha256"}
 )
 
 # Pipeline stages a dispatch marker may legitimately record. A marker for an
@@ -3487,6 +3617,10 @@ def valid_marker(
       marker only (it is the freshness anchor the base-drift guard compares; only
       reviewer dispatch writes it, and a malformed value would silently degrade the
       guard to the merge-base fallback);
+    - ``fix_round``, when present, is a lowercase SHA-256 token on a *review*
+      marker only, preserving the no-change reasoning's round identity;
+    - ``review_sha256``, when present, is a lowercase SHA-256 fingerprint on a
+      *fix* marker only, binding the originating review for coverage checks;
     - ``pre_label`` is one of the real pre-dispatch labels (``ai:implemented`` /
       ``ai:revised``) — never an arbitrary or terminal label, which reconciliation
       would otherwise revert to;
@@ -3556,6 +3690,20 @@ def valid_marker(
             return False
         base_tip_sha = obj.get("base_tip_sha")
         if not isinstance(base_tip_sha, str) or not _COMMIT_OID_RE.fullmatch(base_tip_sha):
+            return False
+
+    if "fix_round" in obj:
+        fix_round = obj.get("fix_round")
+        if stage != "review" or not isinstance(fix_round, str):
+            return False
+        if not re.fullmatch(r"[a-f0-9]{64}", fix_round):
+            return False
+
+    if "review_sha256" in obj:
+        review_sha256 = obj.get("review_sha256")
+        if stage != "fix" or not isinstance(review_sha256, str):
+            return False
+        if not re.fullmatch(r"[a-f0-9]{64}", review_sha256):
             return False
 
     # pr_body is the fixer's PR-body-revision provenance: the fingerprint of the
@@ -3863,6 +4011,7 @@ def harvest_review(
     diff_base_sha: str = "",
     pinned_base_ref: str = "",
     current_base_ref: str = "",
+    fix_round: str = "",
 ) -> HarvestResult:
     """Decide the outcome of harvesting one finished review.
 
@@ -3883,6 +4032,7 @@ def harvest_review(
             against ``current_base_ref`` for retargeting (empty disables).
         current_base_ref: The PR's live base branch name at harvest (empty
             disables the retarget check).
+        fix_round: No-change fixer token pinned at reviewer dispatch.
 
     Returns:
         A HarvestResult mapping with action, label, and stage-specific keys.
@@ -3901,6 +4051,7 @@ def harvest_review(
         diff_base_sha=diff_base_sha,
         pinned_base_ref=pinned_base_ref,
         current_base_ref=current_base_ref,
+        fix_round=fix_round,
     )
     return result  # type: ignore[return-value]
 
@@ -3979,6 +4130,8 @@ def harvest_fix(
     pinned_head: str = "",
     current_head: str = "",
     body_revision: str = "",
+    dispatch_id: str = "",
+    review_sha256: str = "",
 ) -> HarvestResult:
     """Decide the outcome of a finished fixer engine.
 
@@ -3992,6 +4145,8 @@ def harvest_fix(
             push check).
         body_revision: The state the controller reached on the fixer's
             replacement PR body; empty when it offered none.
+        dispatch_id: Fixer marker identity required for no-change completion.
+        review_sha256: Original review fingerprint pinned at fixer dispatch.
 
     Returns:
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
@@ -4003,6 +4158,8 @@ def harvest_fix(
         pinned_head=pinned_head,
         current_head=current_head,
         body_revision=body_revision,
+        dispatch_id=dispatch_id,
+        review_sha256=review_sha256,
     )
     return decision  # type: ignore[return-value]
 
@@ -4151,6 +4308,7 @@ def _cmd_harvest_review(args: argparse.Namespace) -> int:
         diff_base_sha=args.diff_base_sha,
         pinned_base_ref=args.pinned_base_ref,
         current_base_ref=args.current_base_ref,
+        fix_round=args.fix_round,
     )
     print(json.dumps(decision))
     return 0
@@ -4241,6 +4399,8 @@ def _cmd_harvest_fix(args: argparse.Namespace) -> int:
         pinned_head=args.pinned_head,
         current_head=args.current_head,
         body_revision=args.body_revision,
+        dispatch_id=args.dispatch_id,
+        review_sha256=args.review_sha256,
     )
     print(json.dumps(decision))
     return 0
@@ -4493,6 +4653,7 @@ def main(argv: list[str] | None = None) -> int:
         help="PR's live base branch name at harvest (empty disables the retarget check)",
     )
     p_harvest.add_argument("--threshold", type=int, default=MAX_ITERATIONS)
+    p_harvest.add_argument("--fix-round", default="", help="Pinned no-change fixer round")
     p_harvest.set_defaults(func=_cmd_harvest_review)
 
     p_validate = sub.add_parser("validate-review", help="Validate a review.json against the schema")
@@ -4561,6 +4722,10 @@ def main(argv: list[str] | None = None) -> int:
         "harvest-fix", help="Decide a finished fixer's outcome"
     )
     p_harvest_fix.add_argument("--result", required=True, help="Path to result.json")
+    p_harvest_fix.add_argument("--dispatch-id", default="", help="Fixer dispatch identity")
+    p_harvest_fix.add_argument(
+        "--review-sha256", default="", help="Original review fingerprint from dispatch.json",
+    )
     p_harvest_fix.add_argument(
         "--pre-label",
         default=LABEL_CHANGES_REQUESTED,
