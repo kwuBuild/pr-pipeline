@@ -20,7 +20,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
    ```bash
    bash ${CLAUDE_PLUGIN_ROOT}/skills/tick/tick.sh [--loop] [pr:N | '#N'] [--impl-engine claude|claude-ds] [--model <model>] [--review-model <model>] [--review-effort <effort>] [--permission-mode dontAsk|auto]
    ```
-   `--permission-mode auto` is experimental, not promoted: classifier-gated engines; default stays `dontAsk`; trial via targeted `pr:N`/`'#N'` runs; a classifier denial fails the run.
+   Claude implementers/fixers default to `auto`: calls needing approval beyond explicit grants reach the classifier; denial can fail the run. `permission_mode` resolves packaged floor → operator `[defaults]` → `[repos."owner/name"]` → CLI. Use `dontAsk` for a route that fails the setup probe (#18); tick performs no automatic route fallback. Under `auto`, the allowlist is not a ceiling: use operator-owned deny rules for forbidden operations. The Codex reviewer retains its separate read-only policy; see [permission modes](README.md#engine-permission-modes).
 3. With `--loop`, cadence is an upper bound: engine completion or `touch .claude/worktrees/.tick-state/wake-request` starts the next tick early. Nudges change only timing, never what a tick concludes. See README "Edge-triggered wake-up".
 4. Use `pr:N` or `'#N'` only for a targeted harvest/dispatch. For `#N`, implementation stays scoped to issue `N`; zero or one open closing PR scopes the reviewer and fixer. `pr:N` stays direct PR scope. An ambiguous or malformed closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log and tick lock are excepted. Targeting does not bypass reconciliation, admission, trust, or label-safety gates.
 

@@ -3353,14 +3353,14 @@ def test_fixer_dispatch_uses_pr_branch_for_worktree(
 # --- Adversarial review: unattended engine command contract ---
 
 
+@pytest.mark.parametrize("override", [None, "dontAsk"])
 def test_implementer_dispatch_uses_bounded_unattended_flags(
-    tmp_path: Path,
+    tmp_path: Path, override: str | None,
 ) -> None:
     """Implementer engine runs unattended with a bounded tool allowlist.
 
-    The design contract is ``--permission-mode dontAsk`` plus an explicit
-    ``--allowedTools`` list — NOT ``--dangerously-skip-permissions``, which
-    hands an unattended engine unrestricted tool access. ``claude`` has no
+    Default ``auto`` and explicit ``dontAsk`` retain the narrow pre-approved
+    ``--allowedTools`` grants without bypassing permissions. ``claude`` has no
     ``-o`` flag: the prompt is fed via stdin (``prompt.txt``) and the result
     JSON is captured by redirecting stdout to ``result.json``.
     """
@@ -3388,6 +3388,7 @@ def test_implementer_dispatch_uses_bounded_unattended_flags(
                             issue_number=461,
                             issue_title="PWA icons",
                             tick_log=None,
+                            **({"permission_mode": override} if override else {}),
                         )
 
     popen_mock.assert_called_once()
@@ -3400,11 +3401,11 @@ def test_implementer_dispatch_uses_bounded_unattended_flags(
         f"claude has no -o flag; result capture is stdout redirection, "
         f"got: {engine_cmd}"
     )
-    assert engine_cmd[engine_cmd.index("--permission-mode") + 1] == "dontAsk"
+    assert engine_cmd[engine_cmd.index("--permission-mode") + 1] == (override or "auto")
     allowed = engine_cmd[engine_cmd.index("--allowedTools") + 1]
     # The implementer's push permission is EXACT: its worktree checks out its
-    # own branch, so `git push origin HEAD` is the entire remote-mutation
-    # surface. No wildcard — `HEAD*` would admit arbitrary refspec destinations
+    # own branch, so `git push origin HEAD` is the pre-approved remote-mutation
+    # surface (auto can approve other commands). No wildcard — `HEAD*` would admit arbitrary refspec destinations
     # and command suffixes (e.g. force options).
     assert "Bash(git push origin HEAD)" in allowed
     assert "HEAD*" not in allowed
@@ -3569,13 +3570,14 @@ def test_fixer_dispatch_honors_permission_mode_auto(
     )
 
 
+@pytest.mark.parametrize("override", [None, "dontAsk"])
 def test_fixer_dispatch_uses_bounded_unattended_flags(
-    tmp_path: Path,
+    tmp_path: Path, override: str | None,
 ) -> None:
     """Fixer engine runs unattended with a bounded tool allowlist.
 
-    Same contract as the implementer: ``--permission-mode dontAsk`` +
-    ``--allowedTools``, prompt via stdin, result via stdout redirection.
+    Same contract as the implementer: auto by default with dontAsk available,
+    narrow pre-approved grants, prompt via stdin, result via stdout redirection.
     """
     from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
 
@@ -3615,6 +3617,7 @@ def test_fixer_dispatch_uses_bounded_unattended_flags(
                                     _dispatch_one_fixer(
                                         pr_number=42,
                                         tick_log=None,
+                                        **({"permission_mode": override} if override else {}),
                                     )
 
     popen.assert_called_once()
@@ -3627,10 +3630,10 @@ def test_fixer_dispatch_uses_bounded_unattended_flags(
         f"claude has no -o flag; result capture is stdout redirection, "
         f"got: {engine_cmd}"
     )
-    assert engine_cmd[engine_cmd.index("--permission-mode") + 1] == "dontAsk"
+    assert engine_cmd[engine_cmd.index("--permission-mode") + 1] == (override or "auto")
     allowed = engine_cmd[engine_cmd.index("--allowedTools") + 1]
     # The fixer's push permission is EXACT and stage-specific: the detached
-    # worktree has no checked-out branch, so the only allowed push is the
+    # worktree has no checked-out branch, so the only pre-approved push is the
     # fully-qualified refspec to this PR's validated head ref. No wildcard,
     # and no bare-HEAD form either.
     assert "Bash(git push origin HEAD:refs/heads/fix-branch)" in allowed
@@ -4508,6 +4511,10 @@ def test_reviewer_dispatch_includes_unattended_flags(
     sep_idx = engine_cmd.index("--")
     codex_argv = engine_cmd[sep_idx + 1:]
 
+    # Claude's auto default must not select a writable Codex permission preset.
+    assert "--approve-for-me" not in codex_argv
+    assert "--full-auto" not in codex_argv
+    assert "--permission-mode" not in codex_argv
     assert "--dangerously-bypass-approvals-and-sandbox" not in codex_argv, (
         f"reviewer must run sandboxed; the full bypass hands a prompt-injected "
         f"engine arbitrary writes and command network, got: {codex_argv}"
@@ -4571,7 +4578,10 @@ def test_parse_cli_args_reads_permission_mode_flag() -> None:
     assert mixed["target"] == "#651"
 
 
-def test_dispatch_implementers_passes_permission_mode_through() -> None:
+@pytest.mark.parametrize("override", [None, "auto", "dontAsk"])
+def test_dispatch_implementers_passes_permission_mode_through(
+    override: str | None,
+) -> None:
     """dispatch_implementers() forwards the requested permission mode.
 
     The option must survive the queue→dispatch boundary: a default that
@@ -4595,14 +4605,17 @@ def test_dispatch_implementers_passes_permission_mode_through() -> None:
                     dispatch_implementers(
                         tick_log=None, target=("issue", 463),
                         authoritative_in_flight=[],
-                        permission_mode="auto",
+                        **({"permission_mode": override} if override else {}),
                     )
 
     dispatch_one.assert_called_once()
-    assert dispatch_one.call_args[1]["permission_mode"] == "auto"
+    assert dispatch_one.call_args[1]["permission_mode"] == (override or "auto")
 
 
-def test_dispatch_fixers_passes_permission_mode_through() -> None:
+@pytest.mark.parametrize("override", [None, "auto", "dontAsk"])
+def test_dispatch_fixers_passes_permission_mode_through(
+    override: str | None,
+) -> None:
     """dispatch_fixers() forwards the requested permission mode."""
     import pipeline as _pipeline
     from tick import dispatch_fixers  # type: ignore[import-untyped]
@@ -4621,11 +4634,11 @@ def test_dispatch_fixers_passes_permission_mode_through() -> None:
                     dispatch_fixers(
                         tick_log=None, target=("pr", 42),
                         authoritative_in_flight=[],
-                        permission_mode="auto",
+                        **({"permission_mode": override} if override else {}),
                     )
 
     dispatch_one.assert_called_once()
-    assert dispatch_one.call_args[1]["permission_mode"] == "auto"
+    assert dispatch_one.call_args[1]["permission_mode"] == (override or "auto")
 
 
 def test_parse_cli_args_reads_review_model_and_effort_flags() -> None:

@@ -749,7 +749,7 @@ The implementer engine is selectable via `--impl-engine` on `/pr-pipeline:tick`:
 ```bash
 # Default (claude):
 (cd .claude/worktrees/issue-<N> && claude -p \
-  --permission-mode dontAsk \
+  --permission-mode auto \
   --allowedTools "Read Edit Write Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push <remote> HEAD) Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright) Bash(npm --prefix frontend *)" \
   --output-format json \
   < prompt.txt \
@@ -763,7 +763,7 @@ The implementer engine is selectable via `--impl-engine` on `/pr-pipeline:tick`:
   ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY" \
   ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-pro[1m]" \
   claude -p \
-    --permission-mode dontAsk \
+    --permission-mode auto \
     --allowedTools "..." \
     --output-format json \
     --model "deepseek-v4-pro[1m]" \
@@ -780,38 +780,29 @@ The implementer gets:
 - The verification commands the operator declared as `verify_tools` — the target
   repo's tests, linter, and type checker
 - `git` for committing and pushing to its own branch
-- No network tools beyond what sandbox allows
+- Network/tool calls remain subject to operator settings and permission decisions
 - The target repo's own `CLAUDE.md` governs behavior (TDD, commit hygiene, and
   which verification commands to run in which order)
 
-**Git surface and remote blast radius — stated exactly.** The implementer has no
-`gh`, so it cannot label, comment on, merge, or close PRs/issues. But `git push`
-*does* reach GitHub, and `Bash(git *)` as written is broad enough to force-push,
-delete remote branches, edit global git config, or push refs other than the
-agent's own branch if credentials allow. For unattended automation that surface
-must be narrowed and guarded, not waved away:
+**Git surface and remote blast radius.** The explicit grants include commit
+and one exact stage-specific push: `git push <remote> HEAD` for the implementer,
+`git push <remote> HEAD:refs/heads/<head-ref>` for the detached fixer. The remote
+and head ref are validated before launch. No wildcard push grant is added.
 
-- Replace the blanket `Bash(git *)` with the minimum mutation surface the
-  implementer needs — read/inspect plus commit and a single-branch push, e.g.
-  `Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push <remote> HEAD)`.
-  `git push <remote> HEAD` pushes only the worktree's checked-out branch and
-  cannot delete remotes or push arbitrary refspecs.
-- Explicitly disallow `git push --force*`, `git push --delete`, `git branch -D`
-  on remotes, and `git config --global`. These are not in the allowlist above,
-  and `dontAsk` cannot approve a tool that is not allow-listed.
-- The honest claim is therefore: the implementer **can mutate its own remote
-  branch** (commit + fast-forward push), and the blast radius is bounded to that
-  one branch by the git allowlist plus worktree isolation — not "cannot touch
-  GitHub."
-- The push permission is **stage-specific and always exact — never a glob**.
-  The implementer worktree checks out its own branch, so its permission is the
-  exact `Bash(git push <remote> HEAD)`, templated from the resolved remote. The
-  fixer worktree is detached (no local branch custody), so its permission is the exact fully-qualified
-  refspec `Bash(git push <remote> HEAD:refs/heads/<head-ref>)`, templated from
-  the resolved remote and PR's validated head ref (refs failing the conservative
-  ref-name shape check escalate instead of launching). A wildcard like `HEAD*` would admit
-  arbitrary refspec destinations and command suffixes (e.g. force options);
-  the prompt is guidance, not an enforcement boundary.
+Claude engines default to `auto`, resolved through the packaged floor, operator
+`[defaults]`, per-repository settings, and finally the CLI. `dontAsk` remains an
+explicit fallback for routes that fail setup's probe. Under `dontAsk`, calls
+that would prompt are denied. Under `auto`, calls outside the pre-approved
+list can reach the classifier, including `gh`, force-push, remote-branch deletion,
+and arbitrary refspec pushes. The allowlist is not a ceiling in that mode;
+operator-owned deny rules must forbid operations that must never run. Prompts
+assign GitHub metadata writes to the controller, but are not enforcement.
+
+A classifier denial can still fail verification and the run. Tick does not probe
+or silently change the selected mode; setup (#18) owns measuring route behavior
+and recording any fallback/refusal. CLI acceptance alone is not evidence of
+provider capability. See [engine permission modes](../skills/tick/README.md#engine-permission-modes),
+including why Codex's `--approve-for-me` is not applied to the read-only reviewer.
 
 **Reviewer (Codex):**
 
@@ -1380,7 +1371,7 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
 - Review comments from the PR (via `gh pr view --json comments`)
 - The current PR body, and the requirements of every issue GitHub reports under
   `closingIssuesReferences` (via `gh pr view --json body,closingIssuesReferences`
-  plus `gh issue view --json title,body`). The engine has no `gh` of its own, so
+  plus `gh issue view --json title,body`). The engine has no pre-approved `gh` access, so
   these are read at dispatch and substituted; each is capped at
   `tick.FIXER_CONTEXT_BUDGET` with the cut stated in the text — the linked issues
   share one budget, allowanced shortest-first so no issue is dropped outright —
@@ -1552,15 +1543,12 @@ target's `CLAUDE.md`/`AGENTS.md` and the docs those route to. Engine prompts say
 not name `pytest`, `ruff`, `npm`, or any other stack. A pipeline that hard-coded
 one repo's toolchain would be installable in exactly one repo.
 
-The one place a command name is unavoidable is the engine tool allowlist:
-headless engines run under `--permission-mode dontAsk` with an *exact*
-permission list, never a glob (see *Permission mode for headless Claude*), so
-the operator declares the verification commands their repo actually uses as
-`verify_tools`, per target where they differ. That list is a permission grant,
-not an instruction — the prompt still defers to the repo's own guides for what
-to run and in what order. The shipped floor is the Python triple, because a
-default that grants nothing makes a fresh install fail its first dispatch with
-a permission denial rather than a legible message.
+The operator declares verification commands as `verify_tools`, per target where
+they differ. Those entries are pre-approved tool grants, not instructions: the
+prompt still defers to the repo's guides for what to run and in what order.
+Under `dontAsk`, calls needing approval beyond the grants are denied; under the
+default `auto`, they reach the classifier. Approval is not guaranteed. The
+shipped floor still grants the Python triple; emptying it is a separate change.
 
 **The pipeline owns the control plane.** The label vocabulary
 (`docs/working/pr-guidelines.md`), the state machine, custody, and the cadence
@@ -1854,30 +1842,16 @@ the review stage catches it; the fix stage addresses it; `max_iterations`
 caps spend; `ai:needs-human-decision` is the escape hatch. Start with
 well-scoped issues.
 
-**Permission mode for headless Claude:** the engines run with Claude Code's
-auto-approve mode on (`--permission-mode dontAsk` / auto mode assumed available
-in the dispatch environment), so the tool allowlist is *not* the only thing
-standing between the agent and the rest of GitHub. Two boundaries back it up:
-
-1. **Scoped token (primary boundary for unattended operation).** The dispatch
-   environment hands the engines a GitHub token scoped to exactly the repos they
-   operate on. Even if the git allowlist were wider than intended, a repo-scoped
-   token cannot push to, delete branches on, or otherwise mutate any other repo.
-   This is the real blast-radius guarantee and it does not depend on enumerating
-   git subcommands perfectly. This boundary is what makes auto mode safe to run
-   *unattended*; during the supervised incubation phase (see *Rollout & repo
-   strategy*) the human in the loop is the boundary, and the scoped token is
-   pulled forward where practical. The token's clean home is the dedicated repo
-   the tool extracts to before its first unattended run.
-2. **Narrowed tool allowlist (defense in depth).** `--allowedTools` still
-   restricts the git surface to commit + exactly one stage-specific **exact**
-   push permission — `git push <remote> HEAD` for the implementer (its worktree's
-   checked-out branch), `git push <remote> HEAD:refs/heads/<head-ref>` for the
-   fixer (its detached worktree's validated PR head ref). No wildcard entries,
-   so no force-push, remote-branch deletion, arbitrary refspec push, or
-   `git config --global`; even within the scoped repo the agent cannot rewrite
-   history or delete branches. Combined with worktree isolation, the bounded
-   capability is exactly "commit and fast-forward-push the agent's own branch."
+**Permission mode for headless Claude:** implementers and fixers request `auto`
+by default and inherit the operator's complete environment and settings. Tick
+does not provision a scoped GitHub token or an OS sandbox for them. The explicit
+allowlist pre-approves narrow commands but does not cap classifier approvals.
+Use operator-owned deny rules for forbidden actions and scoped credentials to
+bound remote access. Worktree isolation keeps edits separate; it does not prevent
+an engine with ambient credentials from acting elsewhere. `dontAsk` remains
+available when an exact pre-approval workflow is required. Neither mode proves
+that a provider/model route supports unattended completion; setup's probe owns
+that evidence.
 
 ## Repo strategy
 

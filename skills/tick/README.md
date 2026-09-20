@@ -138,7 +138,7 @@ allow_touching  = false       # auto-review PRs that edit reviewer-governing fil
 checklist_paths = []          # the target's own review checklists, repo-relative
 verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
 base_ref        = ""          # "" = the interim default, main
-permission_mode = "dontAsk"   # engine --permission-mode
+permission_mode = "auto"      # Claude implementer/fixer --permission-mode
 
 [scan]
 repos = []                    # empty or absent = unrestricted
@@ -783,6 +783,54 @@ accepted as a value only when nothing exists at that path, while missing,
 directory, dangling-symlink, permission, and other path-read failures fail
 closed. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are optional.
 
+### Engine permission modes
+
+Claude implementers and fixers default to `--permission-mode auto`. The existing
+`permission_mode` key accepts only `auto` and `dontAsk`, with precedence:
+packaged floor → operator `[defaults]` → `[repos."owner/name"]` → CLI flag.
+Malformed values stop startup and name the key. For a repository whose route
+fails the setup probe, persist the fallback in the operator's config:
+
+```toml
+[repos."owner/project"]
+permission_mode = "dontAsk"
+verify_tools = ["./gradlew test *"]
+```
+
+`auto` lets calls needing approval beyond the explicit grants reach Claude's
+classifier; it does not guarantee approval. A classifier denial can prevent
+verification and fail the run. CLI flag acceptance does not prove that a
+particular provider/model supports auto or can finish unattended. Tick passes
+the selected mode without automatically changing it; setup (#18) owns measuring
+the route's effective mode, denial behavior, and any fallback/refusal. Changing
+the provider/model requires rechecking that evidence.
+
+The narrow `--allowedTools` grants, including the stage's exact push command,
+remain in both modes. Under `dontAsk`, calls that would prompt are denied.
+Under `auto`, commands outside those grants, including force-push, remote-branch
+deletion, and arbitrary refspec pushes, can reach the classifier. Use
+operator-owned Claude deny rules for forbidden operations; omission from the
+allowlist is not a denial rule. Setup's deny-rule assistance belongs to #18.
+Implementers/fixers still inherit the operator's environment and settings.
+
+**Codex uses different controls.** On the locally inspected `codex-cli 0.155.1`,
+`codex exec --help` exposes `--approve-for-me`: automatic review of approval
+requests with a `workspace-write` sandbox. Its configuration uses
+`approval_policy = "on-request"` and `approvals_reviewer = "auto_review"`.
+Actions already permitted by the sandbox proceed normally; eligible requests
+to cross its boundary go to a separate reviewer, which can approve or deny.
+Denial can still stop an unattended task. See OpenAI's
+[auto-review documentation](https://learn.chatgpt.com/docs/sandboxing/auto-review).
+
+The older `--full-auto` is a deprecated compatibility flag for workspace-write,
+not classifier review; see the [CLI reference](https://developers.openai.com/codex/cli/reference).
+Neither flag is the full sandbox/approval bypass. The pipeline's Codex engine is
+a reviewer, so it keeps `-s read-only`, `--ignore-user-config`, and
+`--ignore-rules`; the Claude `permission_mode` setting does not apply to it.
+Applying `--approve-for-me` would permit workspace writes and approval-based
+escalation, changing that review boundary. No live Codex approval probe or
+provider-capability claim is implied by the CLI inspection.
+
 ### Prompt-bound skills (`skill_unresolved`)
 
 The fixer prompt binds `review-response-hygiene` by naming its doc path and
@@ -796,9 +844,10 @@ evaluates the decision instead of reconstructing it from the diff. The decisions
 are re-checked against the pushed diff before the completion sentinel, which now
 needs them alongside the three green commands.
 
-The binding is a doc path rather than a skill invocation on purpose: engines run
-under `--permission-mode dontAsk` (the default; the experimental `auto` mode is
-opt-in) with a bounded allowlist that carries `Read` and no `Skill` tool.
+The binding is a doc path rather than a skill invocation on purpose: the explicit
+grants include `Read` and no `Skill` tool. Reading the installed doc works with
+both `auto` (the default) and `dontAsk`, without depending on classifier approval
+of a skill invocation.
 
 The path is the **install's** — an absolute path into the pipeline's own
 `skills/` directory, not a path inside the fixer's worktree. The guidance ships
@@ -823,14 +872,14 @@ the PR back to `ai:changes-requested`.
 
 The rules above ask the fixer to check the PR's story surface (rule 2) and to
 re-read the contract the review cited (rule 5). Neither document is in the
-worktree, and the engine has no `gh` and no web access, so dispatch reads them
+worktree, and the engine has no pre-approved `gh` or web access, so dispatch reads them
 and substitutes them into the prompt: the PR body, and the body of every issue
 GitHub reports under `closingIssuesReferences`. Without them the prompt would be
 demanding work the engine cannot perform.
 
 Reading them here rather than granting the engine `gh` is the point, and it does
 not depend on which permission mode the engine launched under. Under `dontAsk` a
-`gh` call is denied outright; under the experimental `auto` mode it would reach
+`gh` call needing approval is denied; under the default `auto` mode it can reach
 the classifier instead, which is exactly the case the dispatch-side read is
 insurance against — an engine-side read that fails is invisible to the
 controller and silently becomes "no contract", while a controller-side one
@@ -856,9 +905,9 @@ prompt says so in words.
 
 ### The PR body the fixer hands back
 
-The fixer still has no `gh`, so it cannot edit the PR body itself. What it can do
-is write a full replacement to `.pr-body-revision.md` in its worktree root and
-let the harvest publish it — the same engine-writes-file, controller-applies-it
+The fixer is instructed to leave GitHub metadata writes to the controller. It
+writes a full replacement to `.pr-body-revision.md` in its worktree root and
+lets the harvest publish it — the same engine-writes-file, controller-applies-it
 shape as the implementer's `.pr-body.md`. Leaving the file absent is the normal
 case and the prompt says so; it is written only when the body no longer describes
 the head the fixer pushed.

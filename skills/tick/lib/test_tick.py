@@ -3164,13 +3164,13 @@ def test_launch_claude_engine_uses_explicit_model(tmp_path: Path) -> None:
     )
 
 
-def test_launch_claude_engine_emits_permission_mode_auto(tmp_path: Path) -> None:
-    """_launch_claude_engine emits --permission-mode auto when requested.
+@pytest.mark.parametrize("override", [None, "auto", "dontAsk"])
+def test_launch_claude_engine_permission_mode(
+    tmp_path: Path, override: str | None,
+) -> None:
+    """Default auto and explicit modes preserve the narrow pre-approved grants.
 
-    Headless auto mode routes non-allowlisted tool calls through the auto-mode
-    classifier (verified working on the DeepSeek gateway), while narrow
-    ``--allowedTools`` rules still resolve before the classifier — so the
-    bounded allowlist must survive the switch unchanged.
+    This asserts launch policy, not provider classifier availability or verdict.
     """
     from tick import _launch_claude_engine  # type: ignore[import-untyped]
 
@@ -3189,13 +3189,13 @@ def test_launch_claude_engine_emits_permission_mode_auto(tmp_path: Path) -> None
             result_path=result_path,
             env={"HOME": "/tmp", "PATH": "/usr/bin"},
             push_permission="Bash(git push origin HEAD)",
-            permission_mode="auto",
+            **({"permission_mode": override} if override is not None else {}),
         )
 
     cmd = popen.call_args[0][0]
     perm_idx = cmd.index("--permission-mode")
-    assert cmd[perm_idx + 1] == "auto", (
-        f"Expected --permission-mode auto, got "
+    assert cmd[perm_idx + 1] == (override or "auto"), (
+        f"Expected --permission-mode {override or 'auto'}, got "
         f"--permission-mode {cmd[perm_idx + 1]}"
     )
     assert "--allowedTools" in cmd, (
@@ -19647,10 +19647,69 @@ def test_main_refuses_a_login_removed_from_the_config(
     body.assert_not_called()
 
 
-def test_main_refuses_a_blank_permission_mode_before_any_dispatch(
+@pytest.mark.parametrize(
+    ("defaults", "repo_mode", "cli_mode", "expected"),
+    [
+        (None, None, "", "auto"),
+        ("dontAsk", None, "", "dontAsk"),
+        ("auto", "dontAsk", "", "dontAsk"),
+        ("dontAsk", "auto", "", "auto"),
+        ("auto", "auto", "dontAsk", "dontAsk"),
+        ("dontAsk", "dontAsk", "auto", "auto"),
+    ],
+)
+def test_main_resolves_permission_mode_before_dispatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    defaults: str | None, repo_mode: str | None, cli_mode: str, expected: str,
 ) -> None:
-    """A blank engine permission mode is refused at startup, not at launch.
+    """The real tick sends the winning layer to both Claude stages only."""
+    import pipeline
+    import tick
+
+    config_text = '[operator]\nlogin = "test-owner"\n'
+    if defaults is not None:
+        config_text += f'[defaults]\npermission_mode = "{defaults}"\n'
+    if repo_mode is not None:
+        config_text += (
+            f'[repos."{tick.TRUSTED_HEAD_REPO}"]\n'
+            f'permission_mode = "{repo_mode}"\n'
+        )
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(config_text, encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    monkeypatch.setattr(
+        pipeline, "_PACKAGED_CONFIG_PATH",
+        Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+    )
+
+    with (
+        mock.patch("tick.git", return_value=str(tmp_path)),
+        mock.patch("tick._startup_probe"),
+        mock.patch("tick.harvest_reviewers", return_value=True),
+        mock.patch("tick.harvest_implementers", return_value=True),
+        mock.patch("tick.harvest_fixers", return_value=True),
+        mock.patch("tick.read_authoritative_in_flight_labels", return_value=[]),
+        mock.patch("tick.dispatch_reviewers") as reviewers,
+        mock.patch("tick.dispatch_implementers") as implementers,
+        mock.patch("tick.dispatch_fixers") as fixers,
+        mock.patch("tick._compute_post_dispatch_state", return_value=(0, False, [])),
+    ):
+        assert tick.main(permission_mode=cli_mode) == 0
+
+    implementers.assert_called_once()
+    fixers.assert_called_once()
+    reviewers.assert_called_once()
+    assert implementers.call_args.kwargs["permission_mode"] == expected
+    assert fixers.call_args.kwargs["permission_mode"] == expected
+    assert "permission_mode" not in reviewers.call_args.kwargs
+
+
+@pytest.mark.parametrize("value", ['""', '"yolo"', '7', 'true', '[]'])
+def test_main_refuses_a_malformed_permission_mode_before_any_dispatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    value: str,
+) -> None:
+    """A malformed engine permission mode is refused before harvest or dispatch.
 
     Accepted, it passes the startup gate and raises inside the engine launch —
     after a dispatch lease and worktree exist, leaving a ``state="launching"``
@@ -19661,7 +19720,7 @@ def test_main_refuses_a_blank_permission_mode_before_any_dispatch(
 
     cfg = tmp_path / "config.toml"
     cfg.write_text(
-        '[operator]\nlogin = "userA"\n\n[defaults]\npermission_mode = ""\n',
+        f'[operator]\nlogin = "userA"\n\n[defaults]\npermission_mode = {value}\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))

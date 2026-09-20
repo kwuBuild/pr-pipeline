@@ -719,14 +719,13 @@ def _reviewer_safe_value(key: str, value: object, source: str) -> str:
     return ""
 
 
-# Bounded tool allowlist for headless claude engines (implementer/fixer).
-# The design contract is --permission-mode dontAsk + this explicit list —
-# never --dangerously-skip-permissions. The allowlist restricts the git
-# surface to commit plus exactly ONE stage-specific push permission (appended
-# by _engine_allowed_tools) and is a named security boundary for unattended
-# operation: no force-push, remote-branch deletion, or arbitrary refspec push.
-# The prompt is guidance, not enforcement — the permission string itself must
-# be exact, never a glob.
+# Narrow pre-approved grants for headless Claude implementer/fixer engines.
+# The default auto mode can approve additional calls through its classifier;
+# this list is not a ceiling. dontAsk denies calls that would otherwise prompt.
+# Neither mode bypasses operator settings: deny rules are needed to forbid
+# force-push, remote-branch deletion, or arbitrary refspec push under auto.
+# Keep exactly ONE stage-specific push grant (appended by _engine_allowed_tools)
+# exact, never a glob. The prompt is guidance, not enforcement.
 _ENGINE_ALLOWED_TOOLS_BASE = (
     "Read Edit Write "
     "Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) "
@@ -736,10 +735,9 @@ _ENGINE_ALLOWED_TOOLS_BASE = (
 # The verification commands an engine is permitted to run are a *permission
 # grant*, not an instruction: the engine prompts tell the engine to run the
 # repository's own verification commands and follow its CLAUDE.md/AGENTS.md,
-# because only the target repo knows what those are. But engines run under
-# `--permission-mode dontAsk` against an exact list, never a glob, so a command
-# the operator never declared is denied rather than run — and a denial mid-run
-# reads to the engine as a broken repo, not a missing grant.
+# because only the target repo knows what those are. Under dontAsk, undeclared
+# commands needing approval are denied; under auto they reach the classifier.
+# A denial can still prevent verification and completion in either mode.
 #
 # The shipped Python stack lives in the packaged `config.toml` `[defaults]`, as
 # layer 1 of the resolution order and nowhere else. A second copy here would
@@ -786,7 +784,7 @@ def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
 
 # The implementer worktree checks out its own branch, so the exact permission
 # `git push <remote> HEAD` (fast-forward push of the checked-out branch) is its
-# entire remote-mutation surface.
+# pre-approved remote-mutation surface; auto may approve other commands.
 def _implementer_push_permission() -> str:
     """Grant the implementer one push to the validated target remote."""
     return f"Bash(git push {TARGET_REMOTE} HEAD)"
@@ -827,7 +825,7 @@ def _fixer_push_permission(head_ref: str) -> str:
     """Return the fixer's exact, stage-specific push permission.
 
     The fixer worktree is detached (no local branch custody), so its only
-    allowed push is the fully-qualified refspec to this PR's validated head
+    pre-approved push is the fully-qualified refspec to this PR's validated head
     ref. The caller must have validated ``head_ref`` via
     :func:`_valid_push_head_ref` first.
 
@@ -908,9 +906,9 @@ def _launch_claude_engine(
     env: dict[str, str],
     push_permission: str,
     model: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
 ) -> subprocess.Popen[bytes] | None:
-    """Launch a headless ``claude -p`` engine with the bounded tool allowlist.
+    """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
     ``claude`` has no ``-o`` output flag: the prompt is fed via stdin from
     ``prompt.txt`` and the result JSON is captured by redirecting stdout to
@@ -937,7 +935,7 @@ def _launch_claude_engine(
             the flag entirely so the CLI resolves the operator's own
             configured model — passing a value here overrides it.
         permission_mode: The ``--permission-mode`` value for the engine:
-            ``"dontAsk"`` (default) or ``"auto"``. ``auto`` routes
+            ``"auto"`` (default) or ``"dontAsk"``. ``auto`` routes
             non-allowlisted tool calls through the auto-mode classifier while
             the bounded ``--allowedTools`` allowlist still resolves first.
 
@@ -6478,7 +6476,7 @@ def _fixer_body_revision(
 ) -> tuple[str, str]:
     """Classify the fixer's candidate replacement PR body.
 
-    The engine has no ``gh``, so it hands the controller a candidate and the
+    The engine is instructed to hand the controller a candidate and the
     controller decides. Every rejection is a state the published fix comment
     names, because ``gh pr edit`` replaces the whole body and the pipeline has
     no undo: a body left alone with a stated reason is always recoverable, and a
@@ -9436,7 +9434,7 @@ def dispatch_implementers(
     *,
     impl_engine: str = "claude",
     model: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
 ) -> None:
     """Dispatch implementer engines for issues at ai:available.
 
@@ -9463,8 +9461,8 @@ def dispatch_implementers(
             operator's own configured model" for claude, and
             ``deepseek-v4-pro[1m]`` for claude-ds. Non-empty overrides both
             the ``--model`` CLI flag and ``ANTHROPIC_MODEL`` (for claude-ds).
-        permission_mode: Engine ``--permission-mode``: ``"dontAsk"``
-            (default) or ``"auto"`` (classifier-gated, experimental).
+        permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
+            classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
     """
     # Target type gate: only dispatch for issue targets.
     if target is not None and target[0] != "issue":
@@ -9613,7 +9611,7 @@ def _dispatch_one_implementer(
     tick_log: TickLog | None = None,
     impl_engine: str = "claude",
     model: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
 ) -> None:
     """Launch a single implementer engine for one issue.
 
@@ -9633,8 +9631,8 @@ def _dispatch_one_implementer(
             claude so the CLI uses the operator's configured model, and
             resolves to ``deepseek-v4-pro[1m]`` for claude-ds. Non-empty
             overrides both the ``--model`` CLI flag and ``ANTHROPIC_MODEL``.
-        permission_mode: Engine ``--permission-mode``: ``"dontAsk"`` (default)
-            or ``"auto"`` (classifier-gated, experimental).
+        permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
+            classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
     """
     wt_dir = os.path.join(WT_ROOT, f"issue-{issue_number}")
     dispatch_id = f"impl-{issue_number}-{int(time.time())}"
@@ -9888,7 +9886,7 @@ def dispatch_fixers(
     *,
     impl_engine: str = "claude",
     model: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
 ) -> None:
     """Dispatch fixer engines for PRs at ai:changes-requested.
 
@@ -9912,8 +9910,8 @@ def dispatch_fixers(
             operator's own configured model" for claude, and
             ``deepseek-v4-pro[1m]`` for claude-ds. Non-empty overrides both
             the ``--model`` CLI flag and ``ANTHROPIC_MODEL`` (for claude-ds).
-        permission_mode: Engine ``--permission-mode``: ``"dontAsk"``
-            (default) or ``"auto"`` (classifier-gated, experimental).
+        permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
+            classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
     """
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
@@ -10206,7 +10204,7 @@ def _dispatch_one_fixer(
     tick_log: TickLog | None = None,
     impl_engine: str = "claude",
     model: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
 ) -> None:
     """Launch a single fixer engine for one PR.
 
@@ -10222,8 +10220,8 @@ def _dispatch_one_fixer(
             claude so the CLI uses the operator's configured model, and
             resolves to ``deepseek-v4-pro[1m]`` for claude-ds. Non-empty
             overrides both the ``--model`` CLI flag and ``ANTHROPIC_MODEL``.
-        permission_mode: Engine ``--permission-mode``: ``"dontAsk"`` (default)
-            or ``"auto"`` (classifier-gated, experimental).
+        permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
+            classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
     """
     wt_dir = os.path.join(WT_ROOT, f"pr-{pr_number}")
     dispatch_id = f"fix-{pr_number}-{int(time.time())}"
@@ -10840,11 +10838,10 @@ def main(
         review_effort: Reasoning-effort override for the reviewer engine.
             Empty string (default) resolves the same way as ``review_model``.
         permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines: ``"dontAsk"`` or ``"auto"`` (classifier-gated,
-            experimental — not promoted). Empty (default) resolves the
-            operator's configured value, which the packaged floor sets to
-            ``"dontAsk"``; a value passed here is the explicit per-invocation
-            flag and outranks every config layer.
+            fixer engines: ``"auto"`` (classifier-gated) or ``"dontAsk"``.
+            Empty (default) resolves the operator's configured value, which
+            the packaged floor sets to ``"auto"``. A value passed here is the
+            explicit per-invocation flag and outranks every config layer.
         loop: When True, run ticks in-process until interrupted or quiescent.
 
     Returns:
@@ -10941,7 +10938,7 @@ def _run_single_tick_locked(
         review_model: Model override for reviewer engines.
         review_effort: Reasoning-effort override for reviewer engines.
         permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines (``"dontAsk"`` or experimental ``"auto"``). Empty
+            fixer engines (``"auto"`` or ``"dontAsk"``). Empty
             means no flag was typed, so the operator's configured value
             applies. Resolution happens here rather than in ``main`` so a
             ``--loop`` run picks up a config change on its next tick.
@@ -12421,7 +12418,7 @@ def _run_tick_body(
     model: str = "",
     review_model: str = "",
     review_effort: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "auto",
     trusted_author: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
@@ -12439,7 +12436,7 @@ def _run_tick_body(
         review_model: Model override for the reviewer engine.
         review_effort: Reasoning-effort override for the reviewer engine.
         permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines (``"dontAsk"`` or experimental ``"auto"``).
+            fixer engines (``"auto"`` or ``"dontAsk"``).
         trusted_author: The operator login this tick resolved and validated,
             forwarded to the reviewer dispatch so admission uses the identity
             startup checked.
@@ -12843,7 +12840,7 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
 
     # "" means the flag was not typed, which is what lets the operator's
     # configured permission_mode apply. Defaulting it here would make every
-    # invocation look like an explicit --permission-mode dontAsk and shadow
+    # invocation look like an explicit --permission-mode auto and shadow
     # the config layer entirely.
     permission_mode = values["permission_mode"]
     if permission_mode and permission_mode not in ("dontAsk", "auto"):

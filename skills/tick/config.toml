@@ -36,7 +36,7 @@
 #   checklist_paths = []
 #   verify_tools    = ["uv run pytest *"]
 #   base_ref        = ""
-#   permission_mode = "dontAsk"
+#   permission_mode = "auto"
 #
 #   [scan]
 #   repos = []                        # empty or absent = unrestricted
@@ -84,14 +84,14 @@ checklist_paths = []
 # The verification commands an engine is permitted to run, as Bash permission
 # bodies (each is wrapped in `Bash(...)`). This is a permission grant, not an
 # instruction: the engine prompts tell the engine to run the verification
-# commands the target repo's own CLAUDE.md/AGENTS.md prescribe. But engines run
-# under an exact allowlist, never a glob, so a command that is not granted here
-# is denied rather than run.
+# commands the target repo's own CLAUDE.md/AGENTS.md prescribe. Calls needing
+# approval beyond these grants reach the classifier under auto, or are denied
+# under dontAsk. Neither mode guarantees the repo's verification can complete.
 #
 # Replace this list wholesale for a non-Python stack. A trailing ` *` allows
 # arguments; without it only the bare command is permitted. An entry containing
-# a parenthesis or newline is dropped — it would break out of the allowlist
-# entry and widen the boundary. A value that is not a list of strings is a
+# a parenthesis or newline is a startup error — it would break out of the
+# allowlist entry and widen the grant. A value that is not a list of strings is a
 # startup error, which is deliberately *not* the same state as an empty list:
 # read as empty, one typo would dispatch an unverified PR and still promote it.
 #
@@ -113,9 +113,12 @@ verify_tools = [
 # one would target a branch the operator never named.
 base_ref = ""
 
-# The engine `--permission-mode`: "dontAsk" (an exact allowlist, nothing else
-# runs) or the experimental classifier-gated "auto". The floor is the
-# conservative one; `--permission-mode` on a single run outranks it. Blank is
-# not one of the values — unlike base_ref, it names nothing — and is a startup
-# error rather than a ValueError raised after a dispatch lease already exists.
-permission_mode = "dontAsk"
+# Claude implementer/fixer `--permission-mode`: "auto" sends calls needing
+# approval beyond the explicit grants to the classifier; approval is not
+# guaranteed. "dontAsk" denies calls that would prompt. A per-repo override
+# can retain dontAsk for a route that fails the setup probe; the CLI wins over
+# both file layers. No automatic route fallback is performed here.
+# Under auto the allowlist is not a ceiling: use operator-owned deny rules for
+# forbidden operations. The Codex reviewer keeps its separate read-only policy.
+# Blank or malformed values are startup errors naming this key.
+permission_mode = "auto"

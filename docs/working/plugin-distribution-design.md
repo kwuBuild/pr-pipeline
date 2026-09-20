@@ -205,12 +205,15 @@ from ever completing unattended.
 The default flips back to `false` as part of the deferred author-widening work,
 not separately; section 4 records the two as one change.
 
-### Mapping from the current format
+### Mapping from the pre-migration format
 
-The runtime reads five keys today across three tables, each through its own
+This migration is implemented: the resolver includes `permission_mode`, and
+section 5 activates its `auto` default. The mapping below records the old format.
+
+The old runtime read five keys across three tables, each through its own
 accessor: `[target] repo`, `[target] trusted_author`, `[policy] allow_touching`,
 `[policy] checklist_paths`, `[engine] verify_tools`. A sixth setting,
-`permission_mode`, has no config key at all — it is CLI-only (`tick.py:12633`,
+`permission_mode`, had no config key — it was CLI-only (`tick.py:12633`,
 defaulted to `dontAsk` at `:12699`), and section 8 requires an operator's
 per-route choice to be recorded rather than re-typed on every invocation, so it
 acquires one here. Layering new tables beside the existing ones produces two
@@ -409,60 +412,35 @@ confirms it once.
 
 ### The change
 
-Engines default to `--permission-mode auto` instead of `dontAsk`. `auto` is
-already implemented and accepted at `tick.py:952`; it is currently opt-in and
-documented as experimental.
+Claude implementers and fixers default to `--permission-mode auto`; `dontAsk`
+remains an explicit override. The existing `permission_mode` key resolves through
+packaged floor → operator `[defaults]` → `[repos."owner/name"]` → CLI. Malformed
+values are startup errors naming the key. This activates the default on top of
+the layered resolver, rather than introducing another configuration path.
+
+The Codex reviewer keeps its separate read-only policy. Codex's automatic
+approval review (`--approve-for-me` on the inspected 0.155.1 CLI) is a different
+control that selects workspace-write and allows reviewed escalation; it is not
+applied to the pipeline reviewer. See [engine permission modes](../../skills/tick/README.md#engine-permission-modes).
 
 ### Why it fits the rest of this design
 
-Under `dontAsk` an undeclared command is not prompted for. The comment at
-`tick.py:760` records the consequence: "a denial mid-run reads to the engine as a
-broken repo, not a missing grant." That is why the packaged floor's
-`[defaults] verify_tools` ships a Python stack today — an empty default would
-have made a fresh install fail its first dispatch on an illegible denial. (That
-default lived in `tick.py` as `_DEFAULT_VERIFY_TOOLS` when this was written; it
-now lives only in `skills/tick/config.toml`, because a fallback in the code is
-one an operator cannot narrow away.)
-
-Section 7 empties that default. Under `auto` an undeclared command reaches the
-classifier instead, so an unconfigured Gradle repository degrades to "the
-classifier evaluates `./gradlew test`" rather than "the engine concludes the
-repository is broken."
+Under `dontAsk`, an undeclared command needing approval is denied. Under `auto`,
+it can reach the classifier. This makes an empty `verify_tools` useful for
+commands the classifier approves, but does not guarantee an unconfigured
+repository can complete its tests. The packaged Python grants remain until
+section 7's separate change.
 
 ### Reaching the classifier is not the same as being permitted
 
-That is as far as the argument goes, and the earlier draft took it further than
-it goes. This project's own documentation says so: `SKILL.md:24` records that
-under `auto` *"a classifier denial fails the run,"* and `README.md:644` describes
-the same path. A classifier that declines `./gradlew test` produces a failed run,
-not a graceful degradation — the same illegible outcome `dontAsk` produces, via a
-different route.
-
-Two facts about the launcher make the headless case genuinely unestablished
-rather than merely unproven:
-
-- `build_engine_cmd` (`tick.py:959-964`) passes `-p`, `--permission-mode`, and
-  `--allowedTools`, and nothing else bearing on prompting.
-- `claude --help` on `2.1.270` documents `--permission-prompts`, defaulting to
-  `host`: with `--print` and no SDK host or `--permission-prompt-tool`, *"anything
-  that would prompt is denied automatically; the permission mode still decides
-  everything else."*
-
-So what happens to an undeclared command that `auto`'s classifier does not
-auto-approve — denial, prompt-then-denial, or hang — is a property of the
-installed CLI that has not been measured. The honest form of the argument is
-therefore conditional:
-
-**`auto` improves on `dontAsk` for commands the classifier approves, and is no
-worse for the rest.** That is still the right default, because the set of
-approved-but-undeclared commands is exactly the set `dontAsk` strands. It is not
-a guarantee that an unconfigured repository completes a dispatch, and section 7's
-empty `verify_tools` must not be justified as if it were.
-
-What follows is a real gate rather than a reassurance. Section 8's probe is
-strengthened to measure this directly instead of confirming that the flag is
-accepted, and open question 12.3 owns the prompting semantics, alongside
-12.2's `--allowedTools` question.
+A classifier denial can prevent verification and fail the run. Tick requests the
+resolved mode; it does not infer provider capability from CLI flag acceptance or
+silently choose a different mode for a provider. The actual route's effective
+mode and behavior after a denial, including any fallback/refusal, must be
+measured by section 8's setup probe (#18). A failed probe can be recorded as
+`permission_mode = "dontAsk"` for the tested repository. A provider/model change
+requires rechecking the evidence. There is no promised graceful degradation or
+guaranteed unattended completion. Open question 12.3 remains owned by that probe.
 
 ### The operator's deny list is the floor
 
