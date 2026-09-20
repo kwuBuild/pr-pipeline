@@ -101,10 +101,13 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 printf '%s' "$json" | "$PY" "$PIPELINE" atomic-write --path dispatch.json
 
 # Report whether a diff touches a reviewer-governing file (CLAUDE.md/AGENTS.md at
-# any level, or a path listed under [policy] checklist_paths). Reads paths
+# any level, or a path listed under the resolved checklist_paths). Reads paths
 # from stdin; prints
 # {"touches_policy": true|false}. Dispatch escalates a true result to a human.
-git diff --name-only <base>...<head> | "$PY" "$PIPELINE" touches-review-policy
+# --repo selects the target's [repos."owner/name"] config layer; without it only
+# the operator-wide defaults apply.
+git diff --name-only <base>...<head> \
+  | "$PY" "$PIPELINE" touches-review-policy --repo owner/name
 
 # Enforce the shipped credential boundary before worktree/auth exposure. Reads the
 # gh pr view JSON object from stdin; only the exact owner-authored same-repo shape

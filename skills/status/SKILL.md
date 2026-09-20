@@ -53,8 +53,11 @@ watch -n 5 'bash /absolute/path/to/install/skills/status/status.sh'
 while true; do clear; bash /absolute/path/to/install/skills/status/status.sh; sleep 5; done
 ```
 
-The repo comes from `[target] repo` in `skills/tick/config.toml`,
-the same value the tick uses; override for one run with
+The repo comes from the deprecated `[target] repo` key in
+`skills/tick/config.toml` — the same value the tick uses, parsed
+with `sed` because the dashboard must run before any interpreter is resolved.
+Operator settings live in `~/.claude/pr-pipeline/config.toml`, which the
+dashboard reads nothing from. Override the repo for one run with
 `PIPELINE_REPO=<owner/repo>`. With neither set the dashboard exits 2 rather
 than rendering some other repository's queue.
 

@@ -218,18 +218,28 @@ MIN_CODEX_VERSION = "codex-cli 0.142.5"
 # auto-review. The pipeline operates a repo it does not own, so neither can be a
 # shipped constant: a pinned default would silently point a fresh install at
 # somebody else's repository, and a wrong `--repo` is a remote mutation, not a
-# no-op. Both come from `config.toml` `[target]`, with an env override for the
-# one-off run against a different repo. Unset reads as empty, and `main` refuses
-# to run a tick in that state (see the startup gate) rather than letting an
-# empty `--repo` reach `gh`.
+# no-op. Both come from the resolved operator config, with an env override for
+# the one-off run against a different repo. Unset reads as empty, and `main`
+# refuses to run a tick in that state (see the startup gate) rather than letting
+# an empty `--repo` reach `gh`.
+#
+# The repo still comes from the deprecated `[target] repo` remnant in the
+# packaged file: resolving it from the working directory's git remote is the
+# canonical-target issue's change, and until then that remnant is what an
+# already-configured install has. The login has moved to `[operator] login` in
+# the operator's own config, with the remnant as its floor.
+#
+# Resolution at import cannot raise: `resolve_config` reports a malformed value
+# in `errors` and resolves the value itself to its conservative reading, and
+# `main` refuses the tick on those errors (see the startup gate). A raising
+# import would turn an operator's config typo into a traceback from whichever
+# CLI helper happened to import this module first.
+_IMPORT_CONFIG = pipeline.resolve_config()
 TRUSTED_HEAD_REPO = (
     os.environ.get("PIPELINE_REPO", "").strip()
-    or pipeline.config_string("target", "repo")
+    or _IMPORT_CONFIG.legacy_target_repo
 )
-TRUSTED_REVIEW_AUTHOR = (
-    os.environ.get("PIPELINE_TRUSTED_AUTHOR", "").strip()
-    or pipeline.config_string("target", "trusted_author")
-)
+TRUSTED_REVIEW_AUTHOR = _IMPORT_CONFIG.login
 _PR_BODY_SOURCE_FILE = ".pr-body.md"
 _PR_CREATE_BODY_FILE = ".pr-create-body.md"
 # The fixer's optional replacement PR body, and the two-line envelope that binds
@@ -748,55 +758,55 @@ _ENGINE_ALLOWED_TOOLS_BASE = (
     "Bash(git log *)"
 )
 
-# The verification commands an engine is permitted to run, as bare Bash
-# permission bodies (each is wrapped in `Bash(...)` by _engine_verify_tools).
+# The verification commands an engine is permitted to run are a *permission
+# grant*, not an instruction: the engine prompts tell the engine to run the
+# repository's own verification commands and follow its CLAUDE.md/AGENTS.md,
+# because only the target repo knows what those are. But engines run under
+# `--permission-mode dontAsk` against an exact list, never a glob, so a command
+# the operator never declared is denied rather than run — and a denial mid-run
+# reads to the engine as a broken repo, not a missing grant.
 #
-# This is the one place a target repo's toolchain has to be named, and it is
-# named as a *permission grant*, not an instruction: the engine prompts tell the
-# engine to run the repository's own verification commands and follow its
-# CLAUDE.md/AGENTS.md, because only the target repo knows what those are. But
-# engines run under `--permission-mode dontAsk` against an exact list, never a
-# glob, so a command the operator never declared is denied rather than run — and
-# a denial mid-run reads to the engine as a broken repo, not a missing grant.
-#
-# The shipped default is a Python stack because an empty default makes a fresh
-# install fail its first dispatch on a permission denial instead of a legible
-# message. An operator on another stack replaces the list wholesale in
-# `config.toml` `[engine] verify_tools`.
-_DEFAULT_VERIFY_TOOLS: tuple[str, ...] = (
-    "uv run pytest *",
-    "uv run ruff *",
-    "uv run pyright",
-    "npm --prefix frontend *",
-)
-
-# A configured permission body may not contain a parenthesis or any newline.
-# `--allowedTools` is a space-separated list of `Tool(body)` entries, so a `)`
-# inside a body closes the entry early and every character after it is parsed as
-# a *new* permission — an operator typo, or a malicious config, would widen the
-# security boundary this list exists to be. Spaces are legal and load-bearing
-# (`uv run pytest *`), so they cannot be the delimiter check.
-_VERIFY_TOOL_RE = re.compile(r"\A[^()\r\n]+\Z")
+# The shipped Python stack lives in the packaged `config.toml` `[defaults]`, as
+# layer 1 of the resolution order and nowhere else. A second copy here would
+# have to be a *fallback*, and a fallback is precisely what an operator cannot
+# override: `verify_tools = []` under their `[repos."owner/name"]` is a
+# deliberate narrowing of a permission grant, and handing back the built-in
+# list instead would re-grant what they removed.
 
 
-def _engine_verify_tools() -> tuple[str, ...]:
+def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
     """Return the engine's verification-command permissions, as `Bash(...)`.
 
-    Reads ``[engine] verify_tools`` from the operator config, falling back to
-    :data:`_DEFAULT_VERIFY_TOOLS` when the key is absent or contains no usable
-    entry. Entries failing :data:`_VERIFY_TOOL_RE` are dropped individually
-    rather than rejected as a set, so one bad line cannot strip an engine of
-    every verification permission it needs.
+    Reads the resolved ``verify_tools`` — the operator's per-repository value,
+    else their default, else the packaged floor — and grants exactly that.
+    There is no fallback beneath it: the floor *is* the fallback, and anything
+    substituted here would be a grant the operator had already narrowed away.
+    An empty resolved list therefore grants no verification command at all,
+    which is what ``verify_tools = []`` says.
+
+    A ``verify_tools`` that is malformed — wrong shape, or an entry that is not
+    a permission body — never reaches here: the resolver reports it and startup
+    refuses, so neither a typo nor an all-invalid list can arrive as the
+    silently narrower grant, or as the unconfigured empty one.
+
+    The :data:`pipeline.VERIFY_TOOL_BODY_RE` check is repeated here anyway. It
+    is unreachable through a validated startup and exists for the one path that
+    is not: the config file is re-read per dispatch, so an edit landing between
+    startup and this call would otherwise template an unvalidated body straight
+    into ``--allowedTools``. That is the boundary this list *is*, so the last
+    word on it belongs next to the argv, not to a check that ran earlier.
+
+    Args:
+        repo: The resolved target as ``owner/name``, for its config layer.
 
     Returns:
         The permission entries, each already wrapped in ``Bash(...)``.
     """
-    configured = pipeline.config_string_list("engine", "verify_tools")
-    usable = tuple(
-        entry for entry in (configured or _DEFAULT_VERIFY_TOOLS)
-        if _VERIFY_TOOL_RE.match(entry)
+    return tuple(
+        f"Bash({entry})"
+        for entry in pipeline.resolve_config(repo).verify_tools
+        if pipeline.VERIFY_TOOL_BODY_RE.match(entry)
     )
-    return tuple(f"Bash({entry})" for entry in usable or _DEFAULT_VERIFY_TOOLS)
 
 
 # The implementer worktree checks out its own branch, so the exact permission
@@ -863,8 +873,20 @@ def _engine_allowed_tools(push_permission: str) -> str:
     Returns:
         The full ``--allowedTools`` string for the engine launch.
     """
-    verify = " ".join(_engine_verify_tools())
-    return f"{_ENGINE_ALLOWED_TOOLS_BASE} {verify} {push_permission}"
+    # The tick drives one canonical target, so the per-repository layer of the
+    # operator's config is TRUSTED_HEAD_REPO's — passing nothing here would
+    # silently ignore a `[repos."owner/name"] verify_tools` override.
+    # An operator who granted no verification command gets no empty slot in the
+    # argv for it: `--allowedTools` is whitespace-separated, and a stray double
+    # space is a difference in the security boundary's serialization that no
+    # test of the resolved list would catch.
+    return " ".join(
+        part for part in (
+            _ENGINE_ALLOWED_TOOLS_BASE,
+            *_engine_verify_tools(TRUSTED_HEAD_REPO),
+            push_permission,
+        ) if part
+    )
 
 
 _CLAUDE_STREAM_WRAPPER = os.path.join(
@@ -8724,6 +8746,7 @@ def dispatch_reviewers(
     authoritative_in_flight: list[pipeline.InFlightRef] | None = None,
     review_model: str = "",
     review_effort: str = "",
+    trusted_author: str = "",
 ) -> None:
     """Dispatch reviewer engines for PRs at ai:implemented / ai:revised.
 
@@ -8746,7 +8769,14 @@ def dispatch_reviewers(
             "resolve from the operator's codex config".
         review_effort: Reasoning-effort override for the reviewer engine.
             Empty means "resolve from the operator's codex config".
+        trusted_author: The operator login this tick resolved and validated.
+            The tick always passes it, so the identity a tick *authorizes*
+            under is the identity its own startup gate checked — reading the
+            import-time constant here instead would validate one login and
+            admit under another for the lifetime of a ``--loop`` process.
+            Empty falls back to that constant, for direct callers.
     """
+    trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
         return
@@ -8865,7 +8895,7 @@ def dispatch_reviewers(
 
         if not pipeline.trusted_review_candidate(
             candidate,
-            trusted_author=TRUSTED_REVIEW_AUTHOR,
+            trusted_author=trusted_author,
             trusted_repo=TRUSTED_HEAD_REPO,
         ):
             if tick_log:
@@ -8884,6 +8914,7 @@ def dispatch_reviewers(
             tick_log=tick_log,
             review_model=review_model,
             review_effort=review_effort,
+            trusted_author=trusted_author,
         )
 
         # Track this new engine in the in-flight set.
@@ -8901,6 +8932,7 @@ def _dispatch_one_reviewer(
     tick_log: TickLog | None = None,
     review_model: str = "",
     review_effort: str = "",
+    trusted_author: str = "",
 ) -> None:
     """Launch a single codex reviewer engine for one PR.
 
@@ -8920,7 +8952,11 @@ def _dispatch_one_reviewer(
             operator config" (see :func:`resolve_reviewer_model_settings`).
         review_effort: Resolved reviewer reasoning effort. Empty means
             "resolve from the operator config".
+        trusted_author: The operator login this tick resolved. Empty falls
+            back to the import-time :data:`TRUSTED_REVIEW_AUTHOR`, for the
+            direct callers that are not running a tick.
     """
+    trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     wt_dir = os.path.abspath(os.path.join(WT_ROOT, f"pr-{pr_number}"))
     dispatch_id = f"review-{pr_number}-{int(time.time())}"
 
@@ -9095,7 +9131,7 @@ def _dispatch_one_reviewer(
         )
         return
     changed_paths = [p for p in raw_diff.splitlines() if p.strip()]
-    if pipeline.touches_review_policy(changed_paths):
+    if pipeline.touches_review_policy(changed_paths, TRUSTED_HEAD_REPO):
         _escalate_dispatch_setup_failure(
             entity="pr",
             number=pr_number,
@@ -9205,7 +9241,7 @@ def _dispatch_one_reviewer(
         "base_sha": base_sha,
         "head_sha": head_sha,
         "trusted_head_repo": TRUSTED_HEAD_REPO,
-        "trusted_review_author": TRUSTED_REVIEW_AUTHOR,
+        "trusted_review_author": trusted_author,
         "pr_title": pr_title,
         "pr_body": pr_body,
     })
@@ -9605,7 +9641,14 @@ def _dispatch_one_implementer(
         return
 
     # Fetch and resolve base SHA before creating the worktree.
-    base_ref = "main"
+    #
+    # The base branch is the operator's to name: not every repository's trunk is
+    # called `main`, and a hard-coded one either fails every fetch or, on a repo
+    # that has both, builds the PR on a branch nobody merges to. A blank
+    # configured value is the documented "resolve the target's default branch",
+    # which the canonical-target issue implements; `main` stands in until then,
+    # so this reads exactly as it did before for an unconfigured install.
+    base_ref = pipeline.resolve_config(TRUSTED_HEAD_REPO).base_ref or "main"
     try:
         git("-C", checkout_root, "fetch", "--quiet", "origin", base_ref)
         base_sha = git("-C", checkout_root, "rev-parse", f"origin/{base_ref}")
@@ -10751,7 +10794,7 @@ def main(
     model: str = "",
     review_model: str = "",
     review_effort: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "",
     loop: bool = False,
 ) -> int:
     """Run one PR-pipeline tick: HARVEST → DISPATCH → Summary.
@@ -10772,8 +10815,11 @@ def main(
         review_effort: Reasoning-effort override for the reviewer engine.
             Empty string (default) resolves the same way as ``review_model``.
         permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines: ``"dontAsk"`` (default) or ``"auto"``
-            (classifier-gated, experimental — not promoted).
+            fixer engines: ``"dontAsk"`` or ``"auto"`` (classifier-gated,
+            experimental — not promoted). Empty (default) resolves the
+            operator's configured value, which the packaged floor sets to
+            ``"dontAsk"``; a value passed here is the explicit per-invocation
+            flag and outranks every config layer.
         loop: When True, run ticks in-process until interrupted or quiescent.
 
     Returns:
@@ -10857,7 +10903,7 @@ def _run_single_tick_locked(
     model: str,
     review_model: str = "",
     review_effort: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
 ) -> int:
@@ -10870,7 +10916,10 @@ def _run_single_tick_locked(
         review_model: Model override for reviewer engines.
         review_effort: Reasoning-effort override for reviewer engines.
         permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines (``"dontAsk"`` or experimental ``"auto"``).
+            fixer engines (``"dontAsk"`` or experimental ``"auto"``). Empty
+            means no flag was typed, so the operator's configured value
+            applies. Resolution happens here rather than in ``main`` so a
+            ``--loop`` run picks up a config change on its next tick.
         count_quiescent_heartbeat: Forwarded to :func:`_run_tick_body`; only
             the in-process loop passes ``False``, for a nudge-initiated tick.
 
@@ -10901,22 +10950,71 @@ def _run_single_tick_locked(
         except Exception:  # noqa: BLE001
             pass
 
+    # Fail fast on a configuration value that has no conservative reading —
+    # base_ref, permission_mode, [operator] login, verify_tools, [scan] repos.
+    # Each of those either names a branch, grants a permission, or decides whose
+    # work is trusted, so a malformed one cannot be coerced into something the
+    # operator did not write: the resolver reports it and the tick refuses here,
+    # naming the key. A malformed verify_tools in particular must never be read
+    # as an empty one, which would dispatch with no verification and still award
+    # ai:ready-for-human.
+    config = pipeline.resolve_config(
+        TRUSTED_HEAD_REPO,
+        cli_overrides=(
+            {"permission_mode": permission_mode} if permission_mode else None
+        ),
+    )
+    for warning in config.warnings:
+        print(f"tick: config: {warning}", file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(
+                pr=None, phase="startup", stage="",
+                action="startup_config_warning",
+                reason=warning,
+            )
+    if config.errors:
+        msg = "tick: invalid configuration: " + "; ".join(config.errors)
+        print(msg, file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(
+                pr=None, phase="startup", stage="",
+                action="startup_config_invalid",
+                reason=msg,
+            )
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
+        print(tick_state.format_line(), file=sys.stderr)
+        sys.stderr.flush()
+        return 3
+    # From here on the resolved value is the one the engines run under: the
+    # flag if one was typed, else the operator's configured mode.
+    permission_mode = config.permission_mode
+
+    # The identity this tick reviews under is the one just resolved and
+    # validated, not the one this module resolved when it was imported. A
+    # `--loop` process lives across config edits, and validating the file's
+    # current login while admitting candidates against a stale one is the
+    # worst of both: an operator who corrects or removes their login sees the
+    # tick accept the change and keep authorizing under the old identity.
+    trusted_author = config.login
+
     # Fail fast when the target repository is not configured. Every `gh` call
     # this tick makes is `--repo TRUSTED_HEAD_REPO`, and the reviewer admission
-    # gate compares against TRUSTED_REVIEW_AUTHOR — unset, the first would
+    # gate compares against the resolved login — unset, the first would
     # resolve `--repo ""` against whatever the cwd happens to be and the second
     # would admit nobody. Both are remote-facing, so this refuses the tick with
     # a legible message rather than discovering it mid-dispatch.
     unconfigured = [
         name for name, value in (
             ("[target] repo", TRUSTED_HEAD_REPO),
-            ("[target] trusted_author", TRUSTED_REVIEW_AUTHOR),
+            ("[operator] login", trusted_author),
         ) if not value
     ]
     if unconfigured:
         msg = (
             "tick: target not configured: "
-            f"{', '.join(unconfigured)} — set them in "
+            f"{', '.join(unconfigured)} — set [operator] login in "
+            f"{pipeline.operator_config_path()} and [target] repo in "
             "skills/tick/config.toml (or export PIPELINE_REPO / "
             "PIPELINE_TRUSTED_AUTHOR)"
         )
@@ -10955,6 +11053,7 @@ def _run_single_tick_locked(
         return _run_tick_body(
             tick_log, parsed_target, impl_engine, model,
             review_model, review_effort, permission_mode,
+            trusted_author=trusted_author,
             count_quiescent_heartbeat=count_quiescent_heartbeat,
         )
     except Exception:
@@ -11177,11 +11276,16 @@ def _run_loop_locked(
     model: str,
     review_model: str = "",
     review_effort: str = "",
-    permission_mode: str = "dontAsk",
+    permission_mode: str = "",
     *,
     quiescent_stop_after: int = pipeline.LOOP_QUIESCENT_STOP_AFTER,
 ) -> int:
-    """Run ticks in-process until interrupted or quiescent stop fires."""
+    """Run ticks in-process until interrupted or quiescent stop fires.
+
+    ``permission_mode`` is forwarded unresolved (empty means no flag was
+    typed): each tick resolves the operator's config for itself, so a config
+    edit mid-loop takes effect on the next tick rather than at loop start.
+    """
     stop_event = threading.Event()
     old_sigint = signal.getsignal(signal.SIGINT)
     old_sigterm = signal.getsignal(signal.SIGTERM)
@@ -12282,6 +12386,7 @@ def _run_tick_body(
     review_model: str = "",
     review_effort: str = "",
     permission_mode: str = "dontAsk",
+    trusted_author: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
 ) -> int:
@@ -12299,6 +12404,9 @@ def _run_tick_body(
         review_effort: Reasoning-effort override for the reviewer engine.
         permission_mode: Engine ``--permission-mode`` for implementer and
             fixer engines (``"dontAsk"`` or experimental ``"auto"``).
+        trusted_author: The operator login this tick resolved and validated,
+            forwarded to the reviewer dispatch so admission uses the identity
+            startup checked.
         count_quiescent_heartbeat: Whether a quiescent observation from this
             tick counts toward the consecutive-heartbeat stop. Only the
             in-process loop passes ``False``, for a nudge-initiated tick that
@@ -12454,6 +12562,7 @@ def _run_tick_body(
             authoritative_in_flight=authoritative_in_flight,
             review_model=review_model,
             review_effort=review_effort,
+            trusted_author=trusted_author,
         )
         dispatch_implementers(
             tick_log=tick_log, target=stage_targets["implementer"],
@@ -12696,8 +12805,12 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
         target = arg
         i += 1
 
-    permission_mode = values["permission_mode"] or "dontAsk"
-    if permission_mode not in ("dontAsk", "auto"):
+    # "" means the flag was not typed, which is what lets the operator's
+    # configured permission_mode apply. Defaulting it here would make every
+    # invocation look like an explicit --permission-mode dontAsk and shadow
+    # the config layer entirely.
+    permission_mode = values["permission_mode"]
+    if permission_mode and permission_mode not in ("dontAsk", "auto"):
         print(
             f"tick: --permission-mode must be 'dontAsk' or 'auto', "
             f"got {permission_mode!r}",

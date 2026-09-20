@@ -15,6 +15,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import tomllib
 from pathlib import Path
 from typing import NamedTuple
@@ -1550,6 +1551,70 @@ def test_shipped_config_ships_the_conservative_reviewer_policy_gate() -> None:
     )
 
 
+def test_shipped_floor_ships_the_conservative_reviewer_policy_gate() -> None:
+    """The same guard, on the table the resolver actually reads.
+
+    ``allow_touching`` moved from ``[policy]`` to ``[defaults]`` when
+    configuration became layered, and the guard above still watches the old
+    table — deliberately, because a later change reintroducing a ``[policy]``
+    remnant must not be able to smuggle an opt-out through it. This one watches
+    the live key, so the invariant survives the move rather than passing
+    vacuously after it.
+
+    The design argues for ``true``, and that argument holds — but only once
+    pickup is operator-only. Until then any author's ``ai:available`` issue is
+    still dispatchable, so a PR produced from an outsider's issue could edit the
+    instructions its own reviewer runs under and be auto-promoted.
+    """
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    assert config.get("defaults", {}).get("allow_touching") is False, (
+        "the packaged floor does not ship allow_touching = false; every "
+        "adopter inherits the reviewer-policy opt-out without choosing it"
+    )
+
+
+def test_shipped_floor_carries_no_operator_owned_table() -> None:
+    """No ``[operator]``, ``[repos.*]`` or ``[scan]`` table may ship here.
+
+    This file is layer 1 and only layer 1. A plugin install lands at a
+    hash-named path and ``/plugin update`` installs the next version at a
+    *different* hash, so an operator value written here is discarded on the next
+    upgrade with nothing to show for it. The resolver reports these tables as a
+    configuration error; this catches the commit that adds one, which is where
+    the mistake actually originates.
+    """
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    assert not {"operator", "repos", "scan"} & set(config), (
+        "the packaged config.toml carries an operator-owned table; operator "
+        "configuration belongs in ~/.claude/pr-pipeline/config.toml"
+    )
+
+
+def test_shipped_floor_declares_every_per_target_setting() -> None:
+    """Every per-target key the runtime reads must appear in the floor.
+
+    The floor is what a fresh install runs on and what the file documents to an
+    adopter. A key the resolver reads but the floor omits is a setting an
+    operator has no way to discover, and its effective default lives only in
+    Python rather than in the file they are being asked to copy.
+    """
+    import pipeline
+
+    with open(POLICY_CONFIG, "rb") as fh:
+        config = tomllib.load(fh)
+
+    missing = set(pipeline._CONFIG_KEYS) - set(config.get("defaults", {}))
+
+    assert not missing, (
+        f"the packaged floor omits per-target settings the resolver reads: "
+        f"{sorted(missing)}"
+    )
+
+
 def test_no_operator_doc_names_a_pipeline_path_that_does_not_exist() -> None:
     """Every pipeline path an operator doc names must resolve in this repo.
 
@@ -1734,8 +1799,8 @@ def test_no_shipped_surface_hardcodes_a_target_repo_toolchain() -> None:
 
     assert not violations, (
         "engine-facing surfaces name a target repo's toolchain; verification "
-        "commands belong to the target's own CLAUDE.md and to "
-        "`[engine] verify_tools`:\n" + "\n".join(violations)
+        "commands belong to the target's own CLAUDE.md and to the operator's "
+        "`verify_tools`:\n" + "\n".join(violations)
     )
 
 
@@ -1818,7 +1883,7 @@ def test_shipped_config_declares_no_target() -> None:
 
 
 def test_shipped_config_declares_no_review_checklist_paths() -> None:
-    """``[policy] checklist_paths`` must ship empty.
+    """``[defaults] checklist_paths`` must ship empty.
 
     ``CLAUDE.md`` and ``AGENTS.md`` gate by basename with no configuration, so
     the shipped list has nothing it needs to carry. A path pinned here would be
@@ -1828,8 +1893,50 @@ def test_shipped_config_declares_no_review_checklist_paths() -> None:
     with open(POLICY_CONFIG, "rb") as fh:
         config = tomllib.load(fh)
 
-    assert config.get("policy", {}).get("checklist_paths") == [], (
+    assert config.get("defaults", {}).get("checklist_paths") == [], (
         "config.toml ships review-checklist paths that belong to one target repo"
+    )
+
+
+def test_status_dashboard_can_still_parse_the_target_from_the_packaged_file() -> None:
+    """``status.sh``'s ``sed`` parse must still find ``[target] repo``.
+
+    The dashboard cannot call the config resolver — it must run before any
+    interpreter is resolved, because telling an operator their interpreter
+    situation is broken is part of its job — so it ``sed``-parses the packaged
+    file for the target. That makes the `[target]` table a live contract
+    between two files that share no code: restructure this file without leaving
+    the table where the ``sed`` expression looks, and an operator who had filled
+    it in loses their dashboard (exit 2) with nothing to connect it to.
+
+    The expression under test is lifted from ``status.sh`` rather than
+    re-invented, and it runs against a copy of the *shipped* file with a value
+    filled in — the shipped value is blank, so parsing it as-is would pass
+    whether or not the table still existed.
+    """
+    expression = next(
+        line for line in STATUS_SCRIPT.read_text().splitlines()
+        if line.strip().startswith("REPO=\"$(sed -n")
+    )
+    match = re.search(r"sed -n '([^']*)'", expression)
+    assert match is not None, (
+        "status.sh no longer parses the target with a single-quoted sed "
+        "expression; update this guard to match how it reads the target now"
+    )
+
+    filled = POLICY_CONFIG.read_text().replace('repo = ""', 'repo = "owner/name"', 1)
+    with tempfile.NamedTemporaryFile("w", suffix=".toml") as fh:
+        fh.write(filled)
+        fh.flush()
+        parsed = subprocess.run(
+            ["sed", "-n", match.group(1), fh.name],
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+
+    assert parsed[:1] == ["owner/name"], (
+        "status.sh's target parse no longer finds [target] repo in the "
+        f"packaged config.toml (got {parsed!r}); the dashboard exits 2 on a "
+        "working install"
     )
 
 

@@ -417,9 +417,12 @@ documented as experimental.
 
 Under `dontAsk` an undeclared command is not prompted for. The comment at
 `tick.py:760` records the consequence: "a denial mid-run reads to the engine as a
-broken repo, not a missing grant." That is why `_DEFAULT_VERIFY_TOOLS`
-(`tick.py:766`) ships a Python stack today — an empty default would have made a
-fresh install fail its first dispatch on an illegible denial.
+broken repo, not a missing grant." That is why the packaged floor's
+`[defaults] verify_tools` ships a Python stack today — an empty default would
+have made a fresh install fail its first dispatch on an illegible denial. (That
+default lived in `tick.py` as `_DEFAULT_VERIFY_TOOLS` when this was written; it
+now lives only in `skills/tick/config.toml`, because a fallback in the code is
+one an operator cannot narrow away.)
 
 Section 7 empties that default. Under `auto` an undeclared command reaches the
 classifier instead, so an unconfigured Gradle repository degrades to "the
@@ -645,7 +648,7 @@ the remote name, and `status.sh`'s independent config parse.
 
 ## 7. `verify_tools` ships empty
 
-`_DEFAULT_VERIFY_TOOLS` (`tick.py:766`) currently ships `uv run pytest`,
+The packaged floor's `[defaults] verify_tools` currently ships `uv run pytest`,
 `uv run ruff`, `uv run pyright`, and an `npm --prefix frontend` entry. For a
 plugin pointed at a repository we have never seen, those are a guess about
 someone else's toolchain — and a wrong guess is worse than none, because the

@@ -589,7 +589,17 @@ is still captured in `stderr.log`.
   length `tick._PR_BODY_MAX_CHARS=65536`, enforced against both the character
   count and the UTF-8 byte length; the classifier reads at most
   `tick._PR_BODY_REVISION_READ_LIMIT`
-- Trusted reviewer gate: `[target] trusted_author` / `[target] repo` from
-  `config.toml` (env override `PIPELINE_TRUSTED_AUTHOR` / `PIPELINE_REPO`);
-  a tick with either unset exits 3 before dispatching anything
+- Trusted reviewer gate: `[operator] login` from
+  `~/.claude/pr-pipeline/config.toml` and the deprecated `[target] repo` from
+  the packaged `config.toml` (env override `PIPELINE_TRUSTED_AUTHOR` /
+  `PIPELINE_REPO`); a tick with either unset exits 3 before dispatching anything
+- Configuration errors: a malformed `base_ref`, `permission_mode`,
+  `[operator] login`, `verify_tools`, `checklist_paths` or `[scan] repos` exits
+  3 with `startup_config_invalid` naming the key — none of them has a reading
+  that is both conservative and the one the operator wrote. A malformed
+  `allow_touching` does: it logs `startup_config_warning`, resolves to the
+  closed gate, and the tick runs. A container declared as a non-table
+  (`[[defaults]]`, `[[scan]]`) and a relative `$PR_PIPELINE_CONFIG` /
+  `$CLAUDE_CONFIG_DIR` are errors too. Grep the tick log for `startup_config_`
+  when a setting looks ignored
 - Reviewer Codex floor: `codex-cli 0.142.5`
