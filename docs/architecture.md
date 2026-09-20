@@ -883,8 +883,8 @@ worktree's `AGENTS.md` as its project doc — that file carries the binding
 review obligations (review the full change scope against adjacent contracts;
 report the complete set of blocker/major findings) — and the read-only sandbox
 leaves every repo file readable, so the reviewer decides for itself which
-additional standards docs (`CLAUDE.md`, the target's review checklists,
-architecture docs) to consult, with the same independence as a manually invoked
+additional standards docs (the target's review checklists and relevant
+architecture sections) to consult, with the same independence as a manually invoked
 codex review. Verified empirically on
 the pinned CLI with the exact dispatch flags: the project `AGENTS.md` is loaded
 automatically and doc pointers inside it are followed. The accepted trade:
@@ -1350,8 +1350,9 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
 **Implementation prompt:**
 - Issue body and title (via `gh issue view`)
 - Relevant architecture doc sections (referenced in issue)
-- The target repo's own `CLAUDE.md` conventions (inherited by the worktree),
-  which are also where the verification commands to run come from
+- The target repo's governing instructions (inherited by the worktree), which
+  also supply its verification commands. This repo's `CLAUDE.md` imports the
+  shared `AGENTS.md`; see [instruction inheritance](working/pr-pipeline-internals.md#4-claudemd--agentsmd-inheritance)
 - **Sentinel instruction:** end with `IMPLEMENTATION_COMPLETE` once code is
   committed and pushed, or `NEEDS_HUMAN_DECISION` if blocked on scope/design
 
@@ -1362,7 +1363,7 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   output schema, with the verdict and findings semantics spelled out
 - No pinned reading list — deliberate. The worktree's `AGENTS.md` auto-loads as
   the codex project doc, and the reviewer consults further standards docs
-  (`CLAUDE.md`, the target's review checklists) at its own discretion (see
+  (the target's review checklists and architecture sections) as needed (see
   *Reviewer (Codex)*)
 - `--output-schema` pointing at `review-schema.json`; verdict read from the typed
   `review.json` the wrapper validates and publishes
