@@ -4,8 +4,20 @@ Design for turning `pr-pipeline` from a repository that operates on itself into 
 Claude Code plugin that one operator installs once and points at many
 repositories they do not own.
 
-This is a design document, not operational documentation. Implementation is
-sequenced by the plan that follows it; nothing here is built yet.
+This document owns unfinished migration requirements and the review history
+behind them; it is not the operator manual. The configuration/target foundation
+has landed (#10 and #11), alongside packaging (#7–#9), label provisioning (#13),
+and permission-mode configuration (#15). Use the
+[operator README](../../skills/tick/README.md) for shipped commands and examples,
+[internals](pr-pipeline-internals.md) for current mechanisms, and
+[architecture](../architecture.md) for stable design rationale.
+
+The target experience and schema below still include unfinished work: issue-author
+pickup (#14), default-branch discovery (#12), empty-verification evidence (#16),
+launcher/setup (#17–#18), and independence validation (#19). The
+[backlog index](https://github.com/kwuBuild/pr-pipeline/issues/39) and linked issues
+own live delivery status. Section 13 records historical review findings, not a
+second description of the current runtime.
 
 Revised across four reviews. Findings that survived verification against the
 source are folded in; section 13 records what each review changed and
@@ -17,9 +29,9 @@ else can resolve is not a citation.
 
 ## 1. Goal and target experience
 
-Today the pipeline is a git clone whose install path the operator exports as
-`$PR_PIPELINE_HOME`, whose configuration lives inside that clone, and which only
-completes a fix cycle because the repository it operates on happens to be itself.
+The original baseline was a git clone with install-relative configuration and
+self-hosted assumptions. That baseline motivated this migration; it no longer
+describes the shipped configuration or packaging.
 
 The target is an ordinary plugin install:
 
@@ -35,88 +47,51 @@ owns every policy decision; no target repository gets a vote.
 
 ## 2. Configuration ownership
 
-**Configuration is authored by the operator and read from outside both the
-install and the target repository.**
+Configuration placement is implemented by the operator-owned resolver (#10).
+The [architecture ownership decision](../architecture.md#configuration-ownership)
+is the canonical rationale; the [runtime resolver contract](pr-pipeline-internals.md#7-operator-configuration-resolution)
+records its implementation.
 
 ### Why it cannot stay in the install
 
-`pipeline.py:197` resolves `_POLICY_CONFIG_PATH` install-relative. A plugin
-install lands in `~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/`, and
-`/plugin update` installs the next version at a *different* hash. An
-install-relative config is therefore silently discarded on every upgrade.
-
-That settles the location question on its own, independent of any threat model,
-and it is the reason this section exists.
+Plugin upgrades replace the cache directory. Operator values must survive
+independently of the packaged floor; see the ownership decision above.
 
 ### Why it cannot move into the target repository either
 
-The obvious alternative — per-repo config committed to the target — puts policy
-inside the tree the reviewer and fixer check out. A pull request would then
-supply the settings it is judged under. That is a bad shape regardless of who is
-contributing, so config lives with the operator.
+A PR must not supply the policy used to judge it. No configuration layer may be
+read from the target or an engine worktree; preserve this boundary in future
+setup and migration work.
 
 ### What this does *not* claim
 
-This is a placement decision, not a security boundary, and an earlier draft of
-this document oversold it as one.
-
-Moving configuration outside the target tree stops a PR from **supplying**
-policy. It does not stop a PR from **overwriting** it. A granted verification
-command such as `npm test` or `./gradlew test` executes scripts the pull request
-controls, in a process holding A's filesystem access and ambient credentials.
-That script can write `~/.claude/pr-pipeline/config.toml` directly. A Bash
-permission rule governs which command string the model may invoke; it inspects
-nothing about what the resulting process then does.
-
-Containment of that belongs to the engine and model layer — process isolation, a
-sandboxed filesystem and network, of the kind the reviewer already gets via its
-scrub-dir and `HOME`/`CODEX_HOME` redirect. It is not something a config-location
-rule can deliver, and no amount of orchestrator-side gating substitutes for it. It
-is out of scope here and recorded as open question 12.1.
-
-The property that *is* enforced gets a test: no configuration layer is ever read
-from inside a target repository or an engine worktree. It should fail loudly if a
-later convenience override reintroduces the path.
+External placement is not process containment. Verification scripts can still
+run with operator filesystem access. Engine isolation remains unfinished
+phase 2 work (open question 12.1), not a benefit this placement change claims.
 
 ## 3. Configuration: location, layers, and schema
 
 ### Location
 
-`~/.claude/pr-pipeline/config.toml`, honouring `$CLAUDE_CONFIG_DIR` when set,
-with `$PR_PIPELINE_CONFIG` as an explicit override for testing.
-
-This replaces the install-relative `_POLICY_CONFIG_PATH` (`pipeline.py:197`)
-for the upgrade-safety reason given in section 2.
+Implemented by #10. Use the [operator configuration guide](../../skills/tick/README.md#configuration)
+for the file location and environment overrides, and
+[internals](pr-pipeline-internals.md#7-operator-configuration-resolution) for
+path validation. Setup must write the operator file, never the plugin cache.
 
 ### Layers
 
-Resolution order, later layers overriding earlier ones:
-
-1. **Packaged defaults** — the install's existing
-   `skills/tick/config.toml`, now read-only and treated as the
-   shipped floor.
-2. **`[defaults]`** — operator-wide settings in A's config.
-3. **`[repos."owner/name"]`** — per-repository overrides.
-4. **Environment variables** — the existing `PIPELINE_REPO` /
-   `PIPELINE_TRUSTED_AUTHOR` one-off overrides.
-5. **Explicit CLI flags** — `--permission-mode` and the other per-invocation
-   arguments the tick already accepts. Highest, because a flag typed on one run
-   is the most specific statement of intent there is.
-
-The two environment overrides need restating, because the keys they override
-today do not survive this change:
-
-- `PIPELINE_REPO` no longer overrides a config key — `[target] repo` is gone. It
-  overrides **git-remote resolution**: the canonical target becomes its value
-  instead of whatever the working directory's remote reports, and the
-  `[repos."owner/name"]` section selected is the one matching that value. It is
-  checked against a non-empty `[scan] repos` like any other target, so a one-off
-  override cannot widen scope the operator restricted.
-- `PIPELINE_TRUSTED_AUTHOR` overrides `[operator] login`, which sits outside the
-  `[defaults]` / `[repos.*]` layering — see the note under the schema. The layer
-  order still applies; there is simply one layer beneath it rather than three.
+Implemented by #10; [the resolver contract](pr-pipeline-internals.md#7-operator-configuration-resolution)
+owns precedence, list replacement, and operator identity. #11 separately owns
+canonical target/remote selection: `PIPELINE_REPO` selects a matching local
+remote and cannot widen `[scan] repos`. It is not another config-file layer.
 
 ### The schema
+
+This is the **target migration schema**, not a copyable statement of today's
+defaults. In particular, operator-only pickup and its `allow_touching` change
+belong to #14, shipping empty verification with durable evidence belongs to #16,
+and blank-base discovery belongs to #12. Setup (#18) consumes these contracts
+as they land. Current examples live in the operator guide linked above.
 
 Every per-target setting the runtime reads appears in `[defaults]` and may be
 overridden in `[repos."owner/name"]`. Nothing is per-target *only* in one of the
@@ -186,24 +161,14 @@ their PRs as well.
 
 ### What `allow_touching` governs
 
-The reviewer runs with its working directory inside a checkout of the PR's own
-head, and Codex loads `AGENTS.md` from there automatically — which in this
-repository routes to `CLAUDE.md`. So a PR that edits those files edits the
-instructions its own reviewer runs under. `touches_review_policy`
-(`pipeline.py:1676`) covers `CLAUDE.md`, `AGENTS.md`, the operator's
-`checklist_paths`, and the pipeline's own `config.toml`/`pipeline.py`/`tick.py`
-by path suffix; `tick.py:9098` routes a matching PR to a human instead of
-auto-reviewing it.
+The current [runtime policy gate](pr-pipeline-internals.md#policy-gate-touches_review_policy)
+owns path matching, governing instructions, and escalation behavior. The
+packaged floor currently keeps `allow_touching = false`.
 
-`allow_touching = true` turns that routing off, and **that is the shipped
-default**. The gate is only load-bearing once someone other than the operator can
-get code in front of the reviewer, which phase 1 does not permit. Against that,
-it escalates constantly on any repository the pipeline develops itself — where
-nearly every PR touches `pipeline.py` or `tick.py` — which would stop a cycle
-from ever completing unattended.
-
-The default flips back to `false` as part of the deferred author-widening work,
-not separately; section 4 records the two as one change.
+The migration to `true` belongs to #14 and must land together with operator-only
+issue pickup. Widening authors later (#21) restores `false`; relaxing author
+trust must not silently leave policy-editing PRs auto-reviewable. Keep these
+coupled transitions as migration requirements, not alternate runtime defaults.
 
 ### Mapping from the pre-migration format
 
@@ -236,82 +201,33 @@ configuration rather than the floor.
 
 ### Resolution rules
 
-- **One resolver, one result.** A single function returns the effective
-  configuration for a resolved target, and `tick.py`, the setup skill, and every
-  Python caller read it. No caller reads a raw table. The existing per-key
-  accessors (`pipeline.config_string`, `pipeline.config_string_list`) become its
-  internals, not its API.
-- **Lists replace, they do not merge.** A repository's `verify_tools` overrides
-  the default list wholesale. A merge would mean an operator could never
-  *narrow* a grant for one target, which is the wrong direction for a
-  permission list.
-- **Fail-closed is scoped to the settings that have a safe direction.** A
-  non-list where a list is expected, or a non-boolean gate, resolves to the
-  restrictive value and emits a tick-log entry, matching the current
-  conservative read of a malformed `config.toml`. It is never silently coerced.
-  Settings with no conservative value — `base_ref`, `permission_mode`,
-  `[operator] login` — have no fail-closed reading to fall back to, so a
-  malformed one is a hard startup error naming the key. A blank `base_ref` is
-  not malformed; it is the documented "resolve the default branch" value.
-- **A malformed `verify_tools` is not an empty `verify_tools`.** These are
-  different states and section 7 treats them differently: an empty list is a
-  deliberate operator choice that dispatches with a warning, while a list that
-  failed to parse is a hard startup error. Without the distinction, a typo in
-  one config line silently becomes an unverified PR promoted to
-  `ai:ready-for-human` — fail-closed and section 7's dispatch-anyway decision
-  compose into exactly the hole neither rule has on its own.
-- **A repository section naming a repo absent from a non-empty `[scan] repos`**
-  is a configuration error reported at setup, not a silent override.
+The shipped [resolver contract](pr-pipeline-internals.md#7-operator-configuration-resolution)
+owns parsing, precedence, validation, and explicit-empty versus malformed
+values. Setup and future extensions must reuse `ResolvedConfig` rather than add
+a reader. Keeping one validated result across an entire tick is still #26.
+
+Remaining migration requirements:
+
+- Setup (#18) must report a repository section outside a non-empty `[scan] repos`
+  as a configuration error, rather than silently accepting an unusable override.
+- An intentionally empty `verify_tools` must dispatch with durable unverified
+  evidence (#16, section 7). A malformed list must remain a startup error.
+- A blank `base_ref` is valid; resolving it to the target's default branch is #12.
 
 ### `status.sh` reads no config at all
 
-`status.sh` cannot call the resolver. Its own comment (`status.sh:32-38`) records
-why it `sed`-parses rather than importing a TOML library: it *"must run before any
-interpreter is resolved."* That is load-bearing — the dashboard's job includes
-telling an operator that their interpreter situation is broken, so it cannot
-require one.
-
-It does not need one either. The only thing the dashboard reads from config today
-is the target, and the target now comes from the working directory's git remote
-with `PIPELINE_REPO` as the override — the same rule the resolver uses, reached
-without an interpreter and without TOML. So the `[target] repo` parse
-(`status.sh:44-45`) is deleted rather than ported.
-
-That leaves exactly one reader of the config, in Python, and no bash/Python
-agreement test to maintain. If the dashboard later needs to *display* a resolved
-config value, that is the point to reopen this — not before.
+Implemented by #11. The dashboard shares the shell target resolver without
+requiring Python or reading TOML; see the
+[current target-resolution contract](pr-pipeline-internals.md#7-operator-configuration-resolution).
+If status later needs to display resolved configuration, design that extension
+explicitly rather than reintroducing an independent parser.
 
 ### One canonical target, used everywhere
 
-The target repository is resolved from the working directory's git remote.
-`[target] repo` and the startup check that refuses to run when it is unset are
-removed — that check is what confines an install to a single repository.
-
-Removing it is not sufficient on its own, because repository identity is
-currently split across three mechanisms:
-
-- `gh()` (`tick.py:1004`) forwards its arguments verbatim and most call sites,
-  including relabels, pass no `--repo` — so they resolve against whatever the
-  working directory happens to be.
-- Other call sites use an explicit trusted-head-repo value.
-- Git fetch and push assume the remote is named `origin`.
-- `status.sh:44-45` independently `sed`-parses the install-relative `config.toml`
-  for `[target] repo`, deliberately avoiding a TOML library because it must run
-  before any interpreter is resolved (`status.sh:32-38`). Deleting that key
-  breaks the dashboard.
-
-So this change resolves **one** canonical target plus its matching git remote,
-and threads it through dispatch, harvest, cadence, mutation, and the dashboard.
-`status.sh` drops the config parse and resolves the target from the git remote
-with `PIPELINE_REPO` as the override — the same rule as the resolver, reached
-without an interpreter, per the carve-out above.
-
-`[scan] repos = []` means unrestricted, which is the shipped default. A non-empty
-list restricts which repositories are eligible.
-
-`trusted_review_candidate` (`pipeline.py:2508`) separately matches the PR's
-*head* repository to reject cross-repository fork PRs. That mechanism stays; it
-derives from the resolved target rather than from config.
+Implemented by #11. The runtime owner linked above covers main-checkout identity,
+matching remotes, explicit GitHub host, worktree-context validation, and refusal
+behavior. Reviewer head-repository admission remains a separate check; target
+selection does not grant trust to fork PRs.
 
 ## 4. Issue-author trust gate
 

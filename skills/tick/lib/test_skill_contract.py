@@ -307,6 +307,35 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
 # --- Category D — documentation invariants ---
 
 
+def test_internals_source_references_use_existing_symbols() -> None:
+    """Runtime citations survive line insertions and still identify real owners."""
+    text = INTERNALS.read_text()
+    assert not re.search(r"#L\d|\b(?:\w+\.py|reviewer\.txt|design):\d", text), (
+        "cite a file and symbol instead of maintaining source line numbers"
+    )
+    targets = dict(re.findall(r"^\[([^\]]+)\]: (\S+)", text, re.MULTILINE))
+    for target in targets.values():
+        if "://" not in target:
+            assert (INTERNALS.parent / target.split("#", 1)[0]).is_file(), target
+
+    citations = re.findall(r"\[`(\w+)\.(\w+)`\]\[([^\]]+)\]", text)
+    assert citations, "internals must retain searchable source owners"
+    symbols_by_path: dict[Path, set[str]] = {}
+    for module, symbol, ref in citations:
+        source = (INTERNALS.parent / targets[ref]).resolve()
+        assert source.stem == module, (module, source)
+        if source not in symbols_by_path:
+            names: set[str] = set()
+            for node in ast.parse(source.read_text()).body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    names.add(node.name)
+                elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    assigned = node.targets if isinstance(node, ast.Assign) else [node.target]
+                    names.update(n.id for n in assigned if isinstance(n, ast.Name))
+            symbols_by_path[source] = names
+        assert symbol in symbols_by_path[source], (source, symbol)
+
+
 def test_skill_md_references_tick_py_invocation() -> None:
     """SKILL.md must reference the new Python orchestrator entry point."""
     text = SKILL.read_text()

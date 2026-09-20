@@ -128,8 +128,12 @@ Three files, each with a clear job:
   sandbox rationale, startup diagnostics, reviewer posture, constants, and
   debugging pointers. Read it when a tick fails or the SOP says "read DEBUG.md."
 
-Update all three together when an operator-facing command or stop condition
-changes.
+Update each affected surface when its commands or stop conditions change;
+link to the detailed owner instead of copying its mechanics. The
+[internals reference](../../docs/working/pr-pipeline-internals.md) owns current
+runtime behavior, [architecture](../../docs/architecture.md) owns rationale, and
+the [distribution plan](../../docs/working/plugin-distribution-design.md) owns
+unfinished migration requirements.
 
 ### Stage and engine state
 
@@ -146,12 +150,9 @@ Operator configuration lives in **`~/.claude/pr-pipeline/config.toml`** —
 `$PR_PIPELINE_CONFIG` names the file outright (that override exists for tests
 and one-off runs).
 
-It is outside the install because a plugin install lands at
-`~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/` and `/plugin update`
-installs the next version at a *different* hash: a config in the install is
-silently discarded on every upgrade, verification grants included. It is outside
-the target repository because config committed there is config the pull request
-under review can author.
+Keep operator values in this file, not in the packaged defaults or target repo.
+See [configuration ownership](../../docs/architecture.md#configuration-ownership)
+for the upgrade and trust rationale.
 
 ```toml
 [operator]
@@ -177,60 +178,24 @@ The verification commands are whatever the target repository's own
 grants permission to run the one the operator declares. A trailing ` *` allows
 arguments; without it only the bare command is permitted.
 
-Layers, later overriding earlier:
+Per-repository keys override `[defaults]`; lists replace wholesale, so
+`verify_tools = []` grants no verification commands. Explicit CLI overrides win.
+The [resolver contract](../../docs/working/pr-pipeline-internals.md#7-operator-configuration-resolution)
+owns the complete precedence and validation rules.
 
-1. the packaged `skills/tick/config.toml` — the shipped floor,
-   read-only; **do not put your settings here**
-2. `[defaults]`
-3. `[repos."owner/name"]`
-4. environment variables (`PIPELINE_TRUSTED_AUTHOR`)
-5. explicit CLI flags (`--permission-mode`)
+Bad configuration exits 3 and names the offending key. The exception is
+`allow_touching`: an unusable value keeps the conservative gate, warns, and lets
+the tick run. An explicitly empty grant is valid; a malformed grant is an error.
+Fix the named value rather than treating the error as an empty/default setting.
 
-Lists replace wholesale rather than merging, so a repository can *narrow* a
-grant the defaults widen — the direction that matters for a permission list.
+A blank `base_ref` currently uses `main`; automatic default-branch discovery is
+[issue #12](https://github.com/kwuBuild/pr-pipeline/issues/12). A blank
+`permission_mode` is invalid. `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
+name absolute locations.
 
-How a bad value behaves depends on whether the setting has a safe direction.
-`allow_touching` does: an unusable value resolves to the conservative gate,
-warns on stderr and in the tick log, and the tick runs. Every other setting is
-a startup error naming the key, and the tick exits 3:
-
-- `base_ref`, `permission_mode` and `[operator] login` have no restrictive
-  reading — there is no conservative branch name, no safe permission mode, and
-  no identity that usefully trusts nobody.
-- A malformed `verify_tools` is deliberately **not** the same state as an empty
-  one: read as empty it would dispatch an engine with no verification and still
-  promote the result. An *explicitly* empty one grants nothing, which is what
-  it says; nothing is substituted underneath it. An entry that cannot be a
-  `Bash(...)` permission body — it contains a parenthesis or a newline — is
-  malformed too, rather than being dropped at dispatch: dropping it would
-  narrow the grant the operator wrote, and drop an all-invalid list into the
-  empty state above.
-- `checklist_paths` is a list of files to **block**, so its empty state is the
-  permissive one. A malformed value keeps every usable path any layer named —
-  including a valid `[defaults]` list a bad per-repo override would otherwise
-  replace — so the gate does not weaken while the tick refuses.
-- A malformed `[scan] repos` resolves to the empty *restrictive* set:
-  "unrestricted" has to be something the operator wrote.
-
-A container declared as something other than a table (`[[defaults]]` for
-`[defaults]`, say) is a startup error too. Read as absent it would hand back
-the shipped floor in place of the settings the operator wrote, silently.
-
-A blank `base_ref` is not malformed; it is the documented "resolve the target's
-default branch", and until that resolution lands the dispatch uses `main`. It
-is the only setting for which blank means something — a blank
-`permission_mode` is an error like any other unusable value.
-
-`$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must name an **absolute**
-location. A relative one is refused with a startup error rather than resolved:
-the tick chdirs to the repository root after startup, so a relative path would
-mean one process reading two different configurations — and an engine's cwd is
-a checkout of the pull request's own head.
-
-The operator login is resolved per tick like every other setting, so a
-`--loop` process picks up a change on its next tick and refuses to run at all
-once the login is blank. It is the identity the reviewer admission gate
-compares against; issue *pickup* is not filtered by it yet (issue #14).
+The operator login is reloaded for each tick; a blank login stops the loop. It
+controls reviewer admission. Operator-only issue pickup remains
+[issue #14](https://github.com/kwuBuild/pr-pipeline/issues/14).
 
 The target repository and remote come from the main checkout's Git configuration,
 anchored by the common Git directory even when invoked from a linked worktree.
@@ -244,17 +209,12 @@ tick, including `PIPELINE_REPO` overrides. Repository identity comparisons are
 case-insensitive, including per-repository config and reviewer admission.
 Duplicate `[repos.*]` sections differing only in case are configuration errors.
 
-The selected remote is used for every fetch and for both engines' exact push
-permissions and prompts. The dashboard uses the same shell resolver before
-looking for Python and reads no TOML. GitHub commands pin the host with
-`--repo github.com/owner/name`, so `GH_HOST` cannot redirect them.
-Before launching an implementer or fixer, the controller also checks the
-selected remote's effective fetch and push URLs in that engine's worktree and
-environment. Conditional includes, worktree configuration, or environment
-overrides that point elsewhere refuse the launch and leave the item queued.
-Reviewer harvest checks its worktree before fetching; a mismatch retains the
-marker and review result for retry after the operator corrects the configuration.
-These checks read local Git configuration and open no network connection.
+The same selected target drives controller and dashboard operations. An engine
+worktree whose effective fetch/push destination differs is refused before
+launch, leaving the item queued. A reviewer-harvest mismatch retains the marker
+and result: correct the Git configuration and retry. The
+[internals target-resolution contract](../../docs/working/pr-pipeline-internals.md#7-operator-configuration-resolution)
+describes the shared resolver, explicit GitHub host, and worktree-context checks.
 Git configuration must remain stable while a dispatched engine is running.
 Supported URLs are GitHub.com HTTPS, SSH
 (`git@github.com:owner/name` or `ssh://git@github.com[:22]/owner/name`), and Git

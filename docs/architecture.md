@@ -735,54 +735,17 @@ lost bookkeeping.
 
 **Implementer (Claude):**
 
-The implementer engine is selectable via `--impl-engine` on `/pr-pipeline:tick`:
+Claude supplies a read/write implementation engine while the controller retains
+GitHub metadata and workflow ownership. Its target repository supplies coding
+and verification instructions; the operator supplies permission grants.
 
-- `claude` (default): runs `claude -p` against the Anthropic API with no
-  `--model` flag, so the CLI resolves the operator's own configured model.
-  `--model` on the tick CLI overrides it.
-- `claude-ds`: runs `claude -p` routed through DeepSeek's Anthropic-compatible
-  endpoint (`ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic`) with model
-  `deepseek-v4-pro[1m]`. Requires `DEEPSEEK_API_KEY` (or `DEEPSEEK_API_KEYPATH`)
-  in the dispatch environment. Falls back to skipping the dispatch with a log
-  entry if the token is unavailable.
-
-```bash
-# Default (claude):
-(cd .claude/worktrees/issue-<N> && claude -p \
-  --permission-mode auto \
-  --allowedTools "Read Edit Write Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push <remote> HEAD) Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright) Bash(npm --prefix frontend *)" \
-  --output-format json \
-  < prompt.txt \
-  > result.json 2> stderr.log) &
-
-# DeepSeek-routed (claude-ds):
-# Inline env prefix keeps the token in the child's environ, NOT in argv
-# where `ps aux` would show it. Do NOT use `env VAR=val` for secrets.
-(cd .claude/worktrees/issue-<N> && \
-  ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic" \
-  ANTHROPIC_AUTH_TOKEN="$DEEPSEEK_API_KEY" \
-  ANTHROPIC_DEFAULT_SONNET_MODEL="deepseek-v4-pro[1m]" \
-  claude -p \
-    --permission-mode auto \
-    --allowedTools "..." \
-    --output-format json \
-    --model "deepseek-v4-pro[1m]" \
-    < prompt.txt \
-    > result.json 2> stderr.log) &
-```
-
-The engine value is recorded in `dispatch.json` (`"engine":"claude-ds"`) and in
-the tick log (`"engine":"claude-ds"`) for observability — `jq` queries can count
-DeepSeek-routed launches across the tick history.
-
-The implementer gets:
-- Full read/write access to the worktree
-- The verification commands the operator declared as `verify_tools` — the target
-  repo's tests, linter, and type checker
-- `git` for committing and pushing to its own branch
-- Network/tool calls remain subject to operator settings and permission decisions
-- The target repo's own `CLAUDE.md` governs behavior (TDD, commit hygiene, and
-  which verification commands to run in which order)
+The [operator engine options](../skills/tick/README.md#engine-selection---impl-engine)
+own route selection, credentials, and overrides. The
+[internals launch summary](working/pr-pipeline-internals.md#1-engine-launch-summary)
+and [model resolution](working/pr-pipeline-internals.md#2-model-and-reasoning-effort)
+own the current launch behavior and source references. Follow those owners
+rather than copying a subprocess command here: wrapper capture, exact push
+grants, and environment construction are part of the runtime contract.
 
 **Git surface and remote blast radius.** The explicit grants include commit
 and one exact stage-specific push: `git push <remote> HEAD` for the implementer,
@@ -1563,89 +1526,35 @@ operator's `config.toml` defaults.
 
 ### Configuration ownership
 
-**Configuration is authored by the operator and read from outside both the
-install and the target repository:** `~/.claude/pr-pipeline/config.toml`
-(`$CLAUDE_CONFIG_DIR` relocates it; `$PR_PIPELINE_CONFIG` names it outright for
-tests).
+**The operator owns configuration outside both the install and the target
+repository.** An install-relative file disappears when a plugin upgrade moves
+to a new cache directory. A target-owned file lets the PR supply the policy it
+is judged under. These are separate reasons for the same placement decision.
 
-Two independent reasons put it there, and only the first is load-bearing on its
-own. A plugin install lands at
-`~/.claude/plugins/cache/<marketplace>/<plugin>/<hash>/`, and `/plugin update`
-installs the next version at a *different* hash — so an install-relative config
-is silently discarded on every upgrade. That settles the location regardless of
-any threat model. Separately, config committed to the *target* would be config
-the pull request under review supplies, since the reviewer and fixer check that
-tree out.
+Placement is **not process isolation**: an allowed verification command can run
+PR-authored scripts with the operator's filesystem access and overwrite external
+configuration. Containing that belongs to engine isolation. Configuration layers
+must never be read from a target repository or engine worktree.
 
-The second reason is a placement decision, not a security boundary. Moving
-configuration outside the target tree stops a PR from **supplying** policy; it
-does not stop a PR from **overwriting** it, because a granted verification
-command such as `npm test` executes scripts the PR controls in a process holding
-the operator's filesystem access. Containing that belongs to the engine and model
-layer — process and filesystem isolation — not to a config-location rule. What
-*is* enforced, and tested: no configuration layer is ever read from inside a
-target repository or an engine worktree.
+**One resolver owns interpretation.** Callers use `ResolvedConfig` rather than
+inventing their own parsing rules. A list override must be able to narrow a
+grant, and an explicitly empty grant must remain distinct from malformed input.
+A setting with no safe fallback must refuse startup rather than silently change
+the operator's intent. The remaining per-tick snapshot work is tracked with the
+[current resolver contract](working/pr-pipeline-internals.md#7-operator-configuration-resolution).
 
-**One resolver owns the layering.** `pipeline.resolve_config` returns the
-effective configuration for one resolved target and every Python caller reads it;
-no caller reads a raw table, so two callers cannot disagree. Layers, later
-overriding earlier: the packaged floor, `[defaults]`, `[repos."owner/name"]`,
-environment, explicit CLI flags. Lists replace wholesale — an operator who cannot
-narrow a grant for one target cannot use a permission list properly.
+**Target identity is shared by controller and dashboard.** Resolving one
+repository and matching remote prevents reads, mutations, and engine push grants
+from disagreeing about their target. Worktree-context validation checks the
+actual Git destination before launch/fetch; it does not freeze Git settings for
+an already running engine.
 
-**The packaged `config.toml` is layer 1 and only layer 1.** It is the shipped
-floor: read-only, carrying the conservative default for every per-target setting,
-and no operator value may land there (the resolver reports an `[operator]`,
-`[repos.*]` or `[scan]` table in it as a configuration error). Its `[target]`
-table retains only the deprecated `trusted_author` login fallback. Its `repo`
-key is no longer read; old declarations produce a migration warning.
-
-**One canonical target and remote.** `skills/tick/resolve-target.sh` resolves
-the repository from a local GitHub remote. `PIPELINE_REPO` selects exactly one
-matching remote when there are several; it cannot name a repository absent
-from local remotes or outside a configured `[scan] repos` restriction. Remote
-names must pass conservative validation before appearing in engine permissions
-or prompts, and fetch/push URLs must identify the same repository. Repository
-comparisons ignore case; duplicate config sections differing only in case fail.
-The controller supplies explicit `--repo github.com/owner/name` arguments and
-uses the selected remote for all fetches and push commands. Qualified linked-issue reads can name their
-own repository through the `repo=` helper parameter. The dashboard invokes the
-same resolver before looking for Python and reads no TOML. Both anchor Git
-resolution on the main checkout's common Git directory, matching marker state.
-Before an implementer or fixer starts, the controller validates the same remote
-in the actual child cwd and environment. This check does not re-anchor to the
-main checkout: conditional Git includes and worktree settings can change the
-effective destination. A mismatch refuses launch before an engine starts.
-Reviewer harvest validates its worktree before fetching and retains custody on
-rejection. The shared shell helper owns URL validation in both contexts; these
-checks do not freeze Git configuration for an already running engine.
-A startup failure stops `--loop` before remote cadence observation can bypass
-the refusal.
-
-**Fail-closed is scoped to the settings that have a safe direction.**
-`allow_touching` resolves to the restrictive reading and warns. `base_ref`,
-`permission_mode`, `[operator] login`, `verify_tools`, `checklist_paths` and
-`[scan] repos` have no value that is both conservative and the one the operator
-wrote — there is no restrictive branch name and no identity that usefully trusts
-nobody — so a malformed one is a startup error naming the key and the tick exits
-3. A malformed `verify_tools` is deliberately not an empty one: read as empty it
-composes with "dispatch anyway on an empty grant" into an engine that verifies
-nothing and a PR promoted regardless. `checklist_paths` runs the other way —
-these are files to *block*, so empty is the permissive state — and a malformed
-value keeps every usable path any layer named while the tick refuses.
-
-**The empty state of a permission list is an operator decision, and nothing
-underneath it may override that.** `verify_tools = []` under a repository
-section grants no verification command at all; the shipped Python stack lives
-in the packaged floor, as layer 1, and not as a fallback in the dispatch code
-that an operator would have no way to narrow.
-
-**The operator config is located from the environment, never from the working
-directory.** `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must be absolute; a
-relative value is a startup error. The tick chdirs to the repository root after
-import, and an engine's cwd is a checkout of the PR head, so a cwd-relative
-config path is one process reading two configurations — or a PR supplying the
-policy it is judged under.
+The [internals configuration section](working/pr-pipeline-internals.md#7-operator-configuration-resolution)
+owns file selection, precedence, validation, and target-resolution mechanics.
+The [operator configuration guide](../skills/tick/README.md#configuration) owns
+copyable examples and corrective actions. The
+[distribution plan](working/plugin-distribution-design.md#3-configuration-location-layers-and-schema)
+keeps migration requirements, including changes not yet shipped.
 
 ## Skill structure
 
