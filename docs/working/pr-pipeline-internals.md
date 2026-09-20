@@ -143,8 +143,8 @@ The pre-PR hooks are a quality gate for the interactive workflow only.
 ### Governing-file contracts per engine
 
 Each engine runs with `cwd` set to an isolated git worktree:
-- Implementer: worktree at `origin/main` tip
-  ([tick.py:9662][impl-wt])
+- Implementer: worktree at `<remote>/main` tip
+  ([tick.py:9663][impl-wt])
 - Fixer: worktree at the PR's head branch
   ([tick.py:10314–10315][fix-wt])
 - Reviewer: worktree at the PR's head SHA (detached)
@@ -246,6 +246,9 @@ own repository, or a plugin root) — `_POLICY_PATH_SUFFIXES`
   return `False` unconditionally, or removes the gate call from the reviewer
   dispatch, is the same silent-disable vector, so pipeline-code PRs escalate to
   a human while the gate is enabled
+- `skills/tick/resolve-target.sh` — selects the repository whose review policy
+  startup loads and validates the effective worktree destinations. Changing
+  this authority requires the same policy review as changing the controller
 - `skills/<name>/SKILL.md` for every `pipeline.BOUND_SKILLS` entry, and every
   file under `skills/tick/lib/prompts/` — the instructions the install *supplies*
   to a dispatched engine. Sourcing them from the install already stops a PR from
@@ -276,9 +279,12 @@ The `--allowedTools` allowlist is a named security boundary
 ```
 Read Edit Write
 Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *)
-Bash(git log *) Bash(git push origin HEAD)
+Bash(git log *) Bash(git push <remote> HEAD)
 <one Bash(...) entry per resolved verify_tools value>
 ```
+
+`<remote>` is the validated remote selected at startup; the fixer uses the
+exact `HEAD:refs/heads/<head-ref>` refspec on that same remote.
 
 The verification entries are the operator's, not the pipeline's: `_engine_verify_tools`
 wraps each resolved value in `Bash(...)`. An entry containing a parenthesis or a
@@ -654,6 +660,36 @@ stay discarded, and the two values that do cross are shape-checked first.
 
 ## 7. Operator configuration resolution
 
+Before configuration is selected, `pipeline.resolve_target` invokes the shared
+`skills/tick/resolve-target.sh` helper. It resolves one GitHub repository and
+matching local remote without Python inside the helper or any GitHub request.
+The common Git directory anchors resolution to the main checkout, so linked
+worktree settings cannot make the dashboard and controller disagree.
+`PIPELINE_REPO` selects a matching remote and cannot override `[scan] repos`.
+Missing or ambiguous matches, unsafe names, and conflicting push destinations
+fail startup. `status.sh` invokes this same helper before resolving Python and
+reads no TOML. `[target] repo` is no longer read.
+
+The controller binds this identity for the tick: `gh` adds
+`--repo github.com/owner/name` (including the host), all fetches
+use the resolved remote, and implementer/fixer prompts and push grants carry the
+same remote. Qualified issue reads may use `gh_json(..., repo="owner/other")`;
+the explicit read repository is separate from the target used for mutations.
+Repository comparisons in configuration, scan scope, and reviewer admission
+ignore case. `--loop` exits on startup rejection before observing remote cadence.
+
+`pipeline.validate_target_context` invokes the helper's `--check-remote` mode
+without changing the supplied working directory. `_launch_claude_engine` runs
+it with the engine's cwd and environment before opening output files or starting
+either an implementer or fixer. A conflicting effective fetch or push URL
+returns a launch failure, leaves the item on its pickup label, and reports the
+target error on stderr. `_harvest_one_reviewer` performs the same local check
+before its worktree fetch; a rejection logs `target_context_invalid` and retains
+the marker and result for retry. This closes routing differences caused by
+conditional includes and worktree configuration while preserving startup's
+shared main-checkout identity. Configuration must stay stable during an engine
+run; the checks do not pin future Git transport.
+
 `resolve_config` ([pipeline.py:2122][resolver]) is the only reader. Every Python
 caller takes its `ResolvedConfig`; nothing reads a raw table, so two callers
 cannot disagree about what the operator configured.
@@ -724,8 +760,8 @@ are things the operator wrote, while a malformed value resolves to the empty
 *restrictive* set, so even a caller that ignores errors cannot read a typo as
 "every repository is eligible".
 
-The resolver never raises. `tick.py` resolves at import to seed
-`TRUSTED_HEAD_REPO`/`TRUSTED_REVIEW_AUTHOR`, and an exception there would turn a
+The config resolver never raises. `tick.py` resolves at import to seed
+`TRUSTED_REVIEW_AUTHOR`, and an exception there would turn a
 config typo into a traceback from whichever CLI helper imported the module first.
 The startup gate is the single enforcement point.
 

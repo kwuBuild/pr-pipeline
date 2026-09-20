@@ -53,13 +53,15 @@ watch -n 5 'bash /absolute/path/to/install/skills/status/status.sh'
 while true; do clear; bash /absolute/path/to/install/skills/status/status.sh; sleep 5; done
 ```
 
-The repo comes from the deprecated `[target] repo` key in
-`skills/tick/config.toml` — the same value the tick uses, parsed
-with `sed` because the dashboard must run before any interpreter is resolved.
-Operator settings live in `~/.claude/pr-pipeline/config.toml`, which the
-dashboard reads nothing from. Override the repo for one run with
-`PIPELINE_REPO=<owner/repo>`. With neither set the dashboard exits 2 rather
-than rendering some other repository's queue.
+The repo comes from the main checkout's Git remote through the same
+`skills/tick/resolve-target.sh` helper the tick uses. The dashboard reads no
+configuration and resolves the target before looking for Python.
+Linked-worktree invocations share the main checkout's target and marker space.
+`PIPELINE_REPO=<owner/repo>` selects exactly one matching local remote; multiple
+remotes require this selection. A missing, ambiguous, or unsafe remote, or a
+different push destination, exits 2 before any GitHub request. The dashboard
+does not enforce `[scan] repos` because it reads no TOML; the tick enforces that
+operator scope before doing any work.
 
 This dashboard is optional — `gh pr list --label ai:...` shows every pipeline stage
 since labels are the source of truth. Its only added value is the **in-flight,

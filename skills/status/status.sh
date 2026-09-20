@@ -29,26 +29,11 @@ set -uo pipefail
 shopt -s nullglob 2>/dev/null || true
 setopt NULL_GLOB 2>/dev/null || true
 
-# The target repo. Read from the tick's config.toml so the dashboard and the
-# tick cannot disagree about which repository they are talking about, with
-# PIPELINE_REPO as the one-off override. There is no fallback default on
-# purpose: a pinned one would point a fresh install at somebody else's repo and
-# render *their* queue, which reads as a plausible dashboard rather than as an
-# error. Parsed with sed rather than a TOML library because this script must run
-# before any interpreter is resolved.
+# Resolve before looking for Python. Both tick and this dashboard use the
+# same local-Git resolver; no configuration file or GitHub request is needed.
 SKILL_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO="${PIPELINE_REPO:-}"
-if [ -z "$REPO" ]; then
-  # Scoped to the [target] table: an unscoped match would read a `repo` key
-  # from whichever table happened to declare one first.
-  REPO="$(sed -n '/^\[target\]/,/^\[/ s/^[[:space:]]*repo[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' \
-    "$SKILL_DIR/../tick/config.toml" 2>/dev/null | head -1)"
-fi
-if [ -z "$REPO" ]; then
-  echo "status: no target repo configured. Set [target] repo in" >&2
-  echo "  skills/tick/config.toml, or export PIPELINE_REPO." >&2
-  exit 2
-fi
+TARGET="$(bash "$SKILL_DIR/../tick/resolve-target.sh")" || exit 2
+REPO="${TARGET%%$'\n'*}"
 # Anchor on the git common dir, not --show-toplevel: run from inside a linked
 # worktree the latter names that worktree, whose .claude/worktrees is empty,
 # and the dashboard would report zero in-flight engines for a busy pipeline.
@@ -145,7 +130,7 @@ done
 # --- PIPELINE STATE (GitHub labels) ---------------------------------------
 echo
 echo "PIPELINE STATE (open PRs by ai: label)"
-gh pr list --repo "$REPO" --state open --json number,title,labels --limit 100 \
+gh pr list --repo "github.com/$REPO" --state open --json number,title,labels --limit 100 \
   | jq -r '
       .[]
       | . as $p
@@ -160,7 +145,7 @@ echo "PIPELINE STATE (open issues by ai: label)"
 # Every ai: label, not just ai:available: reconciliation never escalates an
 # in-flight item on a missing marker, so this listing is the only place a
 # markerless ai:implementing becomes visible to the operator.
-gh issue list --repo "$REPO" --state open --json number,title,labels --limit 100 \
+gh issue list --repo "github.com/$REPO" --state open --json number,title,labels --limit 100 \
   | jq -r '
       .[]
       | . as $i

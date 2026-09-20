@@ -13,22 +13,10 @@ from unittest import mock
 
 import pytest
 
-# The target repo and trusted author every test runs against.
-#
-# `tick.py` resolves both at import time — the repo from `PIPELINE_REPO` else
-# the packaged file's deprecated `[target] repo`, the login from
-# `PIPELINE_TRUSTED_AUTHOR` else the resolved `[operator] login` — and nothing
-# that ships fills either in, on purpose: a pinned default would point a fresh
-# install at somebody else's repository. Blank is also what `main` refuses to
-# start on, so the suite has to declare a target the way an operator does. Set
-# here, before the first `import tick` anywhere in the session, so every test
-# agrees on one value rather than each patching the module constant.
-#
-# These stay in the environment for the whole session; the per-test
-# `isolate_operator_config` fixture clears `PIPELINE_TRUSTED_AUTHOR` again
-# so config-resolution tests are not steered by it after import.
+# Test identity is hermetic: startup resolution is stubbed by the fixture below
+# unless a test opts into real_target. The login fallback is seeded at import;
+# isolate_operator_config exercises per-tick login resolution from a file.
 TRUSTED_AUTHOR = "test-owner"
-os.environ.setdefault("PIPELINE_REPO", f"{TRUSTED_AUTHOR}/test-repo")
 os.environ.setdefault("PIPELINE_TRUSTED_AUTHOR", TRUSTED_AUTHOR)
 
 # A PR body that satisfies `tick._pr_body_matches_guidelines` for issue #7 — the
@@ -80,6 +68,9 @@ def restore_cwd_after_test() -> Iterator[None]:
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register the marker that opts a test back into the real ``tick.gh``."""
+    config.addinivalue_line(
+        "markers", "real_target: exercise local Git target resolution",
+    )
     config.addinivalue_line(
         "markers",
         "real_gh_helper: exercise tick.gh/relabel itself; the autouse "
@@ -493,6 +484,21 @@ def isolate_operator_config(
         f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n', encoding="utf-8",
     )
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+
+@pytest.fixture(autouse=True)
+def isolate_target_resolution(request, monkeypatch):
+    """Unit ticks use a declared target; integration tests opt into real Git."""
+    import pipeline
+    import tick
+
+    monkeypatch.setattr(tick, "TRUSTED_HEAD_REPO", f"{TRUSTED_AUTHOR}/test-repo")
+    monkeypatch.setattr(tick, "TARGET_REMOTE", "origin")
+    if request.node.get_closest_marker("real_target") is None:
+        monkeypatch.setattr(tick, "resolve_target", lambda: pipeline.ResolvedTarget(
+            f"{TRUSTED_AUTHOR}/test-repo", "origin",
+        ))
+        monkeypatch.setattr(pipeline, "validate_target_context", lambda *args, **kwargs: None)
 
 
 # --- Helpers ---

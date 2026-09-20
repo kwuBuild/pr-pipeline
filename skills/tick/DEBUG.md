@@ -592,9 +592,18 @@ is still captured in `stderr.log`.
   count and the UTF-8 byte length; the classifier reads at most
   `tick._PR_BODY_REVISION_READ_LIMIT`
 - Trusted reviewer gate: `[operator] login` from
-  `~/.claude/pr-pipeline/config.toml` and the deprecated `[target] repo` from
-  the packaged `config.toml` (env override `PIPELINE_TRUSTED_AUTHOR` /
-  `PIPELINE_REPO`); a tick with either unset exits 3 before dispatching anything
+  `~/.claude/pr-pipeline/config.toml` (env override `PIPELINE_TRUSTED_AUTHOR`)
+  and the repository resolved from Git. `PIPELINE_REPO` must match exactly one
+  local remote; fetch and push destinations must agree. Failed resolution logs
+  `startup_target_invalid`; a missing login or target outside `[scan] repos`
+  exits 3 before GitHub access, including in `--loop` mode.
+- Worktree target validation: `launch_failed` with a target error on stderr
+  means the implementer/fixer's effective remote differs from startup's target.
+  Reviewer harvest logs `target_context_invalid` and retains its marker and
+  result before fetching. Inspect `git remote get-url --all <remote>` and
+  `git remote get-url --push --all <remote>` in that worktree, including its
+  `includeIf`, worktree settings and engine `GIT_CONFIG_*` environment. Correct
+  the configuration and rerun the tick; do not discard retained review evidence.
 - Configuration errors: a malformed `base_ref`, `permission_mode`,
   `[operator] login`, `verify_tools`, `checklist_paths` or `[scan] repos` exits
   3 with `startup_config_invalid` naming the key — none of them has a reading

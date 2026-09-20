@@ -118,6 +118,7 @@ _ENGINE_EXTRA_CLAUSES: dict[str, list[str]] = {
 # well-formed, not realistic.
 _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
     "implementer": {
+        "target_remote": "upstream",
         "issue_number": 1,
         "issue_title": "contract render",
         "issue_body": "body",
@@ -125,6 +126,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "pr_body_source_file": "pr-body.md",
     },
     "fixer": {
+        "target_remote": "upstream",
         "pr_number": 2,
         "review_body": "findings",
         "pr_body": "## Summary",
@@ -1869,20 +1871,12 @@ def test_definition_of_done_cites_no_work_item_number() -> None:
 
 
 def test_shipped_config_declares_no_target() -> None:
-    """``config.toml`` must ship with ``[target]`` blank.
-
-    The file is copied into every install, so a committed ``repo`` or
-    ``trusted_author`` points a fresh install at somebody else's repository —
-    and every ``gh`` call the tick makes carries ``--repo``, so a wrong value is
-    a remote mutation against a stranger's queue, not a no-op. Blank is what
-    ``main``'s startup gate refuses to run on, which turns the unconfigured case
-    into a legible message instead of a plausible-looking wrong target.
-    """
+    """The install carries no target repo key or preconfigured author identity."""
     with open(POLICY_CONFIG, "rb") as fh:
         config = tomllib.load(fh)
 
     target = config.get("target", {})
-    assert target.get("repo") == "", (
+    assert "repo" not in target, (
         "config.toml ships a target repo; every adopter inherits it"
     )
     assert target.get("trusted_author") == "", (
@@ -1903,66 +1897,6 @@ def test_shipped_config_declares_no_review_checklist_paths() -> None:
 
     assert config.get("defaults", {}).get("checklist_paths") == [], (
         "config.toml ships review-checklist paths that belong to one target repo"
-    )
-
-
-def test_status_dashboard_can_still_parse_the_target_from_the_packaged_file() -> None:
-    """``status.sh``'s ``sed`` parse must still find ``[target] repo``.
-
-    The dashboard cannot call the config resolver — it must run before any
-    interpreter is resolved, because telling an operator their interpreter
-    situation is broken is part of its job — so it ``sed``-parses the packaged
-    file for the target. That makes the `[target]` table a live contract
-    between two files that share no code: restructure this file without leaving
-    the table where the ``sed`` expression looks, and an operator who had filled
-    it in loses their dashboard (exit 2) with nothing to connect it to.
-
-    The expression under test is lifted from ``status.sh`` rather than
-    re-invented, and it runs against a copy of the *shipped* file with a value
-    filled in — the shipped value is blank, so parsing it as-is would pass
-    whether or not the table still existed.
-    """
-    expression = next(
-        line for line in STATUS_SCRIPT.read_text().splitlines()
-        if line.strip().startswith("REPO=\"$(sed -n")
-    )
-    match = re.search(r"sed -n '([^']*)'", expression)
-    assert match is not None, (
-        "status.sh no longer parses the target with a single-quoted sed "
-        "expression; update this guard to match how it reads the target now"
-    )
-
-    filled = POLICY_CONFIG.read_text().replace('repo = ""', 'repo = "owner/name"', 1)
-    with tempfile.NamedTemporaryFile("w", suffix=".toml") as fh:
-        fh.write(filled)
-        fh.flush()
-        parsed = subprocess.run(
-            ["sed", "-n", match.group(1), fh.name],
-            capture_output=True, text=True, check=True,
-        ).stdout.splitlines()
-
-    assert parsed[:1] == ["owner/name"], (
-        "status.sh's target parse no longer finds [target] repo in the "
-        f"packaged config.toml (got {parsed!r}); the dashboard exits 2 on a "
-        "working install"
-    )
-
-
-def test_status_dashboard_has_no_fallback_target_repo() -> None:
-    """``status.sh`` must not fall back to a hard-coded repository.
-
-    The dashboard is the signal an operator reads to decide the pipeline is idle
-    and safe to touch. Pointed at the wrong repo it renders a real, plausible
-    queue — the worst failure shape available, because nothing about it looks
-    like an error. It reads the tick's own ``[target] repo`` so the two cannot
-    disagree, and exits rather than guessing.
-    """
-    text = STATUS_SCRIPT.read_text()
-    assert 'REPO="${PIPELINE_REPO:-}"' in text, (
-        "status.sh still carries a fallback default for the target repo"
-    )
-    assert "no target repo configured" in text, (
-        "status.sh does not fail loudly when no target is configured"
     )
 
 

@@ -60,6 +60,7 @@ import claude_stream_wrapper
 import pipeline
 import process_control
 import reviewer_observability
+from pipeline import resolve_target
 
 # --- Repo anchoring (must precede the constants that derive from it) ---
 
@@ -214,31 +215,11 @@ DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 60 * 60
 TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
 MIN_CODEX_VERSION = "codex-cli 0.142.5"
 
-# The repository this tick drives, and the GitHub login whose PRs it may
-# auto-review. The pipeline operates a repo it does not own, so neither can be a
-# shipped constant: a pinned default would silently point a fresh install at
-# somebody else's repository, and a wrong `--repo` is a remote mutation, not a
-# no-op. Both come from the resolved operator config, with an env override for
-# the one-off run against a different repo. Unset reads as empty, and `main`
-# refuses to run a tick in that state (see the startup gate) rather than letting
-# an empty `--repo` reach `gh`.
-#
-# The repo still comes from the deprecated `[target] repo` remnant in the
-# packaged file: resolving it from the working directory's git remote is the
-# canonical-target issue's change, and until then that remnant is what an
-# already-configured install has. The login has moved to `[operator] login` in
-# the operator's own config, with the remnant as its floor.
-#
-# Resolution at import cannot raise: `resolve_config` reports a malformed value
-# in `errors` and resolves the value itself to its conservative reading, and
-# `main` refuses the tick on those errors (see the startup gate). A raising
-# import would turn an operator's config typo into a traceback from whichever
-# CLI helper happened to import this module first.
+# Target identity is bound together at startup, before any GitHub access.
+# Imports and read-only CLI helpers do not require a configured Git remote.
 _IMPORT_CONFIG = pipeline.resolve_config()
-TRUSTED_HEAD_REPO = (
-    os.environ.get("PIPELINE_REPO", "").strip()
-    or _IMPORT_CONFIG.legacy_target_repo
-)
+TRUSTED_HEAD_REPO = ""
+TARGET_REMOTE = ""
 TRUSTED_REVIEW_AUTHOR = _IMPORT_CONFIG.login
 _PR_BODY_SOURCE_FILE = ".pr-body.md"
 _PR_CREATE_BODY_FILE = ".pr-create-body.md"
@@ -804,9 +785,12 @@ def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
 
 
 # The implementer worktree checks out its own branch, so the exact permission
-# `git push origin HEAD` (fast-forward push of the checked-out branch) is its
+# `git push <remote> HEAD` (fast-forward push of the checked-out branch) is its
 # entire remote-mutation surface.
-_IMPLEMENTER_PUSH_PERMISSION = "Bash(git push origin HEAD)"
+def _implementer_push_permission() -> str:
+    """Grant the implementer one push to the validated target remote."""
+    return f"Bash(git push {TARGET_REMOTE} HEAD)"
+
 
 # Conservative shape for a head ref that may be templated into the fixer's
 # exact push permission and prompt: git ref-name characters only, no leading
@@ -853,7 +837,7 @@ def _fixer_push_permission(head_ref: str) -> str:
     Returns:
         The exact ``Bash(...)`` permission string for ``--allowedTools``.
     """
-    return f"Bash(git push origin HEAD:refs/heads/{head_ref})"
+    return f"Bash(git push {TARGET_REMOTE} HEAD:refs/heads/{head_ref})"
 
 
 def _engine_allowed_tools(push_permission: str) -> str:
@@ -861,7 +845,7 @@ def _engine_allowed_tools(push_permission: str) -> str:
 
     Args:
         push_permission: The stage-specific exact push permission
-            (:data:`_IMPLEMENTER_PUSH_PERMISSION` or
+            (:func:`_implementer_push_permission` or
             :func:`_fixer_push_permission`).
 
     Returns:
@@ -947,7 +931,7 @@ def _launch_claude_engine(
         env: The environment for the engine process.
         push_permission: The stage-specific exact ``git push`` permission
             appended to the base allowlist
-            (:data:`_IMPLEMENTER_PUSH_PERMISSION` or
+            (:func:`_implementer_push_permission` or
             :func:`_fixer_push_permission`).
         model: The model to pass to ``--model``. Empty (the default) omits
             the flag entirely so the CLI resolves the operator's own
@@ -958,8 +942,8 @@ def _launch_claude_engine(
             the bounded ``--allowedTools`` allowlist still resolves first.
 
     Returns:
-        The Popen handle, or ``None`` when prompt/result file setup or the
-        spawn failed (the caller cleans up the worktree and logs).
+        The Popen handle, or ``None`` when target validation, prompt/result
+        file setup or spawn failed (the caller cleans up the worktree and logs).
 
     Raises:
         ValueError: When ``permission_mode`` is not one of the supported
@@ -970,6 +954,15 @@ def _launch_claude_engine(
             f"permission_mode must be 'dontAsk' or 'auto', "
             f"got {permission_mode!r}"
         )
+    try:
+        pipeline.validate_target_context(
+            pipeline.ResolvedTarget(TRUSTED_HEAD_REPO, TARGET_REMOTE),
+            cwd=wt_dir, env=env,
+        )
+    except (OSError, ValueError) as exc:
+        print(f"tick: refusing engine launch: target validation failed: {exc}", file=sys.stderr)
+        return None
+
     prompt_path = os.path.join(wt_dir, "prompt.txt")
     stderr_path = os.path.join(wt_dir, "stderr.log")
     engine_cmd = [
@@ -1017,7 +1010,21 @@ def _launch_claude_engine(
 # --- gh / git helpers ---
 
 
-def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+def _gh_repo_args(args: tuple[str, ...], repo: str | None) -> tuple[str, ...]:
+    """Bind commands without interpreting user content as repository flags."""
+    if args and args[0] in {"pr", "issue"}:
+        target_repo = TRUSTED_HEAD_REPO if repo is None else repo
+        if not target_repo:
+            raise ValueError("target repository has not been resolved")
+        # The resolver accepts github.com remotes. Pin the host as well so
+        # GH_HOST or local gh configuration cannot redirect this identity.
+        return (*args, "--repo", f"github.com/{target_repo}")
+    return args
+
+
+def gh(
+    *args: str, check: bool = True, repo: str | None = None,
+) -> subprocess.CompletedProcess:
     """Run a ``gh`` command and return the completed process.
 
     ``encoding="utf-8", errors="replace"`` prevents ``UnicodeDecodeError`` on
@@ -1027,6 +1034,9 @@ def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     Args:
         *args: Arguments to pass to ``gh``.
         check: If True (default), raise on non-zero exit.
+        repo: Explicit ``owner/name`` for qualified reads, such as a linked issue
+            in another repository. Defaults to the canonical target. Use this
+            keyword instead of embedding ``--repo`` in ``args``.
 
     Returns:
         The completed process with captured stdout/stderr.
@@ -1035,7 +1045,7 @@ def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
         subprocess.CalledProcessError: If ``check`` is True and exit != 0.
     """
     return subprocess.run(
-        ["gh", *args],
+        ["gh", *_gh_repo_args(args, repo)],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -1043,11 +1053,12 @@ def gh(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     )
 
 
-def gh_json(*args: str) -> Any:
+def gh_json(*args: str, repo: str | None = None) -> Any:
     """Run ``gh --json ...`` and return parsed JSON.
 
     Args:
         *args: Arguments to pass to ``gh`` (typically ``--json`` queries).
+        repo: Optional explicit ``owner/name`` for qualified issue reads.
 
     Returns:
         The parsed JSON value.
@@ -1055,15 +1066,16 @@ def gh_json(*args: str) -> Any:
     Raises:
         subprocess.CalledProcessError: On non-zero exit.
     """
-    result = gh(*args, check=True)
+    result = gh(*args, check=True, repo=repo)
     return json.loads(result.stdout)
 
 
-def gh_text(*args: str) -> str:
+def gh_text(*args: str, repo: str | None = None) -> str:
     """Run ``gh ...`` and return stripped stdout text.
 
     Args:
         *args: Arguments to pass to ``gh``.
+        repo: Optional explicit ``owner/name`` for qualified issue reads.
 
     Returns:
         The stripped stdout text.
@@ -1071,7 +1083,7 @@ def gh_text(*args: str) -> str:
     Raises:
         subprocess.CalledProcessError: On non-zero exit.
     """
-    result = gh(*args, check=True)
+    result = gh(*args, check=True, repo=repo)
     return result.stdout.strip()
 
 
@@ -6041,8 +6053,21 @@ def _harvest_one_reviewer(
     current_base = ""
     if current_base_ref == base_ref:
         try:
-            git("-C", wt_dir, "fetch", "--quiet", "origin", base_ref)
-            current_base = git("-C", wt_dir, "rev-parse", f"origin/{base_ref}")
+            pipeline.validate_target_context(
+                pipeline.ResolvedTarget(TRUSTED_HEAD_REPO, TARGET_REMOTE),
+                cwd=wt_dir,
+            )
+        except (OSError, ValueError) as exc:
+            print(f"tick: retaining reviewer harvest: target validation failed: {exc}", file=sys.stderr)
+            if tick_log:
+                tick_log.log(
+                    pr=n, phase="harvest", stage="review",
+                    action="target_context_invalid", reason=str(exc),
+                )
+            return
+        try:
+            git("-C", wt_dir, "fetch", "--quiet", TARGET_REMOTE, base_ref)
+            current_base = git("-C", wt_dir, "rev-parse", f"{TARGET_REMOTE}/{base_ref}")
         except subprocess.CalledProcessError:
             return
         if not current_base:
@@ -9008,8 +9033,8 @@ def _dispatch_one_reviewer(
         return
 
     try:
-        git("-C", checkout_root, "fetch", "--quiet", "origin", base_ref)
-        base_tip_sha = git("-C", checkout_root, "rev-parse", f"origin/{base_ref}")
+        git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE, base_ref)
+        base_tip_sha = git("-C", checkout_root, "rev-parse", f"{TARGET_REMOTE}/{base_ref}")
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
             entity="pr",
@@ -9074,7 +9099,7 @@ def _dispatch_one_reviewer(
     # Fetch the PR head so head_sha is available in local objects. This is
     # required both for the policy gate diff and for creating the worktree.
     try:
-        git("-C", checkout_root, "fetch", "--quiet", "origin",
+        git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE,
             f"pull/{pr_number}/head")
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
@@ -9089,12 +9114,12 @@ def _dispatch_one_reviewer(
         return
 
     # Compute the merge-base so the reviewer diffs only the PR's actual changes.
-    # Using origin/{base_ref} tip would include commits that landed on main after
+    # Using <remote>/{base_ref} tip would include commits that landed on main after
     # this PR's branch was cut, producing findings about code this PR never touched.
     # base_tip_sha (current main tip) is kept separately for drift detection.
     try:
         base_sha = git("-C", checkout_root, "merge-base",
-                       f"origin/{base_ref}", head_sha)
+                       f"{TARGET_REMOTE}/{base_ref}", head_sha)
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
             entity="pr",
@@ -9649,8 +9674,8 @@ def _dispatch_one_implementer(
     # so this reads exactly as it did before for an unconfigured install.
     base_ref = pipeline.resolve_config(TRUSTED_HEAD_REPO).base_ref or "main"
     try:
-        git("-C", checkout_root, "fetch", "--quiet", "origin", base_ref)
-        base_sha = git("-C", checkout_root, "rev-parse", f"origin/{base_ref}")
+        git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE, base_ref)
+        base_sha = git("-C", checkout_root, "rev-parse", f"{TARGET_REMOTE}/{base_ref}")
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
             entity="issue",
@@ -9663,7 +9688,7 @@ def _dispatch_one_implementer(
         )
         return
 
-    # Create an isolated git worktree on a named branch at origin/main tip.
+    # Create an isolated git worktree on a named branch at the selected remote's main tip.
     # The canonical branch name must match what harvest uses for
     # ``gh pr create --head``.
     branch_name = f"agent/issue-{issue_number}"
@@ -9691,7 +9716,7 @@ def _dispatch_one_implementer(
     deadline = time.time() + IMPLEMENTER_TIMEOUT
 
     # For implementers, head_sha is set to base_sha: the engine branches
-    # from origin/main, so the initial "head" is the base tip. After the
+    # from the selected remote's main, so the initial "head" is the base tip. After the
     # engine commits, head advances, but HARVEST does not check head drift
     # for implementers (it harvests result.json, not review.json).
     lease_marker: dict[str, object] = {
@@ -9724,6 +9749,7 @@ def _dispatch_one_implementer(
 
     # Build the implementer prompt.
     prompt = load_prompt_template("implementer", {
+        "target_remote": TARGET_REMOTE,
         "issue_number": issue_number,
         "issue_title": issue_title,
         "issue_body": issue_body,
@@ -9766,7 +9792,7 @@ def _dispatch_one_implementer(
         wt_dir=wt_dir,
         result_path=result_path,
         env={**_engine_env(), **engine_extra_env},
-        push_permission=_IMPLEMENTER_PUSH_PERMISSION,
+        push_permission=_implementer_push_permission(),
         model=model,
         permission_mode=permission_mode,
     )
@@ -9777,7 +9803,7 @@ def _dispatch_one_implementer(
             tick_log.log(
                 pr=issue_number, phase="dispatch", stage="implement",
                 action="launch_failed",
-                reason="prompt/result file setup or subprocess.Popen failed",
+                reason="target validation, prompt/result setup or subprocess.Popen failed",
                 engine=impl_engine,
             )
         return
@@ -10248,8 +10274,8 @@ def _dispatch_one_fixer(
         return
 
     try:
-        git("-C", checkout_root, "fetch", "--quiet", "origin", base_ref)
-        base_sha = git("-C", checkout_root, "rev-parse", f"origin/{base_ref}")
+        git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE, base_ref)
+        base_sha = git("-C", checkout_root, "rev-parse", f"{TARGET_REMOTE}/{base_ref}")
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
             entity="pr",
@@ -10319,15 +10345,15 @@ def _dispatch_one_fixer(
     # detached HEAD mode. Detached HEAD avoids the "branch already checked
     # out in another worktree" error that occurs when a stale implementer
     # worktree still holds a local reference to the same branch. The fixer
-    # prompt uses ``git push origin HEAD:refs/heads/<head_ref>`` (explicit
+    # prompt uses ``git push <remote> HEAD:refs/heads/<head_ref>`` (explicit
     # fully-qualified refspec, mirrored exactly by the push permission in the
     # tool allowlist) so the push lands on the correct remote branch without
     # needing a local branch ref in the worktree.
     try:
         git("-C", checkout_root, "worktree", "prune")
-        git("-C", checkout_root, "fetch", "--quiet", "origin", head_ref)
+        git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE, head_ref)
         git("-C", checkout_root, "worktree", "add",
-            "--detach", wt_dir, f"origin/{head_ref}")
+            "--detach", wt_dir, f"{TARGET_REMOTE}/{head_ref}")
     except subprocess.CalledProcessError:
         _escalate_dispatch_setup_failure(
             entity="pr",
@@ -10435,6 +10461,7 @@ def _dispatch_one_fixer(
     # prompt that names a doc the engine cannot open or a size the comment
     # truncates.
     prompt = load_prompt_template("fixer", {
+        "target_remote": TARGET_REMOTE,
         "pr_number": pr_number,
         "review_body": review_body,
         "pr_body": pr_context.body_block,
@@ -10492,7 +10519,7 @@ def _dispatch_one_fixer(
             tick_log.log(
                 pr=pr_number, phase="dispatch", stage="fix",
                 action="launch_failed",
-                reason="prompt/result file setup or subprocess.Popen failed",
+                reason="target validation, prompt/result setup or subprocess.Popen failed",
                 engine=impl_engine,
             )
         return
@@ -10719,7 +10746,6 @@ def _resolve_stage_targets(
     issue_number = target[1]
     payload = gh_json(
         "issue", "view", str(issue_number),
-        "--repo", TRUSTED_HEAD_REPO,
         "--json", "closedByPullRequestsReferences",
     )
     if not isinstance(payload, dict):
@@ -10751,14 +10777,14 @@ def _resolve_stage_targets(
 
         owner = repository.get("owner")
         if (
-            repository.get("name") != trusted_name
+            not pipeline.same_repository(repository.get("name"), trusted_name)
             or not isinstance(owner, dict)
-            or owner.get("login") != trusted_owner
+            or not pipeline.same_repository(owner.get("login"), trusted_owner)
         ):
             raise ValueError("closing PR reference belongs to an untrusted repository")
 
         pr_payload = gh_json(
-            "pr", "view", str(number), "--repo", TRUSTED_HEAD_REPO,
+            "pr", "view", str(number),
             "--json", "state,number",
         )
         if not isinstance(pr_payload, dict):
@@ -10925,6 +10951,8 @@ def _run_single_tick_locked(
     Returns:
         Process exit code (0, 1, 2, 3, or 4 — same semantics as ``main()``).
     """
+    global TRUSTED_HEAD_REPO, TARGET_REMOTE
+
     # Open tick log early (non-fatal) so startup diagnostics are captured.
     tick_log = None
     try:
@@ -10957,6 +10985,21 @@ def _run_single_tick_locked(
     # naming the key. A malformed verify_tools in particular must never be read
     # as an empty one, which would dispatch with no verification and still award
     # ai:ready-for-human.
+    TRUSTED_HEAD_REPO = TARGET_REMOTE = ""
+    try:
+        resolved_target = resolve_target()
+    except (ValueError, OSError) as exc:
+        msg = f"tick: target resolution failed: {exc}"
+        print(msg, file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(pr=None, phase="startup", stage="",
+                         action="startup_target_invalid", reason=msg)
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
+        print(tick_state.format_line(), file=sys.stderr)
+        return 3
+    TRUSTED_HEAD_REPO = resolved_target.repo
+    TARGET_REMOTE = resolved_target.remote
     config = pipeline.resolve_config(
         TRUSTED_HEAD_REPO,
         cli_overrides=(
@@ -10971,8 +11014,13 @@ def _run_single_tick_locked(
                 action="startup_config_warning",
                 reason=warning,
             )
-    if config.errors:
-        msg = "tick: invalid configuration: " + "; ".join(config.errors)
+    config_errors = list(config.errors)
+    if config.scan_repos is not None and not any(
+        pipeline.same_repository(TRUSTED_HEAD_REPO, repo) for repo in config.scan_repos
+    ):
+        config_errors.append(f"target {TRUSTED_HEAD_REPO} is outside [scan] repos")
+    if config_errors:
+        msg = "tick: invalid configuration: " + "; ".join(config_errors)
         print(msg, file=sys.stderr)
         if tick_log is not None:
             tick_log.log(
@@ -10997,25 +11045,10 @@ def _run_single_tick_locked(
     # tick accept the change and keep authorizing under the old identity.
     trusted_author = config.login
 
-    # Fail fast when the target repository is not configured. Every `gh` call
-    # this tick makes is `--repo TRUSTED_HEAD_REPO`, and the reviewer admission
-    # gate compares against the resolved login — unset, the first would
-    # resolve `--repo ""` against whatever the cwd happens to be and the second
-    # would admit nobody. Both are remote-facing, so this refuses the tick with
-    # a legible message rather than discovering it mid-dispatch.
-    unconfigured = [
-        name for name, value in (
-            ("[target] repo", TRUSTED_HEAD_REPO),
-            ("[operator] login", trusted_author),
-        ) if not value
-    ]
-    if unconfigured:
+    if not trusted_author:
         msg = (
-            "tick: target not configured: "
-            f"{', '.join(unconfigured)} — set [operator] login in "
-            f"{pipeline.operator_config_path()} and [target] repo in "
-            "skills/tick/config.toml (or export PIPELINE_REPO / "
-            "PIPELINE_TRUSTED_AUTHOR)"
+            "tick: [operator] login not configured — set it in "
+            f"{pipeline.operator_config_path()} or export PIPELINE_TRUSTED_AUTHOR"
         )
         print(msg, file=sys.stderr)
         if tick_log is not None:
@@ -11318,6 +11351,10 @@ def _run_loop_locked(
                 review_model, review_effort, permission_mode,
                 count_quiescent_heartbeat=after_heartbeat,
             )
+            if last_rc == 3:
+                # Startup refused this target/configuration. Cadence reads
+                # GitHub too, so observing here would bypass that refusal.
+                return last_rc
             state = _observe_loop_state(parsed_target)
             if not state["quiescent"]:
                 consecutive_quiescent = 0
@@ -12232,7 +12269,7 @@ def _target_item_is_dispatchable(entity: str, number: int) -> bool:
         ValueError: When ``gh`` returns malformed JSON.
     """
     payload = gh_json(
-        entity, "view", str(number), "--repo", TRUSTED_HEAD_REPO,
+        entity, "view", str(number),
         "--json", "labels,state",
     )
     if not isinstance(payload, dict):

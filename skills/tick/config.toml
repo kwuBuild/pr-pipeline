@@ -45,23 +45,10 @@
 #   base_ref     = "master"
 #   verify_tools = ["npm test *"]
 
-# DEPRECATED, and the one exception to "no operator value lives here": the
-# target repository, still read from this file because resolving it from the
-# working directory's git remote is a later change. An install that filled this
-# in before configuration moved to the operator's home keeps working across that
-# move — the dashboard (skills/status/status.sh) parses this same
-# key with sed, because it must run before any interpreter is resolved.
-#
-# trusted_author is superseded by [operator] login in the operator's own config
-# and is read only as that key's floor. Set the new key, not this one.
-#
-# Both are blank on purpose: a committed value would point a fresh install at
-# somebody else's repository, and every `gh` call the tick makes carries
-# `--repo`, so a wrong value is a remote mutation rather than a no-op. `main`
-# refuses to run a tick with either unset. Override for a one-off run with
-# PIPELINE_REPO / PIPELINE_TRUSTED_AUTHOR.
+# The target comes from the working directory's Git remote. PIPELINE_REPO
+# selects a matching local remote; no repository identity belongs in config.
+# Deprecated login fallback only; configure [operator] login in your own file.
 [target]
-repo = ""
 trusted_author = ""
 
 # The shipped floor for every per-target setting. Each key here is overridable

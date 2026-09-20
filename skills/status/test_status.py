@@ -18,6 +18,11 @@ import pytest
 TICK_LIB = Path(__file__).resolve().parents[1] / "tick" / "lib"
 
 
+@pytest.fixture(autouse=True)
+def isolate_target_override(monkeypatch):
+    monkeypatch.delenv("PIPELINE_REPO", raising=False)
+
+
 @pytest.fixture
 def tick_module() -> Iterator[ModuleType]:
     """Import the sibling tick skill's dispatcher, the marker's real writer.
@@ -447,6 +452,31 @@ def test_status_lists_open_issues_at_every_pipeline_label(tmp_path: Path) -> Non
     assert re.search(r"ai:available\s+#13", result.stdout), result.stdout
 
 
+def test_status_resolves_foreign_remote_without_config(tmp_path, monkeypatch):
+    monkeypatch.delenv("PIPELINE_REPO", raising=False)
+    monkeypatch.setenv("GH_HOST", "other.example")
+    repo = install_status_script(tmp_path, target_repo="elsewhere/project")
+    result = run_status(repo)
+    assert result.returncode == 0, result.stderr
+    assert "elsewhere/project" in result.stdout
+    calls = (repo.parent / "gh-calls").read_text().splitlines()
+    assert len(calls) == 2
+    assert all("--repo github.com/elsewhere/project" in call for call in calls)
+
+
+def test_status_rejects_mismatched_override_before_interpreter_or_github(tmp_path, monkeypatch):
+    repo = install_status_script(tmp_path, target_repo="elsewhere/project")
+    monkeypatch.setenv("PIPELINE_REPO", "wrong/project")
+    # Reaching either executable makes the ordering failure unambiguous.
+    resolver = repo / ".claude/skills/tick/resolve-python.sh"
+    resolver.write_text('echo INTERPRETER_CALLED >&2\nexit 42\n')
+    result = run_status(repo)
+    assert result.returncode == 2
+    assert "upstream" in result.stderr
+    assert "INTERPRETER_CALLED" not in result.stderr
+    assert not (repo.parent / "gh-calls").exists()
+
+
 # --- Helpers ---
 
 
@@ -473,7 +503,7 @@ def write_stub(path: Path, content: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
-def install_status_script(tmp_path: Path) -> Path:
+def install_status_script(tmp_path: Path, *, target_repo="test-owner/test-repo") -> Path:
     """Create a git repo holding the dashboard and the tick lib it calls.
 
     The lib is copied rather than stubbed because the progress column is
@@ -486,12 +516,15 @@ def install_status_script(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "upstream", f"https://github.com/{target_repo}"],
+                   cwd=repo, check=True)
     script_dst = repo / ".claude/skills/status/status.sh"
     script_dst.parent.mkdir(parents=True)
     shutil.copy(Path(__file__).with_name("status.sh"), script_dst)
     tick_dst = repo / ".claude/skills/tick"
     tick_dst.mkdir(parents=True)
     shutil.copy(TICK_LIB.parent / "resolve-python.sh", tick_dst / "resolve-python.sh")
+    shutil.copy(TICK_LIB.parent / "resolve-target.sh", tick_dst / "resolve-target.sh")
     lib_dst = tick_dst / "lib"
     lib_dst.mkdir(parents=True)
     for name in os.listdir(TICK_LIB):
@@ -525,7 +558,10 @@ def dispatch_real_implementer_marker(
     proc.pid = 999999
     with (
         mock.patch.object(tick, "WT_ROOT", str(wt_root)),
+        mock.patch.object(tick, "TARGET_REMOTE", "upstream"),
+        mock.patch.object(tick, "TRUSTED_HEAD_REPO", "test-owner/test-repo"),
         mock.patch.object(tick, "git", side_effect=fake_git),
+        mock.patch.object(tick.pipeline, "validate_target_context"),
         mock.patch.object(tick, "relabel"),
         mock.patch("subprocess.Popen", return_value=proc),
     ):
@@ -592,11 +628,12 @@ def run_status(
     """
     stub_bin = repo.parent / "bin"
     stub_bin.mkdir(exist_ok=True)
-    write_stub(stub_bin / "gh", "#!/bin/sh\nprintf '[]'\n")
+    write_stub(stub_bin / "gh", '#!/bin/sh\nprintf "%s\\n" "$*" >> "$STATUS_GH_LOG"\nprintf "[]"\n')
 
     env = os.environ.copy()
     env["PATH"] = f"{stub_bin}:{env['PATH']}"
     env["PR_PIPELINE_PYTHON"] = sys.executable
+    env["STATUS_GH_LOG"] = str(repo.parent / "gh-calls")
     return subprocess.run(
         ["bash", str(repo / ".claude/skills/status/status.sh")],
         cwd=cwd or repo,

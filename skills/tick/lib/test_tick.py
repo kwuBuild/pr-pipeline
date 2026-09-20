@@ -2568,7 +2568,7 @@ def test_gh_runs_subprocess_with_encoding() -> None:
         )
         result = gh("pr", "list")
         run.assert_called_once_with(
-            ["gh", "pr", "list"], capture_output=True,
+            ["gh", "pr", "list", "--repo", "github.com/test-owner/test-repo"], capture_output=True,
             encoding="utf-8", errors="replace", check=True,
         )
         assert result.returncode == 0
@@ -2680,7 +2680,7 @@ def test_relabel_adds_and_removes_labels() -> None:
         relabel("pr", 42, "ai:reviewing", "ai:ready-for-human")
         run.assert_called_once_with(
             ["gh", "pr", "edit", "42", "--add-label", "ai:ready-for-human",
-             "--remove-label", "ai:reviewing"],
+             "--remove-label", "ai:reviewing", "--repo", "github.com/test-owner/test-repo"],
             capture_output=True, encoding="utf-8", errors="replace", check=True,
         )
 
@@ -4887,15 +4887,15 @@ def test_resolve_stage_targets_reads_issue_closing_pr_scope() -> None:
 
     assert gh_json_mock.call_args_list == [
         mock.call(
-            "issue", "view", "462", "--repo", "test-owner/test-repo",
+            "issue", "view", "462",
             "--json", "closedByPullRequestsReferences",
         ),
         mock.call(
-            "pr", "view", "550", "--repo", "test-owner/test-repo",
+            "pr", "view", "550",
             "--json", "state,number",
         ),
         mock.call(
-            "pr", "view", "551", "--repo", "test-owner/test-repo",
+            "pr", "view", "551",
             "--json", "state,number",
         ),
     ]
@@ -19544,33 +19544,22 @@ def test_main_startup_probe_failed_emits_tick_state(tmp_path: Path) -> None:
     assert "tick-state: status=FAILED in_flight=unknown queue=unknown quiescent=unknown" in output
 
 
-def test_main_refuses_to_tick_without_a_configured_target(tmp_path: Path) -> None:
-    """An unconfigured `[target]` stops the tick before any GitHub call.
+def test_main_refuses_to_tick_without_a_resolvable_target(tmp_path: Path) -> None:
+    """A failed local Git target resolution stops the tick before GitHub access."""
+    import tick
 
-    Every `gh` invocation the tick makes carries `--repo TRUSTED_HEAD_REPO`.
-    Unset, that resolves against whatever repository the cwd happens to be —
-    so the failure would not be an error but a *plausible* tick against the
-    wrong queue, with real relabels. The check runs ahead of the binary probe
-    because it is the cheaper and more dangerous of the two.
-    """
-    from tick import main  # type: ignore[import-untyped]
-
-    with mock.patch("tick.git") as git_mock:
-        git_mock.return_value = str(tmp_path)
-        with mock.patch("tick.TRUSTED_HEAD_REPO", ""):
-            with mock.patch("tick._startup_probe") as probe:
-                import io
-                stderr = io.StringIO()
-                with mock.patch("sys.stderr", stderr):
-                    result = main()
+    with (
+        mock.patch("tick.repo_root", return_value=str(tmp_path)),
+        mock.patch("tick.resolve_target", side_effect=ValueError("no remote")),
+        mock.patch("tick.gh") as gh,
+        mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+    ):
+        result = tick.main()
 
     assert result == 3
-    output = stderr.getvalue()
-    assert "target not configured" in output
-    assert "[target] repo" in output
-    # The probe may run (it only reads PATH), but nothing past the gate does.
-    probe.assert_called_once()
-    assert "tick-state: status=FAILED" in output
+    assert "target resolution failed: no remote" in stderr.getvalue()
+    assert "tick-state: status=FAILED" in stderr.getvalue()
+    gh.assert_not_called()
 
 
 def test_main_refuses_to_tick_without_a_trusted_author(
