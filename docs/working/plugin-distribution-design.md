@@ -14,7 +14,7 @@ and permission-mode configuration (#15). Use the
 
 The target experience and schema below still include unfinished work: issue-author
 pickup (#14), default-branch discovery (#12), empty-verification evidence (#16),
-launcher/setup (#17–#18), and independence validation (#19). The
+interactive setup (#18), and independence validation (#19). The
 [backlog index](https://github.com/kwuBuild/pr-pipeline/issues/39) and linked issues
 own live delivery status. Section 13 records historical review findings, not a
 second description of the current runtime.
@@ -693,19 +693,23 @@ a blanket substitution breaks the second:
    correct here.
 2. **Commands an operator or agent reads out of `README.md` / `DEBUG.md` and runs
    in a shell** — including the documented dashboard loop,
-   `watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'`. These files are
+   `watch -n 5 '~/.claude/pr-pipeline/bin/pr-pipeline status'`. These files are
    read as plain text, by a human in a separate terminal or by an agent via
    `Read`; nothing substitutes them and nothing exports the variable. Written
    against `${CLAUDE_PLUGIN_ROOT}` the command resolves to
    `/skills/status/status.sh` and fails.
 
-So the standalone surface gets a real entrypoint rather than a placeholder:
+The standalone surface now has a real entrypoint:
 
-- A **launcher installed outside the cache** — `~/.claude/pr-pipeline/bin/` —
-  written by setup, which resolves the current install path and executes the
-  target script. It is written once and survives plugin upgrade because the
-  resolution happens at run time, which a hardcoded export would not.
-- `README.md`/`DEBUG.md` commands are rewritten against the launcher, and the
+- A **launcher installed outside the cache** —
+  `~/.claude/pr-pipeline/bin/pr-pipeline` — copied by
+  `skills/tick/install-launcher.sh`. It queries `claude plugin list --json` at
+  each invocation for one enabled `pr-pipeline@pr-pipeline` install and executes
+  the selected `tick`, `status`, `preflight`, or `labels` entry point. It fails
+  with setup guidance for missing or ambiguous installs, without guessing a
+  cache version. The copy survives upgrades; interactive installation remains
+  part of setup (#18).
+- `README.md`/`DEBUG.md` commands use the launcher, and the
   `PR_PIPELINE_HOME` export is documented as the development-checkout path, still
   supported and no longer the only way to run anything.
 - **Install smoke test:** run every documented standalone command with both

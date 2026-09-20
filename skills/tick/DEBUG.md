@@ -193,7 +193,7 @@ Debugging notes:
   guess, not reporting a healthy engine. Reproduce it by hand with:
 
   ```bash
-  bash $PR_PIPELINE_HOME/skills/tick/tick.sh engine-progress \
+  ~/.claude/pr-pipeline/bin/pr-pipeline tick engine-progress \
     --wt-root .claude/worktrees
   ```
 
@@ -514,19 +514,23 @@ interpreter nobody chose.
 
 `SKILL.md` anchors its commands at `${CLAUDE_PLUGIN_ROOT}`, which is substituted
 into plugin skill *content* as Claude loads it — the agent reads an absolute
-path and never sees the variable. This file and `README.md` deliberately keep
-`$PR_PIPELINE_HOME` instead, because nothing substitutes them: they are read as
-plain text by a human in a separate terminal or by an agent via `Read`, and
-`CLAUDE_PLUGIN_ROOT` is *not* exported into a Bash tool call's environment
-(verified on CLI `2.1.270`). Written here it would expand to nothing and resolve
-`/skills/tick/lib/tick.py` against the filesystem root.
+path and never sees the variable. This file and `README.md` use the standalone
+`~/.claude/pr-pipeline/bin/pr-pipeline` launcher. It resolves the current enabled
+plugin using `claude plugin list --json` each time, so a shell command needs no
+install-root variable. `CLAUDE_PLUGIN_ROOT` is not exported into a Bash tool
+call's environment. `PR_PIPELINE_HOME` is an optional absolute development
+checkout override; unset it to use the installed plugin again.
 
-Two failure shapes follow from that split:
-
-- **A command that runs against `/skills/...`** was copied out of a skill body
-  into a shell, or out of this file into a context that never set
-  `PR_PIPELINE_HOME`. The install root is empty; export it, or use the absolute
-  path.
+- **The standalone launcher is missing.** Run the launcher installation step
+  described in [the quick start](README.md#quick-start-checklist), then retry.
+  The interactive setup flow remains tracked in #18.
+- **The launcher prints a setup error.** Check `claude plugin list --json` for
+  exactly one enabled `pr-pipeline@pr-pipeline` install. Fix missing/disabled or
+  duplicate installs, ensure `claude` and `jq` are on PATH, or fix/unset an
+  invalid `PR_PIPELINE_HOME`. An unreadable or removed cache path is an error;
+  the launcher does not guess a different cached version.
+- **An old command runs against `/skills/...`.** Replace the copied command
+  with the standalone launcher; an empty shell variable is not an install root.
 - **A session that is already running holds a stale `CLAUDE_PLUGIN_ROOT`.**
   The substitution happened once, when the session loaded the skill, so after
   `/plugin marketplace update` installs a new cache version that session keeps
@@ -543,7 +547,7 @@ Two failure shapes follow from that split:
 | Process control | `lib/process_control.py` |
 | Tick audit trail | `.claude/worktrees/.tick-log/tick-*.jsonl` |
 | Engine or wrapper stderr | Per-worktree `stderr.log`; reviewer has bounded sanitized wrapper diagnostics only, while implementer/fixer engine stderr remains available |
-| Dashboard | `/pr-pipeline:status` or `bash $PR_PIPELINE_HOME/skills/status/status.sh` |
+| Dashboard | `/pr-pipeline:status` or `~/.claude/pr-pipeline/bin/pr-pipeline status` |
 | Startup failures | First two entries of the latest tick log (see above) |
 | OS-level spawn failures | `dmesg` for E2BIG, `ulimit -a` for arg limits |
 

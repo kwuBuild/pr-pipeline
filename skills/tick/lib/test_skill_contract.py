@@ -93,9 +93,8 @@ _PUBLISHED_SKILLS = frozenset({
 # string there would silently resolve to a root-relative path.
 PLUGIN_ROOT_VAR = "${CLAUDE_PLUGIN_ROOT}"
 
-# The install root as the *shell-run* surfaces name it, still, until a resolving
-# launcher replaces it. Retained as the explicit override that keeps development
-# from a git working tree — where there is no plugin cache — working.
+# Explicit development-checkout override. Standalone commands use the installed
+# resolving launcher; plugin skill bodies use the harness-substituted root.
 INSTALL_ROOT_VAR = "$PR_PIPELINE_HOME"
 
 # The scope the credentialed engine prompts must state verbatim. Ambient `gh`
@@ -2024,6 +2023,15 @@ def test_skill_bodies_resolve_the_install_through_the_plugin_root() -> None:
             f"{label} names no install root at all; a bare relative path "
             "resolves against the target repo, not the install"
         )
+
+
+def test_standalone_docs_use_the_resolving_launcher() -> None:
+    for doc in (README, DEBUG):
+        for line in runnable_lines(doc):
+            if line is not None and not line.strip().startswith("#"):
+                assert "$PR_PIPELINE_HOME/" not in line
+                assert "${CLAUDE_PLUGIN_ROOT}/" not in line
+        assert "~/.claude/pr-pipeline/bin/pr-pipeline" in doc.read_text()
 
 
 def test_permission_rules_never_name_the_install_root_as_a_variable() -> None:

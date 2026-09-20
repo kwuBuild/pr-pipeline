@@ -116,6 +116,8 @@ jobs:
           bash -n skills/tick/resolve-python.sh
           bash -n skills/tick/resolve-target.sh
           bash -n skills/tick/tick.sh
+          bash -n skills/tick/pr-pipeline.sh
+          bash -n skills/tick/install-launcher.sh
           bash -n skills/tick/preflight.sh
           bash -n skills/status/status.sh
 
@@ -140,5 +142,7 @@ jobs:
             skills/tick/resolve-python.sh \
             skills/tick/resolve-target.sh \
             skills/tick/tick.sh \
+            skills/tick/pr-pipeline.sh \
+            skills/tick/install-launcher.sh \
             skills/tick/preflight.sh \
             skills/status/status.sh
