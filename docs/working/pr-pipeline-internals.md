@@ -767,6 +767,34 @@ The startup gate is the single enforcement point.
 
 ---
 
+## 8. Label vocabulary and setup
+
+`pipeline.WORKFLOW_LABELS` derives from the `LABEL_*` constants. The installed
+`skills/tick/lib/labels.py provision` command resolves the canonical local Git
+target, reads all repository label pages with an explicit GitHub host, and
+creates only missing vocabulary labels. Existing metadata is preserved; no
+delete, rename, or force-update operation exists. A failed create is accepted
+only when a fresh read proves that another setup has already created the label.
+The final read reports all unknown `ai:` labels and their no-dispatch consequence.
+The interactive setup flow is outside this primitive; the operator runs it in
+each repository being added (see the tick README for interpreter resolution).
+
+`_run_single_tick_locked` calls `labels.verify` after target, configuration,
+identity, and binary validation and before `_run_tick_body`. This precedes
+HARVEST as well as DISPATCH, since both can transition labels. Missing labels
+or unreadable vocabulary emit `startup_labels_invalid`, failed tick state, and
+exit 3; no workflow transition occurs. The error names missing labels and the
+installed provisioning command. Each loop tick repeats the check; unknown
+labels are tolerated. This is a startup check, not a lock against an operator
+deleting a label during a tick.
+
+`status.sh` reads all open items from the paginated REST issues endpoint, which
+includes PRs, and uses `labels.py vocabulary` to obtain the installed known set.
+Its parked rows contain items with at least one unknown `ai:` label and no
+known workflow label. The raw label sections remain usable without Python;
+classification or GitHub read failures render as unavailable, never as no
+parked items. Status remains read-only.
+
 ## Source references
 
 <!-- Anchors for inline references. Every line number below was verified against

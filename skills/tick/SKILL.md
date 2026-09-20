@@ -8,6 +8,7 @@ description: Run one PR-pipeline tick: harvest finished implementer, reviewer, a
 Run from the **target repo** root; `${CLAUDE_PLUGIN_ROOT}` is this pipeline's install path, already resolved below (code from the install, state from the target). Running from a development checkout instead, substitute the checkout path — see README "Where the pipeline lives".
 
 Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage and observability: `README.md`; debugging, invariants, recovery: `DEBUG.md`.
+Before the first tick on each target, provision its label vocabulary using README "Provision each target repository"; the startup error also prints the installed command.
 
 ## Run Procedure
 
@@ -29,7 +30,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 - Tick logs: `.claude/worktrees/.tick-log/tick-*.jsonl`
 - Fast check:
   ```bash
-  grep -E '"action": "(startup_probe_failed|skill_unresolved|lock_held|tick_crash|retained_scratch|corrupt_marker_escalate|archive_failed|kill_failed|worktree_prune_failed|stale_label_retained|terminal_intent_failed|terminal_intent_unresolved|notify_terminal_label|engine_stalled|loop_quiescent_stop|tick_complete)"' .claude/worktrees/.tick-log/tick-*.jsonl
+  grep -E '"action": "(startup_probe_failed|startup_labels_invalid|skill_unresolved|lock_held|tick_crash|retained_scratch|corrupt_marker_escalate|archive_failed|kill_failed|worktree_prune_failed|stale_label_retained|terminal_intent_failed|terminal_intent_unresolved|notify_terminal_label|engine_stalled|loop_quiescent_stop|tick_complete)"' .claude/worktrees/.tick-log/tick-*.jsonl
   ```
 - For live queue state, run `/pr-pipeline:status` or `bash ${CLAUDE_PLUGIN_ROOT}/skills/status/status.sh`.
 
@@ -40,7 +41,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 | 0 | Full tick completed: HARVEST then DISPATCH |
 | 1 | Reconcile failed or target parse failed; dispatch gated |
 | 2 | Reconcile OK, authoritative in-flight label read failed; dispatch gated |
-| 3 | Startup probe failed; required `gh`, `git`, `codex`, or a Python >= 3.11 missing |
+| 3 | Startup rejected: missing tools/Python >= 3.11, invalid target/config, or missing/unreadable label vocabulary |
 | 4 | Unhandled exception; traceback written to tick log when possible |
 | 5 | Tick mutex already held by another invocation |
 

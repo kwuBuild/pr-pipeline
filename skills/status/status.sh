@@ -6,7 +6,7 @@
 #   watch -n 5 'bash $PR_PIPELINE_HOME/skills/status/status.sh'
 #
 # It makes no writes to pipeline state: it never edits labels, dispatches
-# engines, or touches markers. (The two Python calls below invoke a resolved
+# engines, or touches markers. (The Python calls below invoke a resolved
 # interpreter directly and take no tick lock.) It only *reads* the two state
 # sources the pipeline
 # externalizes, so it cannot interfere with a running tick/loop:
@@ -22,6 +22,8 @@
 #                        and minutes left before the hung-deadline.
 #   PIPELINE STATE     — every open PR/issue carrying an ai: pipeline label,
 #                        grouped by label so the queue is visible at a glance.
+#   PARKED ITEMS       — items with unknown ai: labels and no known workflow
+#                        label; no dispatch query selects these items.
 
 set -uo pipefail
 # nullglob: suppress errors when globs match nothing. shopt is bash; setopt is zsh.
@@ -53,14 +55,14 @@ NOW=$(date +%s)
 # A too-old interpreter would fail every render into `?` — a dashboard reporting
 # false idle, which is exactly the signal an operator uses to decide the
 # pipeline is safe to touch. Unlike the tick, this is a warning and not an
-# abort: the label sections below need no interpreter at all, and a dashboard
+# abort: the raw label sections below need no interpreter, and a dashboard
 # that still shows the queue is worth more than one that refuses to start.
 # shellcheck source=../tick/resolve-python.sh
 . "$SKILL_DIR/../tick/resolve-python.sh"
 PY="$(pr_pipeline_resolve_python || true)"
 if [[ -z "$PY" ]]; then
   pr_pipeline_python_requirement_error WARN
-  echo "      Until then, engine-progress and tick-log columns render as '?'." >&2
+  echo "      Engine progress, tick logs, and parked-item classification are unavailable." >&2
 fi
 
 # Progress verdicts, one `name<TAB>label` line per marker, from the same code
@@ -128,32 +130,62 @@ done
 [ "$found" = 0 ] && echo "  (none — no engines dispatched)"
 
 # --- PIPELINE STATE (GitHub labels) ---------------------------------------
-echo
-echo "PIPELINE STATE (open PRs by ai: label)"
-gh pr list --repo "github.com/$REPO" --state open --json number,title,labels --limit 100 \
-  | jq -r '
-      .[]
-      | . as $p
-      | ($p.labels[].name | select(startswith("ai:"))) as $l
-      | "\($l)\t#\($p.number)\t\($p.title[0:60])"
-    ' \
-  | sort \
-  | awk -F'\t' '{ printf "  %-22s %-6s %s\n", $1, $2, $3 }'
+# The REST issues endpoint includes PRs. Read all pages once so older parked
+# items cannot disappear behind the most recent 100 issues or pull requests.
+# A failed or malformed read is unavailable, never an empty pipeline.
+if ! ITEMS=$(gh api --hostname github.com \
+    "repos/$REPO/issues?state=open&per_page=100" --paginate --slurp \
+    | jq -ce '
+        if type == "array" and all(.[]; type == "array")
+          and all(.[][]; type == "object" and (.number | type) == "number"
+            and (.title | type) == "string" and (.labels | type) == "array"
+            and all(.labels[]; type == "object" and (.name | type) == "string"))
+        then [.[][]] else error("invalid open-item response") end
+      '); then
+  ITEMS=""
+  echo "WARN: GitHub pipeline state unavailable; could not read all open items." >&2
+fi
+
+for kind in PRs issues; do
+  echo
+  echo "PIPELINE STATE (open $kind by ai: label)"
+  if [[ -z "$ITEMS" ]]; then
+    echo "  (unavailable — GitHub read failed)"
+    continue
+  fi
+  # Retain every ai: label, including markerless in-flight states and unknown
+  # labels, even when Python is unavailable for the classification below.
+  printf '%s' "$ITEMS" \
+    | jq -r --arg kind "$kind" '
+        .[] | select(has("pull_request") == ($kind == "PRs"))
+        | . as $item
+        | (.labels[].name | select(startswith("ai:"))) as $label
+        | "\($label)\t#\($item.number)\t\($item.title[0:60])"
+      ' \
+    | sort \
+    | awk -F'\t' '{ printf "  %-22s %-6s %s\n", $1, $2, $3 }'
+done
 
 echo
-echo "PIPELINE STATE (open issues by ai: label)"
-# Every ai: label, not just ai:available: reconciliation never escalates an
-# in-flight item on a missing marker, so this listing is the only place a
-# markerless ai:implementing becomes visible to the operator.
-gh issue list --repo "github.com/$REPO" --state open --json number,title,labels --limit 100 \
-  | jq -r '
-      .[]
-      | . as $i
-      | ($i.labels[].name | select(startswith("ai:"))) as $l
-      | "\($l)\t#\($i.number)\t\($i.title[0:60])"
-    ' \
-  | sort \
-  | awk -F'\t' '{ printf "  %-22s %-6s %s\n", $1, $2, $3 }'
+echo "PARKED ITEMS (unknown ai: labels only — no dispatch query selects these)"
+if [[ -z "$ITEMS" ]]; then
+  echo "  (unavailable — GitHub read failed)"
+elif ! VOCABULARY=$("$PY" "$TICK_LIB/labels.py" vocabulary 2>/dev/null); then
+  echo "  (unavailable — Python vocabulary read failed; raw labels shown above)"
+else
+  if ! PARKED=$(printf '%s' "$ITEMS" | jq -r --argjson known "$VOCABULARY" '
+      .[] | [.labels[].name | select(startswith("ai:"))] as $ai
+      | select(($ai | length) > 0 and ($ai - $known) == $ai)
+      | "\(if has("pull_request") then "PR" else "issue" end)\t#\(.number)\t\($ai | sort | join(", "))\t\(.title[0:60])"
+    '); then
+    echo "  (unavailable — vocabulary classification failed; raw labels shown above)"
+  elif [[ -n "$PARKED" ]]; then
+    printf '%s\n' "$PARKED" \
+      | awk -F'\t' '{ printf "  %-5s %-6s %-28s %s\n", $1, $2, $3, $4 }'
+  else
+    echo "  (none)"
+  fi
+fi
 
 # --- LAST TICK LOG SUMMARY ------------------------------------------------------
 echo
