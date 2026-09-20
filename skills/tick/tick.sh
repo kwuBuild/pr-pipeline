@@ -3,7 +3,7 @@
 # The operator entry point for one PR-pipeline tick. Resolves a Python >= 3.11
 # interpreter and hands every argument straight to lib/tick.py:
 #
-#   bash $PR_PIPELINE_HOME/skills/tick/tick.sh [--loop] [pr:N | '#N'] ...
+#   ~/.claude/pr-pipeline/bin/pr-pipeline tick [--loop] [pr:N | '#N'] ...
 #
 # Run it from the target repo root: pipeline CODE resolves relative to this
 # script (under a plugin install the skills live outside the repo entirely),
