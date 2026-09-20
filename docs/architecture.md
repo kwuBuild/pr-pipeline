@@ -1518,7 +1518,10 @@ exist in the repo yet):
   the same worktree, so Codex never manages a separate worktree of its own)
 
 **Implementation worktrees:** The tick creates a worktree via
-`git worktree add .claude/worktrees/issue-<N> -b agent/issue-<N> <remote>/main`.
+`git worktree add .claude/worktrees/issue-<N> -b agent/issue-<N> <base-sha>`.
+The base SHA is fetched from the configured `base_ref`, or from the canonical
+target's GitHub default branch when the setting is blank. Dispatch pins the
+branch and SHA in its marker; harvest uses that branch when creating the PR.
 After PR creation, the directory is renamed to `.claude/worktrees/pr-<PR>/`.
 
 **PR worktrees (fix stage):** `.claude/worktrees/pr-<N>/` persists across

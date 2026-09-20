@@ -6852,7 +6852,7 @@ def _harvest_one_implementer(
     # Read pre_label from dispatch marker; fall back to config default
     dispatch_path = os.path.join(wt_dir, "dispatch.json")
     pre_label: str = _IMPLEMENTER_CONFIG.pre_label
-    base_ref: str = "main"
+    base_ref = ""
     dispatch_id = ""
     engine = "claude"
     if os.path.isfile(dispatch_path):
@@ -6866,7 +6866,7 @@ def _harvest_one_implementer(
             if isinstance(mp, str):
                 pre_label = mp
             br = marker.get("base_ref")
-            if isinstance(br, str):
+            if isinstance(br, str) and br.strip() and br == br.strip():
                 base_ref = br
             did = marker.get("dispatch_id")
             if isinstance(did, str):
@@ -6968,6 +6968,20 @@ def _harvest_one_implementer(
                 skip_cleanup = True
 
         pr_url = ""
+        if not skip_cleanup and not existing_pr.isdigit() and not base_ref:
+            # Only dispatch knows which base the engine actually used. A
+            # fresh lookup or config read here could silently retarget its PR.
+            if tick_log:
+                tick_log.log(
+                    pr=n, phase="harvest", stage="implement",
+                    action="side_effect_failed",
+                    reason=(
+                        f"cannot create PR for {TRUSTED_HEAD_REPO}: "
+                        "dispatch marker has no usable base_ref"
+                    ),
+                    dispatch_id=dispatch_id,
+                )
+            skip_cleanup = True
         if not skip_cleanup and not existing_pr.isdigit():
             pr_metadata_args = _implementation_pr_create_args(wt_dir, n)
             try:
@@ -9782,15 +9796,38 @@ def _dispatch_one_implementer(
     except subprocess.CalledProcessError:
         return
 
-    # Fetch and resolve base SHA before creating the worktree.
-    #
-    # The base branch is the operator's to name: not every repository's trunk is
-    # called `main`, and a hard-coded one either fails every fetch or, on a repo
-    # that has both, builds the PR on a branch nobody merges to. A blank
-    # configured value is the documented "resolve the target's default branch",
-    # which the canonical-target issue implements; `main` stands in until then,
-    # so this reads exactly as it did before for an unconfigured install.
-    base_ref = pipeline.resolve_config(TRUSTED_HEAD_REPO).base_ref or "main"
+    # Resolve against the canonical target, not the checkout's current branch
+    # or a potentially stale local remote HEAD. Explicit configuration wins.
+    base_ref = pipeline.resolve_config(TRUSTED_HEAD_REPO).base_ref
+    if not base_ref:
+        try:
+            metadata = gh_json(
+                "repo", "view", f"github.com/{TRUSTED_HEAD_REPO}",
+                "--json", "defaultBranchRef",
+            )
+        except (subprocess.CalledProcessError, ValueError):
+            metadata = None
+        default_branch = (
+            metadata.get("defaultBranchRef") if isinstance(metadata, dict) else None
+        )
+        name = (
+            default_branch.get("name") if isinstance(default_branch, dict) else None
+        )
+        if (
+            not isinstance(name, str) or not name.strip()
+            or name != name.strip() or name.startswith("-")
+        ):
+            _escalate_dispatch_setup_failure(
+                entity="issue",
+                number=issue_number,
+                pre_label=pipeline.LABEL_AVAILABLE,
+                stage="implement",
+                reason=f"failed to resolve default branch for {TRUSTED_HEAD_REPO}",
+                engine=impl_engine,
+                tick_log=tick_log,
+            )
+            return
+        base_ref = name
     try:
         git("-C", checkout_root, "fetch", "--quiet", TARGET_REMOTE, base_ref)
         base_sha = git("-C", checkout_root, "rev-parse", f"{TARGET_REMOTE}/{base_ref}")
@@ -9806,7 +9843,7 @@ def _dispatch_one_implementer(
         )
         return
 
-    # Create an isolated git worktree on a named branch at the selected remote's main tip.
+    # Create an isolated git worktree at the selected base branch's tip.
     # The canonical branch name must match what harvest uses for
     # ``gh pr create --head``.
     branch_name = f"agent/issue-{issue_number}"
@@ -9834,7 +9871,7 @@ def _dispatch_one_implementer(
     deadline = time.time() + IMPLEMENTER_TIMEOUT
 
     # For implementers, head_sha is set to base_sha: the engine branches
-    # from the selected remote's main, so the initial "head" is the base tip. After the
+    # from the selected base branch, so the initial "head" is the base tip. After the
     # engine commits, head advances, but HARVEST does not check head drift
     # for implementers (it harvests result.json, not review.json).
     lease_marker: dict[str, object] = {

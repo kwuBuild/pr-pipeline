@@ -264,7 +264,8 @@ def test_dispatch_refuses_a_different_worktree_destination(repository, monkeypat
     monkeypatch.setattr(tick, "gh_text", lambda *args: {
         "baseRefName": "main", "headRefOid": head, "headRefName": "feature",
     }[args[args.index("--json") + 1]])
-    monkeypatch.setattr(tick, "gh_json", fixer_gh_json())
+    if stage == "fix":
+        monkeypatch.setattr(tick, "gh_json", fixer_gh_json())
     launches = []
     real_popen = subprocess.Popen
 
@@ -379,6 +380,8 @@ elif args[:2] == ["issue", "view"] and "labels" in args:
     print("ai:available" if "-q" in args else json.dumps({"labels": [{"name": "ai:available"}]}))
 elif args[:2] == ["issue", "view"] and "body" in args:
     print("Implement target")
+elif args[:2] == ["repo", "view"]:
+    print(json.dumps({"defaultBranchRef": {"name": "main"}}))
 else:
     print("" if "-q" in args else "[]")
 ''')
@@ -410,7 +413,11 @@ else:
     assert calls
     assert calls[0] == ["api", "repos/selected/project/labels?per_page=100",
                         "--hostname", "github.com", "--paginate", "--slurp"]
-    assert all(call[-2:] == ["--repo", "github.com/selected/project"] for call in calls[1:])
+    assert [call for call in calls if call[:2] == ["repo", "view"]] == [
+        ["repo", "view", "github.com/selected/project", "--json", "defaultBranchRef"],
+    ]
+    assert all(call[-2:] == ["--repo", "github.com/selected/project"]
+               for call in calls[1:] if call[0] != "repo")
     assert all(call[1] in {"list", "view"} for call in calls[1:])
     assert set(transport_log.read_text().splitlines()) == {"https://github.com/selected/project"}
 

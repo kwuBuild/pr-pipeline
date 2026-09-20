@@ -612,6 +612,9 @@ def dispatch_real_implementer_marker(
         mock.patch.object(tick, "WT_ROOT", str(wt_root)),
         mock.patch.object(tick, "TARGET_REMOTE", "upstream"),
         mock.patch.object(tick, "TRUSTED_HEAD_REPO", "test-owner/test-repo"),
+        mock.patch.object(tick, "gh_json", return_value={
+            "defaultBranchRef": {"name": "main"},
+        }),
         mock.patch.object(tick, "git", side_effect=fake_git),
         mock.patch.object(tick.pipeline, "validate_target_context"),
         mock.patch.object(tick, "relabel"),

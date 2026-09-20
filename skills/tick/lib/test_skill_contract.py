@@ -1289,7 +1289,11 @@ def test_dispatch_writes_the_lease_before_it_relabels(tmp_path: Path) -> None:
         Path(path).write_text(data)
 
     def record_gh(*args: str, **kwargs: object) -> object:
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="")
+        stdout = (
+            '{"defaultBranchRef":{"name":"main"}}'
+            if args[:2] == ("repo", "view") else ""
+        )
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout)
 
     def record_relabel(*args: object, **kwargs: object) -> None:
         order.append("relabel")

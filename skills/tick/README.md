@@ -186,7 +186,7 @@ login = "your-github-login"   # whose issues are picked up and PRs reviewed
 allow_touching  = true        # auto-review PRs that edit reviewer-governing files
 checklist_paths = []          # the target's own review checklists, repo-relative
 verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
-base_ref        = ""          # "" = the interim default, main
+base_ref        = ""          # "" = discover the target's GitHub default branch
 permission_mode = "auto"      # Claude implementer/fixer --permission-mode
 
 [scan]
@@ -212,8 +212,10 @@ Bad configuration exits 3 and names the offending key. The exception is
 the tick run. An explicitly empty grant is valid; a malformed grant is an error.
 Fix the named value rather than treating the error as an empty/default setting.
 
-A blank `base_ref` currently uses `main`; automatic default-branch discovery is
-[issue #12](https://github.com/kwuBuild/pr-pipeline/issues/12). A blank
+A blank `base_ref` is not malformed; it is the documented "resolve the target's
+default branch". Issue dispatch reads it from the canonical target on GitHub and
+pins the selected branch for PR creation; failed discovery stops dispatch with an
+error naming the repository, and an explicit override skips discovery. A blank
 `permission_mode` is invalid. `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
 name absolute locations.
 

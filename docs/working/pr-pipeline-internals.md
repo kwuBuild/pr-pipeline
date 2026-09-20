@@ -791,6 +791,20 @@ The config resolver never raises. `tick.py` resolves at import to seed
 config typo into a traceback from whichever CLI helper imported the module first.
 The startup gate is the single enforcement point.
 
+For issue dispatch, a non-blank resolved `base_ref` wins. A blank value queries
+`gh repo view github.com/<canonical-target> --json defaultBranchRef`; neither
+the checkout's current branch nor a cached remote HEAD supplies the default.
+Failed or unusable discovery takes the existing setup-escalation path with an
+error naming the target, before any fetch, worktree creation, or engine launch.
+Dispatch fetches the selected branch from the resolved remote and pins its name
+and SHA in `dispatch.json`. PR creation uses the pinned name even if the
+operator's config or the repository's default changes while the engine runs.
+Reconciliation still rejects invalid markers before harvest. As a further guard,
+if the base becomes missing or blank between reconciliation and PR creation, the
+harvest helper enters its existing bounded failure path instead of guessing.
+This guard does not impede handoff to an already-created PR. Review and fixer
+dispatch continue to use the actual PR base, including stacked PRs.
+
 ---
 
 ## 8. Label vocabulary and setup
