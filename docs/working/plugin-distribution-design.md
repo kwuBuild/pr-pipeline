@@ -887,9 +887,10 @@ environmental, not code defects.
 `${CLAUDE_PLUGIN_ROOT}` resolves inside a skill body; the dashboard runs **in an
 unrelated repository** and reports an empty queue rather than crashing; and the
 invocable skills are **exactly** the intended set under their real namespaced
-names — `/pr-pipeline:tick`, `/pr-pipeline:status`,
-`/pr-pipeline:definition-of-done`, `/pr-pipeline:review-response-hygiene`, plus
-`/pr-pipeline:setup` once that lands.
+names — compare the installed commands against `_PUBLISHED_SKILLS` in
+`skills/tick/lib/test_skill_contract.py`. This is the explicit publication
+allowlist; its equality check also compares it with the skill directories.
+Update it when a new command ships, including `setup` once that lands.
 
 Exactly, not at-least: an unintended command is the observable symptom of a
 misplaced file, and an assertion that only checks presence cannot see it.

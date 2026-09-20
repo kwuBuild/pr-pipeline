@@ -42,6 +42,9 @@ contract into adjacent owners when needed; a wording fix needs no runtime tour.
 | Diagnose a failed run or recovery | [Tick diagnostics](skills/tick/DEBUG.md) |
 | Change dispatch, harvest, custody, or cadence | Relevant sections of [internals](docs/working/pr-pipeline-internals.md) and [architecture rationale](docs/architecture.md) |
 | Plugin distribution or migration work | Matching section of [distribution design](docs/working/plugin-distribution-design.md); verify status against live code/issues |
+| Dispatch, harvest, launch or GitHub mutation review | [Control-plane review](skills/automation-control-plane-review/SKILL.md) |
+| Marker custody, evidence retention or recovery review | [Durability review](skills/durability-boundary-review/SKILL.md) |
+| Loop scheduling, liveness or stop-condition review | [Cadence review](skills/loop-cadence-contract-review/SKILL.md) |
 | Runtime or workflow proof | [Definition of done](skills/definition-of-done/SKILL.md) |
 | Respond to review findings | [Review response hygiene](skills/review-response-hygiene/SKILL.md) |
 | Issues, PRs, review publication, labels | Relevant section of [PR guidelines](docs/working/pr-guidelines.md) |

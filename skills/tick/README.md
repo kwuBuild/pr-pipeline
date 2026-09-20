@@ -29,9 +29,20 @@ separate registry to add:
 /plugin install pr-pipeline
 ```
 
-That publishes three commands: `/pr-pipeline:tick`, `/pr-pipeline:status`, and
-`/pr-pipeline:definition-of-done`. `claude plugin details pr-pipeline` lists
-them.
+The manifest publishes the skills under `skills/<name>/SKILL.md` as
+`/pr-pipeline:<name>` commands. `claude plugin details pr-pipeline` lists the
+installed set. Use `/pr-pipeline:tick` to operate the pipeline and
+`/pr-pipeline:status` to inspect it.
+
+For implementation and revision work, use `definition-of-done` and
+`review-response-hygiene`. Developers implementing or reviewing changes to
+pr-pipeline itself should use
+[automation-control-plane-review](../automation-control-plane-review/SKILL.md),
+[durability-boundary-review](../durability-boundary-review/SKILL.md), and
+[loop-cadence-contract-review](../loop-cadence-contract-review/SKILL.md) when their
+boundaries apply. Publishing these review skills makes them available to
+interactive maintainers; it does not add them to dispatched-engine prompts or
+change engine permissions.
 
 **Where the pipeline lives.** Pipeline *code* is resolved from the install, not
 from the repository being operated on. Pipeline *state* (`.claude/worktrees/`)
