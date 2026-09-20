@@ -80,6 +80,8 @@ PLUGIN_NAME = "pr-pipeline"
 # observable symptom of a misplaced file, and a containment check cannot see it.
 _PUBLISHED_SKILLS = frozenset({
     "tick", "status", "definition-of-done", "review-response-hygiene",
+    "automation-control-plane-review", "durability-boundary-review",
+    "loop-cadence-contract-review",
 })
 
 # How a skill body names the install root. `${CLAUDE_PLUGIN_ROOT}` is
@@ -1754,7 +1756,8 @@ def test_workflow_docs_use_the_label_vocabulary_the_tick_implements(
 # the pipeline's own `lib/`, which really is a Python project — naming pytest
 # there is a fact about this repository, not a claim about anyone's target.
 _TARGET_INDEPENDENT_SURFACES = (
-    SKILL, README, DEBUG, STATUS_SKILL, INTERNALS, DONE_SKILL, DONE_WHY,
+    README, DEBUG, INTERNALS, DONE_WHY,
+    *sorted(SKILLS_ROOT.glob("*/SKILL.md")),
     PROMPTS / "implementer.txt", PROMPTS / "fixer.txt", PROMPTS / "reviewer.txt",
 )
 
@@ -1973,6 +1976,19 @@ def test_published_skill_set_is_exactly_the_intended_commands() -> None:
         f"  unexpected: {sorted(published - _PUBLISHED_SKILLS)}\n"
         f"  missing:    {sorted(_PUBLISHED_SKILLS - published)}"
     )
+
+
+def test_published_skill_relative_links_resolve_inside_install() -> None:
+    """Moving skills must not leave links into their source checkout."""
+    for skill in sorted(SKILLS_ROOT.glob("*/SKILL.md")):
+        for target in _MARKDOWN_PATH_RE.findall(skill.read_text()):
+            if "://" in target:
+                continue
+            resolved = (skill.parent / target).resolve()
+            assert resolved.is_relative_to(REPO_ROOT.resolve()), (
+                f"{skill}: link escapes the install: {target}"
+            )
+            assert resolved.is_file(), f"{skill}: missing link target: {target}"
 
 
 def test_every_skills_subdirectory_is_a_loadable_skill() -> None:
