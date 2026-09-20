@@ -12,7 +12,6 @@ import datetime as dt
 import io
 import json
 import os
-import platform
 import subprocess
 import sys
 import threading
@@ -1289,7 +1288,88 @@ def test_report_engine_stalled_logs_the_operator_facing_facts(
     assert "18m" in notify.call_args.kwargs["message"]
 
 
-def test_emit_operator_notification_cannot_block_its_caller() -> None:
+def test_terminal_transition_cannot_send_a_desktop_notification(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The shared fixture must isolate desktop delivery, not logs or labels."""
+    import tick
+
+    tick_log = tick.TickLog.open(str(tmp_path))
+    label_reads = [
+        {"labels": [{"name": "ai:implementing"}]},
+        {"labels": [{"name": "ai:needs-human-decision"}]},
+    ]
+    with (
+        mock.patch("tick.platform.system", return_value="Darwin"),
+        mock.patch("tick.gh_json", side_effect=label_reads),
+        mock.patch("tick.gh") as gh,
+        mock.patch(
+            "subprocess.Popen",
+            side_effect=AssertionError("test attempted real desktop delivery"),
+        ) as spawn,
+    ):
+        assert tick._converge_pipeline_labels(
+            "issue", 7, "ai:needs-human-decision",
+            tick_log=tick_log, phase="harvest", stage="implement",
+        )
+
+    spawn.assert_not_called()
+    gh.assert_called_once_with(
+        "issue", "edit", "7", "--add-label", "ai:needs-human-decision",
+        "--remove-label", "ai:implementing",
+    )
+    reason = "issue #7 reached terminal label ai:needs-human-decision"
+    assert reason in capsys.readouterr().err
+    notifications = [
+        entry for entry in tick_log.tail()
+        if entry["action"] == "notify_terminal_label"
+    ]
+    assert len(notifications) == 1
+    assert notifications[0]["reason"] == reason
+
+
+@pytest.mark.parametrize("error", [None, OSError("notifier unavailable")])
+def test_emit_operator_notification_preserves_real_delivery_contract(
+    isolate_operator_notifications: Callable[..., None],
+    error: OSError | None,
+) -> None:
+    """Only pytest's default delivery is muted; the real emitter still works."""
+    import tick
+
+    with (
+        mock.patch("tick.platform.system", return_value="Darwin"),
+        mock.patch("subprocess.run", side_effect=error) as run,
+    ):
+        isolate_operator_notifications(
+            title='Pipeline "ready"', message='Issue #7 needs "review"',
+        )
+
+    run.assert_called_once_with(
+        [
+            "osascript", "-e",
+            r'display notification "Issue #7 needs \"review\"" '
+            r'with title "Pipeline \"ready\""',
+        ],
+        capture_output=True, check=False,
+        timeout=tick.OPERATOR_NOTIFICATION_TIMEOUT_SECONDS,
+    )
+
+
+def test_emit_operator_notification_is_inert_off_macos(
+    isolate_operator_notifications: Callable[..., None],
+) -> None:
+    with (
+        mock.patch("tick.platform.system", return_value="Linux"),
+        mock.patch("subprocess.run") as run,
+    ):
+        isolate_operator_notifications(title="t", message="m")
+
+    run.assert_not_called()
+
+
+def test_emit_operator_notification_cannot_block_its_caller(
+    isolate_operator_notifications: Callable[..., None],
+) -> None:
     """A wedged notifier must not take the wake watcher down with it.
 
     Stall reporting made this reachable from the watcher thread for the first
@@ -1302,18 +1382,21 @@ def test_emit_operator_notification_cannot_block_its_caller() -> None:
     """
     import tick  # type: ignore[import-untyped]
 
-    if platform.system() != "Darwin":
-        pytest.skip("notifications are macOS-only")
+    with (
+        mock.patch("tick.platform.system", return_value="Darwin"),
+        mock.patch(
+            "subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=1),
+        ) as run,
+    ):
+        isolate_operator_notifications(title="t", message="m")
 
-    with mock.patch(
-        "subprocess.run",
-        side_effect=subprocess.TimeoutExpired(cmd="osascript", timeout=1),
-    ) as run:
-        tick._emit_operator_notification(title="t", message="m")
-
-    assert run.call_args.kwargs.get("timeout"), (
-        "the notifier must bound how long it can block its caller"
+    run.assert_called_once_with(
+        ["osascript", "-e", 'display notification "m" with title "t"'],
+        capture_output=True, check=False,
+        timeout=tick.OPERATOR_NOTIFICATION_TIMEOUT_SECONDS,
     )
+    assert tick.OPERATOR_NOTIFICATION_TIMEOUT_SECONDS > 0
 
 
 def test_wake_watcher_loop_wakes_and_reports_a_stalled_engine(

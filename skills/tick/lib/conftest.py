@@ -79,6 +79,27 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
+def isolate_operator_notifications(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[..., None]:
+    """Keep simulated terminal transitions, stalls, and loop stops off the desktop.
+
+    Patch only delivery: stderr, tick logs, and transition logic still run.
+    Tests asserting notification content can install their own mock as usual.
+    Return the original emitter for its boundary tests, which must mock
+    ``subprocess.run`` before calling it. The module stays isolated even in
+    those tests; no production code or operator settings change.
+    """
+    import tick
+
+    emit = tick._emit_operator_notification
+    monkeypatch.setattr(
+        tick, "_emit_operator_notification", mock.Mock(return_value=None),
+    )
+    return emit
+
+
+@pytest.fixture(autouse=True)
 def block_real_gh_mutations(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
