@@ -750,7 +750,7 @@ The implementer engine is selectable via `--impl-engine` on `/pr-pipeline:tick`:
 # Default (claude):
 (cd .claude/worktrees/issue-<N> && claude -p \
   --permission-mode dontAsk \
-  --allowedTools "Read Edit Write Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push origin HEAD) Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright) Bash(npm --prefix frontend *)" \
+  --allowedTools "Read Edit Write Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push <remote> HEAD) Bash(uv run pytest *) Bash(uv run ruff *) Bash(uv run pyright) Bash(npm --prefix frontend *)" \
   --output-format json \
   < prompt.txt \
   > result.json 2> stderr.log) &
@@ -793,8 +793,8 @@ must be narrowed and guarded, not waved away:
 
 - Replace the blanket `Bash(git *)` with the minimum mutation surface the
   implementer needs — read/inspect plus commit and a single-branch push, e.g.
-  `Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push origin HEAD)`.
-  `git push origin HEAD` pushes only the worktree's checked-out branch and
+  `Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) Bash(git log *) Bash(git push <remote> HEAD)`.
+  `git push <remote> HEAD` pushes only the worktree's checked-out branch and
   cannot delete remotes or push arbitrary refspecs.
 - Explicitly disallow `git push --force*`, `git push --delete`, `git branch -D`
   on remotes, and `git config --global`. These are not in the allowlist above,
@@ -805,11 +805,11 @@ must be narrowed and guarded, not waved away:
   GitHub."
 - The push permission is **stage-specific and always exact — never a glob**.
   The implementer worktree checks out its own branch, so its permission is the
-  literal `Bash(git push origin HEAD)`. The fixer worktree is detached (no
-  local branch custody), so its permission is the exact fully-qualified
-  refspec `Bash(git push origin HEAD:refs/heads/<head-ref>)`, templated from
-  the PR's validated head ref (refs failing the conservative ref-name shape
-  check escalate instead of launching). A wildcard like `HEAD*` would admit
+  exact `Bash(git push <remote> HEAD)`, templated from the resolved remote. The
+  fixer worktree is detached (no local branch custody), so its permission is the exact fully-qualified
+  refspec `Bash(git push <remote> HEAD:refs/heads/<head-ref>)`, templated from
+  the resolved remote and PR's validated head ref (refs failing the conservative
+  ref-name shape check escalate instead of launching). A wildcard like `HEAD*` would admit
   arbitrary refspec destinations and command suffixes (e.g. force options);
   the prompt is guidance, not an enforcement boundary.
 
@@ -884,7 +884,7 @@ python .claude/skills/tick/engine_wrapper.py run \
 ```
 
 The `<BASE_SHA>` is the pinned base recorded at dispatch (see *Base refresh*
-below), not a live `origin/<base>` ref — so the review can never silently run
+below), not a live `<remote>/<base>` ref — so the review can never silently run
 against a base that moved underneath it.
 
 **The prompt deliberately does not pin a reading list.** Codex auto-loads the
@@ -991,8 +991,8 @@ the Codex process and its tools, so the review slice is not safe for arbitrary c
 content. Before worktree creation or credential exposure, dispatch reads the PR author,
 head repository, and cross-repository flag from GitHub and checks them against the
 operator-owned repository contract: the login the operator declared as
-`[operator] login` (in their own config), the repository from the packaged
-file's deprecated `[target] repo`, and
+`[operator] login` (in their own config), the repository resolved from local Git
+remotes, and
 `isCrossRepository=false`. Only a proven match may proceed. Anything missing,
 malformed, or outside that allowlist routes to `ai:needs-human-decision`; it
 never launches Codex. This is an enforced trust boundary, not a prose
@@ -1074,7 +1074,7 @@ against a stale base is worse in an unattended loop than manually: a PR can be
 reviewed against yesterday's base, declared clean, and promoted to
 `ai:ready-for-human` while the real base has moved. So dispatch must, for each PR:
 read the PR's actual `baseRefName` (`gh pr view <N> --json baseRefName`), `git fetch
-origin <baseRefName>`, and pin **two** base SHAs in `dispatch.json` — they serve
+<remote> <baseRefName>`, and pin **two** base SHAs in `dispatch.json` — they serve
 different invariants. `base_tip_sha` is the fetched base tip (the freshness
 snapshot): harvest re-reads the current base tip, and if it advanced past the
 pinned tip the review is discarded and the PR re-dispatched rather than promoted.
@@ -1084,7 +1084,7 @@ would flag commits that landed on the base after the branch was cut. The posted
 review comment and its hidden idempotency token record the full
 (diff base, base tip, head, base ref) identity so the audit trail states honestly
 which range was reviewed and against which base. If the `baseRefName` read fails, the
-PR is retained for the next tick — the base is never guessed as `origin/main`,
+PR is retained for the next tick — the base is never guessed as `<remote>/main`,
 because a stacked PR's base is another branch.
 
 The base branch *name* is re-checked at harvest, not only at dispatch: harvest
@@ -1150,8 +1150,8 @@ Same as implementer, but the prompt includes the review comments fetched
 from the PR via `gh pr view <N> --json comments`, the worktree is a detached
 checkout of the PR branch's remote tip (no local branch custody, so a stale
 implementer worktree holding the same branch cannot block dispatch), and the
-push permission is the exact refspec `git push origin HEAD:refs/heads/<head-ref>`
-instead of the implementer's bare `git push origin HEAD`.
+push permission is the exact refspec `git push <remote> HEAD:refs/heads/<head-ref>`
+instead of the implementer's bare `git push <remote> HEAD`.
 
 ### File-based handoff
 
@@ -1495,12 +1495,12 @@ exist in the repo yet):
   the same worktree, so Codex never manages a separate worktree of its own)
 
 **Implementation worktrees:** The tick creates a worktree via
-`git worktree add .claude/worktrees/issue-<N> -b agent/issue-<N> origin/main`.
+`git worktree add .claude/worktrees/issue-<N> -b agent/issue-<N> <remote>/main`.
 After PR creation, the directory is renamed to `.claude/worktrees/pr-<PR>/`.
 
 **PR worktrees (fix stage):** `.claude/worktrees/pr-<N>/` persists across
 fix cycles. The fixer's worktree is (re)created as a detached checkout of
-`origin/<head-ref>` — never a named-branch checkout, so a stale implementer
+`<remote>/<head-ref>` — never a named-branch checkout, so a stale implementer
 worktree still holding the branch cannot collide with fixer dispatch.
 
 **PR worktrees (review stage):** `codex exec` runs with its cwd set to
@@ -1608,8 +1608,30 @@ narrow a grant for one target cannot use a permission list properly.
 floor: read-only, carrying the conservative default for every per-target setting,
 and no operator value may land there (the resolver reports an `[operator]`,
 `[repos.*]` or `[scan]` table in it as a configuration error). Its `[target]`
-table is a deprecated remnant, read only so an install configured before the move
-survives it, and removed when the target is resolved from the git remote.
+table retains only the deprecated `trusted_author` login fallback. Its `repo`
+key is no longer read; old declarations produce a migration warning.
+
+**One canonical target and remote.** `skills/tick/resolve-target.sh` resolves
+the repository from a local GitHub remote. `PIPELINE_REPO` selects exactly one
+matching remote when there are several; it cannot name a repository absent
+from local remotes or outside a configured `[scan] repos` restriction. Remote
+names must pass conservative validation before appearing in engine permissions
+or prompts, and fetch/push URLs must identify the same repository. Repository
+comparisons ignore case; duplicate config sections differing only in case fail.
+The controller supplies explicit `--repo github.com/owner/name` arguments and
+uses the selected remote for all fetches and push commands. Qualified linked-issue reads can name their
+own repository through the `repo=` helper parameter. The dashboard invokes the
+same resolver before looking for Python and reads no TOML. Both anchor Git
+resolution on the main checkout's common Git directory, matching marker state.
+Before an implementer or fixer starts, the controller validates the same remote
+in the actual child cwd and environment. This check does not re-anchor to the
+main checkout: conditional Git includes and worktree settings can change the
+effective destination. A mismatch refuses launch before an engine starts.
+Reviewer harvest validates its worktree before fetching and retains custody on
+rejection. The shared shell helper owns URL validation in both contexts; these
+checks do not freeze Git configuration for an already running engine.
+A startup failure stops `--loop` before remote cadence observation can bypass
+the refusal.
 
 **Fail-closed is scoped to the settings that have a safe direction.**
 `allow_touching` resolves to the restrictive reading and warns. `base_ref`,
@@ -1849,8 +1871,8 @@ standing between the agent and the rest of GitHub. Two boundaries back it up:
    the tool extracts to before its first unattended run.
 2. **Narrowed tool allowlist (defense in depth).** `--allowedTools` still
    restricts the git surface to commit + exactly one stage-specific **exact**
-   push permission — `git push origin HEAD` for the implementer (its worktree's
-   checked-out branch), `git push origin HEAD:refs/heads/<head-ref>` for the
+   push permission — `git push <remote> HEAD` for the implementer (its worktree's
+   checked-out branch), `git push <remote> HEAD:refs/heads/<head-ref>` for the
    fixer (its detached worktree's validated PR head ref). No wildcard entries,
    so no force-push, remote-branch deletion, arbitrary refspec push, or
    `git config --global`; even within the scoped repo the agent cannot rewrite
@@ -1894,12 +1916,10 @@ token is.
 
 Known gaps, in the order they block adoption:
 
-1. **Standalone install.** Operator settings now live outside the install (see
-   *Configuration ownership*), but the *target repository* is still read from the
-   packaged file's deprecated `[target] repo` — which the status dashboard also
-   parses — so pointing a fresh install at a repository still means editing a file
-   inside the install. Resolving the target from the working directory's git
-   remote closes this and deletes that remnant.
+1. **Standalone install acceptance.** Operator settings live outside the install
+   and the target resolves from local Git remotes. Full foreign-repository
+   adoption still needs the remaining Phase 1 acceptance work in the plugin
+   distribution design.
 2. **Process-level install proof.** No test yet proves the *installed* plugin
    behaves identically to an in-repo copy; that needs a shim harness driving the
    shipped entry points from outside the checkout.

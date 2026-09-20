@@ -996,6 +996,17 @@ def test_touches_review_policy_true_for_gate_implementation() -> None:
     )
 
 
+@pytest.mark.parametrize("path,protected", [
+    ("skills/tick/resolve-target.sh", True),
+    (".claude/skills/tick/resolve-target.sh", True),
+    ("plugin/skills/tick/resolve-target.sh", True),
+    ("other-skills/tick/resolve-target.sh", False),
+])
+def test_target_resolver_is_review_policy(path: str, protected: bool) -> None:
+    """The resolver chooses the repo whose review policy startup will load."""
+    assert pipeline.touches_review_policy([path]) is protected
+
+
 def test_touches_review_policy_false_for_unrelated_dotclaude_files() -> None:
     # A change to some other skill under .claude/ does not steer the reviewer's
     # governing instructions, so it must not block auto-review.
@@ -5399,8 +5410,8 @@ def test_resolve_config_login_falls_back_to_the_deprecated_remnant(
 
     ``[target] trusted_author`` in the packaged file is a deprecated remnant,
     read only so an operator who filled it in does not lose their pipeline on
-    the merge that moves configuration to their home. The canonical-target
-    issue deletes it.
+    the merge that moves configuration to their home. Repository identity is
+    resolved independently from Git; its deprecated config key is ignored.
     """
     packaged_floor(
         monkeypatch, tmp_path,
@@ -5411,7 +5422,8 @@ def test_resolve_config_login_falls_back_to_the_deprecated_remnant(
     config = pipeline.resolve_config("owner/name")
 
     assert config.login == "userA"
-    assert config.legacy_target_repo == "owner/name"
+    assert not hasattr(config, "legacy_target_repo")
+    assert any("[target] repo" in w for w in config.warnings)
     assert config.errors == ()
 
 
@@ -5420,10 +5432,8 @@ def test_resolve_config_warns_when_target_is_set_in_the_operator_config(
 ) -> None:
     """`[target]` in the operator's own config is read by nothing.
 
-    It is the obvious place to put a target, and it is the wrong one until the
-    canonical-target issue lands — so an operator who writes it there would
-    otherwise watch the tick refuse to start with no idea why the value they
-    just set is being ignored.
+    Repository identity comes from Git, so a stale target declaration produces
+    an explicit migration warning instead of silently appearing effective.
     """
     operator_config(
         monkeypatch, tmp_path, '[target]\nrepo = "owner/name"\n',
@@ -5431,7 +5441,7 @@ def test_resolve_config_warns_when_target_is_set_in_the_operator_config(
 
     config = pipeline.resolve_config("owner/name")
 
-    assert config.legacy_target_repo == ""
+    assert not hasattr(config, "legacy_target_repo")
     assert any("[target]" in w for w in config.warnings)
 
 

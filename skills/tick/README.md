@@ -208,10 +208,44 @@ The operator login is resolved per tick like every other setting, so a
 once the login is blank. It is the identity the reviewer admission gate
 compares against; issue *pickup* is not filtered by it yet (issue #14).
 
-The target repository is still read from the deprecated `[target] repo` key in
-the packaged file (`PIPELINE_REPO` overrides it), which is also what the
-dashboard parses. That remnant goes away when the target is resolved from the
-working directory's git remote.
+The target repository and remote come from the main checkout's Git configuration,
+anchored by the common Git directory even when invoked from a linked worktree.
+With one GitHub remote, no repository setting is needed. With multiple remotes, set
+`PIPELINE_REPO=owner/name`; exactly one remote must match. Missing or ambiguous
+matches, unsafe remote names, and differing fetch/push destinations stop startup
+before GitHub access. `[target] repo` is ignored with a migration warning.
+
+`[scan] repos = []` permits any resolved target; a non-empty list restricts the
+tick, including `PIPELINE_REPO` overrides. Repository identity comparisons are
+case-insensitive, including per-repository config and reviewer admission.
+Duplicate `[repos.*]` sections differing only in case are configuration errors.
+
+The selected remote is used for every fetch and for both engines' exact push
+permissions and prompts. The dashboard uses the same shell resolver before
+looking for Python and reads no TOML. GitHub commands pin the host with
+`--repo github.com/owner/name`, so `GH_HOST` cannot redirect them.
+Before launching an implementer or fixer, the controller also checks the
+selected remote's effective fetch and push URLs in that engine's worktree and
+environment. Conditional includes, worktree configuration, or environment
+overrides that point elsewhere refuse the launch and leave the item queued.
+Reviewer harvest checks its worktree before fetching; a mismatch retains the
+marker and review result for retry after the operator corrects the configuration.
+These checks read local Git configuration and open no network connection.
+Git configuration must remain stable while a dispatched engine is running.
+Supported URLs are GitHub.com HTTPS, SSH
+(`git@github.com:owner/name` or `ssh://git@github.com[:22]/owner/name`), and Git
+protocol URLs, with an optional `.git` suffix. Remote names use letters, digits,
+dot, underscore, or hyphen, start with a letter or digit, and cannot contain
+`..` or end in `.` or `.lock`.
+
+A startup failure exits 3 in both single-tick and `--loop` mode; loop cadence
+does not issue GitHub requests after a rejected target or configuration.
+
+Use separate clones for different target repositories. Existing markers and
+receipts share a common-directory state space and do not record repository
+identity; switching `PIPELINE_REPO` to another repository while reusing that
+state is not supported. Target resolution does not migrate existing state;
+[repository binding is tracked separately](https://github.com/kwuBuild/pr-pipeline/issues/41).
 
 ## Invocation
 
@@ -710,13 +744,14 @@ is an act the operator performs in their own config. The human merge gate after
 `ai:ready-for-human` is unaffected either way.
 
 The packaged `config.toml` itself is part of the policy path set, as are the
-gate's own implementation files (`lib/pipeline.py`, `lib/tick.py`): a PR that
+gate's own implementation files (`lib/pipeline.py`, `lib/tick.py`) and
+`resolve-target.sh`, which selects the repository whose policy is loaded: a PR that
 flips the floor's `allow_touching`, rewrites `touches_review_policy` to return
 `False` unconditionally, or removes the gate call from the reviewer dispatch is
 escalated to a human (while the gate is enabled) instead of auto-reviewed —
 otherwise a merged change would silently disable the gate for every future
-policy-editing PR. Those three are matched by path *suffix*
-(`skills/tick/config.toml` and the two `lib/` files), so the
+policy-editing PR. These files are matched by path *suffix*
+(`skills/tick/config.toml`, `skills/tick/resolve-target.sh` and the two `lib/` files), so the
 self-protection holds wherever the skill is installed — under `.claude/skills/`
 in a host repo, at `skills/` in the pipeline's own repository, or under a
 plugin root.

@@ -46,6 +46,7 @@ import json
 import math
 import os
 import re
+import subprocess
 import tempfile
 import time
 import tomllib
@@ -53,6 +54,53 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
+
+
+@dataclass(frozen=True)
+class ResolvedTarget:
+    """One GitHub repository and its uniquely matching local Git remote."""
+
+    repo: str
+    remote: str
+
+
+def same_repository(left: object, right: str) -> bool:
+    """GitHub owner/repository identity is case-insensitive."""
+    return isinstance(left, str) and left.casefold() == right.casefold()
+
+
+def resolve_target(cwd: str | Path | None = None) -> ResolvedTarget:
+    """Resolve local Git identity using the dashboard's interpreter-free helper."""
+    result = subprocess.run(
+        ["bash", str(Path(__file__).resolve().parents[1] / "resolve-target.sh")],
+        cwd=cwd, capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip())
+    repo, remote = result.stdout.splitlines()
+    return ResolvedTarget(repo, remote)
+
+
+def validate_target_context(
+    target: ResolvedTarget,
+    *,
+    cwd: str | Path,
+    env: Mapping[str, str] | None = None,
+) -> None:
+    """Refuse destinations that differ in the actual Git execution context.
+
+    Unlike startup resolution, this stays in ``cwd``. Engines must supply their
+    child environment too, because Git's effective URLs depend on both inputs.
+    Only local Git configuration is read; no transport is opened.
+    """
+    result = subprocess.run(
+        ["bash", str(Path(__file__).resolve().parents[1] / "resolve-target.sh"),
+         "--check-remote", target.repo, target.remote],
+        cwd=cwd, env=env, capture_output=True, text=True,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip())
+
 
 # Verdict values the Codex reviewer emits (pinned by review-schema.json).
 VERDICT_READY = "ready_for_human"
@@ -240,6 +288,7 @@ _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
     tuple(suffix.split("/"))
     for suffix in (
         "skills/tick/config.toml",
+        "skills/tick/resolve-target.sh",
         "skills/tick/lib/pipeline.py",
         "skills/tick/lib/tick.py",
     )
@@ -1678,7 +1727,7 @@ _CONFIG_REPO_RE = re.compile(
     r"\A[A-Za-z0-9][A-Za-z0-9._-]*/(?!\.\.?\Z)[A-Za-z0-9._-]+\Z"
 )
 
-# A base branch name conservative enough to hand to `git fetch origin <ref>`
+# A base branch name conservative enough to hand to `git fetch <remote> <ref>`
 # and `gh pr create --base <ref>`: git ref-name characters only, no leading
 # dash or slash (option or refspec ambiguity). This is the operator's own
 # branch name, not an untrusted PR head ref — tick's _valid_push_head_ref
@@ -1714,10 +1763,6 @@ class ResolvedConfig:
             restricts scope to exactly those repositories; a malformed value
             yields the empty *restrictive* tuple plus an entry in
             :attr:`errors`, so a typo can never read as unrestricted.
-        legacy_target_repo: The deprecated ``[target] repo`` remnant in the
-            packaged file, kept only so an install configured before the move
-            to the operator's home keeps working across this change. The
-            canonical-target issue removes it.
         errors: Hard configuration errors, each naming the key. A caller that
             is about to act on the configuration must refuse to start.
         warnings: Fail-closed coercions and ignored keys, for the tick log.
@@ -1730,7 +1775,6 @@ class ResolvedConfig:
     base_ref: str
     permission_mode: str
     scan_repos: tuple[str, ...] | None
-    legacy_target_repo: str
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
 
@@ -2177,14 +2221,11 @@ def resolve_config(
                 "and must not ship in the install"
             )
 
-    # `[target]` is read from the packaged file only, and only until the
-    # canonical-target issue deletes it. An operator who writes it in their own
-    # config has to be told, or their target looks configured and is not.
-    if "target" in operator:
+    if "repo" in _table(packaged, "target") or "target" in operator:
         warnings.append(
-            "[target] is not read from the operator's config — the deprecated "
-            "remnant lives in the packaged config.toml; use PIPELINE_REPO for "
-            "a one-off target"
+            "[target] repo is no longer read; the target comes from Git remotes "
+            "with PIPELINE_REPO selecting a matching remote. Configure the "
+            "login under [operator]."
         )
 
     # Every container the operator may declare is type-checked before its keys
@@ -2213,14 +2254,20 @@ def resolve_config(
         scan_repos, scan_problems = _resolve_scan_repos(declared["scan"])
     errors.extend(scan_problems)
     repos_table = declared["repos"]
+    seen_repos: set[str] = set()
     for name in sorted(repos_table):
+        if name.casefold() in seen_repos:
+            errors.append(f'[repos."{name}"]: duplicate repository ignoring case')
+        seen_repos.add(name.casefold())
         if not isinstance(repos_table[name], dict):
             errors.append(f"[repos.\"{name}\"]: expected a table")
         elif not _CONFIG_REPO_RE.match(name):
             errors.append(
                 f"[repos.\"{name}\"]: not an \"owner/name\" repository"
             )
-        elif scan_repos is not None and name not in scan_repos:
+        elif scan_repos is not None and not any(
+            same_repository(name, entry) for entry in scan_repos
+        ):
             errors.append(
                 f"[repos.\"{name}\"]: names a repository absent from "
                 "[scan] repos"
@@ -2231,7 +2278,10 @@ def resolve_config(
         ("[defaults]", declared["defaults"]),
     ]
     if repo:
-        section = repos_table.get(repo)
+        section = next(
+            (value for name, value in repos_table.items() if same_repository(name, repo)),
+            None,
+        )
         if isinstance(section, dict):
             layers.append((f"[repos.\"{repo}\"]", section))
     if cli_overrides:
@@ -2304,9 +2354,6 @@ def resolve_config(
     if warning:
         warnings.append(warning)
 
-    legacy_target = _table(packaged, "target").get("repo")
-    legacy_target_repo = legacy_target.strip() if isinstance(legacy_target, str) else ""
-
     return ResolvedConfig(
         login=login,
         allow_touching=allow_touching,
@@ -2315,7 +2362,6 @@ def resolve_config(
         base_ref=base_ref,
         permission_mode=permission_mode,
         scan_repos=scan_repos,
-        legacy_target_repo=legacy_target_repo,
         errors=tuple(errors),
         warnings=tuple(warnings),
     )
@@ -3249,10 +3295,11 @@ def trusted_review_candidate(
         metadata: ``gh pr view`` JSON containing ``author``, ``headRepository``,
             and ``isCrossRepository``.
         trusted_author: GitHub login allowed to author automated-review candidates.
-        trusted_repo: Exact ``owner/repo`` allowed to host the candidate head.
+        trusted_repo: Case-insensitive ``owner/repo`` allowed to host the candidate head.
 
     Returns:
-        ``True`` only for an exact author/repository match on a non-cross-repository PR.
+        ``True`` only for an exact author and case-insensitive repository match
+        on a non-cross-repository PR.
     """
     if not isinstance(metadata, dict):
         return False
@@ -3262,7 +3309,7 @@ def trusted_review_candidate(
         return False
     return (
         author.get("login") == trusted_author
-        and head_repository.get("nameWithOwner") == trusted_repo
+        and same_repository(head_repository.get("nameWithOwner"), trusted_repo)
         and metadata.get("isCrossRepository") is False
     )
 

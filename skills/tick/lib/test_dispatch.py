@@ -6024,13 +6024,13 @@ def test_engine_allowed_tools_invents_no_grant_the_operator_removed(
     cfg.write_text("[defaults]\nverify_tools = []\n", encoding="utf-8")
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 
-    allowed = tick._engine_allowed_tools(tick._IMPLEMENTER_PUSH_PERMISSION)
+    allowed = tick._engine_allowed_tools(tick._implementer_push_permission())
 
     assert "pytest" not in allowed
     assert "npm" not in allowed
     assert "  " not in allowed
     assert allowed == (
-        f"{tick._ENGINE_ALLOWED_TOOLS_BASE} {tick._IMPLEMENTER_PUSH_PERMISSION}"
+        f"{tick._ENGINE_ALLOWED_TOOLS_BASE} {tick._implementer_push_permission()}"
     )
 
 
@@ -6146,10 +6146,10 @@ def test_engine_allowed_tools_carries_the_verification_grant() -> None:
     """
     import tick
 
-    allowed = tick._engine_allowed_tools(tick._IMPLEMENTER_PUSH_PERMISSION)
+    allowed = tick._engine_allowed_tools(tick._implementer_push_permission())
 
     for entry in tick._engine_verify_tools():
         assert entry in allowed, f"allowlist is missing the grant {entry!r}"
-    assert tick._IMPLEMENTER_PUSH_PERMISSION in allowed
+    assert tick._implementer_push_permission() in allowed
     # The git surface stays exact: no wildcard push crept in alongside.
     assert "Bash(git push *)" not in allowed
