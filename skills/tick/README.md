@@ -721,6 +721,16 @@ self-protection holds wherever the skill is installed — under `.claude/skills/
 in a host repo, at `skills/` in the pipeline's own repository, or under a
 plugin root.
 
+The instructions the install supplies to a dispatched engine are in the same set
+and matched the same way: every bound skill doc (`skills/<name>/SKILL.md` for
+each `pipeline.BOUND_SKILLS` entry) and every prompt template under
+`skills/tick/lib/prompts/`. Those are read from the install, so a PR can no
+longer steer its own fixer with them — but a merged rewrite governs every
+*future* run, which is the same silent-disable shape as a gate flip. Both sets
+are derived from the constants the runtime actually reads rather than restated,
+so a skill bound by a future stage, or a prompt added for one, is inside the gate
+from the moment it lands.
+
 ### Prerequisites for `claude-ds`
 
 Implementer and fixer engines are trusted local subprocesses and inherit the
@@ -755,15 +765,24 @@ The binding is a doc path rather than a skill invocation on purpose: engines run
 under `--permission-mode dontAsk` (the default; the experimental `auto` mode is
 opt-in) with a bounded allowlist that carries `Read` and no `Skill` tool.
 
-Because it is a path, dispatch resolves it before spending anything. The probe
-runs against the **fixer's own worktree** — a detached checkout of the PR head,
-which is the tree the engine's cwd resolves the path in, so a PR branch cut
-before the skill existed is caught rather than waved through by the operator's
-newer checkout. An unreadable doc logs `skill_unresolved` (with the skill names
-and the probed paths), escalates the PR to `ai:needs-human-decision`, and removes
-the worktree — no lease, no relabel to `ai:fixing`, no engine launched. Recover by
-restoring the skill doc on the PR branch (usually by rebasing it onto a base that
-has it), then relabel the PR back to `ai:changes-requested`.
+The path is the **install's** — an absolute path into the pipeline's own
+`skills/` directory, not a path inside the fixer's worktree. The guidance ships
+with the pipeline, so the operator's installed copy is the right one for every
+target by construction: a repository that has never heard of the skill still
+gets a fixer that can open it, and a PR branch cannot hand its own fixer a
+rewritten copy of the rules it will be revised under. The same doc is published
+as `/pr-pipeline:review-response-hygiene` for interactive sessions.
+
+Because it is a path, dispatch resolves it before spending anything. An
+unreadable doc means the *install* is missing a file its own prompt names — a
+packaging defect, not anything about the PR. It logs `skill_unresolved` (with the
+skill names and the probed paths), escalates the PR to `ai:needs-human-decision`,
+and removes the worktree — no lease, no relabel to `ai:fixing`, no engine
+launched. The escalation is per item because an item left at
+`ai:changes-requested` would otherwise be retried every tick against an install
+that cannot satisfy it. Recover by repairing the install — reinstall or update
+the plugin, or check out the missing doc in a development checkout — then relabel
+the PR back to `ai:changes-requested`.
 
 ### Governing context the fixer is handed
 

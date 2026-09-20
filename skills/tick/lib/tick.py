@@ -302,21 +302,17 @@ _TERMINAL_LABELS = frozenset({
     pipeline.LABEL_MAX_ITERATIONS,
 })
 
-_PROMPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts")
+_PROMPTS_DIR = str(pipeline.PROMPTS_DIR)
 
-# Repo-relative root every skill doc lives under. Engine worktrees are full
-# checkouts, so this resolves inside the engine's own cwd — not the operator's.
-SKILL_DOC_ROOT = ".claude/skills"
-
-# Discipline skills bound into a dispatched engine's prompt. Skills are
-# discretionary reading unless the executed prompt names when they must run, so
-# each binding is a named constant substituted into the template (never
-# hardcoded in the .txt) — a later change can move the binding into config
-# without rewriting prompts.
-REVISION_HYGIENE_SKILL = "review-response-hygiene"
+# The bound-skill vocabulary lives in `pipeline` because the reviewer policy
+# gate derives its own entries from it (see `_POLICY_PATH_SUFFIXES`): one
+# definition, so a doc the install supplies to an engine cannot be bound here
+# and left outside the gate there.
+REVISION_HYGIENE_SKILL = pipeline.REVISION_HYGIENE_SKILL
 
 # The skills `_dispatch_one_fixer` resolves before launch. The implementer half
-# adds its own tuple against the same resolver.
+# adds its own tuple against the same resolver; `pipeline.BOUND_SKILLS` is the
+# union every stage's tuple draws from.
 FIXER_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
 
 # Ceiling on each governing document injected into a fixer prompt (the PR body,
@@ -431,34 +427,32 @@ def load_prompt_template(
 
 
 def skill_doc_path(name: str) -> str:
-    """Return the repo-relative path of one skill's ``SKILL.md``.
+    """Return the absolute path of one installed skill's ``SKILL.md``.
 
-    The same string is both what the prompt tells the engine to read and what
-    :func:`unresolved_skill_docs` probes, so a rename can never leave the two
-    disagreeing about where the doc lives.
+    Thin alias for :func:`pipeline.skill_doc_path`, kept here because the
+    binding is a dispatch concern and every call site is in this module.
 
     Args:
         name: The skill directory name (e.g. ``"review-response-hygiene"``).
 
     Returns:
-        The path relative to a checkout root, e.g.
-        ``.claude/skills/review-response-hygiene/SKILL.md``.
+        The absolute path inside the install.
     """
-    return f"{SKILL_DOC_ROOT}/{name}/SKILL.md"
+    return pipeline.skill_doc_path(name)
 
 
-def unresolved_skill_docs(names: Sequence[str], *, root: str) -> list[str]:
-    """Return the skills whose doc is missing or unreadable under ``root``.
+def unresolved_skill_docs(names: Sequence[str]) -> list[str]:
+    """Return the skills whose installed doc is missing or unreadable.
 
-    ``root`` is the engine's own worktree, not the operator checkout: a fixer
-    runs with its cwd inside a detached checkout of the *PR head*, so a branch
-    cut before the skill existed resolves the doc differently from the machine
-    dispatching it. Probing the operator's tree would pass on exactly the case
-    that leaves the engine unable to open what its prompt names.
+    The docs ship with the pipeline, so the probe reads the install rather than
+    the engine's worktree: the fixer's cwd is a detached checkout of a PR head
+    in a repository the pipeline does not own, which has no reason to carry a
+    copy of the operator's guidance. What this catches is therefore a packaging
+    defect — a doc bound by a prompt and absent from the install — rather than
+    anything about the item being dispatched.
 
     Args:
         names: Skill directory names to resolve.
-        root: The checkout root the engine will run in.
 
     Returns:
         The subset of ``names`` with no readable ``SKILL.md``, in input order.
@@ -466,7 +460,7 @@ def unresolved_skill_docs(names: Sequence[str], *, root: str) -> list[str]:
     """
     unresolved: list[str] = []
     for name in names:
-        path = os.path.join(root, skill_doc_path(name))
+        path = skill_doc_path(name)
         if not os.path.isfile(path) or not os.access(path, os.R_OK):
             unresolved.append(name)
     return unresolved
@@ -8507,18 +8501,23 @@ def _bound_skills_resolve(
 ) -> bool:
     """Fail closed when a prompt-bound skill doc is unreadable before launch.
 
-    A skill binding is a path in a prompt, so a rename or a branch that predates
-    the skill degrades silently: the engine reads nothing, works without the
-    discipline the binding exists to impose, and still emits its completion
-    sentinel. Resolving the doc before spending anything turns that into a
-    visible escalation.
+    A skill binding is a path in a prompt, so a doc missing from the install
+    degrades silently: the engine reads nothing, works without the discipline
+    the binding exists to impose, and still emits its completion sentinel.
+    Resolving the doc before spending anything turns that into a visible
+    escalation.
+
+    The fault this now reports is a packaging defect rather than anything about
+    the item, but the disposition is unchanged deliberately: an item left at its
+    pre-dispatch label would be retried every tick against an install that
+    cannot satisfy it, so the escalation is what puts a person in front of it.
 
     The probe emits its own ``skill_unresolved`` entry *before* escalating so the
     operator grep list distinguishes "the binding is broken" from the generic
     setup-failure escalate that follows it.
 
     Args:
-        wt_dir: The engine's worktree — the tree its cwd resolves paths in.
+        wt_dir: The engine's worktree, removed when the probe escalates.
         skills: The skill names this stage's prompt binds.
         entity: ``"issue"`` or ``"pr"``.
         number: The issue or PR number.
@@ -8531,13 +8530,13 @@ def _bound_skills_resolve(
         ``True`` when every doc resolved and dispatch may continue. ``False``
         after the item has been escalated and ``wt_dir`` cleaned up.
     """
-    unresolved = unresolved_skill_docs(skills, root=wt_dir)
+    unresolved = unresolved_skill_docs(skills)
     if not unresolved:
         return True
 
     probe_paths = [skill_doc_path(name) for name in unresolved]
     reason = (
-        "prompt-bound skill docs unreadable in the engine worktree: "
+        "prompt-bound skill docs unreadable in the pipeline install: "
         f"{', '.join(probe_paths)}"
     )
     if tick_log:
@@ -10342,8 +10341,8 @@ def _dispatch_one_fixer(
         )
         return
 
-    # Resolve every skill the fixer prompt binds against the tree the engine
-    # will actually run in. Nothing has been leased or relabelled yet, so an
+    # Resolve every skill the fixer prompt binds against the install that
+    # supplies them. Nothing has been leased or relabelled yet, so an
     # unresolvable binding costs one worktree and escalates before any spend.
     if not _bound_skills_resolve(
         wt_dir=wt_dir,

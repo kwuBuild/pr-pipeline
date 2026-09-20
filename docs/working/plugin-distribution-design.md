@@ -830,18 +830,24 @@ version mismatch to notice.
 
 ### `review-response-hygiene`
 
-The fixer prompt binds `.claude/skills/review-response-hygiene/SKILL.md`, and
-`_bound_skills_resolve` (`tick.py:8475`) probes for it **inside the fixer's
-worktree** via `skill_doc_path` (`tick.py:423`) against `SKILL_DOC_ROOT =
-".claude/skills"`.
+**Landed.** The doc ships at `skills/review-response-hygiene/SKILL.md` and the
+binding resolves against the install; what follows is the reasoning, kept
+because it is the record of a retired property.
 
-This is the coupling that makes the current pipeline non-independent, and it is
-invisible while dogfooding: this repository ships that file at its own
-`.claude/skills/`, so the probe passes here and fails on every adopter
-repository, escalating every fix dispatch with `skill_unresolved`.
+The fixer prompt used to bind `.claude/skills/review-response-hygiene/SKILL.md`,
+and `_bound_skills_resolve` probed for it **inside the fixer's worktree** via
+`skill_doc_path` against `SKILL_DOC_ROOT = ".claude/skills"`.
+
+That was the coupling that made the pipeline non-independent, and it was
+invisible while dogfooding: this repository shipped that file at its own
+`.claude/skills/`, so the probe passed here and would have failed on every
+adopter repository, escalating every fix dispatch with `skill_unresolved`.
 
 Fix: ship the skill with the plugin rather than expecting it in the target, and
 resolve the bound doc against the plugin root instead of the worktree.
+`pipeline.skill_doc_path` is the one resolver, and `pipeline.BOUND_SKILLS` the
+one binding set, because the reviewer policy gate derives its own entries from
+them — see "Installed policy and the review gate" below.
 
 **This retires a documented property, and the trade is deliberate.**
 `README.md:622-628` states the worktree probe is intentional: it runs against the
@@ -860,10 +866,31 @@ missing from the *install* is a packaging defect, and dispatch fails the same wa
 rather than silently launching an unguided fixer. The `skill_unresolved`
 escalation stays; only what it probes moves.
 
-`README.md` and `DEBUG.md` both describe the worktree probe and its recovery
+`README.md` and `DEBUG.md` both described the worktree probe and its recovery
 procedure ("restore the skill doc on the PR branch, usually by rebasing"), which
-stops being the recovery. Updating them is part of phase 1, not a follow-up —
-see section 14.
+stopped being the recovery. Both now describe the install probe and name
+repairing the install as the recovery.
+
+**Installed policy and the review gate.** Sourcing the doc from the install
+answers half of the source-of-truth question and opens the other half: a PR can
+no longer govern its *own* fixer, but a merged rewrite governs every *future*
+one, and the PR that merged it was auto-reviewed. That is the same
+silent-disable shape `touches_review_policy` already guards `config.toml`,
+`pipeline.py`, and `tick.py` against, so bound skill docs are in the gate — and
+`skills/tick/lib/prompts/*.txt`, which has the identical property and was
+equally absent, is decided with them rather than left for a later round.
+
+Both sets are **derived** from the constants the runtime reads rather than
+restated as paths: the skill entries from `pipeline.BOUND_SKILLS`, the prompt
+entry from `pipeline.PROMPTS_DIR` as a *directory* suffix, since a template that
+does not exist yet cannot be enumerated. A hand-maintained duplicate list is
+exactly how a future stage's binding lands outside the gate by omission, and
+`test_touches_review_policy_guards_the_installed_engine_instructions` asserts the
+relationship rather than the paths.
+
+This is also the answer to the upstream backlog item that asked where
+prompt-bound skill docs are read from and whether they belong in the policy path
+set: read from the install, and yes — together with the prompt templates.
 
 **Where it lands: under `skills/`, published as a command.** With
 `"skills": "./skills"` in the manifest, anything under that directory becomes a
@@ -899,6 +926,18 @@ by a stub: the engine allowlist carries `Read` and no `Skill` tool, which is why
 the binding is a doc path. Whether `Read` resolves an absolute path outside the
 engine's worktree must be verified in L3, not L2 — a PATH-stubbed engine proves
 nothing about the real engine's permissions.
+
+**The obvious mitigation is not obviously safe, which is why it is not taken
+here.** `claude`'s `--add-dir` would put the install inside the engine's
+permitted roots, and the dispatch passes no such flag today. But `--add-dir`
+widens *write* access as well as read, and `_ENGINE_ALLOWED_TOOLS_BASE` grants
+`Edit` and `Write` — so pointing it at the install would let a dispatched fixer
+rewrite the pipeline's own code, or edit the installed guidance that governs
+every later run, which is precisely the authority the doc was moved into the
+install to keep away from branch content. Scoping it to the one skill directory
+narrows the blast radius without removing it. So if L3 finds the read blocked,
+the fix is a *read-scoped* grant decided together with the engine write
+allowlist (phase 2), not an `--add-dir` on the install root.
 
 ### Interpreter resolution
 
@@ -951,8 +990,8 @@ environmental, not code defects.
 unrelated repository** and reports an empty queue rather than crashing; and the
 invocable skills are **exactly** the intended set under their real namespaced
 names — `/pr-pipeline:tick`, `/pr-pipeline:status`,
-`/pr-pipeline:definition-of-done`, plus `/pr-pipeline:setup` and
-`/pr-pipeline:review-response-hygiene` once those land.
+`/pr-pipeline:definition-of-done`, `/pr-pipeline:review-response-hygiene`, plus
+`/pr-pipeline:setup` once that lands.
 
 Exactly, not at-least: an unintended command is the observable symptom of a
 misplaced file, and an assertion that only checks presence cannot see it.
@@ -1251,10 +1290,13 @@ Everything required for A to install the plugin and drive B, C, and D:
 
 - Plugin manifests; `${CLAUDE_PLUGIN_ROOT}` resolution; skill naming and the
   placement of `review-response-hygiene` (section 9).
-- `review-response-hygiene` shipped with the plugin and resolved from the plugin
+- ~~`review-response-hygiene` shipped with the plugin and resolved from the plugin
   root — the coupling that currently makes every fixer dispatch fail on an adopter
   repo — **with `README.md` and `DEBUG.md` updated**, since both document the
-  worktree probe and a recovery procedure that this retires (section 9).
+  worktree probe and a recovery procedure that this retires (section 9).~~
+  **Done** — published as `/pr-pipeline:review-response-hygiene`, bound through
+  `pipeline.skill_doc_path`, and inside the review policy gate along with the
+  prompt templates.
 - Operator-owned layered config, restructured packaged `config.toml`, and one
   canonical target threaded through dispatch, harvest, cadence, mutation, and
   `status.sh` — which drops its config parse entirely and resolves the target

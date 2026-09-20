@@ -5978,3 +5978,27 @@ def test_operator_config_path_is_never_inside_the_install(
     install_root = Path(pipeline.__file__).resolve().parent.parent
 
     assert not pipeline.operator_config_path().is_relative_to(install_root)
+
+
+def test_skill_doc_path_resolves_inside_the_install() -> None:
+    """A bound skill doc is the install's file, not the target repository's.
+
+    The fixer's worktree is a detached checkout of a PR head in a repository
+    the pipeline does not own, so a repo-relative binding resolves to a file
+    only this repository happens to ship. Resolving against the installed
+    ``skills/`` root — derived from ``pipeline.py``'s own location, the same
+    way the packaged config floor is — is what makes the doc present for every
+    target by construction.
+    """
+    install_skills_root = Path(pipeline.__file__).resolve().parents[2]
+
+    path = Path(pipeline.skill_doc_path(pipeline.REVISION_HYGIENE_SKILL))
+
+    assert path.is_absolute(), (
+        f"{path} is relative, so a dispatched engine resolves it against its "
+        "own worktree rather than the install"
+    )
+    assert path == (
+        install_skills_root / pipeline.REVISION_HYGIENE_SKILL / "SKILL.md"
+    )
+    assert path.is_file(), f"the install ships no {path}"

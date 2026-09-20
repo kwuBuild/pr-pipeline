@@ -2975,6 +2975,46 @@ def test_touches_review_policy_guards_the_gate_at_any_install_depth() -> None:
     assert touches_review_policy(["skills/tick/lib/README.md"]) is False
 
 
+def test_touches_review_policy_guards_the_installed_engine_instructions() -> None:
+    """The policy the install *supplies* is review policy for future runs.
+
+    A bound skill doc and a prompt template are read from the install, so a PR
+    that rewrites one can no longer steer its own fixer. What it can still do
+    is change the instructions every later dispatch runs under, which is the
+    same silent-disable vector the gate already guards ``pipeline.py`` and
+    ``tick.py`` against — a merged rewrite governs every future PR, and the PR
+    that merged it was auto-reviewed. So both sets are gated, and both are
+    derived from the runtime's own constants rather than restated here: a skill
+    bound by a future stage, or a prompt added for one, is covered by being
+    added to the runtime, not by being remembered in this list.
+    """
+    from pipeline import (  # type: ignore[import-untyped]
+        BOUND_SKILLS,
+        PROMPTS_DIR,
+        touches_review_policy,
+    )
+
+    tails = [f"skills/{name}/SKILL.md" for name in BOUND_SKILLS]
+    tails += [
+        f"skills/tick/lib/prompts/{path.name}"
+        for path in sorted(PROMPTS_DIR.iterdir())
+    ]
+    assert len(tails) > len(BOUND_SKILLS), "no prompt template was discovered"
+
+    for prefix in ("", ".claude/", "vendor/pr-pipeline/"):
+        for tail in tails:
+            assert touches_review_policy([prefix + tail]) is True, (
+                f"the gate does not protect installed engine instructions: "
+                f"{prefix + tail}"
+            )
+
+    # Segment matching, here too: a same-named directory elsewhere is not the
+    # install's, and a file the install does not read is not policy.
+    assert touches_review_policy(["docs/prompts/fixer.txt"]) is False
+    assert touches_review_policy(["skills/tick/lib/prompts/README.md"]) is True
+    assert touches_review_policy(["skills/review-response-hygiene/notes.md"]) is False
+
+
 # --- Adversarial review: reviewer codex exec argv ---
 
 
@@ -4294,18 +4334,18 @@ def test_dispatch_pins_a_closure_contract_github_reports_no_linked_issue_for() -
     )
 
 
-def test_dispatch_one_fixer_escalates_when_a_bound_skill_does_not_resolve(
+def test_dispatch_one_fixer_resolves_its_bound_skill_from_the_install(
     tmp_path: Path,
 ) -> None:
-    """A skill the engine cannot open must stop the launch, not the reading.
+    """A target repository that never heard of the skill must still get a fixer.
 
-    The binding is a path in a prompt, so a renamed or missing skill degrades
-    silently: the engine reads nothing, revises anyway, and still emits its
-    completion sentinel. The probe runs against the *fixer's own worktree* —
-    a detached checkout of the PR head — because that is the tree the engine's
-    cwd resolves the path in, and a PR branch cut before the skill existed is
-    exactly the case an operator-checkout probe would wave through.
+    The doc ships with the pipeline, so the operator's installed copy is the
+    right one for every target by construction. Probing the fixer's own
+    worktree — a detached checkout of a PR head in a repository the pipeline
+    does not own — asked a question with one answer everywhere but here, and
+    escalated every fix dispatch on every adopter.
     """
+    import pipeline  # type: ignore[import-untyped]
     from tick import TickLog, _dispatch_one_fixer  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -4315,7 +4355,7 @@ def test_dispatch_one_fixer_escalates_when_a_bound_skill_does_not_resolve(
     tick_log = TickLog.open(str(tmp_path / "logs"))
 
     def bare_worktree(*args: str) -> str:
-        # A checkout whose tree carries no `.claude/skills/` at all.
+        # A checkout whose tree carries no skill docs at all.
         if "worktree" in args and "add" in args:
             Path(args[-2]).mkdir(parents=True, exist_ok=True)
         return str(repo_root)
@@ -4326,16 +4366,69 @@ def test_dispatch_one_fixer_escalates_when_a_bound_skill_does_not_resolve(
                 gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                 with mock.patch("tick.gh_json", side_effect=fixer_gh_json()):
                     with mock.patch(
-                        "tick.gh", side_effect=allow_escalation_comment(),
-                    ), mock.patch(
-                        "tick._relabel_with_context",
-                    ) as relabel_mock:
+                        "tick._publish_marker_or_revert", return_value=True,
+                    ):
                         with mock.patch("tick.relabel"):
                             with mock.patch("subprocess.Popen") as popen:
                                 popen.return_value.pid = 12345
                                 _dispatch_one_fixer(
                                     pr_number=42, tick_log=tick_log,
                                 )
+
+    popen.assert_called_once()
+    assert not [
+        entry for entry in tick_log.tail() if entry["action"] == "skill_unresolved"
+    ], "a bare target checkout still escalated on the skill probe"
+
+    prompt = (wt_root / "pr-42" / "prompt.txt").read_text()
+    doc = pipeline.skill_doc_path(pipeline.REVISION_HYGIENE_SKILL)
+    assert doc in prompt, f"the prompt does not name the installed doc {doc}"
+    assert Path(doc).is_file()
+
+
+def test_dispatch_one_fixer_escalates_when_the_install_lacks_a_bound_skill(
+    tmp_path: Path,
+) -> None:
+    """A doc missing from the install is a packaging defect, and fails closed.
+
+    The binding is a path in a prompt, so an absent doc degrades silently: the
+    engine reads nothing, revises anyway, and still emits its completion
+    sentinel. Only what the probe reads moved to the install — the disposition
+    did not. No lease, no relabel to ``ai:fixing``, no engine launched, and the
+    scratch worktree is removed.
+    """
+    from tick import TickLog, _dispatch_one_fixer  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    empty_install = tmp_path / "install-without-the-doc"
+    empty_install.mkdir()
+    tick_log = TickLog.open(str(tmp_path / "logs"))
+
+    def worktree(*args: str) -> str:
+        if "worktree" in args and "add" in args:
+            Path(args[-2]).mkdir(parents=True, exist_ok=True)
+        return str(repo_root)
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)):
+        with mock.patch("pipeline.INSTALL_SKILLS_ROOT", empty_install):
+            with mock.patch("tick.git", side_effect=worktree):
+                with mock.patch("tick.gh_text") as gh_text_mock:
+                    gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
+                    with mock.patch("tick.gh_json", side_effect=fixer_gh_json()):
+                        with mock.patch(
+                            "tick.gh", side_effect=allow_escalation_comment(),
+                        ), mock.patch(
+                            "tick._relabel_with_context",
+                        ) as relabel_mock:
+                            with mock.patch("tick.relabel"):
+                                with mock.patch("subprocess.Popen") as popen:
+                                    popen.return_value.pid = 12345
+                                    _dispatch_one_fixer(
+                                        pr_number=42, tick_log=tick_log,
+                                    )
 
     popen.assert_not_called()
     relabel_mock.assert_called_once()
@@ -4351,7 +4444,7 @@ def test_dispatch_one_fixer_escalates_when_a_bound_skill_does_not_resolve(
     assert unresolved["stage"] == "fix"
     assert unresolved["details"]["skills"] == ["review-response-hygiene"]
     assert unresolved["details"]["probe_paths"] == [
-        ".claude/skills/review-response-hygiene/SKILL.md",
+        str(empty_install / "review-response-hygiene" / "SKILL.md"),
     ]
 
 

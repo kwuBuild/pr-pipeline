@@ -1048,6 +1048,15 @@ are review policy on the same reasoning and are matched by path *suffix*, per
 segment, so the rule holds at every install depth rather than only the one the
 skills were incubated at.
 
+So are the instructions the install supplies to a dispatched engine — every
+bound skill doc and every prompt template. Those are read from the install, so
+a PR cannot govern its own fixer with them; what the gate adds is that a PR
+rewriting them for every future run is not auto-reviewed under the rules it is
+changing. Their entries are *derived* from the constants the runtime reads
+(`pipeline.BOUND_SKILLS`, `pipeline.PROMPTS_DIR`) rather than restated as a
+path list, so a binding added by a future stage cannot land outside the gate by
+omission — which is the failure the hand-maintained alternative invites.
+
 This gate is operator-configurable: `allow_touching = true` under `[defaults]` or
 `[repos."owner/name"]` in the operator's own config lets policy-editing PRs flow to
 auto-review anyway (the operator accepts that the review runs under instructions the
@@ -1384,8 +1393,10 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
 - The current diff (the worktree is the PR head; `git diff`/`git log` are allowed)
 - Instructions to address each finding, commit, and push
 - The doc path of each bound discipline skill (`tick.FIXER_SKILLS`), resolved
-  against the fixer's own worktree at dispatch; unreadable escalates instead of
-  launching
+  against the *install* at dispatch — the guidance ships with the pipeline, so
+  no target repository needs a copy and no PR branch supplies the rules its own
+  fixer runs under; a doc missing from the install is a packaging defect and
+  escalates instead of launching
 - A repair-or-replacement declaration **per finding**, made before editing and
   re-checked against the pushed diff, published in that finding's own block of
   the change summary. One run may mix repairs and replacements; each replacement
@@ -1675,6 +1686,8 @@ skills/
   definition-of-done/
     SKILL.md                    # the bar a change clears before green counts as proof
     references/why.md           # the failure shapes each step was built from
+  review-response-hygiene/
+    SKILL.md                    # the revision rules the fixer prompt binds by path
 ```
 
 The skills compose `gh`, `git`, `claude -p`, and `codex exec` directly. The decisions
