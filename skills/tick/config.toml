@@ -32,7 +32,7 @@
 #   login = "your-github-login"
 #
 #   [defaults]
-#   allow_touching  = false
+#   allow_touching  = true
 #   checklist_paths = []
 #   verify_tools    = ["uv run pytest *"]
 #   base_ref        = ""
@@ -56,18 +56,16 @@ trusted_author = ""
 [defaults]
 # allow_touching governs the reviewer admission gate. A PR whose diff edits
 # files that steer the reviewer (CLAUDE.md, AGENTS.md, the review checklists,
-# the pipeline's own config/pipeline.py/tick.py) is escalated to a human instead
-# of auto-reviewed — the reviewer runs on the PR's own worktree, so it would
-# otherwise review under instructions the PR itself supplied.
+# the pipeline's own config/pipeline.py/tick.py) is escalated to a human when
+# allow_touching is false: the reviewer runs under the PR's own instructions.
 #
-# The gate ships ON, and that is the shipped floor precisely because it is a
-# trust boundary: an install inherits whatever is written here, so opting every
-# adopter out by default would make the choice for them. An operator who accepts
-# that boundary sets allow_touching = true in their own config. The human merge
-# gate after ai:ready-for-human still stands either way.
+# Operator-only issue pickup and reviewer admission make true the shipped
+# default. Set false in your own config to require human review for policy
+# edits. Widening issue authors must restore false in the same change. The
+# human merge gate after ai:ready-for-human still stands either way.
 #
-# A missing or malformed config keeps the conservative gate (fail closed).
-allow_touching = false
+# A missing floor or malformed value keeps the conservative gate (fail closed).
+allow_touching = true
 
 # checklist_paths names the target repo's *own* reviewer-governing docs, as
 # repo-relative paths. CLAUDE.md and AGENTS.md are matched by basename at any

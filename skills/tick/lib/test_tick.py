@@ -26,6 +26,7 @@ import pytest
 
 from conftest import (  # type: ignore[import-untyped]
     FIXER_HARVEST_HEAD,
+    TRUSTED_AUTHOR,
     REVISED_PR_BODY,
     STALE_PR_BODY,
     allow_escalation_comment,
@@ -2279,7 +2280,7 @@ def test_has_actionable_queue_ignores_human_held_items() -> None:
     awake: a held-only queue is quiescent, matching dispatch eligibility."""
     import tick  # type: ignore[import-untyped]
 
-    held_issue = [{"labels": [
+    held_issue = [{"author": {"login": TRUSTED_AUTHOR}, "labels": [
         {"name": "ai:available"}, {"name": "ai:blocked"},
     ]}]
     held_pr = [{"labels": [
@@ -2305,7 +2306,7 @@ def test_has_actionable_queue_ignores_an_in_flight_labelled_item() -> None:
     """
     import tick  # type: ignore[import-untyped]
 
-    in_flight_issue = [{"labels": [
+    in_flight_issue = [{"author": {"login": TRUSTED_AUTHOR}, "labels": [
         {"name": "ai:available"}, {"name": "ai:implementing"},
     ]}]
     in_flight_pr = [{"labels": [
@@ -2365,8 +2366,8 @@ def test_has_actionable_queue_sees_hold_free_item_past_held_one() -> None:
     import tick  # type: ignore[import-untyped]
 
     issues = [
-        {"labels": [{"name": "ai:available"}, {"name": "ai:blocked"}]},
-        {"labels": [{"name": "ai:available"}]},
+        {"author": {"login": TRUSTED_AUTHOR}, "labels": [{"name": "ai:available"}, {"name": "ai:blocked"}]},
+        {"author": {"login": TRUSTED_AUTHOR}, "labels": [{"name": "ai:available"}]},
     ]
 
     with mock.patch("tick.gh_json", side_effect=[issues]):
@@ -2379,7 +2380,7 @@ def test_has_actionable_queue_stays_warm_when_held_page_may_truncate() -> None:
     import tick  # type: ignore[import-untyped]
 
     full_held_page = [
-        {"labels": [{"name": "ai:available"}, {"name": "ai:blocked"}]}
+        {"author": {"login": TRUSTED_AUTHOR}, "labels": [{"name": "ai:available"}, {"name": "ai:blocked"}]}
         for _ in range(tick._ACTIONABLE_QUEUE_SCAN_LIMIT)
     ]
 
@@ -2466,7 +2467,7 @@ def test_target_has_actionable_queue_covers_an_issue_targets_open_pr() -> None:
         if "state,number" in args:
             return {"number": 590, "state": "OPEN"}
         if args[0] == "issue":
-            return {"state": "OPEN", "labels": [{"name": "ai:implementing"}]}
+            return {"state": "OPEN", "author": {"login": TRUSTED_AUTHOR}, "labels": [{"name": "ai:implementing"}]}
         return {"state": "OPEN", "labels": [{"name": "ai:changes-requested"}]}
 
     with mock.patch("tick.gh_json", side_effect=side_effect):
@@ -5958,7 +5959,7 @@ def test_dispatch_skips_a_candidate_that_already_carries_an_in_flight_label(
 
     def fake_gh_json(*args: str, **kwargs: object) -> object:
         if "list" in args:
-            return [{"number": 77, "title": "Candidate"}]
+            return [{"number": 77, "title": "Candidate", "author": {"login": TRUSTED_AUTHOR}}]
         if "author,headRepository,isCrossRepository" in args:
             return {
                 "author": {"login": tick.TRUSTED_REVIEW_AUTHOR},
@@ -18753,8 +18754,8 @@ def test_run_tick_body_publishes_a_setup_failure_before_holding_the_issue(
 
     def fake_gh_json(*args: str) -> object:
         if args[:2] == ("issue", "list"):
-            return [{"number": 42, "title": "Add a thing"}]
-        return {"labels": [{"name": "ai:available"}]}
+            return [{"number": 42, "title": "Add a thing", "author": {"login": TRUSTED_AUTHOR}}]
+        return {"author": {"login": TRUSTED_AUTHOR}, "labels": [{"name": "ai:available"}]}
 
     def fake_gh_text(*args: str) -> str:
         # The eligibility gate reads the item's own label set; everything else
@@ -19066,7 +19067,7 @@ def test_run_tick_body_dispatches_nothing_when_every_queue_is_mid_transition(
             return []
         if "list" in args:
             return [
-                {"number": n, "title": f"Candidate {n}"}
+                {"number": n, "title": f"Candidate {n}", "author": {"login": TRUSTED_AUTHOR}}
                 for n in numbers_for_label(label_argument(args))
             ]
         return {
@@ -19162,7 +19163,7 @@ def test_run_tick_body_does_not_dispatch_a_pr_it_already_launched_this_tick(
             return []
         if "list" in args:
             return [
-                {"number": n, "title": f"Candidate {n}"}
+                {"number": n, "title": f"Candidate {n}", "author": {"login": TRUSTED_AUTHOR}}
                 for n in queue_numbers.get(label_argument(args), [])
             ]
         return {
@@ -20266,7 +20267,7 @@ def test_compute_post_dispatch_state_held_only_queue_not_actionable() -> None:
     actionable work so the external loop can quiesce."""
     from tick import _compute_post_dispatch_state  # type: ignore[import-untyped]
 
-    held_page = [{"labels": [
+    held_page = [{"author": {"login": TRUSTED_AUTHOR}, "labels": [
         {"name": "ai:available"}, {"name": "ai:blocked"},
     ]}]
 

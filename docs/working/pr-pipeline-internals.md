@@ -205,18 +205,20 @@ or explicitly apply any checklist ([reviewer prompt][reviewer-prompt]).
 
 ### Policy gate: `touches_review_policy`
 
-The reviewer dispatch checks whether the PR's diff modifies any file that governs
-the reviewer's own behaviour ([`tick._dispatch_one_reviewer`][tick]). If so, the PR is
-escalated to human review instead of being auto-reviewed.
+With `allow_touching = false`, reviewer dispatch checks whether the PR's diff
+modifies any file that governs the reviewer's own behaviour
+([`tick._dispatch_one_reviewer`][tick]). If so, the PR is escalated to human review.
 
 The gate is operator-configurable: `allow_touching = true` under `[defaults]` or
 `[repos."owner/name"]` in `~/.claude/pr-pipeline/config.toml` lets policy-editing
 PRs flow to auto-review anyway (the operator accepts that the review runs under
-instructions the PR itself supplies). Missing config, malformed TOML, or `false`
-keep the escalation — the gate fails closed. The packaged floor ships `false`,
-because an install inherits it and the opt-out is a trust decision only the
-operator can make; see the skill README's "Admission gate: reviewer policy
-files" section.
+instructions the PR itself supplies). The packaged floor ships `true` together
+with operator-only issue pickup; reviewer admission also requires the operator.
+An absent operator setting inherits the floor. A missing floor or mistyped
+`allow_touching` falls back to `false`; malformed operator TOML refuses startup.
+Set `false` to require human review for policy edits. Widening issue authors
+must restore the shipped `false` default in the same change; see the skill
+README's "Admission gate: reviewer policy files" section.
 
 The gate function `touches_review_policy` ([`pipeline.touches_review_policy`][pipeline])
 matches changed paths against:
@@ -237,8 +239,8 @@ install depth — `.claude/skills/` in a host repo, `skills/` in the pipeline's
 own repository, or a plugin root) — `_POLICY_PATH_SUFFIXES`
 ([`pipeline._POLICY_PATH_SUFFIXES`][pipeline]):
 - `skills/tick/config.toml` — the packaged floor, which is where the
-  gate's shipped default lives; a PR flipping its `allow_touching` is escalated
-  to a human rather than auto-reviewed (a merged flip would otherwise disable
+  gate's shipped default lives; while the gate is enabled, a PR flipping its
+  `allow_touching` is escalated to a human (a merged flip would otherwise disable
   the gate for every future policy-editing PR). The operator's own config is
   outside every repository, so no PR can edit it
 - `skills/tick/lib/pipeline.py` and `lib/tick.py` — the
@@ -581,8 +583,8 @@ writes ([reviewer sandbox rationale][design-sandbox-scope]), so the full bypass
 only — not the network and not out-of-process tools — and it still permits reads.
 A prompt-injected PR could induce the reviewer to read a secret and place it in a
 finding the tick then posts as a public PR comment. Full isolation would require
-running the reviewer in an externally sandboxed environment. Until then, two
-dispatch-time gates are the primary controls:
+running the reviewer in an externally sandboxed environment. Dispatch provides
+an author/repository trust gate and an optional policy-file gate:
 
 1. **Trusted-candidate gate** (`pipeline.trusted_review_candidate`,
    [`pipeline.trusted_review_candidate`][pipeline]): the tick only dispatches a review for
@@ -591,9 +593,9 @@ dispatch-time gates are the primary controls:
 2. **Policy-file gate** (`pipeline.touches_review_policy`,
    [`tick._dispatch_one_reviewer`][tick]): if the PR's diff modifies files that govern the
    reviewer's own behaviour (`CLAUDE.md`, `AGENTS.md`, review checklists — see
-   section 4), the PR is escalated to human review unless the operator opts out
-   via `allow_touching = true` in their own config (the packaged floor sets
-   `false`, per section 4). When active, it prevents a trusted author from
+   section 4), the PR is escalated to human review when the operator sets
+   `allow_touching = false` in their own config (the packaged floor sets
+   `true` with operator-only issue pickup, per section 4). When active, it prevents a trusted author from
    (accidentally or otherwise) auto-approving changes to the review policy
    itself.
 
@@ -641,11 +643,11 @@ its own session.
 | Env scrub | None (trusted local engine inherits the parent env) | scrub-dir (`HOME`/`CODEX_HOME` redirect) |
 | User config blocked | No | Yes (`--ignore-user-config`) |
 | Project rules blocked | No | Yes (`--ignore-rules`) |
-| Policy gate | N/A (implementers don't review) | Yes (`touches_review_policy`) |
+| Policy gate | N/A (implementers don't review) | Enabled by `allow_touching = false` (`touches_review_policy`) |
 | Worktree isolation | Yes | Yes |
 | Process group isolation | Yes (`start_new_session`) | Yes (`os.setpgrp()`) |
-| Trusted-candidate gate | N/A | Yes (`trusted_review_candidate`) |
-| Residual read+exfil risk | Accepted within the operator-equivalent local trust boundary | Accepted; trusted-candidate + policy gates are primary controls (policy gate opt-out available via `allow_touching`, see section 4) |
+| Trusted-candidate gate | Implementer: operator issue author (`trusted_issue_candidate`) | Yes (`trusted_review_candidate`) |
+| Residual read+exfil risk | Accepted within the operator-equivalent local trust boundary | Accepted; trusted-candidate gate is the primary control, with an optional policy gate (see section 4) |
 
 ## 6. Reviewer `--ignore-user-config` rationale
 
@@ -733,11 +735,19 @@ truthiness, so `verify_tools = []` for one repository beats a non-empty default 
 lists replace wholesale rather than merging, because an operator who cannot
 *narrow* a grant per target cannot use a permission list properly.
 
-The login the tick reviews under is the one each tick resolves, threaded into
-`dispatch_reviewers` rather than read from the import-time
-`TRUSTED_REVIEW_AUTHOR`. A `--loop` process outlives a config edit, and
-validating the file's current login while admitting candidates against a stale
-one would authorize under an identity the operator had already replaced.
+The login for issue pickup, reviewer admission, and issue cadence is the one
+each tick resolves and validates. Successful startup binds
+`TRUSTED_REVIEW_AUTHOR` for dispatch and the following loop observation, and
+also passes the login explicitly to `dispatch_reviewers`. The next tick adopts
+a later config edit. No issue author gate rereads config during a tick.
+
+`trusted_issue_candidate` requires an exact operator login and refuses missing
+or mistyped authors. Global dispatch and cadence read only that author's
+issues using bounded `--author` queries. Targeted issue reads include `author`
+and apply the same predicate. Known other authors are non-actionable; unreadable
+authors keep cadence warm while remaining refused at dispatch. Neither case
+grants custody or changes an issue label. A separate bounded number-only query
+reports excluded issues in the dispatch log; it does not feed cadence.
 
 `[operator] login` sits outside that layering deliberately: it is an identity,
 not a per-target setting, and a per-repository override would mean reviewing PRs

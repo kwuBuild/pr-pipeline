@@ -981,13 +981,24 @@ via `os.killpg`) so the wrapper and its engine child are stopped together.
 Post-spawn relabel failure uses the same group-aware death proof before archiving
 scratch or releasing marker custody; wrapper exit alone is insufficient.
 
+**Issue-author admission.** Only issues authored by the configured operator can
+dispatch. `trusted_issue_candidate` fails closed on missing or mistyped authors
+before an issue body is read. Issue queue reads use a bounded server-side
+`--author` filter, including cadence reads; a page of other authors' issues
+cannot starve eligible work or prevent quiescence. Targeted issue reads apply
+the same predicate. Unknown author metadata keeps cadence warm while dispatch
+refuses it. Skipped issues receive no relabel or escalation. One additional
+bounded number-only read logs excluded issues, as a lower bound when truncated;
+when both pages truncate only zero is provable, and unreadable or detectably
+inconsistent reads produce no count. The validated operator identity stays
+fixed through the tick and its following cadence observation.
+
 **Candidate-controlled review policy (trust boundary).** Because the reviewer runs
 inside the PR's checked-out tree, auto-loads that tree's `AGENTS.md`, and reads its
 `CLAUDE.md` and review checklists at its own discretion, a PR that *edits* any of those
 files would steer the very reviewer that decides whether it is promoted — untrusted
-input controlling its own validator. Reading policy from the head is safe only when
-the PR does not change it (then head == base for those files); when it does, dispatch
-must not auto-review under instructions the PR supplies. So dispatch checks the diff
+input controlling its own validator. An operator who requires unchanged review
+policy enables the gate with `allow_touching = false`. Dispatch then checks the diff
 (`git diff --name-only <base_sha>...<head_sha>`) for any reviewer-governing file
 (`CLAUDE.md` or `AGENTS.md` at any level, plus any path the operator listed under
 `checklist_paths`) and routes such a PR to `ai:needs-human-decision`
@@ -1014,10 +1025,12 @@ omission — which is the failure the hand-maintained alternative invites.
 This gate is operator-configurable: `allow_touching = true` under `[defaults]` or
 `[repos."owner/name"]` in the operator's own config lets policy-editing PRs flow to
 auto-review anyway (the operator accepts that the review runs under instructions the
-PR itself supplies); the config fails closed — missing, malformed, or `false` keep
-the escalation. The packaged floor ships `false`, so the gate is on unless an
-operator turns it off; see the skill README's "Admission gate: reviewer policy
-files" section.
+PR itself supplies). The packaged floor ships `true` together with operator-only
+issue pickup and reviewer admission. Absent operator settings inherit that
+floor; a missing floor or mistyped value falls back to `false`, and malformed
+operator TOML refuses startup. Widening issue authors must restore the shipped
+`false` default in the same change. See the skill README's "Admission gate:
+reviewer policy files" section.
 
 Note that the operator's config is not in any repository, so no PR can edit it.
 The packaged `config.toml` is, and it is still part of the policy path set for

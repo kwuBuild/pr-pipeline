@@ -1051,7 +1051,40 @@ def test_touches_review_policy_config_conservative_by_default(
     assert pipeline.touches_review_policy(["CLAUDE.md"]) is True
 
 
-# --- trusted_review_candidate (credential exposure boundary) ---
+# --- Issue and PR author trust (credential exposure boundary) ---
+
+
+def test_packaged_policy_default_allows_operator_authored_policy_edits(monkeypatch):
+    monkeypatch.setattr(
+        pipeline, "_PACKAGED_CONFIG_PATH", Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+    )
+    assert pipeline.resolve_config().allow_touching is True
+    assert pipeline.touches_review_policy(["AGENTS.md"]) is False
+
+
+@pytest.mark.parametrize(
+    "metadata,trusted_author,expected",
+    [
+        ({"author": {"login": "operator"}}, "operator", True),
+        ({"author": {"login": "stranger"}}, "operator", False),
+        ({"author": {"login": "Operator"}}, "operator", False),
+        (None, "operator", False),
+        ([], "operator", False),
+        ({}, "operator", False),
+        ({"author": None}, "operator", False),
+        ({"author": "operator"}, "operator", False),
+        ({"author": {}}, "operator", False),
+        ({"author": {"login": None}}, "operator", False),
+        ({"author": {"login": 123}}, "operator", False),
+        ({"author": {"login": ""}}, "", False),
+    ],
+)
+def test_trusted_issue_candidate_fails_closed(
+    metadata: object, trusted_author: str, expected: bool,
+) -> None:
+    assert pipeline.trusted_issue_candidate(
+        metadata, trusted_author=trusted_author,
+    ) is expected
 
 
 def test_trusted_review_candidate_accepts_owner_authored_same_repo_pr() -> None:
