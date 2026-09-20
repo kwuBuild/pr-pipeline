@@ -1243,7 +1243,7 @@ LOG_DIR=".claude/worktrees/.tick-log"
 # All claude-ds implementer dispatches
 jq 'select(.engine=="claude-ds")' "$LOG_DIR"/tick-*.jsonl
 
-# Engine usage breakdown across all ticks
+# Engine dispatch counts across all ticks (not token usage)
 jq -s '[.[] | select(.action=="launch")] | group_by(.engine) | map({engine: .[0].engine, count: length})' "$LOG_DIR"/tick-*.jsonl
 
 # Correlate dispatch → harvest for a single engine (cross-tick trace)
@@ -1265,6 +1265,81 @@ jq -s '.[] | select(.action=="retained_scratch" or .action=="archive_failed" or 
 ls "$LOG_DIR"/tick-$(date +%Y%m%d)*.jsonl 2>/dev/null | wc -l
 ```
 
+#### Per-attempt token usage
+
+`engine_result_summary.details.usage` (Claude implement/fix) and
+`reviewer_skill_observation.details.usage` (Codex review) contain the same small
+record: `status`, `source`, `token_unit: "tokens"`, `input_tokens`,
+`cached_input_tokens`, `output_tokens`, allowlisted `native` counters, and optional
+`reported_cost: {amount, unit: "USD", source}`. Missing or invalid numeric values are
+`null` in normalized fields and absent from `native`, never invented zeroes.
+`complete` means the three comparable counters are present and valid;
+`partial` preserves usable values with missing/invalid counters or degraded
+collection; `unavailable` means no usable token/cost report. Availability is
+independent of engine success. Explicit provider zeroes remain zeroes.
+Counters must be nonnegative integers within signed 64-bit range; cost must be
+finite, nonnegative and at most USD 1 trillion. Boolean and numeric-string
+values are rejected. Contradictory Codex subcounts also make usage partial.
+
+Provider semantics are deliberately retained:
+
+| Source | Input total | Subcounts and limits |
+| --- | --- | --- |
+| Claude terminal `result.usage` | `input_tokens + cache_read_input_tokens + cache_creation_input_tokens` | Cache reads are cached input. Nested cache-creation TTL counts are excluded because their parent already counts them. |
+| Codex terminal `turn.completed.usage` | `input_tokens` | `cached_input_tokens` and optional `cache_write_input_tokens` are input subcounts; optional `reasoning_output_tokens` is an output subcount. None is added again. |
+
+These are cumulative token-processing reports for the engine invocation/turn,
+not the size of its current context window. Claude's result `usage` describes
+the main agent loop; its `total_cost_usd` can include subagents and is a
+provider-reported estimate, not proof of invoiced charges or subscription quota
+consumption. Error results can underreport or report zero after a crash. This
+feature does not reconstruct missing usage or aggregate `modelUsage` on top of
+`usage`. See [Claude result accounting](https://code.claude.com/docs/en/agent-sdk/cost-tracking),
+[Claude cache semantics](https://platform.claude.com/docs/en/build-with-claude/prompt-caching),
+and the [Codex terminal schema](https://github.com/openai/codex/blob/main/codex-rs/exec/src/exec_events.rs).
+
+The Codex collector keeps the last terminal snapshot without summing events.
+Multiple terminals make usage `partial` because no stable event identity is
+available to aggregate them safely. Oversized/malformed events retain the
+existing stream bounds. Version 1 observations still supply skill evidence but
+have unavailable usage. Unknown counters, raw events and tool payloads are not
+copied. None of this evidence participates in completion validation or labels.
+
+Run this read-only query from the target repository for one row per retained
+stage/dispatch attempt. It selects one usage snapshot even if harvest logs it
+again on retry, and keeps separate dispatch IDs separate. Launches without
+usable terminal evidence appear as unavailable. Records lacking dispatch IDs
+cannot be assigned safely and are excluded. Log retention limits historical
+coverage; a missing log does not prove zero usage.
+
+<!-- engine-usage-report -->
+```bash
+LOG_DIR=".claude/worktrees/.tick-log"
+jq -s '
+  [.[] | select(.action | IN("launch", "model_resolved", "engine_result_summary", "reviewer_skill_observation"))
+       | select((.dispatch_id | type) == "string" and .dispatch_id != "" and .dispatch_id != "unknown")]
+  | group_by([.pr, .stage, .dispatch_id])[]
+  | select(any(.action != "model_resolved")) | sort_by(.ts) as $rows
+  | ($rows | map(select(.details.usage?))
+     | max_by([({unavailable: 0, partial: 1, complete: 2}[.details.usage.status] // 0), .ts])) as $evidence
+  | ($rows | map(select(.details.model? != null)) | last | .details) as $route
+  | {pr: $rows[0].pr, stage: $rows[0].stage, dispatch_id: $rows[0].dispatch_id,
+     engine: ($rows | map(select(.engine != "")) | last | .engine),
+     model: $route.model, effort: $route.effort,
+     reported_models: $evidence.details.reported_models,
+     engine_reported_turns: $evidence.details.num_turns,
+     usage: ($evidence.details.usage // {status: "unavailable", input_tokens: null, cached_input_tokens: null, output_tokens: null})}
+' "$LOG_DIR"/tick-*.jsonl
+```
+
+`model`/`effort` are dispatch-supplied settings when recorded; an inherited
+Claude default is `null`. `reported_models` lists bounded model identifiers
+actually present in Claude's terminal `modelUsage`, which may include more than
+the primary model. Missing provenance stays `null`, including when its dispatch
+log has expired. `engine_reported_turns` is Claude's `num_turns`, not a model/API
+call count; the latter is not reported here. Engine names identify the route
+(`claude`, `claude-ds`, `codex`); usage source names identify the CLI schema.
+
 ### 3. Worktree markers — `dispatch.json` (per-engine, authoritative)
 
 Every dispatched engine gets a `dispatch.json` in its worktree:
@@ -1279,14 +1354,15 @@ Every dispatched engine gets a `dispatch.json` in its worktree:
     dispatch.json      ← reviewer marker
     review.json        ← reviewer typed verdict (lands when engine exits)
     completion.json    ← engine wrapper exit proof
-    review-observation.json ← bounded sanitized skill-file evidence
+    review-observation.json ← bounded sanitized skill-file and usage evidence
     stderr.log         ← bounded sanitized wrapper diagnostics only
 ```
 
 The reviewer runs with `codex exec --json`. Its stdout is streamed through a bounded
 sanitizer; raw JSONL, prompts, model messages, commands, command output, and absolute
 paths are never retained. `review-observation.json` contains only normalized identities
-for `SKILL.md` paths referenced by successful command executions plus parser counters.
+for `SKILL.md` paths referenced by successful command executions, parser counters,
+and the optional terminal usage snapshot described above.
 HARVEST validates that exact shape and writes it to the tick log as
 `reviewer_skill_observation` before cleanup. This is evidence of successful command
 references, not a skill-file read or semantic invocation event: the current Codex CLI

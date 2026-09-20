@@ -545,7 +545,8 @@ equivalent explicit `Skill` tool event. Reviewer dispatch adds `--json`; the eng
 wrapper drains that stream and recognizes successful command-execution events that
 reference normalized repository or installed-plugin `SKILL.md` paths. It retains no
 raw event, prompt, model message, command, output, or absolute path. The strict bounded
-summary is logged at HARVEST as `reviewer_skill_observation`. Its
+summary (including a sanitized terminal token-usage snapshot in schema version 2)
+is logged at HARVEST as `reviewer_skill_observation`. Its
 `explicit_invocation_events_supported` field is `false`: `observed_skills` is
 successful command-reference evidence, not proof of a read or semantic invocation,
 and an empty list does not prove skills were unavailable. Missing or malformed
