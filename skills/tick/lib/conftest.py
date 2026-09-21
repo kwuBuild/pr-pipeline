@@ -117,7 +117,8 @@ def block_real_gh_mutations(
     failure handling, and — because this fixture short-circuits ``tick.gh`` —
     it would never reach that backstop either.
 
-    Reads return an empty success. They are inert, and the many tests that
+    Reads return an empty success except default-branch discovery, which reports
+    the suite's conventional ``main``. They are inert, and the many tests that
     drive a whole tick body only need the seam to not shell out. Note the
     read helpers ``gh_json``/``gh_text`` delegate to ``tick.gh``, so they are
     covered by this fixture too; a test that needs payloads from either
@@ -150,7 +151,12 @@ def block_real_gh_mutations(
                 "would let an unplanned mutation pass silently and would "
                 "never exercise that write's failure handling.",
             )
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+        stdout = (
+            '{"defaultBranchRef":{"name":"main"}}'
+            if args[:2] == ("repo", "view") and "defaultBranchRef" in args
+            else ""
+        )
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=stdout)
 
     monkeypatch.setattr(tick, "gh", refuse_real_gh)
 
@@ -578,7 +584,12 @@ def allow_escalation_comment(
                 "allow_escalation_comment only fabricates the escalation "
                 "comment; install a double for this write and assert on it.",
             )
-        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="")
+        stdout = (
+            '{"defaultBranchRef":{"name":"main"}}'
+            if args[:2] == ("repo", "view") and "defaultBranchRef" in args
+            else ""
+        )
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout=stdout)
 
     return side_effect
 

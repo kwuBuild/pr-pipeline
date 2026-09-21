@@ -11076,8 +11076,49 @@ def test_scan_marker_identities_rejects_non_finite_deadline(tmp_path: Path) -> N
 # --- HARVEST side effects (Step 9 — full implementations) ---
 
 
+@pytest.mark.parametrize("base_field", [
+    {}, {"base_ref": ""}, {"base_ref": "  "}, {"base_ref": None},
+])
+def test_implementer_harvest_requires_pinned_base_before_creating_pr(
+    base_field: dict[str, object], tmp_path: Path,
+) -> None:
+    """Recovery must retain evidence rather than guess a completed job's base."""
+    import tick
+
+    wt_dir = tmp_path / "issue-42"
+    wt_dir.mkdir()
+    (wt_dir / "result.json").write_text('{"result": "IMPLEMENTATION_COMPLETE"}')
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "dispatch_id": "impl-42-1", **base_field,
+    }))
+    log = mock.Mock()
+    with (
+        mock.patch("tick.gh_json", return_value=[]),
+        mock.patch(
+            "tick.gh_text", return_value="https://github.com/test/repo/pull/99",
+        ) as create,
+        mock.patch("tick.relabel") as relabel_mock,
+        mock.patch("tick._converge_pipeline_labels", return_value=True) as converge,
+        mock.patch("tick._bound_failed_harvest") as failed,
+    ):
+        tick._harvest_one_implementer({"pr_number": 42}, str(tmp_path), tick_log=log)
+
+    create.assert_not_called()
+    relabel_mock.assert_not_called()
+    converge.assert_not_called()
+    failed.assert_called_once()
+    assert (wt_dir / "dispatch.json").exists()
+    assert (wt_dir / "result.json").exists()
+    assert any(
+        "base_ref" in call.kwargs.get("reason", "")
+        for call in log.log.call_args_list
+    )
+
+
+@pytest.mark.parametrize("base_ref", ["main", "master", "release/stable"])
 def test_harvest_one_implementer_creates_pr_on_create_pr_action(
     tmp_path: Path,
+    base_ref: str,
 ) -> None:
     """_harvest_one_implementer creates the PR, relabels, and clears custody."""
     from tick import _harvest_one_implementer  # type: ignore[import-untyped]
@@ -11094,7 +11135,7 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
         "stage": "implement",
         "pr_number": 42,
         "deadline": 9999999999.0,
-        "base_ref": "main",
+        "base_ref": base_ref,
         "base_sha": "abc123",
         "head_sha": "",
         "pre_label": "ai:available",
@@ -11138,13 +11179,14 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
         result='{"result": "IMPLEMENTATION_COMPLETE", "exit_status": 0}',
         pre_label="ai:available",
     )
-    # PR created for branch agent/issue-42 against main
+    # PR creation uses the recorded dispatch base, without rediscovering it.
     assert gh_text_mock.call_count == 1
     pr_create_args = gh_text_mock.call_args[0]
     assert "pr" in pr_create_args
     assert "create" in pr_create_args
     assert "--head" in pr_create_args
     assert "agent/issue-42" in pr_create_args
+    assert pr_create_args[pr_create_args.index("--base") + 1] == base_ref
     assert pr_create_args[pr_create_args.index("--title") + 1] == (
         "feat: implement issue #42"
     )
@@ -11165,8 +11207,10 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
     assert not new_wt.exists()
 
 
+@pytest.mark.parametrize("base_ref", ["master", ""])
 def test_harvest_one_implementer_resumes_handoff_for_existing_pr(
     tmp_path: Path,
+    base_ref: str,
 ) -> None:
     """A retried handoff whose PR already exists must not run `gh pr create`
     again — it rediscovers the open PR and retries only the label steps."""
@@ -11181,7 +11225,7 @@ def test_harvest_one_implementer_resumes_handoff_for_existing_pr(
     )
     (wt_dir / "dispatch.json").write_text(json.dumps({
         "engine": "claude", "stage": "implement", "pr_number": 42,
-        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "abc123",
+        "deadline": 9999999999.0, "base_ref": base_ref, "base_sha": "abc123",
         "head_sha": "", "pre_label": "ai:available", "dispatch_id": "d-42",
         "pid": 12345, "start_time": 9999999999.0, "pgid": 12345,
     }))
@@ -11648,6 +11692,7 @@ def test_harvest_one_implementer_falls_back_when_pr_body_file_is_malformed(
     (wt_dir / "result.json").write_text(
         '{"result": "IMPLEMENTATION_COMPLETE"}',
     )
+    (wt_dir / "dispatch.json").write_text(json.dumps({"base_ref": "main"}))
     (wt_dir / ".pr-body.md").write_text(
         "Incomplete generated title\n\n## Summary\n- Missing required sections.\n",
     )
@@ -12479,6 +12524,7 @@ def test_harvest_one_implementer_skips_cleanup_on_gh_failure(
     (wt_dir / "result.json").write_text(
         '{"result": "IMPLEMENTATION_COMPLETE"}',
     )
+    (wt_dir / "dispatch.json").write_text(json.dumps({"base_ref": "main"}))
 
     decision: dict[str, object] = {
         "action": "harvest",
@@ -18003,6 +18049,111 @@ def test_dispatch_one_reviewer_policy_touch_relabel_failure_does_not_propagate(
                                 pre_label="ai:implemented",
                                 tick_log=None,
                             )
+
+
+@pytest.mark.parametrize("metadata", [
+    subprocess.CalledProcessError(1, "gh"),
+    ValueError("invalid JSON"),
+    None, [], {}, {"defaultBranchRef": None},
+    {"defaultBranchRef": {}}, {"defaultBranchRef": "master"},
+    {"defaultBranchRef": {"name": None}},
+    {"defaultBranchRef": {"name": ""}},
+    {"defaultBranchRef": {"name": "  "}},
+    {"defaultBranchRef": {"name": "--upload-pack=unexpected"}},
+])
+def test_implementer_dispatch_reports_unresolved_default_branch(
+    metadata: object, tmp_path: Path,
+) -> None:
+    """Unavailable metadata stops before fetching or launching, with context."""
+    import tick
+
+    with (
+        mock.patch("tick.gh_json") as lookup,
+        mock.patch("tick.git", return_value=str(tmp_path)) as git_mock,
+        mock.patch("tick._launch_claude_engine") as launch,
+        mock.patch("tick._escalate_dispatch_setup_failure") as escalate,
+    ):
+        if isinstance(metadata, Exception):
+            lookup.side_effect = metadata
+        else:
+            lookup.return_value = metadata
+        tick._dispatch_one_implementer(issue_number=77, issue_title="Default branch")
+
+    git_mock.assert_called_once_with("rev-parse", "--show-toplevel")
+    launch.assert_not_called()
+    assert not (Path(tick.WT_ROOT) / "issue-77").exists()
+    escalate.assert_called_once()
+    context = escalate.call_args.kwargs
+    assert context["entity"] == "issue"
+    assert context["number"] == 77
+    assert context["pre_label"] == "ai:available"
+    assert tick.TRUSTED_HEAD_REPO in context["reason"]
+    assert "default branch" in context["reason"]
+
+
+@pytest.mark.parametrize(("configured_base", "expected_base"), [
+    (None, "master"), ("", "master"), ("  ", "master"),
+    ("main", "main"), ("release/stable", "release/stable"),
+])
+def test_implementer_dispatch_uses_target_default_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    configured_base: str | None, expected_base: str,
+) -> None:
+    """A real fetch and checkout must choose master even when main exists."""
+    import tick
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_init_repo(repo)
+    monkeypatch.chdir(repo)
+    tick.git("branch", "-M", "main")
+    tick.git("checkout", "-b", "master")
+    tick.git("commit", "--allow-empty", "-m", "Default branch advances")
+    tick.git("checkout", "-b", "release/stable")
+    tick.git("commit", "--allow-empty", "-m", "Release branch advances")
+    expected_sha = tick.git("rev-parse", expected_base)
+    tick.git("checkout", "main")
+    bare = tmp_path / "server.git"
+    tick.git("clone", "--bare", str(repo), str(bare))
+    tick.git("--git-dir", str(bare), "symbolic-ref", "HEAD", "refs/heads/master")
+    tick.git("remote", "add", "upstream", str(bare))
+    monkeypatch.setattr(tick, "TARGET_REMOTE", "upstream")
+    monkeypatch.setattr(tick, "TRUSTED_HEAD_REPO", "elsewhere/project")
+    monkeypatch.setenv("GH_HOST", "other.example")
+    if configured_base is not None:
+        # Even a blank repository override must replace a non-blank default.
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            '[defaults]\nbase_ref = "main"\n'
+            f'[repos."elsewhere/project"]\nbase_ref = {json.dumps(configured_base)}\n',
+        )
+        monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    wt_dir = Path(tick.WT_ROOT) / "issue-77"
+
+    with (
+        mock.patch("tick.gh_json", return_value={
+            "defaultBranchRef": {"name": "master"},
+        }) as metadata,
+        mock.patch("tick._launch_claude_engine", return_value=mock.Mock(pid=12345)),
+        mock.patch("tick._publish_marker_or_revert", return_value=True),
+        mock.patch("tick.relabel"),
+    ):
+        if configured_base and configured_base.strip():
+            metadata.side_effect = AssertionError(
+                "explicit base must not need GitHub discovery",
+            )
+        tick._dispatch_one_implementer(issue_number=77, issue_title="Default branch")
+
+    assert tick.git("-C", str(wt_dir), "rev-parse", "HEAD") == expected_sha
+    marker = json.loads((wt_dir / "dispatch.json").read_text())
+    assert marker["base_ref"] == expected_base
+    assert marker["base_sha"] == marker["head_sha"] == expected_sha
+    if configured_base and configured_base.strip():
+        metadata.assert_not_called()
+    else:
+        metadata.assert_called_once_with(
+            "repo", "view", "github.com/elsewhere/project", "--json", "defaultBranchRef",
+        )
 
 
 def test_dispatch_one_implementer_creates_isolated_git_worktree(

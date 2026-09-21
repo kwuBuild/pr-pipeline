@@ -105,8 +105,8 @@ verify_tools = [
 ]
 
 # The base branch the implementer branches from and targets its PR at. Blank
-# means "resolve the target's default branch"; until that resolution lands the
-# dispatch falls back to `main`. A malformed value is a startup error naming the
+# means "resolve the target's default branch" from GitHub at issue dispatch.
+# Failed discovery stops dispatch. A malformed value is a startup error naming the
 # key — there is no conservative branch to fall back to, and silently picking
 # one would target a branch the operator never named.
 base_ref = ""

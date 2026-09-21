@@ -13,10 +13,10 @@ and permission-mode configuration (#15). Use the
 [architecture](../architecture.md) for stable design rationale.
 
 The target experience and schema below still include unfinished work: issue-author
-pickup (#14), default-branch discovery (#12), empty-verification evidence (#16),
-interactive setup (#18), and independence validation (#19). The
-[backlog index](https://github.com/kwuBuild/pr-pipeline/issues/39) and linked issues
-own live delivery status. Section 13 records historical review findings, not a
+pickup (#14), empty-verification evidence (#16), interactive setup (#18), and
+independence validation (#19). The
+[backlog index](https://github.com/kwuBuild/pr-pipeline/issues/39) and linked
+issues own live delivery status. Section 13 records historical review findings, not a
 second description of the current runtime.
 
 Revised across four reviews. Findings that survived verification against the
@@ -89,9 +89,9 @@ remote and cannot widen `[scan] repos`. It is not another config-file layer.
 
 This is the **target migration schema**, not a copyable statement of today's
 defaults. In particular, operator-only pickup and its `allow_touching` change
-belong to #14, shipping empty verification with durable evidence belongs to #16,
-and blank-base discovery belongs to #12. Setup (#18) consumes these contracts
-as they land. Current examples live in the operator guide linked above.
+belong to #14 and shipping empty verification with durable evidence belongs to
+#16. Setup (#18) consumes these contracts as they land. Current examples live in
+the operator guide linked above.
 
 Every per-target setting the runtime reads appears in `[defaults]` and may be
 overridden in `[repos."owner/name"]`. Nothing is per-target *only* in one of the
@@ -212,7 +212,6 @@ Remaining migration requirements:
   as a configuration error, rather than silently accepting an unusable override.
 - An intentionally empty `verify_tools` must dispatch with durable unverified
   evidence (#16, section 7). A malformed list must remain a startup error.
-- A blank `base_ref` is valid; resolving it to the target's default branch is #12.
 
 ### `status.sh` reads no config at all
 
@@ -480,11 +479,13 @@ must call these primitives for each repository it adds.
 
 ### Default branch
 
-`base_ref` is hardcoded to `"main"` at `tick.py:9608` for issue dispatch, with a
-matching default at `tick.py:6801`. A repository on `master`, `trunk`, or
-anything else either fails to fetch or branches from the wrong ref. The resolved
-value comes from the repository's actual default branch, with a
-`[repos."owner/name"] base_ref` override.
+Implemented: issue dispatch uses the resolved `base_ref` override, including
+`[repos."owner/name"] base_ref`. When blank, it queries the canonical target's
+actual GitHub default branch. A repository on `master`, `trunk`, or another
+branch therefore uses that branch even when a separate `main` exists. Discovery
+failure reports the target and stops dispatch instead of falling back. The
+dispatch marker pins the selected branch for PR creation; harvest never guesses
+a missing base from current configuration or a fresh default-branch lookup.
 
 ### Label provisioning — part of installation
 
