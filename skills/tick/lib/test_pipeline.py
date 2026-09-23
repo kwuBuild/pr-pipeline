@@ -3713,7 +3713,7 @@ def test_every_body_revision_state_the_tick_returns_renders_a_reason() -> None:
     side has to come here and state its reason.
     """
     assert set(pipeline._BODY_REVISION_INPUTS) == {
-        "ready", "conflict", "invalid", "unstamped", "unavailable",
+        "ready", "warning-only", "conflict", "invalid", "unstamped", "unavailable",
         "truncated", "stale-head", "closure-drift", "unreadable", "oversized",
     }
     assert all(

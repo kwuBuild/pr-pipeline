@@ -547,12 +547,10 @@ the remote name, and `status.sh`'s independent config parse.
 
 ## 7. `verify_tools` ships empty
 
-The packaged floor's `[defaults] verify_tools` currently ships `uv run pytest`,
-`uv run ruff`, `uv run pyright`, and an `npm --prefix frontend` entry. For a
-plugin pointed at a repository we have never seen, those are a guess about
-someone else's toolchain — and a wrong guess is worse than none, because the
-allowlist is an exact grant, so the engine silently cannot run the target's real
-tests. A Gradle or Maven repository gets nothing usable.
+The packaged floor's `[defaults] verify_tools` ships empty. The former Python
+and frontend defaults guessed a target's toolchain and granted nothing useful
+to repositories using another stack. Verification permissions belong to the
+operator's configuration for the target.
 
 The packaged layer therefore documents the *shape* with empty lists and no
 values. Per-repository values come from `[repos."owner/name"] verify_tools`,
@@ -565,8 +563,9 @@ This is the operator's call, made with the objection below already on the table.
 
 "Deliberately" carries weight. Per section 3, a `verify_tools` that failed to
 parse is a hard startup error, not an empty list — otherwise a typo inherits this
-decision and quietly produces an unverified PR. Empty means an operator wrote
-`[]`, or accepted it at setup on a route that passed the section 8 probe.
+decision and quietly produces an unverified PR. Empty includes the packaged
+floor or an explicit `[]` override. Setup's route probe remains section 8's
+separate contract; tick does not claim that setup has run.
 
 The objection, which is strong: the pipeline can spend money, push code, and
 award `ai:ready-for-human` with no operator-defined acceptance check having run.

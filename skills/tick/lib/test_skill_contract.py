@@ -120,6 +120,7 @@ _ENGINE_EXTRA_CLAUSES: dict[str, list[str]] = {
 _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
     "implementer": {
         "target_remote": "upstream",
+        "verification_context": "Operator grants are configured.",
         "issue_number": 1,
         "issue_title": "contract render",
         "issue_body": "body",
@@ -128,6 +129,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
     },
     "fixer": {
         "target_remote": "upstream",
+        "verification_context": "Operator grants are configured.",
         "pr_number": 2,
         "review_body": "findings",
         "pr_body": "## Summary",

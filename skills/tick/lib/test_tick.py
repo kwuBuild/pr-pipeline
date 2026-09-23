@@ -11176,6 +11176,7 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
 
     # Verify pipeline.harvest_implementation was called with result content
     harvest_impl.assert_called_once_with(
+        verification_unconfigured=False,
         result='{"result": "IMPLEMENTATION_COMPLETE", "exit_status": 0}',
         pre_label="ai:available",
     )
@@ -14119,6 +14120,7 @@ def test_harvest_one_fixer_rechecks_and_relabels(
                     )
 
     harvest_fix.assert_called_once_with(
+        verification_unconfigured=False,
         result='{"result": "FIXES_PUSHED_RECHECK_NEEDED", "exit_status": 0}',
         pre_label="ai:changes-requested",
         pinned_head="def",

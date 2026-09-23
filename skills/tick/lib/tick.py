@@ -744,12 +744,8 @@ _ENGINE_ALLOWED_TOOLS_BASE = (
 # commands needing approval are denied; under auto they reach the classifier.
 # A denial can still prevent verification and completion in either mode.
 #
-# The shipped Python stack lives in the packaged `config.toml` `[defaults]`, as
-# layer 1 of the resolution order and nowhere else. A second copy here would
-# have to be a *fallback*, and a fallback is precisely what an operator cannot
-# override: `verify_tools = []` under their `[repos."owner/name"]` is a
-# deliberate narrowing of a permission grant, and handing back the built-in
-# list instead would re-grant what they removed.
+# The packaged floor is empty. Grants come from operator-owned configuration;
+# dispatch pins that choice for launch, completion and durable PR evidence.
 
 
 def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
@@ -762,17 +758,11 @@ def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
     An empty resolved list therefore grants no verification command at all,
     which is what ``verify_tools = []`` says.
 
-    A ``verify_tools`` that is malformed — wrong shape, or an entry that is not
-    a permission body — never reaches here: the resolver reports it and startup
-    refuses, so neither a typo nor an all-invalid list can arrive as the
-    silently narrower grant, or as the unconfigured empty one.
-
-    The :data:`pipeline.VERIFY_TOOL_BODY_RE` check is repeated here anyway. It
-    is unreachable through a validated startup and exists for the one path that
-    is not: the config file is re-read per dispatch, so an edit landing between
-    startup and this call would otherwise template an unvalidated body straight
-    into ``--allowedTools``. That is the boundary this list *is*, so the last
-    word on it belongs next to the argv, not to a check that ran earlier.
+    Production dispatch validates the resolved configuration and passes its
+    own pinned tuple to the launcher. This helper serves callers without that
+    snapshot; the body check prevents them from serializing an unsafe grant.
+    It does not turn malformed configuration into a dispatchable empty grant:
+    startup and dispatch reject resolver errors before publishing custody.
 
     Args:
         repo: The resolved target as ``owner/name``, for its config layer.
@@ -843,13 +833,34 @@ def _fixer_push_permission(head_ref: str) -> str:
     return f"Bash(git push {TARGET_REMOTE} HEAD:refs/heads/{head_ref})"
 
 
-def _engine_allowed_tools(push_permission: str) -> str:
+def _verification_prompt(unconfigured: bool) -> str:
+    """Supply the engine's dispatch-bound completion obligation."""
+    if not unconfigured:
+        return (
+            "Operator verification grants are configured; "
+            "grants are not evidence of execution."
+        )
+    return (
+        pipeline.VERIFICATION_WARNING + "\n"
+        "Immediately before your successful completion sentinel, output the exact "
+        f"line {pipeline.VERIFICATION_WAIVER}. This acknowledges missing grants "
+        "only: still run every check prescribed by the target repository. Never "
+        "report absent, denied, or failed checks as passing. A denied or failed "
+        "required check still requires NEEDS_HUMAN_DECISION."
+    )
+
+
+def _engine_allowed_tools(
+    push_permission: str, verify_tools: tuple[str, ...] | None = None,
+) -> str:
     """Compose the engine allowlist from the base set plus one push permission.
 
     Args:
         push_permission: The stage-specific exact push permission
             (:func:`_implementer_push_permission` or
             :func:`_fixer_push_permission`).
+        verify_tools: Dispatch-pinned grants, already wrapped in Bash(...).
+            None resolves config for callers outside dispatch; () grants nothing.
 
     Returns:
         The full ``--allowedTools`` string for the engine launch.
@@ -861,10 +872,12 @@ def _engine_allowed_tools(push_permission: str) -> str:
     # argv for it: `--allowedTools` is whitespace-separated, and a stray double
     # space is a difference in the security boundary's serialization that no
     # test of the resolved list would catch.
+    if verify_tools is None:
+        verify_tools = _engine_verify_tools(TRUSTED_HEAD_REPO)
     return " ".join(
         part for part in (
             _ENGINE_ALLOWED_TOOLS_BASE,
-            *_engine_verify_tools(TRUSTED_HEAD_REPO),
+            *verify_tools,
             push_permission,
         ) if part
     )
@@ -912,6 +925,7 @@ def _launch_claude_engine(
     push_permission: str,
     model: str = "",
     permission_mode: str = "auto",
+    verify_tools: tuple[str, ...] | None = None,
 ) -> subprocess.Popen[bytes] | None:
     """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
@@ -939,6 +953,8 @@ def _launch_claude_engine(
         model: The model to pass to ``--model``. Empty (the default) omits
             the flag entirely so the CLI resolves the operator's own
             configured model — passing a value here overrides it.
+        verify_tools: Dispatch-pinned verification grants; never re-resolve a
+            provided empty tuple after recording the warning state.
         permission_mode: The ``--permission-mode`` value for the engine:
             ``"auto"`` (default) or ``"dontAsk"``. ``auto`` routes
             non-allowlisted tool calls through the auto-mode classifier while
@@ -971,7 +987,7 @@ def _launch_claude_engine(
     engine_cmd = [
         engine_bin, "-p",
         "--permission-mode", permission_mode,
-        "--allowedTools", _engine_allowed_tools(push_permission),
+        "--allowedTools", _engine_allowed_tools(push_permission, verify_tools),
         "--output-format", "stream-json",
         "--verbose",
     ]
@@ -6236,8 +6252,21 @@ def _harvest_one_reviewer(
     cleanup_scratch(wt_dir)
 
 
-def _fallback_implementation_pr_metadata(issue_number: int) -> tuple[str, str]:
+def _fallback_implementation_pr_metadata(
+    issue_number: int, *, verification_unconfigured: bool = False,
+) -> tuple[str, str]:
     """Return the generated PR title/body used when engine metadata is absent."""
+    verification = (
+        "- Verification grants were unconfigured; the engine acknowledged the waiver.\n\n"
+        "## Test plan\n"
+        "- [ ] Inspect the engine's reported checks; the pipeline has no command-execution evidence."
+        if verification_unconfigured else
+        "- The implementer completed the repository verification commands.\n\n"
+        "## Test plan\n"
+        "- [x] The repository's verification commands (tests, lint, type check) "
+        "passed before the implementer pushed; the pipeline does not record "
+        "which commands those were."
+    )
     return (
         f"feat: implement issue #{issue_number}",
         (
@@ -6252,11 +6281,7 @@ def _fallback_implementation_pr_metadata(issue_number: int) -> tuple[str, str]:
             "- Structure: see the commit diff for the implementation flow.\n"
             "- Impact: the linked issue's requested behavior is now implemented.\n\n"
             "## Test coverage\n"
-            "- The implementer completed the repository verification commands.\n\n"
-            "## Test plan\n"
-            "- [x] The repository's verification commands (tests, lint, type "
-            "check) passed before the implementer pushed; the pipeline does not "
-            "record which commands those were."
+            f"{verification}"
         ),
     )
 
@@ -6488,6 +6513,7 @@ def _fixer_body_revision(
     current_head: str,
     provenance: PRBodyProvenance | None,
     live_body: str | None,
+    verification_unconfigured: bool = False,
 ) -> tuple[str, str]:
     """Classify the fixer's candidate replacement PR body.
 
@@ -6508,10 +6534,13 @@ def _fixer_body_revision(
             ``None`` on a marker that pinned nothing.
         live_body: The PR's body point-read at harvest, or ``None`` when it
             could not be read.
+        verification_unconfigured: Include the dispatch's warning even if the
+            fixer supplies no replacement; retain historical warnings too.
 
     Returns:
         ``(state, body)``. ``state`` is ``""`` when there is no candidate at all
-        (the normal case), ``"ready"`` when ``body`` may be published, and
+        (the normal case), ``"ready"`` for a publishable fixer replacement,
+        ``"warning-only"`` for the controller's warning prefix, and
         otherwise the reason it may not: ``"unreadable"``, ``"oversized"``,
         ``"unstamped"``, ``"stale-head"``, ``"unavailable"``, ``"truncated"``,
         ``"closure-drift"``, ``"invalid"``, or ``"conflict"``. Each names its own
@@ -6527,7 +6556,21 @@ def _fixer_body_revision(
             # Bounded read, not a bounded check: see _PR_BODY_REVISION_READ_LIMIT.
             text = fh.read(_PR_BODY_REVISION_READ_LIMIT + 1)
     except FileNotFoundError:
-        return "", ""
+        if not verification_unconfigured and not (
+            live_body is not None and pipeline.VERIFICATION_WARNING in live_body
+        ):
+            return "", ""
+        if live_body is None:
+            return "unavailable", ""
+        # This is a controller prefix to the freshly read live body, not an
+        # engine rewrite. It needs no issue closure or dispatch-time story
+        # provenance; the write gate rechecks this exact live snapshot.
+        body = _normalized_pr_body(pipeline.with_verification_warning(
+            live_body, required=True,
+        ))
+        if len(body) > _PR_BODY_MAX_CHARS or len(body.encode()) > _PR_BODY_MAX_CHARS:
+            return "oversized", ""
+        return "warning-only", body
     except (OSError, UnicodeDecodeError):
         # Present but unusable is not the same as absent: report it rather than
         # letting an unreadable revision pass as "the fixer wrote nothing".
@@ -6562,6 +6605,10 @@ def _fixer_body_revision(
     body = _normalized_pr_body("\n".join(lines[2:]))
     if not body:
         return "invalid", ""
+    body = _normalized_pr_body(pipeline.with_verification_warning(
+        body, required=verification_unconfigured
+        or pipeline.VERIFICATION_WARNING in live_body,
+    ))
     # Both readings of the limit, because GitHub documents neither: see
     # _PR_BODY_MAX_CHARS. Reported as its own cause rather than as a section
     # failure — the body may be perfectly well formed and simply too long.
@@ -6639,11 +6686,14 @@ def _read_engine_pr_metadata(
 def _implementation_pr_create_args(
     wt_dir: str,
     issue_number: int,
+    *,
+    verification_unconfigured: bool = False,
 ) -> list[str]:
     """Build ``gh pr create`` title/body args for an implementer harvest."""
     metadata = _read_engine_pr_metadata(wt_dir, issue_number)
     if metadata is not None:
         title, body = metadata
+        body = pipeline.with_verification_warning(body, required=verification_unconfigured)
         body_file = os.path.join(wt_dir, _PR_CREATE_BODY_FILE)
         try:
             with open(body_file, "w", encoding="utf-8") as fh:
@@ -6653,7 +6703,10 @@ def _implementation_pr_create_args(
         else:
             return ["--title", title, "--body-file", body_file]
 
-    title, body = _fallback_implementation_pr_metadata(issue_number)
+    title, body = _fallback_implementation_pr_metadata(
+        issue_number, verification_unconfigured=verification_unconfigured,
+    )
+    body = pipeline.with_verification_warning(body, required=verification_unconfigured)
     return ["--title", title, "--body", body]
 
 
@@ -6855,6 +6908,7 @@ def _harvest_one_implementer(
     base_ref = ""
     dispatch_id = ""
     engine = "claude"
+    verification_unconfigured = False
     if os.path.isfile(dispatch_path):
         try:
             with open(dispatch_path) as fh:
@@ -6862,6 +6916,7 @@ def _harvest_one_implementer(
         except (OSError, json.JSONDecodeError):
             marker = None
         if isinstance(marker, dict):
+            verification_unconfigured = marker.get("verification_unconfigured") is True
             mp = marker.get("pre_label")
             if isinstance(mp, str):
                 pre_label = mp
@@ -6877,6 +6932,7 @@ def _harvest_one_implementer(
 
     try:
         harvest_result = pipeline.harvest_implementation(
+            verification_unconfigured=verification_unconfigured,
             result=result_raw,
             pre_label=pre_label,
         )
@@ -6983,7 +7039,9 @@ def _harvest_one_implementer(
                 )
             skip_cleanup = True
         if not skip_cleanup and not existing_pr.isdigit():
-            pr_metadata_args = _implementation_pr_create_args(wt_dir, n)
+            pr_metadata_args = _implementation_pr_create_args(
+                wt_dir, n, verification_unconfigured=verification_unconfigured,
+            )
             try:
                 pr_url = gh_text(
                     "pr", "create",
@@ -7018,20 +7076,31 @@ def _harvest_one_implementer(
                 # corrupt that state, so only a label-less PR gets the initial
                 # handoff label; an unreadable label set retries next tick.
                 needs_handoff_label = True
-                if existing_pr.isdigit():
+                if existing_pr.isdigit() or verification_unconfigured:
                     try:
-                        resumed_labels = _pipeline_labels(
-                            gh_json(
-                                "pr", "view", str(pr_number),
-                                "--json", "labels",
-                            ),
+                        handoff = gh_json(
+                            "pr", "view", str(pr_number), "--json",
+                            "labels,headRefOid,body" if verification_unconfigured
+                            else "labels",
                         )
                     except (subprocess.CalledProcessError, ValueError):
-                        resumed_labels = None
+                        handoff = None
+                    resumed_labels = _pipeline_labels(handoff)
                     if resumed_labels is None:
                         skip_cleanup = True
                     else:
                         needs_handoff_label = not resumed_labels
+                        if verification_unconfigured:
+                            warning_state = _ensure_implementation_warning(
+                                number=pr_number, snapshot=handoff,
+                                wt_root=wt_root, dispatch_id=dispatch_id,
+                                tick_log=tick_log,
+                            )
+                            if warning_state == "held":
+                                # A PR hold cannot spend the issue's retry
+                                # budget toward an escalation that releases it.
+                                return
+                            skip_cleanup = warning_state != "clear"
                 if not skip_cleanup and needs_handoff_label:
                     try:
                         relabel("pr", pr_number, "", pipeline.LABEL_IMPLEMENTED)
@@ -7322,6 +7391,9 @@ def _pr_body_write_authority(
     candidate: str,
     dispatch_id: str,
     tick_log: TickLog | None,
+    expected_body: str | None = None,
+    stage: str = "fix",
+    expected_labels: set[str] | None = None,
 ) -> str:
     """Re-check, at the write itself, everything the replacement assumed.
 
@@ -7343,18 +7415,22 @@ def _pr_body_write_authority(
         number: The PR about to be edited.
         expected_head: The head OID the classification read returned and the
             candidate was validated against.
-        provenance: What dispatch pinned about the body. ``None`` cannot reach
-            here from a ``ready`` classification, and is taken as
-            ``"unreadable"`` rather than narrowed away, so a future caller that
-            gets the pairing wrong withholds the write instead of publishing a
-            body nothing was checked against.
+        provenance: What dispatch pinned about an engine-rewritten body.
+            A controller-only warning prefix instead supplies expected_body;
+            without either source, the write is unreadable and withheld.
         candidate: The normalised replacement body.
         dispatch_id: The run's dispatch id, for the log.
         tick_log: Tick log handle, or ``None``.
+        expected_body: For a controller-only warning prefix, the live body
+            read at harvest. This authorizes only that addition; engine rewrites
+            continue to require dispatch-time provenance.
+        stage: Harvest stage owning the write and its diagnostic record.
+        expected_labels: Implementation handoff's workflow snapshot. A changed
+            set requires a retry so a progressed PR keeps its current label.
 
     Returns:
         ``"clear"`` to proceed, or the reason not to: ``"held"`` (a human hold
-        arrived), ``"drifted"`` (head or body moved under the classification),
+        arrived), ``"drifted"`` (head, body, or expected labels changed),
         or ``"unreadable"`` (the authority could not be established).
     """
     try:
@@ -7364,10 +7440,16 @@ def _pr_body_write_authority(
     except (subprocess.CalledProcessError, ValueError):
         live = None
     labels = _pipeline_labels(live)
-    if not isinstance(live, dict) or labels is None or provenance is None:
+    expected_digest = (
+        _pr_body_digest(_normalized_pr_body(expected_body))
+        if expected_body is not None else provenance.digest if provenance else None
+    )
+    if not isinstance(live, dict) or labels is None or expected_digest is None:
         verdict = "unreadable"
     elif pipeline.HOLD_LABELS & set(labels):
         verdict = "held"
+    elif expected_labels is not None and set(labels) != expected_labels:
+        verdict = "drifted"
     else:
         head = live.get("headRefOid")
         body = live.get("body")
@@ -7378,20 +7460,21 @@ def _pr_body_write_authority(
         else:
             # Same two accepted states as the classification, for the same
             # reasons: the body this run already published (a retry), and the
-            # body dispatch pinned (nothing moved). Anything else moved under
-            # the candidate and is not this write's to overwrite.
+            # body dispatch pinned (or the live snapshot before a controller
+            # prefix). Anything else moved under the candidate and is not this
+            # write's to overwrite.
             current = _normalized_pr_body(body)
             verdict = (
                 "clear"
                 if current == candidate
-                or _pr_body_digest(current) == provenance.digest
+                or _pr_body_digest(current) == expected_digest
                 else "drifted"
             )
     if verdict != "clear" and tick_log:
         tick_log.log(
             pr=number,
             phase="harvest",
-            stage=_FIXER_CONFIG.stage,
+            stage=stage,
             action="pr_body_revision_withheld",
             reason=verdict,
             dispatch_id=dispatch_id,
@@ -7399,15 +7482,51 @@ def _pr_body_write_authority(
     return verdict
 
 
-def _apply_fixer_body_revision(
+def _ensure_implementation_warning(
+    *,
+    number: int,
+    snapshot: object,
+    wt_root: str,
+    dispatch_id: str,
+    tick_log: TickLog | None,
+) -> str:
+    """Require visible evidence on created and rediscovered PRs before handoff."""
+    labels = _pipeline_labels(snapshot)
+    if not isinstance(snapshot, dict) or labels is None:
+        return "unreadable"
+    if pipeline.HOLD_LABELS & set(labels):
+        return "held"
+    head, body = snapshot.get("headRefOid"), snapshot.get("body")
+    if not isinstance(head, str) or not head or not isinstance(body, str):
+        return "unreadable"
+    candidate = _normalized_pr_body(pipeline.with_verification_warning(body, required=True))
+    if len(candidate) > _PR_BODY_MAX_CHARS or len(candidate.encode()) > _PR_BODY_MAX_CHARS:
+        return "oversized"
+    authority = _pr_body_write_authority(
+        number=number, expected_head=head, provenance=None, candidate=candidate,
+        expected_body=body, dispatch_id=dispatch_id, tick_log=tick_log,
+        stage="implement", expected_labels=set(labels),
+    )
+    if authority != "clear":
+        return authority
+    if candidate == _normalized_pr_body(body):
+        return "clear"
+    return "clear" if _apply_pr_body_revision(
+        number=number, wt_root=wt_root, body=candidate,
+        dispatch_id=dispatch_id, tick_log=tick_log, stage="implement",
+    ) else "write-failed"
+
+
+def _apply_pr_body_revision(
     *,
     number: int,
     wt_root: str,
     body: str,
     dispatch_id: str,
     tick_log: TickLog | None,
+    stage: str = "fix",
 ) -> bool:
-    """Replace one PR's body with a validated fixer revision.
+    """Publish a guarded engine revision or controller warning prefix.
 
     The first of the two GitHub writes a fixer harvest makes, and it sits next
     to the second for that reason. The body file is staged under the
@@ -7426,6 +7545,7 @@ def _apply_fixer_body_revision(
         body: The validated replacement body.
         dispatch_id: The run's dispatch id, for the failure log.
         tick_log: Tick log handle, or ``None``.
+        stage: Harvest stage owning the write and its diagnostic record.
 
     Returns:
         ``True`` when the live body is the revision; ``False`` when the write
@@ -7443,7 +7563,7 @@ def _apply_fixer_body_revision(
         _log_side_effect_failure(
             tick_log=tick_log,
             number=number,
-            stage=_FIXER_CONFIG.stage,
+            stage=stage,
             dispatch_id=dispatch_id,
             operation="gh pr edit --body-file",
             exc=exc,
@@ -7454,7 +7574,7 @@ def _apply_fixer_body_revision(
             tick_log.log(
                 pr=number,
                 phase="harvest",
-                stage=_FIXER_CONFIG.stage,
+                stage=stage,
                 action="side_effect_failed",
                 reason="staging the PR body revision failed",
                 dispatch_id=dispatch_id,
@@ -7777,6 +7897,7 @@ def _harvest_one_fixer(
     pre_label: str = _FIXER_CONFIG.pre_label
     dispatch_id = ""
     engine = "claude"
+    verification_unconfigured = False
     pinned_head = ""
     review_sha256 = ""
     provenance: PRBodyProvenance | None = None
@@ -7787,6 +7908,7 @@ def _harvest_one_fixer(
         except (OSError, json.JSONDecodeError):
             marker = None
         if isinstance(marker, dict):
+            verification_unconfigured = marker.get("verification_unconfigured") is True
             mp = marker.get("pre_label")
             if isinstance(mp, str):
                 pre_label = mp
@@ -7850,10 +7972,12 @@ def _harvest_one_fixer(
         current_head=current_head,
         provenance=provenance,
         live_body=live_body,
+        verification_unconfigured=verification_unconfigured,
     )
 
     try:
         harvest_result = pipeline.harvest_fix(
+            verification_unconfigured=verification_unconfigured,
             result=result_raw,
             pre_label=pre_label,
             pinned_head=pinned_head,
@@ -7955,12 +8079,28 @@ def _harvest_one_fixer(
     # posted over a body that was not. Only a run that reached re-review
     # publishes one: an escalated or requeued run may not have pushed the head
     # the replacement describes.
-    if harvest_action == "recheck" and revision_state == "ready":
+    if (
+        harvest_action == "recheck" and (
+            verification_unconfigured
+            or (live_body is not None and pipeline.VERIFICATION_WARNING in live_body)
+        )
+        and revision_state not in {"ready", "warning-only"}
+        and (live_body is None or not pipeline.has_visible_verification_warning(live_body))
+    ):
+        # Never publish a successful revision without its durable warning.
+        # Missing/conflicting/oversized body evidence retains custody for retry.
+        _bound_failed_harvest(
+            n, "pr", _FIXER_CONFIG.in_flight_label, wt_dir, attempts,
+            tick_log, _FIXER_CONFIG.stage,
+        )
+        return
+    if harvest_action == "recheck" and revision_state in {"ready", "warning-only"}:
         authority = _pr_body_write_authority(
             number=n,
             expected_head=current_head,
             provenance=provenance,
             candidate=revision_body,
+            expected_body=live_body if revision_state == "warning-only" else None,
             dispatch_id=dispatch_id,
             tick_log=tick_log,
         )
@@ -7984,7 +8124,7 @@ def _harvest_one_fixer(
             return
         # A failed edit retains the label and the scratch, the same bound the
         # failed comment post below takes.
-        if not _apply_fixer_body_revision(
+        if not _apply_pr_body_revision(
             number=n,
             wt_root=wt_root,
             body=revision_body,
@@ -9868,6 +10008,18 @@ def _dispatch_one_implementer(
         )
         return
 
+    config = pipeline.resolve_config(TRUSTED_HEAD_REPO)
+    if config.errors:
+        _escalate_dispatch_setup_failure(
+            entity="issue", number=issue_number,
+            pre_label=pipeline.LABEL_AVAILABLE, stage="implement",
+            reason="invalid dispatch configuration: " + "; ".join(config.errors),
+            engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
+        )
+        return
+    verify_tools = tuple(f"Bash({entry})" for entry in config.verify_tools)
+    verification_unconfigured = not verify_tools
+
     deadline = time.time() + IMPLEMENTER_TIMEOUT
 
     # For implementers, head_sha is set to base_sha: the engine branches
@@ -9885,6 +10037,7 @@ def _dispatch_one_implementer(
         "pre_label": pipeline.LABEL_AVAILABLE,
         "dispatch_id": dispatch_id,
         "state": "launching",
+        "verification_unconfigured": verification_unconfigured,
     }
     try:
         pipeline.atomic_write(
@@ -9903,8 +10056,15 @@ def _dispatch_one_implementer(
         return
 
     # Build the implementer prompt.
+    if verification_unconfigured and tick_log:
+        tick_log.log(
+            pr=issue_number, phase="dispatch", stage="implement",
+            action="verification_unconfigured", reason=pipeline.VERIFICATION_WARNING,
+            dispatch_id=dispatch_id, engine=impl_engine,
+        )
     prompt = load_prompt_template("implementer", {
         "target_remote": TARGET_REMOTE,
+        "verification_context": _verification_prompt(verification_unconfigured),
         "issue_number": issue_number,
         "issue_title": issue_title,
         "issue_body": issue_body,
@@ -9950,6 +10110,7 @@ def _dispatch_one_implementer(
         push_permission=_implementer_push_permission(),
         model=model,
         permission_mode=permission_mode,
+        verify_tools=verify_tools,
     )
     if proc is None:
         # Launch failed — clean up and leave label unchanged.
@@ -10538,6 +10699,18 @@ def _dispatch_one_fixer(
     ):
         return
 
+    config = pipeline.resolve_config(TRUSTED_HEAD_REPO)
+    if config.errors:
+        _escalate_dispatch_setup_failure(
+            entity="pr", number=pr_number,
+            pre_label=pipeline.LABEL_CHANGES_REQUESTED, stage="fix",
+            reason="invalid dispatch configuration: " + "; ".join(config.errors),
+            engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
+        )
+        return
+    verify_tools = tuple(f"Bash({entry})" for entry in config.verify_tools)
+    verification_unconfigured = not verify_tools
+
     deadline = time.time() + FIXER_TIMEOUT
 
     lease_marker: dict[str, object] = {
@@ -10551,6 +10724,7 @@ def _dispatch_one_fixer(
         "pre_label": pipeline.LABEL_CHANGES_REQUESTED,
         "dispatch_id": dispatch_id,
         "state": "launching",
+        "verification_unconfigured": verification_unconfigured,
     }
     # PR-body revision provenance, pinned here because none of it can be
     # recovered at harvest: by then the body may already have been replaced (by
@@ -10620,8 +10794,15 @@ def _dispatch_one_fixer(
     # budget is the harvest's own publish limit, so neither can drift into a
     # prompt that names a doc the engine cannot open or a size the comment
     # truncates.
+    if verification_unconfigured and tick_log:
+        tick_log.log(
+            pr=pr_number, phase="dispatch", stage="fix",
+            action="verification_unconfigured", reason=pipeline.VERIFICATION_WARNING,
+            dispatch_id=dispatch_id, engine=impl_engine,
+        )
     prompt = load_prompt_template("fixer", {
         "target_remote": TARGET_REMOTE,
+        "verification_context": _verification_prompt(verification_unconfigured),
         "pr_number": pr_number,
         "review_body": review_body,
         "pr_body": pr_context.body_block,
@@ -10672,6 +10853,7 @@ def _dispatch_one_fixer(
         push_permission=_fixer_push_permission(head_ref),
         model=model,
         permission_mode=permission_mode,
+        verify_tools=verify_tools,
     )
     if proc is None:
         cleanup_scratch(wt_dir)

@@ -2665,10 +2665,57 @@ def _transient_engine_result_decision(
     }
 
 
+# Stable, controller-owned evidence. It describes grants, never test execution.
+VERIFICATION_WAIVER = "VERIFICATION_UNCONFIGURED_WAIVER"
+VERIFICATION_WARNING = (
+    "Verification unconfigured: `verify_tools` was empty for at least one "
+    "implementation or fixer dispatch. Waiver: no operator-defined verification "
+    "grants; this is not evidence that checks passed."
+)
+
+
+def has_visible_verification_warning(body: str) -> bool:
+    """Recognize only the controller's standalone opening paragraph.
+
+    A matching line later in arbitrary Markdown may be hidden by an HTML
+    comment, a collapsed details element, or an unclosed fence. The first
+    paragraph has no preceding engine-controlled rendering context.
+    """
+    normalized = body.replace("\r\n", "\n")
+    return normalized.strip() == VERIFICATION_WARNING or normalized.startswith(
+        VERIFICATION_WARNING + "\n\n",
+    )
+
+
+def with_verification_warning(body: str, *, required: bool) -> str:
+    """Prepend visible controller evidence, preserving engine-authored bytes."""
+    if required and not has_visible_verification_warning(body):
+        return VERIFICATION_WARNING + "\n\n" + body
+    return body
+
+
+def has_verification_waiver(result_obj: object, sentinel: str) -> bool:
+    """Require an explicit waiver line immediately before the success sentinel."""
+    text = result_obj.get("result") if isinstance(result_obj, dict) else None
+    if not isinstance(text, str):
+        return False
+    # Match the same last token occurrence that supplies the outcome, never an
+    # earlier example or an abandoned success claim. It must occupy its line.
+    before, token, after = text.rpartition(sentinel)
+    preceding, newline, indent = before.rpartition("\n")
+    lines = [line.strip() for line in preceding.splitlines() if line.strip()]
+    return bool(
+        token and newline and not indent.strip()
+        and not after.split("\n", 1)[0].strip()
+        and lines and lines[-1] == VERIFICATION_WAIVER
+    )
+
+
 def decide_implementation_harvest(
     *,
     result_obj: object,
     pre_label: str,
+    verification_unconfigured: bool = False,
 ) -> dict[str, object]:
     """Decide the outcome of a finished implementer engine.
 
@@ -2683,6 +2730,8 @@ def decide_implementation_harvest(
         pre_label: The issue's label before dispatch (``ai:available``); used
             for the escalation label revert target (informational, not acted on
             directly since escalation always goes to ``ai:needs-human-decision``).
+        verification_unconfigured: Whether dispatch pinned empty verification
+            grants; successful completion then requires an explicit waiver.
 
     Returns:
         A decision mapping with keys: ``action`` (``"create_pr"`` |
@@ -2691,6 +2740,12 @@ def decide_implementation_harvest(
         extracted sentinel string, or ``None``).
     """
     sentinel = parse_implementation_result(result_obj)
+    if (
+        sentinel == SENTINEL_IMPL_COMPLETE and verification_unconfigured
+        and not has_verification_waiver(result_obj, sentinel)
+    ):
+        return {"action": "escalate", "sentinel": sentinel,
+                "label": LABEL_NEEDS_HUMAN, "reason": "missing verification waiver"}
     if sentinel == SENTINEL_IMPL_COMPLETE:
         return {"action": "create_pr", "sentinel": sentinel, "label": ""}
     if sentinel is None:
@@ -2767,6 +2822,7 @@ def _neutralize_comment_markup(text: str) -> str:
 # replacement — renders no line at all, so the common run keeps its old comment.
 _BODY_REVISION_NOTES = {
     "ready": "replaced with the fixer's revision",
+    "warning-only": "preserved the visible controller-owned verification warning",
     "not-applied": (
         "left unchanged — the fixer offered a revision, but this run did not "
         "reach re-review"
@@ -3246,7 +3302,9 @@ def _fix_escalation_reason(sentinel: str | None, *, head_advanced: bool) -> str:
     )
 
 
-def _all_reported_findings_no_change(result_obj: object) -> bool:
+def _all_reported_findings_no_change(
+    result_obj: object, *, verification_unconfigured: bool = False,
+) -> bool:
     """Require a complete, bounded Finding/Decision/Reason block per finding.
 
     Parse the full result, never the truncated publication excerpt. Extra prose,
@@ -3261,6 +3319,10 @@ def _all_reported_findings_no_change(result_obj: object) -> bool:
     if not isinstance(raw, str):
         return False
     summary, separator, tail = raw.strip().rpartition(SENTINEL_NO_CHANGES)
+    if verification_unconfigured:
+        # The completion validator has already checked this final waiver. It
+        # is protocol evidence, not part of the bounded finding summary.
+        summary = summary.rstrip().removesuffix(VERIFICATION_WAIVER).rstrip()
     if not separator or tail.strip() or len(summary.strip()) > FIX_SUMMARY_BUDGET:
         return False
     lines = [line.strip() for line in summary.splitlines() if line.strip()]
@@ -3283,6 +3345,7 @@ def decide_fix_harvest(
     body_revision: str = "",
     dispatch_id: str = "",
     review_sha256: str = "",
+    verification_unconfigured: bool = False,
 ) -> dict[str, object]:
     """Decide the outcome of a finished fixer engine.
 
@@ -3336,6 +3399,8 @@ def decide_fix_harvest(
             so duplicate publication cannot mint another review round.
         review_sha256: SHA-256 of the original review handed to the fixer;
             required on the no-change path so re-review can check coverage.
+        verification_unconfigured: Whether dispatch pinned empty verification
+            grants; successful completion then requires an explicit waiver.
 
     Returns:
         A decision mapping with keys: ``action`` (``"recheck"`` |
@@ -3352,7 +3417,9 @@ def decide_fix_harvest(
     )
     no_change_round = ""
 
-    def terminal(action: str, label: str, *, head_advanced: bool) -> dict[str, object]:
+    def terminal(
+        action: str, label: str, *, head_advanced: bool, reason: str = "",
+    ) -> dict[str, object]:
         """Build a terminal fixer decision with its PR-comment payload."""
         decision: dict[str, object] = {
             "action": action,
@@ -3366,7 +3433,7 @@ def decide_fix_harvest(
                 pinned_head=pinned_head,
                 current_head=current_head,
                 escalation_reason=(
-                    _fix_escalation_reason(sentinel, head_advanced=head_advanced)
+                    reason or _fix_escalation_reason(sentinel, head_advanced=head_advanced)
                     if action == "escalate"
                     else ""
                 ),
@@ -3380,8 +3447,8 @@ def decide_fix_harvest(
                 # "what was fixed" is what the next reviewer is landing on.
                 engine_report=report,
                 body_revision=(
-                    "not-applied"
-                    if body_revision == "ready" and action != "recheck"
+                    "" if body_revision == "warning-only" and action != "recheck"
+                    else "not-applied" if body_revision == "ready" and action != "recheck"
                     else body_revision
                 ),
                 no_change_round=no_change_round,
@@ -3392,11 +3459,23 @@ def decide_fix_harvest(
             decision["head_advanced"] = False
         return decision
 
+    if (
+        sentinel in {SENTINEL_FIXES_PUSHED, SENTINEL_NO_CHANGES}
+        and verification_unconfigured
+        and not has_verification_waiver(result_obj, sentinel)
+    ):
+        return terminal(
+            "escalate", LABEL_NEEDS_HUMAN, head_advanced=True,
+            reason="empty verification grants require an explicit completion waiver, "
+                   "but the engine did not provide one.",
+        )
     if sentinel == SENTINEL_NO_CHANGES:
         if (
             dispatch_id and pinned_head and pinned_head == current_head
             and re.fullmatch(r"[a-f0-9]{64}", review_sha256)
-            and _all_reported_findings_no_change(result_obj)
+            and _all_reported_findings_no_change(
+                result_obj, verification_unconfigured=verification_unconfigured,
+            )
         ):
             no_change_round = hashlib.sha256(dispatch_id.encode()).hexdigest()
             return terminal("recheck", LABEL_REVISED, head_advanced=False)
@@ -3484,7 +3563,7 @@ _REQUIRED_MARKER_FIELDS = frozenset(
 # rather than partially trusted.
 _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
     {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
-     "fix_round", "review_sha256"}
+     "fix_round", "review_sha256", "verification_unconfigured"}
 )
 
 # Pipeline stages a dispatch marker may legitimately record. A marker for an
@@ -3721,6 +3800,14 @@ def valid_marker(
     # a single key that is either wholly valid or absent. The block as a whole
     # stays optional, which is the real legacy case: markers written before the
     # revision path omit it, as do PRs whose body pins no closure.
+    # Optional for pre-upgrade markers. A present value must be a boolean,
+    # never a truthy string/number that can invent or suppress the waiver gate.
+    if "verification_unconfigured" in obj:
+        if (
+            stage not in {"implement", "fix"}
+            or not isinstance(obj["verification_unconfigured"], bool)
+        ):
+            return False
     if "pr_body" in obj:
         if stage != "fix" or not valid_pr_body_provenance(obj.get("pr_body")):
             return False
@@ -4105,12 +4192,15 @@ def harvest_implementation(
     *,
     result: str,
     pre_label: str = LABEL_AVAILABLE,
+    verification_unconfigured: bool = False,
 ) -> HarvestResult:
     """Decide the outcome of a finished implementer engine.
 
     Args:
         result: JSON string of ``result.json`` contents.
         pre_label: The issue's label before dispatch.
+        verification_unconfigured: Whether dispatch pinned empty verification
+            grants; successful completion then requires an explicit waiver.
 
     Returns:
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
@@ -4118,6 +4208,7 @@ def harvest_implementation(
     result_obj = _load_json_string(result, None)
     decision = decide_implementation_harvest(
         result_obj=result_obj,
+        verification_unconfigured=verification_unconfigured,
         pre_label=pre_label,
     )
     return decision  # type: ignore[return-value]
@@ -4132,6 +4223,7 @@ def harvest_fix(
     body_revision: str = "",
     dispatch_id: str = "",
     review_sha256: str = "",
+    verification_unconfigured: bool = False,
 ) -> HarvestResult:
     """Decide the outcome of a finished fixer engine.
 
@@ -4147,6 +4239,8 @@ def harvest_fix(
             replacement PR body; empty when it offered none.
         dispatch_id: Fixer marker identity required for no-change completion.
         review_sha256: Original review fingerprint pinned at fixer dispatch.
+        verification_unconfigured: Whether dispatch pinned empty verification
+            grants; successful completion then requires an explicit waiver.
 
     Returns:
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
@@ -4154,6 +4248,7 @@ def harvest_fix(
     result_obj = _load_json_string(result, None)
     decision = decide_fix_harvest(
         result_obj=result_obj,
+        verification_unconfigured=verification_unconfigured,
         pre_label=pre_label,
         pinned_head=pinned_head,
         current_head=current_head,
