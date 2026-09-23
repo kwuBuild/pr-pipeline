@@ -8,6 +8,8 @@ out cleanly. Run with::
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import datetime as dt
 import io
 import json
@@ -16,9 +18,10 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 from unittest import mock
 from zoneinfo import ZoneInfo
 
@@ -4729,37 +4732,6 @@ def test_reconcile_engine_noop_when_no_items(tmp_path: Path) -> None:
         results, ok = reconcile_engine(config, tick_log=None, target=None,
                                        wt_root=str(tmp_path))
     assert results == []
-    assert ok is True
-
-
-def test_reconcile_engine_skips_closed_pr(tmp_path: Path) -> None:
-    """reconcile_engine() cleans up scratch for closed/merged PRs."""
-    from pipeline import StageConfig  # type: ignore[attr-defined]
-    from tick import reconcile_engine  # type: ignore[import-untyped]
-
-    config = StageConfig(
-        stage="review",
-        worktree_prefix="pr",
-        attempts_key_prefix="",
-        result_file="review.json",
-        in_flight_label="ai:reviewing",
-        pre_label="ai:implemented",
-        strict_dual_label=True,
-        tick_abort_on_enum_failure=True,
-    )
-    with mock.patch("tick.gh_text") as gh_text:
-        # PR 42 exists and is MERGED
-        gh_text.side_effect = lambda *args: {
-            ("pr", "list", "--label", "ai:reviewing", "--state", "open",
-             "--json", "number", "-q", ".[].number"): "42",
-        }.get(tuple(args), "")
-        with mock.patch("tick.gh_json") as gh_json:
-            gh_json.return_value = {"state": "MERGED"}
-            with mock.patch("tick.cleanup_scratch"):
-                results, ok = reconcile_engine(config, tick_log=None, target=None,
-                                               wt_root=str(tmp_path))
-    # Should call cleanup for the closed PR (via _reconcile_one)
-    # Note: cleanup now happens inside _reconcile_one via the identity check
     assert ok is True
 
 
@@ -21839,6 +21811,2037 @@ def test_liveness_guard_hides_a_real_foreign_process_start_time() -> None:
         reap(proc)
 
 
+# --- Reconcile behavior characterization (issue #28) ---
+#
+# Test-only hardening of _reconcile_one(), _execute_reconcile_actions(), and
+# reconcile_engine(). Every row pins the same five CURRENT observable facts:
+# the final decision, the ordered side-effect calls, the global dispatch gate
+# (reconcile_ok), the durable attempt-counter state, and the surviving durable
+# artifact.
+#
+# Every row therefore drives the production pair a harvester drives —
+# reconcile_engine() then _execute_reconcile_actions(), via
+# drive_reconcile_stage(), or the whole harvest_reviewers() flow that runs that
+# pair itself — because a row that stops at _reconcile_one() sees neither of
+# the last two facts as production leaves them: it reads an intermediate
+# attempt counter the executor is about to change, and there is no dispatch
+# gate at that point to read at all.
+#
+# No test asserts a "desired" correction; where the current behavior looks
+# wrong it is pinned as-is, and the correction belongs in a separate issue.
+
+
+@pytest.mark.parametrize("abort_on_enum_failure", [False, True])
+def test_reconcile_engine_enumeration_failure_sets_dispatch_gate(
+    tmp_path: Path, abort_on_enum_failure: bool,
+) -> None:
+    """A failed authoritative label enumeration gates DISPATCH via reconcile_ok.
+
+    ``tick_abort_on_enum_failure`` changes the shape of the failure inside
+    ``reconcile_engine()`` but not the outcome at the harvester boundary:
+
+    - ``False`` — the pass returns ``reconcile_ok=False`` and the local-marker
+      union still reconciles each on-disk item, which fails closed to
+      ``noop/unknown`` against the same broken gh channel; the executor leaves
+      those alone.
+    - ``True`` — ``reconcile_engine()`` re-raises before any local item is
+      touched.
+
+    The raise is not a tick crash. All three ``reconcile_engine()`` callers
+    wrap it in ``except subprocess.CalledProcessError: return False``, so both
+    shapes reach ``tick_body`` as a harvester returning ``False`` — the same
+    gated DISPATCH. That is asserted here through the real ``harvest_*`` entry
+    points rather than described, so a caller that stopped catching would fail
+    this row. In neither case is any scratch cleaned up or any counter changed.
+    """
+    import tick  # type: ignore[import-untyped]
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review", tick_abort_on_enum_failure=abort_on_enum_failure)
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text("{}")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)  # 42-attempts == "3"
+
+    with mock.patch(
+        "tick.gh_text",
+        side_effect=subprocess.CalledProcessError(1, "gh"),
+    ):
+        if abort_on_enum_failure:
+            with pytest.raises(subprocess.CalledProcessError):
+                drive_reconcile_stage(config, tmp_path, attempts)
+            # The production caller for the abort=True config swallows the
+            # raise into the same gate value the abort=False shape returns.
+            assert tick.harvest_reviewers(wt_root=str(tmp_path)) is False
+        else:
+            results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+            # The local-marker union still runs: the on-disk item reconciles
+            # fail-closed against the same broken gh channel.
+            assert results == [
+                {"action": "noop", "label": "", "kill": False,
+                 "identity": "unknown", "pr_number": 42},
+            ]
+            assert ok is False
+            # Both abort=False engine types reach the gate the same way.
+            assert tick.harvest_implementers(wt_root=str(tmp_path)) is False
+            assert tick.harvest_fixers(wt_root=str(tmp_path)) is False
+    assert wt_dir.exists()
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+@pytest.mark.parametrize(
+    ("failure_shape", "expected_log"),
+    [
+        ("state_read_error", ["gh_failed"]),
+        ("unknown_state", ["gh_failed"]),
+        ("labels_transport_error", ["gh_failed"]),
+        # A payload that parsed but carried no usable labels is the one shape
+        # that fails closed silently: no transport error was raised, so nothing
+        # reaches the gh_failed branch and the operator's grep finds no record
+        # of the item being skipped.
+        ("malformed_labels", []),
+    ],
+)
+def test_reconcile_engine_open_row_failures_fail_closed(
+    tmp_path: Path, failure_shape: str, expected_log: list[str],
+) -> None:
+    """OPEN-lifecycle read failures return noop/unknown with no side effects.
+
+    The authoritative-read failure rows — the top-level lifecycle read, an
+    unknown lifecycle state, the label transport read, and a malformed label
+    payload — each fail closed against a fully valid local marker: decision
+    ``noop`` with identity ``unknown``, no kill/cleanup/archive, the attempt
+    counter untouched, the scratch and marker surviving, and ``reconcile_ok``
+    staying True after the executor has seen the row too (these are per-item
+    read failures, not enumeration failures, so they do not gate dispatch).
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 2147483646,
+        "start_time": 1.0, "pgid": 2147483646,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)  # 42-attempts == "3"
+
+    def gh_text_side_effect(*args: str) -> str:
+        if args[:2] == ("pr", "list"):
+            return "42"
+        if failure_shape == "state_read_error":
+            raise subprocess.CalledProcessError(1, "gh")
+        if failure_shape == "unknown_state":
+            return "BOGUS"
+        return "OPEN"
+
+    def gh_json_side_effect(*args: str) -> object:
+        if failure_shape == "labels_transport_error":
+            raise subprocess.CalledProcessError(1, "gh")
+        if failure_shape == "malformed_labels":
+            return [{"name": "ai:reviewing"}]  # a list, not a labels dict
+        return {"labels": []}
+
+    with mock.patch("tick.gh_text", side_effect=gh_text_side_effect):
+        with mock.patch("tick.gh_json", side_effect=gh_json_side_effect):
+            with mock.patch("tick._remove_worktree") as remove_wt:
+                with mock.patch("tick.cleanup_scratch") as cleanup:
+                    with mock.patch("tick.gh") as gh_mock:
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [
+        {"action": "noop", "label": "", "kill": False,
+         "identity": "unknown", "pr_number": 42},
+    ]
+    remove_wt.assert_not_called()
+    cleanup.assert_not_called()
+    gh_mock.assert_not_called()
+    assert ok is True
+    assert reconcile_log_actions(tmp_path) == expected_log
+    assert (tmp_path / "42-attempts").read_text() == "3"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "marker_content",
+    [
+        "{not json",
+        json.dumps({  # a valid fix-stage marker — wrong stage for this pass
+            "engine": "claude", "stage": "fix", "pr_number": 42,
+            "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+            "head_sha": "h1", "pre_label": "ai:changes-requested",
+            "dispatch_id": "d-1", "pid": 99999, "start_time": 999999.0,
+            "pgid": 99999,
+        }),
+    ],
+)
+def test_reconcile_stage_terminal_held_corrupt_or_sibling_marker_leaves(
+    tmp_path: Path, marker_content: str,
+) -> None:
+    """A terminal item under a human hold leaves a corrupt/sibling marker alone.
+
+    The held gate re-reads the marker; when it cannot validate for this stage
+    (unparseable bytes, or a valid marker belonging to the sibling stage) the
+    item returns ``leave`` with identity ``corrupt``. The executor has no
+    branch for ``leave``, so the pass ends with custody retained: no kill, no
+    cleanup, no remote mutation, ``reconcile_ok`` True, the counter unchanged,
+    and the marker bytes surviving byte for byte.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(marker_content)
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:blocked"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._remove_worktree") as remove_wt:
+                    with mock.patch("tick.cleanup_scratch") as cleanup:
+                        with mock.patch(
+                            "process_control.terminate_process_group",
+                        ) as kill:
+                            results, ok = drive_reconcile_stage(
+                                config, tmp_path, attempts,
+                            )
+
+    assert results == [{
+        "action": "leave", "label": "", "kill": False,
+        "identity": "corrupt", "pr_number": 42,
+    }]
+    assert ok is True
+    kill.assert_not_called()
+    remove_wt.assert_not_called()
+    cleanup.assert_not_called()
+    assert remote.mutations == []
+    assert remote.labels == ["ai:blocked"]
+    # Nothing is logged: the retain is silent, so the only trace of the pass is
+    # the marker still sitting there. Pinned, not endorsed — the terminal held
+    # gate returns before any of _reconcile_one()'s log branches.
+    assert reconcile_log_actions(tmp_path) == []
+    assert (wt_dir / "dispatch.json").read_text() == marker_content
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+@pytest.mark.parametrize("held", [False, True])
+def test_reconcile_stage_terminal_launching_lease_retains_custody(
+    tmp_path: Path, held: bool,
+) -> None:
+    """A terminal valid launching lease is never archived or released.
+
+    A lease records no process identity, so a terminal item cannot prove its
+    engine dead. Without a hold the item returns ``noop`` with identity
+    ``unknown`` (unknown_identity_retain); under a hold the held gate returns
+    ``leave`` — the terminal held path has no ``no_process_recorded`` release,
+    so the scratch and its admission slot stay put either way. Both rows pin
+    the same durability facts through the executor: no archive, no kill, no
+    release label, no remote mutation, ``reconcile_ok`` True, counter
+    untouched, lease bytes surviving.
+
+    The decision is asserted as a whole dict, not field by field. The absence
+    of ``release_label`` here is load-bearing — it is what keeps the executor
+    off the release branch — and a subset assertion cannot state an absence:
+    it passes just as happily over a decision that grew the key. Key sets on
+    this seam do move (``held_result_outcome`` and ``hold_label`` were added to
+    the sibling cleanup decisions), so "no other keys" is part of the
+    behavior being recorded.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 1.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "state": "launching",
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:blocked"] if held else [])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._remove_worktree") as remove_wt:
+                    with mock.patch("tick.cleanup_scratch") as cleanup:
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [{
+        "action": "leave" if held else "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    remove_wt.assert_not_called()
+    cleanup.assert_not_called()
+    assert remote.mutations == []
+    # The only side effect either row has. The two params are distinguishable
+    # solely by this line, and it is the operator's record of an admission slot
+    # that stays consumed — `unknown_identity_retain` and
+    # `workflow_hold_retained` are both in DEBUG.md's grep list.
+    assert reconcile_log_actions(tmp_path) == [
+        "workflow_hold_retained" if held else "unknown_identity_retain",
+    ]
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_terminal_no_hold_kill_failure_retains_scratch(
+    tmp_path: Path,
+) -> None:
+    """A failed terminal kill retains the marker for a future re-kill.
+
+    Even with identity proven ``matched``, a failed group kill must not delete
+    the scratch: a zombie engine with no marker is untrackable. The attempt
+    counter survives too — the clear gate sits inside the archive-success
+    branch — and the row reaches the executor as a ``noop``, so a failed kill
+    does not gate dispatch and mutates nothing remote.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 4242,
+        "start_time": 1000.0, "pgid": 4242,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "process_control.get_process_start_time", return_value=1000.0,
+                ):
+                    with mock.patch(
+                        "process_control.terminate_process_group",
+                        return_value=False,
+                    ) as kill:
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "matched", "pr_number": 42,
+    }]
+    assert ok is True
+    kill.assert_called_once_with(
+        4242, grace_seconds=5, kill_grace_seconds=2, poll_interval=0.5,
+    )
+    assert reconcile_log_actions(tmp_path) == ["kill_failed", "cleanup_skipped"]
+    assert remote.mutations == []
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_terminal_archive_failure_retains_scratch_and_counter(
+    tmp_path: Path,
+) -> None:
+    """A terminal inline archive failure retains the scratch and the counter.
+
+    The attempt clear sits inside the archive-success branch: when the archive
+    move fails, custody stays local and the durable retry state must survive
+    for the next tick. The failure is inline in ``_reconcile_one()`` and the row
+    it returns is a plain ``noop``, so — unlike the executor's own archive
+    failure — it carries no signal to the dispatch gate: ``reconcile_ok`` stays
+    True and DISPATCH runs. Pinned as-is.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 4242,
+        "start_time": 1000.0, "pgid": 4242,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "process_control.get_process_start_time", return_value=1000.0,
+                ):
+                    with mock.patch(
+                        "process_control.terminate_process_group",
+                        return_value=True,
+                    ):
+                        with mock.patch(
+                            "tick._archive_and_cleanup_scratch",
+                            return_value=False,
+                        ) as archive:
+                            results, ok = drive_reconcile_stage(
+                                config, tmp_path, attempts,
+                            )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "matched", "pr_number": 42,
+    }]
+    assert ok is True
+    archive.assert_called_once()
+    assert remote.mutations == []
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_hung_kill_failure_downgrades_to_leave(tmp_path: Path) -> None:
+    """A failed hung kill downgrades kill_escalate to leave (zombie guard).
+
+    ``reconcile_dispatch`` returns ``kill_escalate`` for an in-custody hung
+    engine; when the kill fails, the destructive action is downgraded to
+    ``leave`` so the next tick re-attempts instead of archiving a live
+    zombie's scratch. The downgrade is what the executor then sees: no
+    escalation mutation is attempted, the counter is not cleared, and
+    ``reconcile_ok`` stays True — the item is simply left for the next tick.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 1.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 4242,
+        "start_time": 1000.0, "pgid": 4242,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "process_control.get_process_start_time", return_value=1000.0,
+                ):
+                    with mock.patch(
+                        "process_control.pid_is_alive", return_value=True,
+                    ):
+                        with mock.patch(
+                            "tick._terminate_marker_engine", return_value=False,
+                        ) as terminate:
+                            results, ok = drive_reconcile_stage(
+                                config, tmp_path, attempts,
+                            )
+
+    assert results == [{
+        "action": "leave", "kill": False, "label": "",
+        "identity": "matched", "pr_number": 42,
+    }]
+    assert ok is True
+    terminate.assert_called_once()
+    # The log records the decision the pass *started*, not the one it returned:
+    # `kill_escalate` is written before the failed kill downgrades the decision
+    # to `leave`, so an operator grepping for escalations sees one that never
+    # happened. Pinned as-is.
+    assert reconcile_log_actions(tmp_path) == ["kill_escalate"]
+    assert remote.mutations == []
+    assert remote.labels == ["ai:reviewing"]
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
+@pytest.mark.parametrize(
+    ("marker_setup", "expected_identity", "expected_marker_reads"),
+    [
+        ("corrupt_bytes", "corrupt", 1),
+        ("unreadable_file", "corrupt", 1),
+        ("not_a_regular_file", "unknown", 0),
+    ],
+)
+def test_reconcile_stage_open_hold_with_unusable_marker_leaves(
+    tmp_path: Path,
+    marker_setup: str,
+    expected_identity: str,
+    expected_marker_reads: int,
+) -> None:
+    """An OPEN item under a hold fails closed on every unusable marker shape.
+
+    The hold gate keeps workflow custody with the human, and the identity it
+    reports is decided by ``os.path.isfile(marker_path)`` at the return — not
+    by whether the read succeeded. That splits three shapes the names alone
+    would conflate, so each is pinned with the number of times the marker file
+    is actually opened:
+
+    - ``corrupt_bytes`` — a regular file holding unparseable JSON. Opened
+      once, ``json.JSONDecodeError``, isfile True → ``corrupt``.
+    - ``unreadable_file`` — a regular file the process cannot read (mode 000).
+      Opened once, ``PermissionError``, isfile True → ``corrupt``. The bytes
+      are a *valid* review marker, so if the process could read it the row
+      would take the live-marker branch and this assertion would fail loudly
+      rather than pass for the wrong reason (which is what would happen under
+      a root test runner).
+    - ``not_a_regular_file`` — a directory at the marker path. ``os.path.isfile``
+      is False, so the file is never opened at all and the same gate at the
+      return yields ``unknown``. No ``OSError`` is involved anywhere in this
+      shape.
+
+    All three: ``leave``, no kill, no archive, no remote mutation, no counter
+    change, ``reconcile_ok`` True, and the artifact surviving.
+
+    The hold coexists with ``ai:reviewing`` because that is what makes the
+    ``not_a_regular_file`` variant reachable at all: a directory named
+    ``dispatch.json`` fails ``os.path.isfile``, so the local-marker union skips
+    it and the authoritative in-flight label query is the only enumerator.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    marker_path = wt_dir / "dispatch.json"
+    if marker_setup == "corrupt_bytes":
+        marker_path.write_text("{not json")
+    elif marker_setup == "unreadable_file":
+        write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-unreadable")
+        marker_path.chmod(0o000)
+    else:
+        marker_path.mkdir()  # not a regular file: os.path.isfile() is False
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    marker_reads: list[str] = []
+    real_open = open
+
+    def record_marker_read(path: object, *args: object, **kwargs: object) -> Any:
+        if str(path) == str(marker_path):
+            marker_reads.append(str(path))
+        return real_open(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:blocked"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("builtins.open", side_effect=record_marker_read):
+                    with mock.patch("tick._remove_worktree") as remove_wt:
+                        with mock.patch("tick.cleanup_scratch") as cleanup:
+                            with mock.patch(
+                                "process_control.terminate_process_group",
+                            ) as kill:
+                                results, ok = drive_reconcile_stage(
+                                    config, tmp_path, attempts,
+                                )
+
+    assert results == [{
+        "action": "leave", "label": "", "kill": False,
+        "identity": expected_identity, "pr_number": 42,
+    }]
+    assert ok is True
+    # Which shapes reach the read at all, and which are decided by isfile alone.
+    assert len(marker_reads) == expected_marker_reads
+    kill.assert_not_called()
+    remove_wt.assert_not_called()
+    cleanup.assert_not_called()
+    assert remote.mutations == []
+    assert remote.labels == ["ai:reviewing", "ai:blocked"]
+    # Silent for all three shapes. The OPEN hold gate returns ahead of every
+    # log branch, so an unusable marker under a hold leaves no operator-visible
+    # trace at all — not even the `workflow_hold_retained` line DEBUG.md tells
+    # operators to grep for when an item stops moving. Pinned, not corrected.
+    assert reconcile_log_actions(tmp_path) == []
+    assert (tmp_path / "42-attempts").read_text() == "3"
+    assert marker_path.exists()
+
+
+def test_reconcile_stage_dual_label_failed_row_escalates_and_archives(
+    tmp_path: Path,
+) -> None:
+    """A hold-free dual label over a failed engine escalates to a human.
+
+    ``failed`` is not a recoverable dual-label state, so the strict-dual
+    branch converges the full remote set to ``ai:needs-human-decision``,
+    clears the attempt counter once convergence lands, and archives the
+    scratch — in the order converge → clear → archive, asserted as an ordered
+    call log rather than inferred from the end state, which both orderings
+    produce. All three happen inside ``_reconcile_one()``, which then returns a
+    bare ``noop``: the executor has nothing left to do and ``reconcile_ok``
+    stays True.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "d-1", "pid": 2147483646,
+        "start_time": 1.0, "pgid": 2147483646,
+    }))
+    (wt_dir / "completion.json").write_text(json.dumps({
+        "dispatch_id": "d-1", "exit_status": 1, "wrapper_pid": 2147483646,
+        "start_time": 1.0, "result_valid": False, "error_class": "engine_error",
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:implemented"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with recorded_escalation_order(attempts) as calls:
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    # The counter is cleared behind the landed convergence and ahead of the
+    # archive move that deletes the marker the count belongs to.
+    assert calls == ["converge:True", "attempts_clear", "archive"]
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", "ai:needs-human-decision",
+        "--remove-label", "ai:reviewing",
+        "--remove-label", "ai:implemented",
+    )]
+    assert remote.labels == ["ai:needs-human-decision"]
+    assert not (tmp_path / "42-attempts").exists()
+    archive = tmp_path / ".harvest-evidence" / "pr-42-d-1" / "scratch"
+    assert (archive / "dispatch.json").is_file()
+    assert (archive / "completion.json").is_file()
+
+
+def test_reconcile_stage_dual_label_launching_row_escalates_and_archives(
+    tmp_path: Path,
+) -> None:
+    """A hold-free dual label over a launching lease escalates to a human.
+
+    ``launching`` is not a recoverable dual-label state either: the lease is
+    proven custody whose paid child's liveness is unprovable, so the strict
+    branch converges to ``ai:needs-human-decision``, clears the counter, and
+    archives the scratch — all inside ``_reconcile_one()``, leaving the
+    executor a ``noop`` and ``reconcile_ok`` True.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 1.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "state": "launching",
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:implemented"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", "ai:needs-human-decision",
+        "--remove-label", "ai:reviewing",
+        "--remove-label", "ai:implemented",
+    )]
+    assert remote.labels == ["ai:needs-human-decision"]
+    assert not (tmp_path / "42-attempts").exists()
+    archive = tmp_path / ".harvest-evidence" / "pr-42-review-42" / "scratch"
+    assert (archive / "dispatch.json").is_file()
+
+
+@pytest.mark.parametrize("escalation_lands", [True, False])
+def test_reconcile_stage_dual_label_hung_row_kills_then_escalates(
+    tmp_path: Path, escalation_lands: bool,
+) -> None:
+    """A hold-free dual label over a hung engine kills it, then escalates.
+
+    ``hung`` IS a recoverable dual-label state, so no convergence runs inside
+    ``_reconcile_one()``: the item reconciles through the ordinary path, the
+    proven-identity engine is killed, and ``kill_escalate`` is handed to the
+    executor — which is where the escalation and the counter are actually
+    decided. Both outcomes of that single mutation are pinned, because the
+    intermediate counter value ``_reconcile_one()`` leaves behind is not the
+    one production ends on:
+
+    - the escalation lands → the full remote set converges to
+      ``ai:needs-human-decision``, the counter is cleared, ``reconcile_ok``
+      stays True;
+    - the ``gh edit`` exits zero without applying → the read-back catches it,
+      the counter keeps its value, and ``reconcile_ok`` drops to False so
+      DISPATCH is skipped.
+
+    Either way ``kill_escalate`` archives nothing: the marker and scratch
+    survive for the operator the escalation just summoned.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 4242,
+        "start_time": 1000.0, "pgid": 4242,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(
+        ["ai:reviewing", "ai:implemented"], mutations_land=escalation_lands,
+    )
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "tick._classify_marker",
+                    return_value=("hung", "matched", True),
+                ):
+                    with mock.patch(
+                        "tick._terminate_marker_engine", return_value=True,
+                    ) as terminate:
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [{
+        "action": "kill_escalate", "kill": True,
+        "label": "ai:needs-human-decision",
+        "identity": "matched", "pr_number": 42,
+    }]
+    terminate.assert_called_once()
+    # The escalation is one mutation, attempted by the executor — not by the
+    # recoverable dual-label branch, which never converges.
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", "ai:needs-human-decision",
+        "--remove-label", "ai:reviewing",
+        "--remove-label", "ai:implemented",
+    )]
+    assert ok is escalation_lands
+    if escalation_lands:
+        assert remote.labels == ["ai:needs-human-decision"]
+        assert not (tmp_path / "42-attempts").exists()
+    else:
+        assert remote.labels == ["ai:reviewing", "ai:implemented"]
+        assert (tmp_path / "42-attempts").read_text() == "3"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_dual_label_escalation_archive_failure_keeps_scratch_after_clear(
+    tmp_path: Path,
+) -> None:
+    """A dual-label archive failure retains the scratch but not the counter.
+
+    In the strict-dual branch the counter is cleared the moment convergence
+    lands — BEFORE the archive move, asserted as an ordered call log — so an
+    archive failure keeps the scratch durable for the next tick while the
+    retry counter is already reset. The row still returns a bare ``noop``, so
+    ``reconcile_ok`` stays True and DISPATCH runs over a retained scratch whose
+    item is already escalated. Pins the current ordering as-is.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-archfail")
+    (wt_dir / "recovery.txt").write_text("dual-label archive-failure evidence")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:implemented"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with recorded_escalation_order(
+                    attempts, archive_lands=False,
+                ) as calls:
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.labels == ["ai:needs-human-decision"]
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (wt_dir / "recovery.txt").read_text() == "dual-label archive-failure evidence"
+    # The clear landed with convergence, ahead of the failed archive move.
+    assert calls == ["converge:True", "attempts_clear", "archive"]
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_stage_strict_dual_label_disabled_returns_noop_without_side_effects(
+    tmp_path: Path,
+) -> None:
+    """With strict_dual_label=False the dual-label escalation is a pure noop.
+
+    The converge/archive block is gated on the config flag: no convergence, no
+    archive, no attempt-clear — the contradictory remote state is left exactly
+    as found for the operator. The row reaches the executor as a ``noop``, so
+    nothing downstream converges it either and ``reconcile_ok`` stays True:
+    with the flag off, a dual-labelled item does not gate dispatch.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review", strict_dual_label=False)
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-soft-dual")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:implemented"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._converge_pipeline_labels") as converge:
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    converge.assert_not_called()
+    assert remote.mutations == []
+    assert remote.labels == ["ai:reviewing", "ai:implemented"]
+    # A pure noop is silent as well as inert: the contradictory label pair that
+    # would have escalated under strict_dual_label=True leaves no log entry, so
+    # nothing distinguishes this pass from a tick that saw no work.
+    assert reconcile_log_actions(tmp_path) == []
+    assert (tmp_path / "42-attempts").read_text() == "3"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("start_attempts", "expected_action", "expected_label", "expected_counter"),
+    [
+        (1, "revert", "ai:implemented", "2"),
+        (2, "escalate", "ai:needs-human-decision", None),
+    ],
+)
+def test_reconcile_stage_stale_row_reverts_until_the_attempt_cap_escalates(
+    tmp_path: Path,
+    start_attempts: int,
+    expected_action: str,
+    expected_label: str,
+    expected_counter: str | None,
+) -> None:
+    """The durable attempt transitions, driven from a real stale dispatch.
+
+    A stale marker still in custody re-queues to the ``pre_label`` its own
+    marker recorded, and the executor increments the counter behind that landed
+    relabel. Once one more increment would reach ``MAX_DISPATCH_ATTEMPTS`` the
+    planner escalates instead, and the executor clears the counter behind the
+    landed convergence. Both outcomes are read off the durable
+    ``<N>-attempts`` file and the mutated remote label set rather than off a
+    mock, and neither action archives: the scratch survives both.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-stale")
+    attempts = Attempts(str(tmp_path), "")
+    for _ in range(start_attempts):
+        attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": expected_action, "kill": False, "label": expected_label,
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", expected_label, "--remove-label", "ai:reviewing",
+    )]
+    assert remote.labels == [expected_label]
+    counter = tmp_path / "42-attempts"
+    if expected_counter is None:
+        assert not counter.exists()
+    else:
+        assert counter.read_text() == expected_counter
+    assert (wt_dir / "dispatch.json").is_file()
+    assert not (tmp_path / ".harvest-evidence").exists()
+
+
+def test_reconcile_stage_revert_relabel_failure_gates_dispatch_without_incrementing(
+    tmp_path: Path,
+) -> None:
+    """A failed revert relabel gates DISPATCH and leaves the counter alone.
+
+    The increment sits behind the relabel: when ``gh`` exits non-zero the
+    executor swallows the ``CalledProcessError``, drops ``reconcile_ok`` to
+    False, and moves on without touching the counter — so the next tick
+    re-reads the same stale marker at the same attempt count and retries the
+    same revert. The remote label set and the scratch are both unchanged.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-relabel-fail")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch(
+                "tick.gh", side_effect=subprocess.CalledProcessError(1, "gh"),
+            ):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "revert", "kill": False, "label": "ai:implemented",
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is False
+    assert remote.labels == ["ai:reviewing"]
+    assert (tmp_path / "42-attempts").read_text() == "1"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_escalation_convergence_failure_gates_dispatch_without_clearing(
+    tmp_path: Path,
+) -> None:
+    """A convergence that never lands gates DISPATCH and keeps the counter.
+
+    The clear sits behind the convergence, and convergence is only believed
+    after its own read-back: a ``gh edit`` that exits zero without applying is
+    caught by that read and returns False. ``reconcile_ok`` drops to False, the
+    counter keeps the value that made this row escalate in the first place, and
+    the marker stays durable so the next tick re-derives the same escalation.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-converge-fail")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"], mutations_land=False)
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "escalate", "kill": False,
+        "label": "ai:needs-human-decision",
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is False
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", "ai:needs-human-decision",
+        "--remove-label", "ai:reviewing",
+    )]
+    assert remote.labels == ["ai:reviewing"]
+    assert (tmp_path / "42-attempts").read_text() == "2"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_cleanup_archive_failure_gates_dispatch_without_clearing(
+    tmp_path: Path,
+) -> None:
+    """A failed executor archive gates DISPATCH and keeps the counter.
+
+    A stale marker on an item a human has already relabelled out of pipeline
+    custody plans ``cleanup``: no label mutation, just the archive. When the
+    archive move fails the executor drops ``reconcile_ok`` to False and skips
+    the clear, so the scratch and the durable retry state both outlive the
+    failure — unlike the same failure inside ``_reconcile_one()``, which
+    reports nothing to the gate.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-archive-fail")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    # Out of pipeline custody: the item carries neither the in-flight label nor
+    # the marker's pre_label, so the authoritative query no longer lists it and
+    # the local marker union is what reconciles it.
+    remote = FakeLabelRemote(["ai:ready-for-human"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+        listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "tick._archive_and_cleanup_scratch", return_value=False,
+                ) as archive:
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "cleanup", "kill": False, "label": "",
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is False
+    archive.assert_called_once()
+    assert remote.mutations == []
+    assert remote.labels == ["ai:ready-for-human"]
+    assert (tmp_path / "42-attempts").read_text() == "3"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_hold_survives_the_in_flight_label_release(
+    tmp_path: Path,
+) -> None:
+    """Releasing the in-flight label never touches the human hold.
+
+    A held item whose engine is provably dead plans ``cleanup`` carrying
+    ``release_label``: the pipeline's own admission receipt, and nothing else.
+    The executor emits a pure ``--remove-label`` for it, confirms the removal
+    by read-back, and only then archives the scratch and clears the counter.
+    The hold is present in every read and named in no mutation, so it outlives
+    the whole pass — which is the point: the operator's pending decision stays
+    exactly where they left it, with the evidence filed under the archive.
+
+    The decision also carries ``hold_label`` (the hold that justifies the
+    release, which ``_release_in_flight_label`` requires and fails closed
+    without) and an empty ``held_result_outcome``: this marker is stale rather
+    than complete, so there is no engine result to publish before the release,
+    and the executor takes the release branch rather than
+    ``_publish_held_result_and_archive``.
+
+    The ordered call log is what pins the release protocol itself: read the
+    hold, remove the label, read back to confirm the removal landed, then read
+    once more to prove the hold outlived the local custody move that is about
+    to destroy the marker. Asserting the mutation alone cannot see any of the
+    three reads disappear.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-held-dead")
+    (wt_dir / "recovery.txt").write_text("held dead-engine evidence")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:blocked"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "cleanup", "label": "", "kill": False,
+        "identity": "dead", "pr_number": 42,
+        "release_label": "ai:reviewing",
+        "held_result_outcome": "", "hold_label": "ai:blocked",
+    }]
+    assert ok is True
+    assert remote.mutations == [(
+        "pr", "edit", "42", "--remove-label", "ai:reviewing",
+    )]
+    assert remote.calls == [
+        "read",                                 # _reconcile_one: label set
+        "read",                                 # release: the hold justifying it
+        "mutate:--remove-label ai:reviewing",
+        "read",                                 # release: removal confirmed
+        "read",                                 # hold survived the custody move
+    ]
+    assert remote.labels == ["ai:blocked"]
+    assert not wt_dir.exists()
+    archive = tmp_path / ".harvest-evidence" / "pr-42-review-42-held-dead" / "scratch"
+    assert (archive / "recovery.txt").read_text() == "held dead-engine evidence"
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_stage_fix_pass_retains_review_marker_on_terminal_pr(
+    tmp_path: Path,
+) -> None:
+    """The fix pass leaves a reviewer's marker and the shared counter alone.
+
+    Mirror of the review-stage retain path: a valid review marker in the
+    shared ``pr-42`` namespace seen by the fix stage returns ``sibling_stage``
+    retain — no cleanup, no remote mutation, ``reconcile_ok`` True, and the
+    shared ``42-attempts`` counter survives untouched.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("fix")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "d-1", "pid": 99999, "start_time": 999999.0,
+        "pgid": 99999,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:fixing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._remove_worktree") as remove_wt:
+                    with mock.patch("tick.cleanup_scratch") as cleanup:
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "sibling_stage", "pr_number": 42,
+    }]
+    assert ok is True
+    remove_wt.assert_not_called()
+    cleanup.assert_not_called()
+    assert remote.mutations == []
+    # The retain is recorded: this is the one shared-namespace contention path
+    # that leaves an operator-visible trace naming the stage that stood down.
+    assert reconcile_log_actions(tmp_path) == ["sibling_stage_retain"]
+    assert (tmp_path / "42-attempts").read_text() == "3"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_dual_label_escalation_archives_when_hold_lands_after_converge(
+    tmp_path: Path,
+) -> None:
+    """The pre-archive freshness gap: the archive is taken on the pre-converge read.
+
+    The hold gate runs once, before convergence, and convergence's own
+    verification read is the last label read of the pass. A human hold that
+    lands the instant that read returns is therefore inside the window between
+    the final freshness read and the archive move — and the archive is still
+    taken today, because nothing re-reads the label set before it. The read
+    count is asserted alongside the archive, so a pre-archive freshness check
+    added later fails this row rather than passing it silently.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-gap")
+    (wt_dir / "recovery.txt").write_text("pre-archive freshness gap evidence")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:implemented"])
+    label_reads = [0]
+
+    def read_then_land_hold(*args: str, **kwargs: object) -> object:
+        payload = remote.gh_json(*args, **kwargs)
+        label_reads[0] += 1
+        # Read 1 is reconciliation's own label read; read 2 is convergence's
+        # pre-mutation freshness read; read 3 is its post-mutation
+        # verification read, the last label read the pass makes. The hold
+        # lands the instant that one returns.
+        if label_reads[0] == 3:
+            remote.labels.append("ai:blocked")
+        return payload
+
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=read_then_land_hold):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "unknown", "pr_number": 42,
+    }]
+    assert ok is True
+    assert label_reads[0] == 3  # nothing re-reads the labels before the move
+    assert remote.labels == ["ai:needs-human-decision", "ai:blocked"]
+    assert not wt_dir.exists()  # the archive was still taken
+    archive = tmp_path / ".harvest-evidence" / "pr-42-review-42-gap" / "scratch"
+    assert (archive / "recovery.txt").read_text() == "pre-archive freshness gap evidence"
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_stage_implement_terminal_kill_archive_keeps_attempt_counter(
+    tmp_path: Path,
+) -> None:
+    """The implement stage does NOT clear attempts on terminal kill cleanup.
+
+    The attempt-clear gates at all three terminal paths are conditioned on
+    ``config.worktree_prefix == "pr"``. An implement-stage terminal kill that
+    archives successfully must leave the ``issue-42-attempts`` counter file
+    untouched. Deleting any one of the three ``worktree_prefix == "pr"``
+    guards makes this test (or its dead-engine/markerless siblings) fail.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("implement")
+    wt_dir = tmp_path / "issue-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "claude", "stage": "implement", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:available",
+        "dispatch_id": "implement-42", "pid": 4242,
+        "start_time": 1000.0, "pgid": 4242,
+    }))
+    (wt_dir / "result.txt").write_text("implement evidence")
+    attempts = Attempts(str(tmp_path), "issue-")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="issue", in_flight_label="ai:implementing", number=42,
+        state="CLOSED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "process_control.get_process_start_time", return_value=1000.0,
+                ):
+                    with mock.patch(
+                        "process_control.terminate_process_group",
+                        return_value=True,
+                    ):
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "matched", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    archive = tmp_path / ".harvest-evidence" / "issue-42-implement-42" / "scratch"
+    assert (archive / "dispatch.json").is_file()
+    assert (archive / "result.txt").read_text() == "implement evidence"
+    assert (tmp_path / "issue-42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_implement_terminal_dead_engine_archive_keeps_the_counter(
+    tmp_path: Path,
+) -> None:
+    """The implement-stage dead-engine terminal path also keeps the counter.
+
+    Same ``worktree_prefix == "pr"`` gate on the proven-dead path: an
+    implement-stage terminal dead engine archives the scratch but must not
+    clear ``issue-42-attempts``.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("implement")
+    wt_dir = tmp_path / "issue-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "claude", "stage": "implement", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:available",
+        "dispatch_id": "implement-42", "pid": 2147483646,
+        "start_time": 1.0, "pgid": 2147483646,
+    }))
+    attempts = Attempts(str(tmp_path), "issue-")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="issue", in_flight_label="ai:implementing", number=42,
+        state="CLOSED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    archive = tmp_path / ".harvest-evidence" / "issue-42-implement-42" / "scratch"
+    assert (archive / "dispatch.json").is_file()
+    assert (tmp_path / "issue-42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_terminal_corrupt_marker_dead_pid_archives_under_unknown(
+    tmp_path: Path,
+) -> None:
+    """A schema-invalid marker with a dead PID archives under dispatch id "unknown".
+
+    When the corrupt marker cannot yield a dispatch_id, the archive is taken
+    under the literal ``unknown`` id, and the corrupt bytes survive under
+    ``archive/scratch/`` so an operator can inspect what was retained. The
+    review stage (``pr`` prefix) clears the counter after the archive lands.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    corrupt_bytes = json.dumps({
+        # Schema-invalid: missing head_sha, pre_label, dispatch_id, pgid.
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "pid": 2147483646, "start_time": 1.0,
+    })
+    (wt_dir / "dispatch.json").write_text(corrupt_bytes)
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42,
+        state="MERGED", listed=False,
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is True
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    archive = tmp_path / ".harvest-evidence" / "pr-42-unknown" / "scratch"
+    assert (archive / "dispatch.json").read_text() == corrupt_bytes
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_harvest_reviewers_publishes_the_result_replaced_after_the_decision(
+    tmp_path: Path,
+) -> None:
+    """The stage harvester's read, not the decision-time copy, is published.
+
+    The generic decision classifies ``complete`` from the result file's
+    presence; the stage harvester then re-reads review.json. When the file is
+    replaced between the two — here, inside ``_execute_reconcile_actions``,
+    the production step that runs between the decision and the harvester's
+    read — the NEW content is published today. The review text that reaches
+    ``pipeline.harvest_review`` must equal the replaced file, not the bytes
+    the decision saw.
+
+    The converged label is asserted alongside it because it is the outcome the
+    two candidate byte strings disagree about: the replaced ``ready_for_human``
+    promotes to ``ai:ready-for-human``, while the bytes the decision saw would
+    have converged to a changes-requested label. The counter clear and the
+    scratch deletion that follow the landed convergence are pinned too.
+    """
+    import pipeline as _pipeline  # type: ignore[import-untyped]
+    import tick  # type: ignore[import-untyped]
+    from tick import Attempts, harvest_reviewers  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    wt_dir = wt_root / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "abc123",
+        "head_sha": "def456", "pre_label": "ai:implemented",
+        "dispatch_id": "d-42", "pid": 2147483646,
+        "start_time": 1.0, "pgid": 2147483646,
+    }))
+    (wt_dir / "completion.json").write_text(json.dumps({
+        "dispatch_id": "d-42", "exit_status": 0, "wrapper_pid": 2147483646,
+        "start_time": 1.0, "result_valid": True,
+    }))
+    (wt_dir / "review.json").write_text(json.dumps({
+        "verdict": "changes_requested", "findings": [],
+    }))
+    replaced = json.dumps({"verdict": "ready_for_human", "findings": []})
+    attempts = Attempts(str(wt_root), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    def gh_json_side_effect(*args: str) -> object:
+        if "baseRefName,headRefOid" in args:
+            return {"baseRefName": "main", "headRefOid": "def456"}
+        if "comments" in args:
+            return []
+        return {"labels": [{"name": "ai:reviewing"}]}
+
+    def gh_text_side_effect(*args: str) -> str:
+        if args[:2] == ("pr", "list"):
+            return "42"
+        return "OPEN"
+
+    real_execute = tick._execute_reconcile_actions
+    converged_to: list[str] = []
+    decisions_seen: list[dict[str, object]] = []
+
+    def swap_result_then_execute(
+        *args: object, **kwargs: object,
+    ) -> object:
+        # The result is replaced between the generic decision and the stage
+        # harvester's read — exactly the production step boundary between them.
+        decisions_seen.extend(args[0])
+        (wt_dir / "review.json").write_text(replaced)
+        return real_execute(*args, **kwargs)
+
+    def record_converge(
+        _entity: str, _number: int, target_label: str, **_kwargs: object,
+    ) -> bool:
+        converged_to.append(target_label)
+        return True
+
+    with mock.patch("tick.gh_text", side_effect=gh_text_side_effect):
+        with mock.patch("tick.gh_json", side_effect=gh_json_side_effect):
+            with mock.patch("tick.git", return_value="abc123"):
+                with mock.patch(
+                    "tick._execute_reconcile_actions",
+                    side_effect=swap_result_then_execute,
+                ):
+                    with mock.patch(
+                        "tick.pipeline.harvest_review",
+                        wraps=_pipeline.harvest_review,
+                    ) as harvest_review:
+                        with mock.patch(
+                            "tick._converge_pipeline_labels",
+                            side_effect=record_converge,
+                        ):
+                            with mock.patch("tick.gh") as gh_mock:
+                                ok = harvest_reviewers(
+                                    tick_log=tick.TickLog.open(
+                                        str(tick_log_dir(tmp_path)),
+                                    ),
+                                    wt_root=str(wt_root),
+                                )
+
+    assert decisions_seen == [{
+        "action": "harvest", "kill": False, "label": "",
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is True
+    assert "harvest" in reconcile_log_actions(tmp_path)
+    assert harvest_review.call_args[1]["review"] == replaced
+    # The replaced verdict is what decided the label, not the bytes the
+    # generic decision classified from.
+    assert converged_to == ["ai:ready-for-human"]
+    comment_calls = [
+        c for c in gh_mock.call_args_list if c.args[:2] == ("pr", "comment")
+    ]
+    assert len(comment_calls) == 1
+    assert not (wt_root / "42-attempts").exists()
+    assert not wt_dir.exists()
+
+
+@pytest.mark.parametrize("stage", ["review", "fix"])
+def test_reconcile_stage_markerless_terminal_cleanup_deletes_and_clears_counter(
+    tmp_path: Path, stage: str,
+) -> None:
+    """Markerless terminal cleanup, for both stages sharing the pr namespace.
+
+    The only reachable path: the authoritative label query returns the number
+    while the lifecycle read returns ``MERGED``, and the local scratch carries
+    no dispatch marker. Pinned for both ``pr``-prefixed stages, which share the
+    scratch namespace and the ``<N>-attempts`` counter — the review stage
+    aborting on enumeration failure and the fix stage not.
+
+    The decision is ``noop``, so the executor has nothing to act on and folds
+    ``True``. Driving the pair anyway is what proves that, instead of inferring
+    it from the decision and leaving the real dispatch gate unasserted.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config(stage)
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "evidence.txt").write_text("survives until the terminal read")
+
+    attempts = Attempts(str(tmp_path), config.attempts_key_prefix)
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)  # 42-attempts == "3" before reconcile
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label=config.in_flight_label, number=42,
+        state="MERGED",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._remove_worktree", return_value=False):
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    # The decision records the markerless cleanup as a non-destructive noop.
+    assert results == [
+        {"action": "noop", "label": "", "kill": False,
+         "identity": "markerless", "pr_number": 42},
+    ]
+    # A noop decision reaches the executor, which attempts no remote write.
+    assert remote.mutations == []
+    # The scratch directory itself is the deleted artifact.
+    assert not wt_dir.exists()
+    assert not (tmp_path / "pr-42-scrub").exists()
+    # Enumeration and lifecycle reads both succeeded, so DISPATCH stays open.
+    assert ok is True
+    # The shared pr-prefixed counter is cleared by the terminal cleanup.
+    assert not (tmp_path / "42-attempts").exists()
+    # Nothing survives the markerless path: no archive is taken.
+    assert not (tmp_path / ".harvest-evidence").exists()
+
+
+def test_reconcile_engine_markerless_terminal_cleanup_deletes_after_one_label_read(
+    tmp_path: Path,
+) -> None:
+    """A hold landing inside the read-to-delete window does not stop cleanup.
+
+    The terminal hold gate reads the label set exactly once, and nothing
+    re-reads it before the scratch is destroyed. The hold is therefore landed
+    *inside* that window rather than after the pass: the marker-existence probe
+    runs after the label read and before the cleanup, so a side effect on it
+    puts ``ai:blocked`` on the remote at a point a pre-delete freshness check
+    would still see.
+
+    Today no such check runs. The ordered call log is one label read, then the
+    two cleanup calls — so the scratch is deleted and the counter cleared over a
+    hold that is already present remotely. Pinned as-is, with the call log
+    asserted: a pre-delete re-read added later fails this row instead of
+    passing it silently.
+    """
+    import tick  # type: ignore[import-untyped]
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "evidence.txt").write_text("markerless evidence")
+    marker_path = wt_dir / "dispatch.json"
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    calls: list[str] = []
+    real_isfile = os.path.isfile
+    real_cleanup = tick.cleanup_scratch
+
+    def record_label_read(*args: str, **kwargs: object) -> object:
+        calls.append("label_read")
+        return remote.gh_json(*args, **kwargs)
+
+    def land_hold_at_marker_probe(path: str) -> bool:
+        # Armed only once a label read has happened, so the enumeration's own
+        # probe (which runs before it) does not land the hold too early.
+        if calls and str(path) == str(marker_path):
+            if "ai:blocked" not in remote.labels:
+                remote.labels.append("ai:blocked")
+        return real_isfile(path)
+
+    def record_remove_worktree(path: str) -> bool:
+        calls.append("remove_worktree")
+        return False  # renamed scratch: no longer a registered git worktree
+
+    def record_cleanup(path: str) -> None:
+        calls.append("cleanup_scratch")
+        real_cleanup(path)
+
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="MERGED",
+    )):
+        with mock.patch("tick.gh_json", side_effect=record_label_read):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "os.path.isfile", side_effect=land_hold_at_marker_probe,
+                ):
+                    with mock.patch(
+                        "tick._remove_worktree",
+                        side_effect=record_remove_worktree,
+                    ):
+                        with mock.patch(
+                            "tick.cleanup_scratch", side_effect=record_cleanup,
+                        ):
+                            results, ok = drive_reconcile_stage(
+                                config, tmp_path, attempts,
+                            )
+
+    assert results == [{
+        "action": "noop", "label": "", "kill": False,
+        "identity": "markerless", "pr_number": 42,
+    }]
+    assert ok is True
+    # One label read, and it is the last thing that happens before the delete.
+    assert calls == ["label_read", "remove_worktree", "cleanup_scratch"]
+    assert remote.labels == ["ai:blocked"]  # the hold landed before the delete
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_engine_markerless_terminal_cleanup_enumeration_race(
+    tmp_path: Path,
+) -> None:
+    """The os.listdir race: a markered directory whose marker vanishes first.
+
+    reconcile_engine() enumerates the marker and adds the number, then
+    ``_reconcile_one()``'s marker read sees the file gone (unlinked here by
+    the enumeration's own isfile check) — the item is treated as markerless
+    and the terminal cleanup proceeds. Pins the deletion, the counter clear,
+    the decision, and ``reconcile_ok`` for the second reachable race shape.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    marker_path = wt_dir / "dispatch.json"
+    marker_path.write_text(json.dumps({
+        "engine": "codex", "stage": "review", "pr_number": 42,
+        "deadline": 9999999999.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:implemented",
+        "dispatch_id": "review-42", "pid": 2147483646,
+        "start_time": 1.0, "pgid": 2147483646,
+    }))
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    real_isfile = os.path.isfile
+    marker_counted = False
+
+    def race_isfile(path: str) -> bool:
+        nonlocal marker_counted
+        if path == str(marker_path) and not marker_counted:
+            marker_counted = True
+            marker_path.unlink()  # the marker vanishes after being counted
+            return True
+        return real_isfile(path)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="MERGED",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("os.path.isfile", side_effect=race_isfile):
+                    with mock.patch(
+                        "tick._remove_worktree", return_value=False,
+                    ):
+                        results, ok = drive_reconcile_stage(
+                            config, tmp_path, attempts,
+                        )
+
+    assert results == [
+        {"action": "noop", "label": "", "kill": False,
+         "identity": "markerless", "pr_number": 42},
+    ]
+    assert ok is True
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_engine_markerless_terminal_cleanup_without_scratch_dir_still_clears_counter(
+    tmp_path: Path,
+) -> None:
+    """The markerless else branch clears the counter even with no directory.
+
+    When the authoritative label query returns the number but no scratch
+    directory exists at all, ``_remove_worktree`` and ``cleanup_scratch`` both
+    no-op on the missing path — yet the pr-prefixed counter is still cleared.
+    Pins decision, ``reconcile_ok``, and the counter outcome for the last
+    markerless shape.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="MERGED",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                results, ok = drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert results == [
+        {"action": "noop", "label": "", "kill": False,
+         "identity": "markerless", "pr_number": 42},
+    ]
+    assert ok is True
+    assert remote.mutations == []
+    assert not (tmp_path / "pr-42").exists()
+    assert not (tmp_path / "42-attempts").exists()
+
+
+def test_reconcile_engine_implement_markerless_terminal_cleanup_keeps_counter(
+    tmp_path: Path,
+) -> None:
+    """The implement stage keeps the counter on markerless terminal cleanup.
+
+    Mirror of the pr-prefixed engine row: the label query returns the number,
+    the lifecycle read returns ``CLOSED`` (the only terminal state a GitHub
+    issue reports — ``MERGED`` is PR-only), the local ``issue-42`` directory is
+    markerless — and because ``worktree_prefix`` is ``"issue"``, the third
+    attempt-clear gate does not fire. Deleting the gate makes this test fail.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("implement")
+    wt_dir = tmp_path / "issue-42"
+    wt_dir.mkdir()
+    (wt_dir / "evidence.txt").write_text("implement markerless evidence")
+    attempts = Attempts(str(tmp_path), "issue-")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote([])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="issue", in_flight_label="ai:implementing", number=42,
+        state="CLOSED",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch("tick._remove_worktree", return_value=False):
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [
+        {"action": "noop", "label": "", "kill": False,
+         "identity": "markerless", "pr_number": 42},
+    ]
+    assert ok is True
+    assert remote.mutations == []
+    assert not wt_dir.exists()
+    assert (tmp_path / "issue-42-attempts").read_text() == "3"
+
+
+def test_reconcile_stage_counter_increment_crash_after_a_landed_revert(
+    tmp_path: Path,
+) -> None:
+    """A counter write that fails after the revert landed crashes the tick.
+
+    The two writes that must agree are the remote relabel and the durable
+    increment, and they are ordered remote-first with nothing between them: no
+    try/except, no compensation. Crash the second one — here the counter's
+    ``atomic_write`` fails with ENOSPC — and the observable outcome is that the
+    ``OSError`` leaves ``_execute_reconcile_actions()`` entirely, so:
+
+    - the caller never receives a ``reconcile_ok`` to gate DISPATCH with; it
+      gets an exception instead, which escapes to the tick's crash handler;
+    - the revert has already landed remotely and is not rolled back, so the
+      item sits at ``ai:implemented``;
+    - the counter still reads its pre-crash value, so this attempt was never
+      counted against the cap;
+    - the scratch and its marker are untouched, and nothing archives.
+
+    Pinned as-is: the remote label and the durable counter are left out of
+    step, with no compensating write and no retry of the increment. A
+    correction belongs in a separate issue.
+    """
+    import tick  # type: ignore[import-untyped]
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-incr-crash")
+    (wt_dir / "recovery.txt").write_text("revert crash evidence")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"])
+    with mock.patch(
+        "tick._execute_reconcile_actions",
+        wraps=tick._execute_reconcile_actions,
+    ) as execute:
+        with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+            entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+        )):
+            with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+                with mock.patch("tick.gh", side_effect=remote.gh):
+                    with mock.patch(
+                        "tick.pipeline.atomic_write",
+                        side_effect=OSError(28, "No space left on device"),
+                    ):
+                        with pytest.raises(OSError, match="No space left on device"):
+                            drive_reconcile_stage(config, tmp_path, attempts)
+
+    assert execute.call_args.args[0] == [{
+        "action": "revert", "kill": False, "label": "ai:implemented",
+        "identity": "dead", "pr_number": 42,
+    }]
+    # The remote transition landed before the crash and is not rolled back.
+    assert remote.mutations == [(
+        "pr", "edit", "42",
+        "--add-label", "ai:implemented", "--remove-label", "ai:reviewing",
+    )]
+    assert remote.labels == ["ai:implemented"]
+    assert (tmp_path / "42-attempts").read_text() == "1"
+    assert (wt_dir / "dispatch.json").is_file()
+    assert (wt_dir / "recovery.txt").read_text() == "revert crash evidence"
+    assert not (tmp_path / ".harvest-evidence").exists()
+
+
+def test_reconcile_stage_counter_clear_failure_after_a_landed_escalation_is_absorbed(
+    tmp_path: Path,
+) -> None:
+    """A counter clear that fails after a landed escalation is swallowed.
+
+    ``Attempts.clear()`` catches ``OSError`` and returns, so a clear that
+    cannot remove the file reports nothing: the escalation stands, the pass
+    reports ``reconcile_ok`` True, and DISPATCH is not gated. What survives is
+    a counter still holding the value that made this row escalate — so the
+    item's next dispatch cycle starts one attempt from the cap even though the
+    escalation ended this one.
+
+    Pinned as-is. The refusal is scoped to ``*-attempts`` paths so every other
+    filesystem write in the pass stays real.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-clear-fail")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "os.unlink", side_effect=unlink_refusing_attempt_counters(),
+                ):
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "escalate", "kill": False,
+        "label": "ai:needs-human-decision",
+        "identity": "dead", "pr_number": 42,
+    }]
+    assert ok is True  # the failed clear does not gate dispatch
+    assert remote.labels == ["ai:needs-human-decision"]
+    assert (tmp_path / "42-attempts").read_text() == "2"
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_reconcile_stage_counter_clear_failure_after_a_landed_cleanup_is_absorbed(
+    tmp_path: Path,
+) -> None:
+    """A counter clear that fails after a landed cleanup is swallowed too.
+
+    The cleanup path has three durable steps that must agree — release the
+    in-flight label, archive the scratch, clear the counter — and the third one
+    is the only one whose failure is invisible. Fail it after the first two
+    land: the release is confirmed, the archive holds the evidence, the scratch
+    is gone, ``reconcile_ok`` is True, and the counter for an item that no
+    longer has a dispatch at all still reads its old value.
+
+    That stale count is what the executor's own comment says the clear exists
+    to prevent, and nothing retries it: the marker it was derived from has
+    already been archived, so no later pass can re-derive this row. Pinned
+    as-is.
+
+    The release protocol still runs in full ahead of the failed clear — hold
+    read, removal, confirmation, custody-move re-read — so the ordered call log
+    is asserted here too: it is what proves the clear failed *after* the remote
+    transition landed rather than instead of it, which is the whole point of
+    this row.
+    """
+    from tick import Attempts  # type: ignore[import-untyped]
+
+    config = stage_config("review")
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    write_stale_review_marker(wt_dir, pr=42, dispatch_id="review-42-held-clear-fail")
+    (wt_dir / "recovery.txt").write_text("held cleanup evidence")
+    attempts = Attempts(str(tmp_path), "")
+    attempts.incr(42)
+    attempts.incr(42)
+    attempts.incr(42)
+
+    remote = FakeLabelRemote(["ai:reviewing", "ai:blocked"])
+    with mock.patch("tick.gh_text", side_effect=gh_text_stage_reads(
+        entity="pr", in_flight_label="ai:reviewing", number=42, state="OPEN",
+    )):
+        with mock.patch("tick.gh_json", side_effect=remote.gh_json):
+            with mock.patch("tick.gh", side_effect=remote.gh):
+                with mock.patch(
+                    "os.unlink", side_effect=unlink_refusing_attempt_counters(),
+                ):
+                    results, ok = drive_reconcile_stage(
+                        config, tmp_path, attempts,
+                    )
+
+    assert results == [{
+        "action": "cleanup", "label": "", "kill": False,
+        "identity": "dead", "pr_number": 42,
+        "release_label": "ai:reviewing",
+        "held_result_outcome": "", "hold_label": "ai:blocked",
+    }]
+    assert ok is True  # the failed clear does not gate dispatch
+    assert remote.calls == [
+        "read",
+        "read",
+        "mutate:--remove-label ai:reviewing",
+        "read",
+        "read",
+    ]
+    assert remote.labels == ["ai:blocked"]
+    assert not wt_dir.exists()
+    archive = (
+        tmp_path / ".harvest-evidence" / "pr-42-review-42-held-clear-fail" / "scratch"
+    )
+    assert (archive / "recovery.txt").read_text() == "held cleanup evidence"
+    assert (tmp_path / "42-attempts").read_text() == "3"
+
+
 # --- Helpers ---
 
 
@@ -22189,6 +24192,304 @@ def write_stale_review_marker(wt_dir: Path, *, pr: int, dispatch_id: str) -> Non
         "start_time": 1.0,
         "pgid": 2147483646,
     }))
+
+
+@contextlib.contextmanager
+def recorded_escalation_order(
+    attempts: Any, *, archive_lands: bool = True,
+) -> Iterator[list[str]]:
+    """Record the strict-dual escalation's three durable steps in call order.
+
+    ``_reconcile_one()``'s dual-label branch converges the remote label set,
+    clears the attempt counter, and archives the scratch. Asserting only the
+    end state cannot tell that order from its reverse — the clear is
+    unconditional once convergence lands, so both orderings leave the counter
+    gone and the archive taken. Wrapping each step in place is what makes the
+    ordering itself falsifiable: moving ``attempts.clear(n)`` after the archive
+    call reorders this log.
+
+    Every wrapper calls through to the real implementation, so the row still
+    characterizes production rather than the wrapper. ``converge`` is recorded
+    with the value it returned, because the clear and the archive are both
+    gated on it.
+
+    Args:
+        attempts: The row's real ``Attempts`` instance, whose ``clear`` is
+            wrapped in place for the duration.
+        archive_lands: ``False`` refuses the archive move without reaching the
+            filesystem, for rows characterizing an archive failure.
+
+    Yields:
+        The ordered call log, filled in as the pass runs.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    calls: list[str] = []
+    real_converge = tick._converge_pipeline_labels
+    real_archive = tick._archive_and_cleanup_scratch
+    real_clear = attempts.clear
+
+    def record_converge(*args: object, **kwargs: object) -> bool:
+        landed = bool(real_converge(*args, **kwargs))
+        calls.append(f"converge:{landed}")
+        return landed
+
+    def record_clear(number: int) -> None:
+        calls.append("attempts_clear")
+        real_clear(number)
+
+    def record_archive(**kwargs: object) -> bool:
+        calls.append("archive")
+        return bool(real_archive(**kwargs)) if archive_lands else False
+
+    with mock.patch(
+        "tick._converge_pipeline_labels", side_effect=record_converge,
+    ):
+        with mock.patch(
+            "tick._archive_and_cleanup_scratch", side_effect=record_archive,
+        ):
+            with mock.patch.object(attempts, "clear", side_effect=record_clear):
+                yield calls
+
+
+def stage_config(stage: str, **overrides: object) -> Any:
+    """Return the production ``StageConfig`` the tick builds for ``stage``.
+
+    A characterization row has to reconcile against the same config the tick
+    dispatches with. A hand-written ``StageConfig(...)`` literal is a second
+    copy of that contract: it keeps passing after the production config
+    changes underneath it, which is the failure this whole block exists to
+    make impossible. Reading ``tick._REVIEWER_CONFIG`` / ``_IMPLEMENTER_CONFIG``
+    / ``_FIXER_CONFIG`` means the rows move with production instead.
+
+    ``overrides`` exists for the rows that deliberately vary one field —
+    ``strict_dual_label=False`` and the ``tick_abort_on_enum_failure``
+    parametrize — so the variation is visible as a diff against production
+    rather than buried in a re-typed literal.
+
+    Args:
+        stage: ``"review"``, ``"implement"``, or ``"fix"``.
+        **overrides: ``StageConfig`` fields to replace on the production value.
+
+    Returns:
+        The stage's production ``StageConfig`` with ``overrides`` applied.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    configs: dict[str, Any] = {
+        "review": tick._REVIEWER_CONFIG,
+        "implement": tick._IMPLEMENTER_CONFIG,
+        "fix": tick._FIXER_CONFIG,
+    }
+    return dataclasses.replace(configs[stage], **overrides)
+
+
+def drive_reconcile_stage(
+    config: object,
+    wt_root: Path,
+    attempts: object | None = None,
+) -> tuple[list[dict[str, object]], bool]:
+    """Run the reconcile pair every ``harvest_*`` entry point runs, and gate it.
+
+    ``reconcile_engine()`` then ``_execute_reconcile_actions()``, folded into
+    the ``reconcile_ok`` those two contribute to DISPATCH gating. A
+    characterization row that stops at ``_reconcile_one()`` cannot see two of
+    the five facts issue #28 requires: the attempt counter it reads is the
+    value the executor is about to change, and no dispatch gate exists at that
+    point at all.
+
+    This is the reconcile pair, not a whole harvest. ``harvest_reviewers()``
+    folds a third term (``failed_ok``, from ``_harvest_failed_reviewer``) and
+    all three harvesters then run their stage-specific handlers for ``harvest``
+    decisions. No row here produces a ``fail`` or ``harvest`` action, so the
+    two folds agree for every row driven through this helper — but a row that
+    ever does produce one belongs on the real ``harvest_*`` entry point
+    instead, the way the handoff-boundary row uses ``harvest_reviewers()``.
+
+    A real ``TickLog`` is opened and passed to both calls, because production
+    always passes one. Under ``tick_log=None`` every ``if tick_log:`` branch in
+    the pair is dead, and those branches carry the reconcile pass's entire
+    operator-visible record — ``workflow_hold_retained``,
+    ``unknown_identity_retain``, ``sibling_stage_retain``, ``kill_failed`` and
+    the rest, which ``DEBUG.md`` hands operators grep commands for by name. For
+    a ``leave``/``noop`` row the log line is the *only* side effect there is, so
+    without it "ordered side effects" is a fact those rows cannot record at all.
+    Read them back with :func:`reconcile_log_actions`.
+
+    Args:
+        config: The stage's ``StageConfig``.
+        wt_root: Worktree root holding the scratch dirs and attempt counters.
+        attempts: Durable attempt counter, or ``None`` to skip counting.
+
+    Returns:
+        The per-item decisions and the ``reconcile_ok`` gate a harvester would
+        return for them.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    tick_log = tick.TickLog.open(str(tick_log_dir(wt_root)))
+    decisions, enum_ok = tick.reconcile_engine(
+        config, tick_log=tick_log, target=None,
+        wt_root=str(wt_root), attempts=attempts,
+    )
+    transition_ok = tick._execute_reconcile_actions(
+        decisions, config, str(wt_root), tick_log=tick_log, attempts=attempts,
+    )
+    return decisions, enum_ok and transition_ok
+
+
+def tick_log_dir(wt_root: Path) -> Path:
+    """Directory :func:`drive_reconcile_stage` writes its tick logs to.
+
+    Deliberately not a scratch-shaped name: ``reconcile_engine()`` enumerates
+    ``wt_root`` for ``<prefix>-<number>`` directories, and a log directory that
+    matched that shape would add a phantom item to every row's pass.
+    """
+    return wt_root / "tick-logs"
+
+
+def reconcile_log_actions(wt_root: Path) -> list[str]:
+    """The ordered ``action`` strings a driven reconcile pass emitted.
+
+    Asserted rather than the whole entry because the action is the part
+    ``DEBUG.md`` tells operators to grep for; the reason and details text is
+    prose that should be free to improve without failing a characterization
+    row.
+    """
+    log_dir = tick_log_dir(wt_root)
+    if not log_dir.is_dir():
+        return []
+    return [
+        str(entry.get("action", ""))
+        for entry in read_tick_log_entries(log_dir)
+    ]
+
+
+def gh_text_stage_reads(
+    *,
+    entity: str,
+    in_flight_label: str,
+    number: int,
+    state: str,
+    listed: bool = True,
+) -> Callable[..., str]:
+    """Return a ``gh_text`` side effect serving a whole-stage reconcile pass.
+
+    A pass makes two differently shaped ``gh_text`` reads: the authoritative
+    in-flight label enumeration in ``reconcile_engine()`` (bare digits, one per
+    line) and the per-item lifecycle read in ``_reconcile_one()``
+    (``OPEN``/``CLOSED``/``MERGED``). A single ``return_value`` cannot serve
+    both — a lifecycle string handed to the enumeration parses as no numbers at
+    all, silently reducing the pass to its local-marker union.
+
+    Args:
+        entity: ``"pr"`` or ``"issue"``.
+        in_flight_label: The stage's in-flight label, as the query names it.
+        number: The item under test.
+        state: The lifecycle state the item read returns. Issues only ever
+            return ``OPEN`` or ``CLOSED``; ``MERGED`` is a PR-only value.
+        listed: Whether the label query reports ``number``. ``False`` models an
+            item that does not carry the in-flight label (or is no longer open),
+            leaving the local marker union as the only way it is reconciled.
+
+    Returns:
+        A side effect for ``mock.patch("tick.gh_text", side_effect=...)`` that
+        fails the test on any read it does not recognise.
+    """
+    listing = (
+        entity, "list", "--label", in_flight_label, "--state", "open",
+        "--json", "number", "-q", ".[].number",
+    )
+    view = (entity, "view", str(number), "--json", "state", "-q", ".state")
+
+    def side_effect(*args: str) -> str:
+        if tuple(args) == listing:
+            return str(number) if listed else ""
+        if tuple(args) == view:
+            return state
+        raise AssertionError(f"unexpected gh_text read: {args}")
+
+    return side_effect
+
+
+def unlink_refusing_attempt_counters() -> Callable[..., None]:
+    """Return an ``os.unlink`` side effect that fails only on counter files.
+
+    ``Attempts.clear()`` swallows ``OSError``, so the only way to observe what
+    a failed clear leaves behind is to fail the syscall under it. Scoping the
+    refusal to ``*-attempts`` paths keeps every other unlink real, so scratch
+    trees still archive and delete normally in the same run.
+    """
+    real_unlink = os.unlink
+
+    def side_effect(path: object, *args: object, **kwargs: object) -> None:
+        if str(path).endswith("-attempts"):
+            raise PermissionError(13, "Permission denied")
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    return side_effect
+
+
+class FakeLabelRemote:
+    """A mutable stand-in for one item's remote pipeline label set.
+
+    Convergence, revert, and the in-flight release each mutate labels and then
+    read them back, so a fixed ``gh_json`` payload cannot characterize any of
+    them: it either always contradicts the mutation (convergence can never
+    land) or always agrees with it (a mutation that never landed looks landed).
+    This applies each ``--add-label``/``--remove-label`` to a live set, records
+    every mutation argv in order, and serves every read-back from that same
+    set.
+
+    ``calls`` additionally records reads and mutations in one ordered log.
+    Custody-critical ordering on this seam is a read/mutate interleaving, not a
+    mutation sequence: the release reads the hold, removes the in-flight label,
+    reads back to confirm, and then reads once more to prove the hold outlived
+    the removal. ``mutations`` alone shows one entry for all four, so a
+    confirmation or a guard read that stopped happening would be invisible.
+    """
+
+    def __init__(self, labels: list[str], *, mutations_land: bool = True) -> None:
+        """Args:
+            labels: The item's starting label set.
+            mutations_land: ``False`` models a ``gh edit`` that exits zero
+                without applying — the shape every read-back verification
+                exists to catch.
+        """
+        self.labels = list(labels)
+        self.mutations: list[tuple[str, ...]] = []
+        self.calls: list[str] = []
+        self._mutations_land = mutations_land
+
+    def gh(self, *args: str, **_kwargs: object) -> str:
+        """Record a ``gh`` mutation and apply its label flags to the set."""
+        # Pairing flags off fixed offsets is only valid for the argv shape
+        # production actually emits (`gh <entity> edit <n> --flag value ...`).
+        # Assert it rather than assume it: a production argv that ever grew a
+        # positional or a valueless flag would silently turn this into a remote
+        # that records mutations and applies none, and every row asserting a
+        # surviving label set would keep passing over it.
+        assert args[1] == "edit" and len(args) % 2 == 1, (
+            f"unexpected gh mutation argv shape: {args}"
+        )
+        assert all(flag.startswith("--") for flag in args[3::2]), (
+            f"unexpected gh mutation argv shape: {args}"
+        )
+        self.mutations.append(tuple(args))
+        self.calls.append(f"mutate:{' '.join(args[3:])}")
+        if not self._mutations_land:
+            return ""
+        for flag, value in zip(args[3::2], args[4::2]):
+            if flag == "--add-label" and value not in self.labels:
+                self.labels.append(value)
+            elif flag == "--remove-label" and value in self.labels:
+                self.labels.remove(value)
+        return ""
+
+    def gh_json(self, *_args: str, **_kwargs: object) -> object:
+        """Serve a label read-back from the live set."""
+        self.calls.append("read")
+        return {"labels": [{"name": name} for name in self.labels]}
 
 
 def stub_gh_json(*, labels: list[str]) -> Callable[..., object]:
