@@ -48,6 +48,7 @@ PREFLIGHT = Path(__file__).parent.parent / "preflight.sh"
 TICK_SH = Path(__file__).parent.parent / "tick.sh"
 RESOLVE_SH = Path(__file__).parent.parent / "resolve-python.sh"
 STATUS_SKILL = Path(__file__).parent.parent.parent / "status" / "SKILL.md"
+SETUP_SKILL = Path(__file__).parent.parent.parent / "setup" / "SKILL.md"
 PROMPTS = Path(__file__).parent / "prompts"
 STATUS_SCRIPT = Path(__file__).parent.parent.parent / "status" / "status.sh"
 DONE_SKILL = (
@@ -79,7 +80,7 @@ PLUGIN_NAME = "pr-pipeline"
 # description loads into every session's context. An unintended command is the
 # observable symptom of a misplaced file, and a containment check cannot see it.
 _PUBLISHED_SKILLS = frozenset({
-    "tick", "status", "definition-of-done", "review-response-hygiene",
+    "tick", "status", "setup", "definition-of-done", "review-response-hygiene",
     "automation-control-plane-review", "durability-boundary-review",
     "loop-cadence-contract-review",
 })
@@ -2018,7 +2019,7 @@ def test_skill_bodies_resolve_the_install_through_the_plugin_root() -> None:
     elsewhere: nothing substitutes them, and the same string there resolves to a
     root-relative path that fails without saying why.
     """
-    for skill_md in (SKILL, STATUS_SKILL):
+    for skill_md in (SKILL, STATUS_SKILL, SETUP_SKILL):
         text = skill_md.read_text()
         label = str(skill_md.resolve().relative_to(REPO_ROOT))
         assert INSTALL_ROOT_VAR not in text, (

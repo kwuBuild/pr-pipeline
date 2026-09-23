@@ -26,7 +26,7 @@ def offline_tick(tmp_path):
     head = subprocess.check_output([real_git, "rev-parse", "HEAD"], cwd=root, text=True).strip()
     subprocess.run([real_git, "update-ref", "refs/remotes/origin/main", head], cwd=root, check=True)
     cfg = tmp_path / "operator.toml"
-    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\nverify_tools=[]\n')
+    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\nverify_tools=[]\n[repos."example/project"]\n')
     state = tmp_path / "github.json"
     state.write_text(json.dumps({"labels": ["ai:available"], "pr_labels": [], "body": "", "head": head}))
     write_peer(bin_dir / "git", f'''
@@ -123,7 +123,7 @@ def test_cli_dispatch_and_harvest_empty_verification(offline_tick):
     argv = json.loads((wt / "engine-argv.json").read_text())
     assert "pytest" not in argv[argv.index("--allowedTools") + 1]
     # The dispatch snapshot survives a later operator configuration change.
-    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\nverify_tools=["custom-check *"]\n')
+    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\nverify_tools=["custom-check *"]\n[repos."example/project"]\n')
     run_tick(root, env)
     assert "Verification unconfigured:" in json.loads(state.read_text())["body"]
 

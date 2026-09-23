@@ -117,7 +117,7 @@ def test_installed_tick_loop_rejects_missing_labels_before_any_other_github_work
 ):
     repo, script, state, log = label_repo
     config = repo.parent / "operator.toml"
-    config.write_text('[operator]\nlogin = "test-owner"\n')
+    config.write_text('[operator]\nlogin = "test-owner"\n[repos."elsewhere/project"]\n')
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(config))
 
     result = subprocess.run(

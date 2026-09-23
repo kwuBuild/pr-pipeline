@@ -489,6 +489,14 @@ missing vocabulary labels. For read errors, restore GitHub access and retry.
 The check repeats each tick, and `--loop` stops on failure. Unknown `ai:` labels
 do not block startup; inspect the dashboard's **PARKED ITEMS** section.
 
+`startup_repo_unconfigured` exits 6 before the label check, HARVEST, and
+DISPATCH. The resolved target has no `[repos."owner/name"]` section in the
+operator config. Run `/pr-pipeline:setup` for that repository. Do not add the
+section by hand unless you also probe the route: an empty section says setup
+chose this repository's grants and permission mode. Under `--loop` the entry's
+reason says the repository was skipped; restart the loop after setup. See
+[unconfigured targets](README.md#unconfigured-targets).
+
 Every tick log starts with:
 
 - `startup_context` — Python version, cwd, PATH directories, tick PID.
@@ -522,8 +530,8 @@ call's environment. `PR_PIPELINE_HOME` is an optional absolute development
 checkout override; unset it to use the installed plugin again.
 
 - **The standalone launcher is missing.** Run the launcher installation step
-  described in [the quick start](README.md#quick-start-checklist), then retry.
-  The interactive setup flow remains tracked in #18.
+  described in [the quick start](README.md#quick-start-checklist), or rerun
+  `/pr-pipeline:setup`, then retry.
 - **The launcher prints a setup error.** Check `claude plugin list --json` for
   exactly one enabled `pr-pipeline@pr-pipeline` install. Fix missing/disabled or
   duplicate installs, ensure `claude` and `jq` are on PATH, or fix/unset an

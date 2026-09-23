@@ -14,6 +14,9 @@ import pytest
 import pipeline
 import tick
 
+# The stubbed target's own section: a tick refuses a target setup never ran for.
+SECTION = '\n[repos."test-owner/test-repo"]\n'
+
 
 @pytest.mark.parametrize("target", [None, ("issue", 42)])
 @pytest.mark.parametrize("author", [None, {}, "operator", {"login": 1}, {"login": ""}, {"login": "stranger"}])
@@ -203,12 +206,12 @@ def test_issue_trust_tick_binds_reloaded_login_through_following_cadence(tmp_pat
 
     def body(*args, **kwargs):
         # A supported edit during the tick applies only on the NEXT tick.
-        cfg.write_text('[operator]\nlogin = "next-user"\n')
+        cfg.write_text('[operator]\nlogin = "next-user"\n' + SECTION)
         tick.dispatch_implementers(authoritative_in_flight=[])
         tick._compute_post_dispatch_state()
         return 0
 
-    cfg.write_text('[operator]\nlogin = "current-user"\n')
+    cfg.write_text('[operator]\nlogin = "current-user"\n' + SECTION)
     with (
         mock.patch.object(tick, "_startup_probe"),
         mock.patch.object(tick, "_run_tick_body", side_effect=body),

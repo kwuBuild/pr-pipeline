@@ -322,8 +322,9 @@ classifier. The list therefore does not forbid force-push, remote-branch
 deletion, or arbitrary refspec push under auto. Operator-owned deny rules are
 the mitigation; the launcher never passes `--dangerously-skip-permissions`.
 Classifier denial can fail the run, and flag acceptance is not proof of a
-route's capabilities. Setup (#18) owns probing and recording effective mode and
-fallback/refusal; tick uses the selected value without an automatic fallback.
+route's capabilities. Setup's route probe measures the route and records the
+operator's chosen mode per repository; tick uses the selected value without an
+automatic fallback.
 See [engine permission modes](../../skills/tick/README.md#engine-permission-modes).
 
 Environment contract: `_engine_env()` ([`tick._engine_env`][tick]) preserves
@@ -787,6 +788,20 @@ These are paths to *block*, so `()` is the permissive reading, not the
 conservative one; on malformation the resolver keeps every usable string any
 layer declared (`_every_usable_entry`) so that a bad per-repository override
 cannot erase a valid `[defaults]` list, and still errors so the tick stops.
+
+`ResolvedConfig.repo_configured` reports whether the target matched a
+`[repos."owner/name"]` table, empty or not, case-insensitively. After the
+configuration and login checks, a tick whose target has no such table logs
+`startup_repo_unconfigured` and exits `UNCONFIGURED_TARGET_EXIT_CODE` (6)
+before the label check. Under `--loop` the reason says the repository was
+skipped, and the loop returns without observing cadence. Neither path reads
+input.
+
+The setup skill (`skills/setup/lib/setup_flow.py`) is the only writer of the
+operator file. It merges one repository's section into the parsed document and
+serialises the result. It validates the result by resolving a staged copy
+through `resolve_config` with `$PR_PIPELINE_CONFIG` pointed at it, so it
+cannot leave a file the tick refuses. Only then does it replace the file.
 
 A malformed `verify_tools` is therefore not an empty one. Read as empty it would
 compose with the dispatch-anyway rule into an engine that verifies nothing and a

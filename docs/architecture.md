@@ -799,8 +799,8 @@ operator-owned deny rules must forbid operations that must never run. Prompts
 assign GitHub metadata writes to the controller, but are not enforcement.
 
 A classifier denial can still fail verification and the run. Tick does not probe
-or silently change the selected mode; setup (#18) owns measuring route behavior
-and recording any fallback/refusal. CLI acceptance alone is not evidence of
+or silently change the selected mode; setup's route probe measures route
+behavior, and setup records the operator's chosen fallback per repository. CLI acceptance alone is not evidence of
 provider capability. See [engine permission modes](../skills/tick/README.md#engine-permission-modes),
 including why Codex's `--approve-for-me` is not applied to the read-only reviewer.
 

@@ -115,7 +115,7 @@ else:
         )
         stub.chmod(0o755)
     config = repo / "operator.toml"
-    config.write_text('[operator]\nlogin="test-owner"\n')
+    config.write_text('[operator]\nlogin="test-owner"\n[repos."example/usage"]\n')
     env = {
         **os.environ,
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
