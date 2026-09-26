@@ -1539,6 +1539,15 @@ _PIPELINE_PATH_RE = re.compile(
 # Tokens that bind a shipped, paste-ready prompt to one machine or one target.
 _OPERATOR_SPECIFIC_TOKENS = ("/Users/", "/home/", "sworn")
 
+# This repository's owner, and the only form in which a shipped file may name
+# it: a public address (the manifests' owner and homepage URLs, a doc link, and
+# the documented `/plugin marketplace add` source).
+_REPOSITORY_OWNER = "kwuBuild"
+_REPOSITORY_ADDRESS_RE = re.compile(
+    r"github\.com/kwuBuild(?:/pr-pipeline)?\b|marketplace add kwuBuild/pr-pipeline\b",
+    re.IGNORECASE,
+)
+
 # A backticked repo path in a root agent doc: at least one `/`, so a backticked
 # bare term (`pr-pipeline`, `gh`) is not mistaken for a file that must exist.
 _BACKTICKED_PATH_RE = re.compile(r"`([A-Za-z][\w.-]*(?:/[\w.-]*)+)`")
@@ -1818,6 +1827,41 @@ def test_no_shipped_surface_names_the_incubation_checkout() -> None:
 
     assert not violations, (
         "shipped surfaces name a checkout an adopter does not have:\n"
+        + "\n".join(violations)
+    )
+
+
+def test_no_shipped_file_binds_to_a_machine_or_this_repository() -> None:
+    """Every installed file, code included, must resolve without this checkout.
+
+    The surface test above covers what an engine reads. This one covers what
+    the plugin install carries: scripts, modules, prompts, manifests and docs.
+    A developer home path or this repository's slug in any of them works here
+    and nowhere else, so it cannot be seen from this repository. The one
+    allowed mention of the slug is the project's public address.
+    """
+    tracked = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "skills", ".claude-plugin"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    shipped = [
+        path for path in tracked
+        if not re.search(r"(^|/)(test_[^/]*|conftest)\.py$", path)
+    ]
+    assert shipped, "no shipped files found under skills/ or .claude-plugin/"
+
+    violations: list[str] = []
+    for path in shipped:
+        for line_no, line in enumerate(
+            (REPO_ROOT / path).read_text().splitlines(), start=1,
+        ):
+            unaddressed = _REPOSITORY_ADDRESS_RE.sub("", line)
+            for token in (*_OPERATOR_SPECIFIC_TOKENS, _REPOSITORY_OWNER):
+                if token.lower() in unaddressed.lower():
+                    violations.append(f"{path}:{line_no} names {token!r}: {line.strip()!r}")
+
+    assert not violations, (
+        "shipped files bind to one machine or to this repository:\n"
         + "\n".join(violations)
     )
 

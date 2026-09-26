@@ -691,6 +691,43 @@ def test_a_repository_set_up_from_scratch_passes_the_tick_startup_gates(
     assert after_setup.returncode == 0, after_setup.stderr
 
 
+def test_setup_and_tick_open_no_file_in_the_target_tree_but_pipeline_state(
+    doubles, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Configuration comes from the operator, never from the repository driven.
+
+    A target is the one input a pull request can edit, so a config file read
+    from inside it would let a PR supply the policy it is judged under. Every
+    in-tree name a config could plausibly take is planted here, and every file
+    the real setup and tick processes open is recorded by an audit hook: only
+    the pipeline's own state under ``.claude/worktrees`` may appear.
+    """
+    checkout = target_checkout(tmp_path)
+    for name in IN_TREE_CONFIG_CANDIDATES:
+        planted = checkout / name
+        planted.parent.mkdir(parents=True, exist_ok=True)
+        planted.write_text('[defaults]\npermission_mode = "dontAsk"\n')
+    opened_log = tmp_path / "opened.jsonl"
+    hook_dir = tmp_path / "audit-hook"
+    hook_dir.mkdir()
+    (hook_dir / "sitecustomize.py").write_text(OPEN_AUDIT_HOOK)
+    monkeypatch.setenv("PYTHONPATH", str(hook_dir))
+    monkeypatch.setenv("OPEN_AUDIT_LOG", str(opened_log))
+
+    steps = [*run_full_setup(checkout), run_tick(checkout)]
+
+    assert all(step.returncode == 0 for step in steps), [s.stderr for s in steps]
+    opened = opened_paths(opened_log)
+    assert pipeline.operator_config_path().resolve() in opened
+    root = checkout.resolve()
+    state = root / ".claude" / "worktrees"
+    in_tree = sorted(
+        str(path.relative_to(root)) for path in opened
+        if path.is_relative_to(root) and not path.is_relative_to(state)
+    )
+    assert in_tree == []
+
+
 # --- Helpers ---
 
 
@@ -758,6 +795,52 @@ def gh_calls(doubles: dict[str, Path]) -> list[list[str]]:
 
 def label_creations(doubles: dict[str, Path]) -> list[list[str]]:
     return [call for call in gh_calls(doubles) if call[:2] == ["label", "create"]]
+
+
+def opened_paths(log: Path) -> set[Path]:
+    """Resolve every path the audited processes opened, relative ones by cwd."""
+    paths = set()
+    for line in log.read_text().splitlines():
+        entry = json.loads(line)
+        path = Path(entry["path"])
+        paths.add((path if path.is_absolute() else Path(entry["cwd"]) / path).resolve())
+    return paths
+
+
+# Where a config inside the target could plausibly live: this pipeline's own
+# operator-config names, re-rooted in the repository, and the generic ones.
+IN_TREE_CONFIG_CANDIDATES = (
+    ".claude/pr-pipeline/config.toml",
+    ".claude/pr-pipeline.toml",
+    ".pr-pipeline.toml",
+    "pr-pipeline.toml",
+    "config.toml",
+    "skills/tick/config.toml",
+)
+
+# Loaded by every audited Python process through PYTHONPATH. `open` audit
+# events cover builtins.open, io.open, pathlib reads and os.open; a file
+# descriptor argument is not a path and is skipped. The event omits `dir_fd`,
+# so the relative names shutil.rmtree opens beneath a directory descriptor (the
+# setup probe removing its mkdtemp directory) cannot be resolved against the
+# cwd, and they are skipped too.
+OPEN_AUDIT_HOOK = r'''
+import json, os, sys
+_log = os.environ["OPEN_AUDIT_LOG"]
+def _hook(event, args):
+    if event != "open" or not isinstance(args[0], (str, bytes, os.PathLike)):
+        return
+    path = os.fsdecode(args[0])
+    if path == _log:
+        return
+    if not os.path.isabs(path) and sys._getframe(1).f_code.co_filename.endswith(
+        os.sep + "shutil.py"
+    ):
+        return
+    with open(_log, "a") as out:
+        out.write(json.dumps({"path": path, "cwd": os.getcwd()}) + "\n")
+sys.addaudithook(_hook)
+'''
 
 
 GH_DOUBLE = r'''

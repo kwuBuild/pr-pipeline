@@ -902,22 +902,38 @@ A PATH-stubbed engine exercises the controller, not the engine's permissions; an
 a happy-path end-to-end run never reaches the fixer, which is where the worst
 coupling lives. The stages below are scoped accordingly.
 
+This section owns what each stage must prove. The scripts that run the stages,
+their arguments, and the host conditions that change their results are in
+[`validation/README.md`](../../validation/README.md). Results of a run are
+recorded on its issue, not here.
+The [evidence gates](../../validation/README.md#reading-results) define when a
+recorded result is sufficient for PASS, including execution success, fixer
+dispatch identity, audit coverage, and exact per-target grants.
+
 ### L0 — static
 
 Clean clone into a temporary directory; run the suite there. Grep that no runtime
 path resolves to a developer home directory or to this repository by name. Assert
 the section 2 rule: no config read from inside a target tree.
 
-Current baseline: 1328 passed, 10 skipped. One failure and seven errors appear
-under a restrictive sandbox, all from `ps` start-time reads being blocked
-(`test_status.py:63`, "cannot read the child's start time"); they are
-environmental, not code defects.
+Both assertions are in the suite, so CI runs them too:
+`test_no_shipped_file_binds_to_a_machine_or_this_repository` scans every tracked
+shipped file, and
+`test_setup_and_tick_open_no_file_in_the_target_tree_but_pipeline_state` records
+every file that real setup and tick processes open.
+
+One failure and seven errors appear under a restrictive sandbox, all from `ps`
+start-time reads being blocked (`test_status.py:63`, "cannot read the child's
+start time"); they are environmental, not code defects. `test_gh_snapshots.py`
+runs `gh` in the checkout, so it needs a clone whose `origin` is the GitHub
+repository, as a clone from GitHub has.
 
 ### L1 — plugin install smoke
 
-`/plugin marketplace add <clone>`, `/plugin install`, then confirm:
-`${CLAUDE_PLUGIN_ROOT}` resolves inside a skill body; the dashboard runs **in an
-unrelated repository** and reports an empty queue rather than crashing; and the
+`/plugin marketplace add <owner/name>`, `/plugin install`, then confirm:
+`${CLAUDE_PLUGIN_ROOT}` resolves inside a skill body to the versioned cache entry;
+the dashboard runs **in an unrelated repository** and reports an empty queue
+rather than crashing; and the
 invocable skills are **exactly** the intended set under their real namespaced
 names — compare the installed commands against `_PUBLISHED_SKILLS` in
 `skills/tick/lib/test_skill_contract.py`. This is the explicit publication
@@ -928,6 +944,11 @@ Exactly, not at-least: an unintended command is the observable symptom of a
 misplaced file, and an assertion that only checks presence cannot see it.
 `test_published_skill_set_is_exactly_the_intended_commands` is the static half
 of this, so between the two a drift is caught before the install.
+
+The marketplace source must be a GitHub repository, as it is for an adopter. For
+a directory source (`/plugin marketplace add ./path`), Claude Code runs the plugin
+in place: `${CLAUDE_PLUGIN_ROOT}` names the source directory, not a cache entry,
+so the install path that L1 checks and L4 updates is never used.
 
 ### L2 — stubbed tick, controller only
 
@@ -940,6 +961,11 @@ transitions, worktree creation, and evidence archival at zero token cost.
 What this proves: the controller's target resolution, label vocabulary, base-ref
 handling, and config layering work against a repository that is not this one.
 What it cannot prove: anything about real engine permissions.
+
+The stubbed reviewer rejects the first review of a PR, so the stubbed run
+reaches the fixer too. A successful harvest archives no evidence bundle; only an
+escalation or an exhausted retry does. So evidence archival needs a second issue
+whose stubbed implementer escalates.
 
 ### L3 — real engines, two targets, full fix cycle
 
@@ -957,6 +983,12 @@ thinner version would leave open:
 - **An issue filed from a different account**, for the section 4 gate.
 Throwaway targets are required rather than convenient: run against this
 repository, none of it can detect self-coupling.
+
+Unattended engines inherit the operator's Claude user settings. When those
+settings sandbox Bash with `autoAllowBashIfSandboxed`, the engine allowlist is
+not enforced and setup's probe correctly reports `unmeasurable`. Run L3 with the
+sandbox disabled for engines, as `validation/README.md` describes, and record
+that the run did so.
 
 ### L3-adversarial — phase 2, and not a phase 1 gate
 
