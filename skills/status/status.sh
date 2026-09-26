@@ -155,12 +155,14 @@ for kind in PRs issues; do
   fi
   # Retain every ai: label, including markerless in-flight states and unknown
   # labels, even when Python is unavailable for the classification below.
+  # The variable is `ai_label` because `label` is a jq keyword, and jq 1.6
+  # rejects the whole program when a keyword names a variable.
   printf '%s' "$ITEMS" \
     | jq -r --arg kind "$kind" '
         .[] | select(has("pull_request") == ($kind == "PRs"))
         | . as $item
-        | (.labels[].name | select(startswith("ai:"))) as $label
-        | "\($label)\t#\($item.number)\t\($item.title[0:60])"
+        | (.labels[].name | select(startswith("ai:"))) as $ai_label
+        | "\($ai_label)\t#\($item.number)\t\($item.title[0:60])"
       ' \
     | sort \
     | awk -F'\t' '{ printf "  %-22s %-6s %s\n", $1, $2, $3 }'
