@@ -7,14 +7,14 @@ repositories they do not own.
 This document owns unfinished migration requirements and the review history
 behind them; it is not the operator manual. The configuration/target foundation
 has landed (#10 and #11), alongside packaging (#7–#9), label provisioning (#13),
-and permission-mode configuration (#15). Use the
+permission-mode configuration (#15), and interactive setup (#18). Use the
 [operator README](../../skills/tick/README.md) for shipped commands and examples,
 [internals](pr-pipeline-internals.md) for current mechanisms, and
 [architecture](../architecture.md) for stable design rationale.
 
 The target experience and schema below still include unfinished work: issue-author
-pickup (#14), empty-verification evidence (#16), interactive setup (#18), and
-independence validation (#19). The
+pickup (#14), empty-verification evidence (#16), and independence validation
+(#19). The
 [backlog index](https://github.com/kwuBuild/pr-pipeline/issues/39) and linked
 issues own live delivery status. Section 13 records historical review findings, not a
 second description of the current runtime.
@@ -208,8 +208,9 @@ a reader. Keeping one validated result across an entire tick is still #26.
 
 Remaining migration requirements:
 
-- Setup (#18) must report a repository section outside a non-empty `[scan] repos`
-  as a configuration error, rather than silently accepting an unusable override.
+- Implemented: setup resolves its merged file before writing it, so a
+  repository section outside a non-empty `[scan] repos` is reported as a
+  configuration error rather than silently accepted.
 - An intentionally empty `verify_tools` must dispatch with durable unverified
   evidence (#16, section 7). A malformed list must remain a startup error.
 
@@ -589,65 +590,92 @@ rather than a log line, because it is the only signal the human merge gate gets:
 
 ## 8. The `pr-pipeline-setup` skill
 
-A third skill, run once after install and again whenever A points the pipeline at
-a new repository.
+The implementation in PR #60 adds `skills/setup/` as `/pr-pipeline:setup`
+(12.4 reserved the `setup` directory name). Issue #18 remains open until a
+fresh install drives a previously unseen repository through a real implement,
+review, fix, and re-review cycle. Run this third skill once after install and
+again whenever A points the pipeline at a new repository. The
+[setup skill](../../skills/setup/SKILL.md) owns the procedure; the
+[route probe contract](../../skills/tick/README.md#setup-route-probe) and
+[unconfigured targets](../../skills/tick/README.md#unconfigured-targets) own the
+runtime rules. The design in brief:
 
 1. Resolve A's login via `gh api user --jq .login`, display it, ask A to confirm.
-2. Ask which repositories A wants to drive.
+2. Ask which repositories A wants to drive, and which engine route
+   (`--impl-engine`, `--model`) the tick will run.
 3. Per repository: resolve the default branch; create the `ai:` label set
    (section 6); inspect for `pom.xml`, `build.gradle`, `package.json`,
-   `pyproject.toml`, `Cargo.toml`; **propose** verification commands; A confirms
-   or edits.
-4. Offer to install deny rules for the destructive git surface (section 5).
-5. Check the host prerequisites: `gh`, `git`, `codex`, `jq` (the dashboard needs
-   it), and whether the installed `claude` supports the `auto` permission mode at
-   all — including on the DeepSeek implementer route. Report what is missing
-   rather than failing on first dispatch.
-
-   `build_engine_cmd()` accepting the argument is not the check, and neither is a
-   one-shot run that merely starts. `auto` is gated on the provider/model/account
-   actually supporting it, and — per section 5 — reaching the classifier is not
-   the same as being permitted. So the probe is a real
-   `claude --print --permission-mode auto` against the configured route, launched
-   the way dispatch launches an engine (same `--allowedTools`, no
-   `--permission-prompt-tool`, no TTY), asked to run one benign command that is
-   deliberately **not** in the allowlist — `git status` will do. It passes only if
-   that command's output comes back. A probe that starts, classifies, and denies
-   is a failure, and it is the failure that matters: it is the one that would
-   otherwise be discovered as an unexplained dispatch failure on an adopter's
-   first real run.
-
-   The probe result is recorded per route, because the answer can differ by
-   provider and model and a single global yes/no would be wrong for a
-   mixed-engine install.
-
-   Its failure has one of three explicit outcomes, chosen by A and recorded in
-   the config as `permission_mode`, never defaulted silently:
-   1. the route is unsupported and the engine selection changes;
-   2. the run falls back to `dontAsk` with the verification grants configured, because
-      `dontAsk` without grants is the mode that strands an engine mid-run; or
-   3. A accepts `auto`-unsupported operation for that route and the pipeline
-      refuses to dispatch to it.
-
-   This probe runs **before** step 3 accepts an empty `verify_tools`: the warning
-   in section 7 is only survivable because an undeclared command can still be
-   approved at run time, which is exactly what a route failing this probe takes
-   away. On a route that fails it, setup declines to accept an empty
-   `verify_tools` and requires A to name the target's verification commands —
-   the `dontAsk`-with-grants combination, which is the one configuration that
-   does not strand an engine mid-run.
+   `pyproject.toml`, `Cargo.toml` through the GitHub API; **propose**
+   verification commands, aligned with the target's own guidance files; A
+   confirms or edits.
+4. Offer deny rules for the destructive git surface (section 5).
+5. Check the host prerequisites (`gh`, `git`, `codex`, `jq`, `claude`) and run
+   the `auto` route probe. Report what is missing rather than failing on first
+   dispatch.
 6. Write `~/.claude/pr-pipeline/config.toml`. Never write into a target
    repository.
+7. Install the standalone launcher.
 
 Step 3 reads the target repository to *propose*, but a human confirms before
 anything is written, so the target still cannot author its own configuration —
 the rule stated in section 2.
 
+### The probe
+
+`build_engine_cmd()` accepting the argument is not the check, and neither is a
+one-shot run that merely starts. `auto` is gated on the provider/model/account
+actually supporting it, and — per section 5 — reaching the classifier is not
+the same as being permitted. So the probe is a real headless run against the
+configured route, launched from dispatch's own argv builder
+(`tick.claude_engine_argv`): the same `--allowedTools`, no
+`--permission-prompt-tool`, no TTY. It asks the engine to run one benign command
+that is **not** in the effective grants, and passes only if that command ran
+and its output came back. A probe that starts, classifies, and denies is a
+failure, and it is the failure that matters.
+
+The probe has a negative control: the same command and allowlist under
+`dontAsk` must be denied. Success under both modes means the allowlist is not
+enforced, so the probe measured nothing (`unmeasurable`). That is reported
+distinctly from an `auto` denial (`auto_failed`).
+
+Three corrections to the original draft, each from measurement or source:
+
+- **The probe command is `git init`, not `git status` or `pwd`.** `git status`
+  is in `_ENGINE_ALLOWED_TOOLS_BASE`, so its success proves nothing. `pwd` also
+  fails: on CLI 2.1.281 it ran under `dontAsk` with no allow rule naming it,
+  because the CLI treats it as read-only. `git init` writes and is harmless in
+  a throwaway directory. It prints a path the prompt never states and leaves
+  `.git` for the harness to check. A test fails if the base grants widen to
+  cover it.
+- **Two failure outcomes, not three.** A chooses between (1) changing the
+  engine route and (2) `dontAsk` with verification grants. A third "refuse to
+  dispatch" state has no representation in the phase 1 schema.
+- **Recorded per repository, not per route.** The result lands in the existing
+  `[repos."owner/name"] permission_mode` key, with probe evidence (route,
+  grants, outcome) kept beside the operator config. A route-keyed layer, and
+  the invalidation rules a model change would need, wait for a mixed-provider
+  install. Changing the route means running setup again.
+
+The ordering constraint holds in code, not only in the procedure.
+`write-config` refuses an empty `verify_tools`, or `auto`, unless a passing
+probe is recorded for exactly the grants being written. It refuses `dontAsk`
+without grants, because that combination strands an engine mid-run. The
+section 7 warning is survivable only because `auto` can approve an undeclared
+command at run time, and a failing route takes that away.
+
+Measured on this development host: a Claude sandbox with
+`autoAllowBashIfSandboxed` makes every Bash call succeed under `dontAsk`. The
+probe reports `unmeasurable` there, which is the correct result for the engines
+such a host would run. Open question 12.3 (what a denied command does to the
+rest of a headless run) remains open. The probe records only whether the
+command ran.
+
 ### Re-entry on an unconfigured repository
 
-When a tick resolves a target with no `[repos."owner/D"]` section, it prompts to
-run setup. Under `--loop` there is nobody to answer, so unattended operation
-skips that repository with a tick-log entry rather than blocking on input.
+When a tick resolves a target with no `[repos."owner/D"]` section, it exits 6
+and names setup; the tick skill asks A whether to run it. Under `--loop` there
+is nobody to answer, so unattended operation skips that repository with a
+`startup_repo_unconfigured` tick-log entry rather than blocking on input.
 
 ## 9. Plugin packaging and path resolution
 
@@ -707,8 +735,8 @@ The standalone surface now has a real entrypoint:
   each invocation for one enabled `pr-pipeline@pr-pipeline` install and executes
   the selected `tick`, `status`, `preflight`, or `labels` entry point. It fails
   with setup guidance for missing or ambiguous installs, without guessing a
-  cache version. The copy survives upgrades; interactive installation remains
-  part of setup (#18).
+  cache version. The copy survives upgrades; `/pr-pipeline:setup` runs the
+  installation step.
 - `README.md`/`DEBUG.md` commands use the launcher, and the
   `PR_PIPELINE_HOME` export is documented as the development-checkout path, still
   supported and no longer the only way to run anything.

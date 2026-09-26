@@ -498,6 +498,9 @@ def isolate_operator_config(
     suite happens to be run in. It has to name the same operator
     :data:`TRUSTED_AUTHOR` does, or every test that reaches the startup gate
     would be running as somebody the pipeline does not trust.
+
+    It also declares an empty section for the stubbed target, the state setup
+    leaves behind: a tick refuses a target with no section of its own.
     """
     import pipeline
 
@@ -508,7 +511,9 @@ def isolate_operator_config(
     monkeypatch.delenv("PIPELINE_TRUSTED_AUTHOR", raising=False)
     cfg = tmp_path_factory.mktemp("operator-config") / "config.toml"
     cfg.write_text(
-        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n', encoding="utf-8",
+        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n'
+        f'\n[repos."{TRUSTED_AUTHOR}/test-repo"]\n',
+        encoding="utf-8",
     )
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 

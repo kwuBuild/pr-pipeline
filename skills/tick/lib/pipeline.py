@@ -1790,6 +1790,11 @@ class ResolvedConfig:
         errors: Hard configuration errors, each naming the key. A caller that
             is about to act on the configuration must refuse to start.
         warnings: Fail-closed coercions and ignored keys, for the tick log.
+        repo_configured: Whether the resolved target has its own
+            ``[repos."owner/name"]`` table, empty or not. ``[defaults]``
+            answering every key is not the same statement: only setup writes a
+            repository's section, after proposing its verification grants and
+            probing its engine route. Always ``False`` for a blank ``repo``.
     """
 
     login: str
@@ -1801,6 +1806,7 @@ class ResolvedConfig:
     scan_repos: tuple[str, ...] | None
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
+    repo_configured: bool = False
 
 
 def _operator_config_location() -> tuple[Path, str]:
@@ -2301,6 +2307,7 @@ def resolve_config(
         ("the packaged floor [defaults]", packaged_defaults),
         ("[defaults]", declared["defaults"]),
     ]
+    repo_configured = False
     if repo:
         section = next(
             (value for name, value in repos_table.items() if same_repository(name, repo)),
@@ -2308,6 +2315,7 @@ def resolve_config(
         )
         if isinstance(section, dict):
             layers.append((f"[repos.\"{repo}\"]", section))
+            repo_configured = True
     if cli_overrides:
         layers.append(("the command line", dict(cli_overrides)))
     for label, table in layers:
@@ -2388,6 +2396,7 @@ def resolve_config(
         scan_repos=scan_repos,
         errors=tuple(errors),
         warnings=tuple(warnings),
+        repo_configured=repo_configured,
     )
 
 

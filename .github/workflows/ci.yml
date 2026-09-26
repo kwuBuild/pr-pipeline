@@ -120,6 +120,7 @@ jobs:
           bash -n skills/tick/install-launcher.sh
           bash -n skills/tick/preflight.sh
           bash -n skills/status/status.sh
+          bash -n skills/setup/setup.sh
 
       # -x follows the `# shellcheck source=` directives in tick.sh,
       # preflight.sh and status.sh into resolve-python.sh. Without it the
@@ -145,4 +146,5 @@ jobs:
             skills/tick/pr-pipeline.sh \
             skills/tick/install-launcher.sh \
             skills/tick/preflight.sh \
-            skills/status/status.sh
+            skills/status/status.sh \
+            skills/setup/setup.sh

@@ -5499,6 +5499,30 @@ def test_resolve_config_repo_section_overrides_defaults(
     assert other.base_ref == "main"
 
 
+def test_resolve_config_reports_whether_the_target_has_its_own_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Setup's re-entry gate asks whether *this* target was ever configured.
+
+    ``[defaults]`` answering every key is not that: it says what an operator
+    wants everywhere, not that anyone looked at this repository's toolchain or
+    probed its route. An empty section still counts — it is a deliberate
+    statement that the defaults are right here — and the match ignores case,
+    like every other repository comparison.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nverify_tools = ["make test"]\n'
+        '\n[repos."Owner/Configured"]\n'
+        '\n[repos."owner/tuned"]\npermission_mode = "dontAsk"\n',
+    )
+
+    assert pipeline.resolve_config("owner/configured").repo_configured is True
+    assert pipeline.resolve_config("owner/tuned").repo_configured is True
+    assert pipeline.resolve_config("owner/unseen").repo_configured is False
+    assert pipeline.resolve_config().repo_configured is False
+
+
 def test_resolve_config_lists_replace_and_never_merge(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

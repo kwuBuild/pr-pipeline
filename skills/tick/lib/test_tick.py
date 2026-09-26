@@ -395,7 +395,9 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
 
     def fake_tick(
         *_args: object, count_quiescent_heartbeat: bool = True,
+        unattended: bool = False,
     ) -> int:
+        assert unattended
         heartbeat_flags.append(count_quiescent_heartbeat)
         return 0
 
@@ -19905,7 +19907,10 @@ def test_main_ticks_under_the_login_the_config_now_names(
     from tick import main  # type: ignore[import-untyped]
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('[operator]\nlogin = "new-user"\n', encoding="utf-8")
+    cfg.write_text(
+        '[operator]\nlogin = "new-user"\n\n[repos."test-owner/test-repo"]\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
 
     with mock.patch("tick.git") as git_mock:
@@ -19966,11 +19971,9 @@ def test_main_resolves_permission_mode_before_dispatch(
     config_text = '[operator]\nlogin = "test-owner"\n'
     if defaults is not None:
         config_text += f'[defaults]\npermission_mode = "{defaults}"\n'
+    config_text += f'[repos."{tick.TRUSTED_HEAD_REPO}"]\n'
     if repo_mode is not None:
-        config_text += (
-            f'[repos."{tick.TRUSTED_HEAD_REPO}"]\n'
-            f'permission_mode = "{repo_mode}"\n'
-        )
+        config_text += f'permission_mode = "{repo_mode}"\n'
     cfg = tmp_path / "config.toml"
     cfg.write_text(config_text, encoding="utf-8")
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
@@ -20068,6 +20071,91 @@ def test_main_refuses_to_tick_on_an_invalid_configuration(
     assert "invalid configuration" in output
 
 
+def test_main_prompts_setup_for_a_target_with_no_repository_section(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A target nobody ran setup for stops before HARVEST and names setup.
+
+    ``[defaults]`` answers every key, so without this gate the tick would run
+    a repository whose verification grants were never proposed and whose
+    engine route was never probed. It stops before the label check too: a
+    brand-new repository has no vocabulary either, and "run setup" is the one
+    instruction that fixes both.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[operator]\nlogin = "test-owner"\n'
+        '\n[repos."test-owner/elsewhere"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    verify = mock.Mock()
+    monkeypatch.setattr(tick.labels, "verify", verify)
+
+    with mock.patch("tick.git") as git_mock:
+        git_mock.return_value = str(tmp_path)
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick._run_tick_body") as body:
+                stderr = io.StringIO()
+                with mock.patch("sys.stderr", stderr):
+                    result = tick.main()
+
+    output = stderr.getvalue()
+    assert result == tick.UNCONFIGURED_TARGET_EXIT_CODE
+    assert '[repos."test-owner/test-repo"]' in output
+    assert "/pr-pipeline:setup" in output
+    body.assert_not_called()
+    verify.assert_not_called()
+    actions = [e["action"] for e in read_tick_log_entries(Path(tick.TICK_LOG_DIR))]
+    assert actions.count("startup_repo_unconfigured") == 1
+
+
+def test_loop_skips_an_unconfigured_target_without_blocking_on_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Under ``--loop`` nobody can answer a setup prompt, so none is issued.
+
+    The tick logs the skip and the loop returns rather than waiting on stdin
+    or observing cadence: cadence reads GitHub for a target the operator has
+    not admitted yet.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[operator]\nlogin = "test-owner"\n', encoding="utf-8")
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    monkeypatch.setattr(tick.labels, "verify", mock.Mock())
+    monkeypatch.setattr(
+        "builtins.input", mock.Mock(side_effect=AssertionError("prompted")),
+    )
+    monkeypatch.setattr(
+        "sys.stdin", mock.Mock(**{
+            "read.side_effect": AssertionError("read stdin"),
+            "readline.side_effect": AssertionError("read stdin"),
+        }),
+    )
+    observe = mock.Mock(side_effect=AssertionError("observed cadence"))
+    monkeypatch.setattr(tick, "_observe_loop_state", observe)
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_args: None)
+
+    with mock.patch("tick._startup_probe"):
+        with mock.patch("tick._run_tick_body") as body:
+            with mock.patch("sys.stderr", io.StringIO()):
+                rc = tick._run_loop_locked(None, "claude", "")
+
+    assert rc == tick.UNCONFIGURED_TARGET_EXIT_CODE
+    body.assert_not_called()
+    skipped = [
+        e for e in read_tick_log_entries(Path(tick.TICK_LOG_DIR))
+        if e["action"] == "startup_repo_unconfigured"
+    ]
+    assert len(skipped) == 1
+    assert "skipped" in str(skipped[0]["reason"])
+    assert "test-owner/test-repo" in str(skipped[0]["reason"])
+
+
 def test_main_reports_a_fail_closed_config_warning_and_still_ticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -20083,7 +20171,8 @@ def test_main_reports_a_fail_closed_config_warning_and_still_ticks(
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         '[operator]\nlogin = "userA"\n'
-        '\n[defaults]\nallow_touching = "yes"\n',
+        '\n[defaults]\nallow_touching = "yes"\n'
+        '\n[repos."test-owner/test-repo"]\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))

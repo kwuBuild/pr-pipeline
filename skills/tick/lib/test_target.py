@@ -135,6 +135,11 @@ def test_foreign_repository_runs_a_whole_tick_without_target_configuration(repos
 
     git(repository, "remote", "add", "upstream", "https://github.com/elsewhere/project")
     monkeypatch.chdir(repository)
+    # Per-repository settings, not a repository identity: the target still
+    # comes from the remote, and setup leaves exactly this section behind.
+    cfg = repository / "operator.toml"
+    cfg.write_text('[operator]\nlogin="operator"\n[repos."elsewhere/project"]\n')
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
     real_run = subprocess.run
     github_calls = []
 
@@ -394,7 +399,7 @@ else:
                         'exit 1\n')
         stub.chmod(0o755)
     cfg = repository / "operator.toml"
-    cfg.write_text('[operator]\nlogin="test-owner"\n')
+    cfg.write_text('[operator]\nlogin="test-owner"\n[repos."selected/project"]\n')
     env = {**os.environ, "PATH": f"{stub_bin}:{os.environ['PATH']}",
            "PR_PIPELINE_CONFIG": str(cfg), "PR_PIPELINE_PYTHON": sys.executable,
            "TARGET_PROBE_ROOT": str(repository),

@@ -31,8 +31,17 @@ separate registry to add:
 
 The manifest publishes the skills under `skills/<name>/SKILL.md` as
 `/pr-pipeline:<name>` commands. `claude plugin details pr-pipeline` lists the
-installed set. Use `/pr-pipeline:tick` to operate the pipeline and
-`/pr-pipeline:status` to inspect it.
+installed set. Run `/pr-pipeline:setup` once after installing, and again for
+each new target repository; then use `/pr-pipeline:tick` to operate the
+pipeline and `/pr-pipeline:status` to inspect it.
+
+Setup confirms the operator login and, for each repository, resolves the
+default branch, provisions the label vocabulary, proposes verification grants
+for the operator to confirm, and runs the [route probe](#setup-route-probe). It
+then writes the repository's section of the operator config, offers
+[deny rules](#engine-permission-modes), and installs the launcher below. It is
+the only writer of the operator config and never writes into a target
+repository.
 
 For implementation and revision work, use `definition-of-done` and
 `review-response-hygiene`. Developers implementing or reviewing changes to
@@ -50,9 +59,8 @@ stays relative to the target repo, which is why every command below runs with
 the target repo as the working directory.
 
 **Standalone shell commands.** Install the launcher once at
-`~/.claude/pr-pipeline/bin/pr-pipeline`. The interactive setup flow is tracked
-in #18; its installation primitive already ships as
-`skills/tick/install-launcher.sh`. From a development checkout, run:
+`~/.claude/pr-pipeline/bin/pr-pipeline`. `/pr-pipeline:setup` runs
+`skills/tick/install-launcher.sh` for you. From a development checkout, run:
 
 ```bash
 bash skills/tick/install-launcher.sh
@@ -103,9 +111,9 @@ This setup primitive resolves the same canonical Git target as the tick and
 creates only missing `LABEL_*` labels from `pipeline.py`. Re-running it preserves
 existing labels, colors, and descriptions. It reports every unknown `ai:` label
 and explains that items carrying only unknown workflow labels are not selected
-by any dispatch query. It never deletes, renames, or updates a label. The
-interactive setup flow is separate; it can call this same command for each
-repository it adds.
+by any dispatch query. It never deletes, renames, or updates a label.
+`/pr-pipeline:setup` performs the same provisioning, by repository name, for
+each repository it adds.
 
 Every tick checks the complete vocabulary before HARVEST or DISPATCH. Missing
 labels, a failed read, or a malformed response exits 3 with
@@ -267,6 +275,27 @@ dot, underscore, or hyphen, start with a letter or digit, and cannot contain
 
 A startup failure exits 3 in both single-tick and `--loop` mode; loop cadence
 does not issue GitHub requests after a rejected target or configuration.
+
+### Unconfigured targets
+
+A target is configured when the operator config has a `[repos."owner/name"]`
+section for it, even an empty one. `[defaults]` alone does not count: it says
+what the operator wants everywhere, not that anyone proposed this repository's
+verification grants or probed its engine route. Only `/pr-pipeline:setup`
+writes that section.
+
+After the configuration and login checks, and before the label check, a tick
+whose target has no section stops. It writes `startup_repo_unconfigured` to
+the tick log and exits 6 before HARVEST or DISPATCH, naming the missing
+section and `/pr-pipeline:setup`. The tick never reads input:
+
+- **A single tick** hands the prompt to the operator's session. The
+  `/pr-pipeline:tick` skill asks the operator whether to run setup, then reruns
+  the tick.
+- **`--loop`** has nobody to answer, so it logs the repository as skipped and
+  returns 6 without observing cadence. Run setup, then restart the loop.
+
+A missing `[operator] login` still exits 3; its message also names setup.
 
 Use separate clones for different target repositories. Existing markers and
 receipts share a common-directory state space and do not record repository
@@ -833,7 +862,8 @@ Claude implementers and fixers default to `--permission-mode auto`. The existing
 `permission_mode` key accepts only `auto` and `dontAsk`, with precedence:
 packaged floor → operator `[defaults]` → `[repos."owner/name"]` → CLI flag.
 Malformed values stop startup and name the key. For a repository whose route
-fails the setup probe, persist the fallback in the operator's config:
+fails the [setup route probe](#setup-route-probe), setup records the operator's
+chosen fallback in the operator's config:
 
 ```toml
 [repos."owner/project"]
@@ -845,17 +875,62 @@ verify_tools = ["./gradlew test *"]
 classifier; it does not guarantee approval. A classifier denial can prevent
 verification and fail the run. CLI flag acceptance does not prove that a
 particular provider/model supports auto or can finish unattended. Tick passes
-the selected mode without automatically changing it; setup (#18) owns measuring
-the route's effective mode, denial behavior, and any fallback/refusal. Changing
-the provider/model requires rechecking that evidence.
+the selected mode without automatically changing it; setup's route probe
+measures it. Changing the provider or model requires running setup again.
 
 The narrow `--allowedTools` grants, including the stage's exact push command,
 remain in both modes. Under `dontAsk`, calls that would prompt are denied.
 Under `auto`, commands outside those grants, including force-push, remote-branch
 deletion, and arbitrary refspec pushes, can reach the classifier. Use
 operator-owned Claude deny rules for forbidden operations; omission from the
-allowlist is not a denial rule. Setup's deny-rule assistance belongs to #18.
-Implementers/fixers still inherit the operator's environment and settings.
+allowlist is not a denial rule. `/pr-pipeline:setup` offers deny rules for
+force-push, `--delete`/`-d` and `:refs/...` deletion, `+` forced refspecs,
+`--mirror`, and `--prune`. It installs them in the operator's Claude user
+settings only on an explicit yes, where they also bind the operator's own
+sessions. Short-form deletion (`git push <remote> :branch`) has no rule: a rule
+ending in `:*` is Claude Code's legacy prefix form and would deny every stage's
+own push. Implementers/fixers still inherit the operator's environment and
+settings.
+
+#### Setup route probe
+
+Accepting `--permission-mode auto` proves nothing, and neither does a run that
+merely starts: `auto` depends on the provider, model, and account, and a
+classifier denial is not an approval. Setup therefore measures the route the
+tick will use (`--impl-engine`, `--model`) for each repository:
+
+1. Compose the allowlist an implementer launches with: the engine base grants,
+   the repository's confirmed `verify_tools`, and the exact push grant. Refuse
+   to measure (`inconclusive`) if any entry grants the probe command.
+2. **Negative control.** Launch `claude -p --permission-mode dontAsk` with
+   dispatch's own argv: the same `--allowedTools`, no
+   `--permission-prompt-tool`, and the prompt on a stdin pipe (no TTY). Ask it
+   to run `git init` in a fresh throwaway directory. The command must be
+   attempted and denied.
+3. **Measurement.** Repeat under `--permission-mode auto`. The route passes
+   only if the directory now holds `.git` and the harness's tool result
+   contains the directory path, which the prompt never states.
+
+`git init` is used because it is not granted, not read-only, and observable.
+`pwd` and `git status` are not valid probes: on CLI 2.1.281 `pwd` runs under
+`dontAsk` as a read-only command, and `git status` is a base grant. A test
+fails if the base grants ever cover the probe command.
+
+| Outcome | Meaning | What setup accepts |
+|---|---|---|
+| `pass` | Denied under `dontAsk`, run under `auto` | `auto`, including empty `verify_tools` |
+| `auto_failed` | Control held; `auto` denied, rejected, failed, or timed out | Another route, or `dontAsk` with named grants |
+| `unmeasurable` | Ran under `dontAsk` too: the host does not enforce the allowlist (for example sandbox `autoAllowBashIfSandboxed`) | Another route, or `dontAsk` with named grants |
+| `inconclusive` | Nothing measured: route cannot launch, control never attempted the command, or the probe command is granted | Another route, or `dontAsk` with named grants |
+
+The operator chooses the fallback; setup never picks one. The result is
+recorded per repository as `permission_mode` in `[repos."owner/name"]`, and the
+probe evidence is kept under `setup-probes/` beside the operator config.
+`write-config` refuses `auto`, or an empty `verify_tools`, without a passing
+probe for exactly the grants being written. It also refuses `dontAsk` with no
+grants, because that combination strands an engine mid-run. The probe does not
+settle what a denied command does to an otherwise healthy headless run (design
+open question 12.3); it records only whether the command ran.
 
 **Codex uses different controls.** On the locally inspected `codex-cli 0.155.1`,
 `codex exec --help` exposes `--approve-for-me`: automatic review of approval

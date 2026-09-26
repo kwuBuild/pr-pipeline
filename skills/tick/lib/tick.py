@@ -154,6 +154,10 @@ WT_ROOT = _resolve_wt_root()
 TICK_LOG_DIR = os.path.join(WT_ROOT, ".tick-log")
 TICK_LOCK_PATH = os.path.join(WT_ROOT, ".tick.lock")
 LOCK_HELD_EXIT_CODE = 5
+# The resolved target has no [repos."owner/name"] section: setup never ran for
+# it. Distinct from 3 because the remedy is an interactive step, not a fix to a
+# value the operator already wrote.
+UNCONFIGURED_TARGET_EXIT_CODE = 6
 MAX_IN_FLIGHT = 3
 REVIEW_TIMEOUT = 20 * 60  # seconds
 # Quiescence counter tracks consecutive quiescent heartbeats across ticks.
@@ -780,9 +784,15 @@ def _engine_verify_tools(repo: str = "") -> tuple[str, ...]:
 # The implementer worktree checks out its own branch, so the exact permission
 # `git push <remote> HEAD` (fast-forward push of the checked-out branch) is its
 # pre-approved remote-mutation surface; auto may approve other commands.
-def _implementer_push_permission() -> str:
-    """Grant the implementer one push to the validated target remote."""
-    return f"Bash(git push {TARGET_REMOTE} HEAD)"
+def _implementer_push_permission(remote: str = "") -> str:
+    """Grant the implementer one push to the validated target remote.
+
+    Args:
+        remote: The remote to name. Empty uses this tick's validated
+            ``TARGET_REMOTE``; setup's route probe, which runs outside any
+            target checkout, names a representative remote instead.
+    """
+    return f"Bash(git push {remote or TARGET_REMOTE} HEAD)"
 
 
 # Conservative shape for a head ref that may be templated into the fixer's
@@ -915,6 +925,40 @@ def _heartbeat_path(wt_dir: str) -> str:
     )
 
 
+def claude_engine_argv(
+    engine_bin: str,
+    *,
+    permission_mode: str,
+    allowed_tools: str,
+    model: str = "",
+) -> list[str]:
+    """Return the headless Claude argv every implementer and fixer runs.
+
+    One definition shared with setup's route probe, which must launch the way
+    dispatch does — the same flags, and no ``--permission-prompt-tool`` — or
+    it measures a different permission path than the one engines take.
+
+    Args:
+        engine_bin: The engine binary (``"claude"``).
+        permission_mode: ``"auto"`` or ``"dontAsk"``.
+        allowed_tools: The complete ``--allowedTools`` value.
+        model: ``--model`` value; empty omits the flag.
+
+    Returns:
+        The argv, without the stream wrapper dispatch places in front of it.
+    """
+    argv = [
+        engine_bin, "-p",
+        "--permission-mode", permission_mode,
+        "--allowedTools", allowed_tools,
+        "--output-format", "stream-json",
+        "--verbose",
+    ]
+    if model:
+        argv += ["--model", model]
+    return argv
+
+
 def _launch_claude_engine(
     *,
     engine_bin: str,
@@ -984,15 +1028,12 @@ def _launch_claude_engine(
 
     prompt_path = os.path.join(wt_dir, "prompt.txt")
     stderr_path = os.path.join(wt_dir, "stderr.log")
-    engine_cmd = [
-        engine_bin, "-p",
-        "--permission-mode", permission_mode,
-        "--allowedTools", _engine_allowed_tools(push_permission, verify_tools),
-        "--output-format", "stream-json",
-        "--verbose",
-    ]
-    if model:
-        engine_cmd += ["--model", model]
+    engine_cmd = claude_engine_argv(
+        engine_bin,
+        permission_mode=permission_mode,
+        allowed_tools=_engine_allowed_tools(push_permission, verify_tools),
+        model=model,
+    )
     prompt_fh = result_fh = stderr_fh = None
     try:
         with open(prompt_path, "w") as fh:
@@ -11193,7 +11234,8 @@ def main(
         (dispatch gated), 2 = reconcile succeeded but authoritative in-flight
         label read failed (dispatch gated, retryable), 3 = startup probe
         failed (required binary missing), 4 = unhandled exception, 5 = another
-        tick already holds the mutex.
+        tick already holds the mutex, 6 = the target has no
+        ``[repos."owner/name"]`` section (run setup; ``--loop`` logs a skip).
     """
     # Resolve repo root. The main checkout, never the linked worktree the
     # operator happened to invoke from: cwd must agree with WT_ROOT or the
@@ -11272,6 +11314,7 @@ def _run_single_tick_locked(
     permission_mode: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
+    unattended: bool = False,
 ) -> int:
     """Run one tick while the caller owns the tick mutex.
 
@@ -11288,9 +11331,11 @@ def _run_single_tick_locked(
             ``--loop`` run picks up a config change on its next tick.
         count_quiescent_heartbeat: Forwarded to :func:`_run_tick_body`; only
             the in-process loop passes ``False``, for a nudge-initiated tick.
+        unattended: True under the in-process loop, where nobody can answer a
+            setup prompt; an unconfigured target is logged as skipped.
 
     Returns:
-        Process exit code (0, 1, 2, 3, or 4 — same semantics as ``main()``).
+        Process exit code (0 through 4, or 6 — same semantics as ``main()``).
     """
     global TRUSTED_HEAD_REPO, TARGET_REMOTE, TRUSTED_REVIEW_AUTHOR
 
@@ -11388,8 +11433,9 @@ def _run_single_tick_locked(
 
     if not trusted_author:
         msg = (
-            "tick: [operator] login not configured — set it in "
-            f"{pipeline.operator_config_path()} or export PIPELINE_TRUSTED_AUTHOR"
+            "tick: [operator] login not configured — run /pr-pipeline:setup, "
+            f"set it in {pipeline.operator_config_path()}, or export "
+            "PIPELINE_TRUSTED_AUTHOR"
         )
         print(msg, file=sys.stderr)
         if tick_log is not None:
@@ -11403,6 +11449,38 @@ def _run_single_tick_locked(
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
         return 3
+
+    # A target with no section of its own was never set up: nobody proposed its
+    # verification grants or probed its engine route, and [defaults] answering
+    # every key does not say otherwise. Checked before the label vocabulary,
+    # because setup is also what provisions that. Nothing here reads input — an
+    # interactive tick hands the prompt to the operator's session through the
+    # exit code, and an unattended loop has nobody to ask.
+    if not config.repo_configured:
+        section = f'[repos."{TRUSTED_HEAD_REPO}"]'
+        if unattended:
+            msg = (
+                f"tick: skipped {TRUSTED_HEAD_REPO}: no {section} section in "
+                f"{pipeline.operator_config_path()}; an unattended loop cannot "
+                "run setup — run /pr-pipeline:setup, then restart the loop"
+            )
+        else:
+            msg = (
+                f"tick: {TRUSTED_HEAD_REPO} is not set up: no {section} section "
+                f"in {pipeline.operator_config_path()}. Run /pr-pipeline:setup "
+                "for this repository, then rerun the tick"
+            )
+        print(msg, file=sys.stderr)
+        if tick_log is not None:
+            tick_log.log(
+                pr=None, phase="startup", stage="",
+                action="startup_repo_unconfigured", reason=msg,
+            )
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
+        print(tick_state.format_line(), file=sys.stderr)
+        sys.stderr.flush()
+        return UNCONFIGURED_TARGET_EXIT_CODE
 
     # Fail fast when a required binary is missing.
     missing = [name for name in ("gh", "git", "codex")
@@ -11708,10 +11786,12 @@ def _run_loop_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
                 count_quiescent_heartbeat=after_heartbeat,
+                unattended=True,
             )
-            if last_rc == 3:
-                # Startup refused this target/configuration. Cadence reads
-                # GitHub too, so observing here would bypass that refusal.
+            if last_rc in (3, UNCONFIGURED_TARGET_EXIT_CODE):
+                # Startup refused this target/configuration, or skipped a
+                # target setup never ran for. Cadence reads GitHub too, so
+                # observing here would bypass that refusal.
                 return last_rc
             state = _observe_loop_state(parsed_target)
             if not state["quiescent"]:
