@@ -420,7 +420,13 @@ Every nudge source below is one of that thread's polls; nothing outside it turns
 a sleep into an early tick:
 
 1. **Engine completion.** A watcher thread polls every 5s for evidence that a
-   dispatched engine finished. The artifact check is reviewer-only: a
+   dispatched engine finished. Before probing liveness, it polls the `Popen`
+   handles retained for children launched by this tick process. This nonblocking
+   wait reaps exited children so zombie PIDs cannot delay a completion wake until
+   the cadence timer. It never waits on a PID taken from a marker. Each tick
+   also polls those handles, so reaping continues if the watcher fails.
+   Reaping supplies no completion or custody authority; the checks below still
+   apply. The artifact check is reviewer-only: a
    `completion.json` or `review.json` has landed, which the reviewer wrapper
    publishes by atomic rename after the engine exits. Implementers and fixers
    run wrapperless and publish neither, and their engine holds a `Write` tool
@@ -479,7 +485,7 @@ a sleep into an early tick:
 Two properties keep this from becoming a control-plane risk:
 
 - **The watcher holds no custody.** It reads no results, makes no state
-  transition, and never kills or cleans anything. Harvest remains the sole
+  transition, and never kills engines or cleans scratch. Harvest remains the sole
   completion authority. If the watcher fails it logs `wake_watcher_failed` once
   and exits, and the loop continues on its unmodified timer schedule.
 - **Nudges cannot accelerate the quiescent stop.** Only a tick that followed a

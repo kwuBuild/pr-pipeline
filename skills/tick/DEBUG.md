@@ -4,6 +4,24 @@ Read this when a tick fails, an engine stalls, or the operator SOP says "inspect
 DEBUG.md." For normal operation, use `SKILL.md` (the injected SOP). For usage
 examples and observability, use `README.md`.
 
+## Offline completion-wake regression
+
+The developer test command is in the header of
+[`test_smoke_loop.py`](lib/test_smoke_loop.py). Run it from the pipeline source
+checkout, not from a target repository.
+
+`test_smoke_loop.py` runs the real `tick.py --loop` command in an isolated git
+repository. Local executables replace GitHub, remote fetches, paid engines, and
+notifications. Both implementer and fixer cases hold a real engine child alive,
+release it after the loop emits its cadence, and require harvest before that
+deadline. The fixture returns `NEEDS_HUMAN_DECISION`; label edits remain local.
+The tests take about 30 seconds with the production watcher and nudge intervals.
+
+`test_child_reaping.py` checks that a live descendant prevents the completion
+nudge after its wrapper is reaped, and that unrelated children retain their wait
+status. These tests prove process behavior, not provider integration. The other
+loop smoke scenarios remain in issue #34.
+
 ## Operational invariants
 
 1. **HARVEST then DISPATCH** — every tick runs both phases in order.

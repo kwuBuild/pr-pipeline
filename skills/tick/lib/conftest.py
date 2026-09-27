@@ -79,6 +79,14 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture(autouse=True)
+def isolate_engine_children(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Do not carry mocked engine handles into another test's wake scan."""
+    import tick
+
+    monkeypatch.setattr(tick, "_ENGINE_CHILDREN", [])
+
+
+@pytest.fixture(autouse=True)
 def isolate_operator_notifications(
     monkeypatch: pytest.MonkeyPatch,
 ) -> Callable[..., None]:
