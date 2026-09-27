@@ -1936,6 +1936,23 @@ def test_valid_marker_requires_full_provenance_field_set() -> None:
         assert pipeline.valid_marker(m) is False, f"missing {field} must fail closed"
 
 
+@pytest.mark.parametrize("policy,valid", [
+    ({"permission_mode": "dontAsk", "verify_tools": ["sh ./check.sh"]}, True),
+    ({"permission_mode": "auto", "verify_tools": []}, True),
+    ({"permission_mode": "bypassPermissions", "verify_tools": []}, False),
+    ({"permission_mode": "dontAsk"}, False),
+    ({"verify_tools": []}, False),
+    ({"permission_mode": "auto", "verify_tools": "check"}, False),
+    ({"permission_mode": "auto", "verify_tools": [7]}, False),
+    ({"permission_mode": "auto", "verify_tools": ["Bash(check)"]}, False),
+])
+def test_implementer_marker_validates_optional_launch_policy(policy, valid):
+    assert pipeline.valid_marker(impl_marker(**policy)) is valid
+    assert pipeline.valid_marker(marker(**policy)) is False
+    assert pipeline.valid_marker(fix_marker(**policy)) is False
+    assert pipeline.valid_marker(impl_marker()) is True
+
+
 def test_valid_marker_rejects_unknown_fields() -> None:
     # A marker carrying a field this pipeline never writes did not come from its writer;
     # do not partially trust it.

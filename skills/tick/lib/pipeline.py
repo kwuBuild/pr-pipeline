@@ -2771,7 +2771,7 @@ def decide_implementation_harvest(
 def _sanitize_engine_report(value: object) -> str:
     """Return a bounded, comment-safe excerpt of engine-authored result text.
 
-    The excerpt is unbounded model output embedded in a shared record, so three
+    The excerpt is model output embedded in a shared record, so three
     substrings are neutralised beyond the length bound. HTML comment delimiters
     go first: the pipeline's round-counting and idempotency markers *are* HTML
     comments, and a fixer that quotes a reviewer comment back at us would
@@ -2796,6 +2796,85 @@ def _sanitize_engine_report(value: object) -> str:
     if len(text) > _FIX_REPORT_LIMIT:
         text = f"{text[:_FIX_REPORT_LIMIT]}\n… (truncated)"
     return _neutralize_comment_markup(text)
+
+
+def render_implementation_escalation_comment(
+    *,
+    result: str,
+    sentinel: str | None,
+    reason: str,
+    permission_mode: object,
+    verify_tools: object,
+    evidence_path: str,
+) -> str:
+    """Explain a result-driven implementer escalation from dispatch evidence.
+
+    Policy comes from the dispatch marker, never the current configuration.
+    Legacy or malformed metadata is reported as unknown. Engine text, denial
+    commands, and grants are bounded and neutralized before publication; other
+    tool inputs are deliberately omitted.
+    """
+    obj = _load_json_string(result, None)
+    obj = obj if isinstance(obj, dict) else {}
+    stopped = reason or (
+        f"the implementer emitted `{sentinel}`"
+        if sentinel else "the implementer ended without a completion sentinel"
+    )
+    unknown = "unknown (not recorded at dispatch)"
+    mode = permission_mode if permission_mode in ("auto", "dontAsk") else unknown
+    lines = [
+        "**Implementer run — escalated for a human decision.**",
+        "",
+        f"- Why it stopped: {stopped}",
+        f"- Engine sentinel: {f'`{sentinel}`' if sentinel else '_none emitted_'}",
+        f"- Permission mode at dispatch: {mode}",
+        "",
+        "**Engine's last message (bounded excerpt)**",
+        "",
+        "```text",
+        _sanitize_engine_report(obj.get("result")) or "No readable engine message.",
+        "```",
+    ]
+    denials = obj.get("permission_denials")
+    if isinstance(denials, list) and denials:
+        entries = []
+        for denial in denials[:10]:
+            denial = denial if isinstance(denial, dict) else {}
+            tool = denial.get("tool_name")
+            tool = tool[:100] if isinstance(tool, str) else "unknown tool"
+            inputs = denial.get("tool_input")
+            command = inputs.get("command") if isinstance(inputs, dict) else None
+            command = command if isinstance(command, str) else "command unavailable"
+            if len(command) > 500:
+                command = command[:500] + " … (truncated)"
+            entries.append(f"{tool}: {command}")
+        if len(denials) > 10:
+            entries.append("… (truncated; first 10 denials shown)")
+        lines.extend([
+            "", f"**Denied commands ({len(denials)} reported; bounded excerpt)**",
+            "", "```text", _sanitize_engine_report("\n".join(entries)), "```",
+        ])
+    else:
+        lines.extend(["", "Denied commands: none recorded in the result."])
+    if not isinstance(verify_tools, list) or not all(isinstance(v, str) for v in verify_tools):
+        grants = unknown
+    elif not verify_tools:
+        grants = "none (empty at dispatch)"
+    else:
+        entries = [
+            v[:500] + (" … (truncated)" if len(v) > 500 else "")
+            for v in verify_tools[:10]
+        ]
+        if len(verify_tools) > 10:
+            entries.append("… (truncated; first 10 grants shown)")
+        grants = _sanitize_engine_report("\n".join(entries))
+    lines.extend([
+        "", "**Verification grants at dispatch (bounded excerpt)**",
+        "", "```text", grants, "```",
+        "", "**Full output:** local evidence on the machine that ran the tick:",
+        "", "```text", _neutralize_comment_markup(evidence_path), "```",
+    ])
+    return "\n".join(lines)
 
 
 def _neutralize_comment_markup(text: str) -> str:
@@ -3572,7 +3651,8 @@ _REQUIRED_MARKER_FIELDS = frozenset(
 # rather than partially trusted.
 _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
     {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
-     "fix_round", "review_sha256", "verification_unconfigured"}
+     "fix_round", "review_sha256", "verification_unconfigured",
+     "permission_mode", "verify_tools"}
 )
 
 # Pipeline stages a dispatch marker may legitimately record. A marker for an
@@ -3792,6 +3872,22 @@ def valid_marker(
         if stage != "fix" or not isinstance(review_sha256, str):
             return False
         if not re.fullmatch(r"[a-f0-9]{64}", review_sha256):
+            return False
+
+    # Implementer launch policy is one optional snapshot. Old markers omit it;
+    # a partial or malformed snapshot could misstate what the engine received.
+    if "permission_mode" in obj or "verify_tools" in obj:
+        grants = obj.get("verify_tools")
+        if (
+            stage != "implement"
+            or obj.get("permission_mode") not in ("auto", "dontAsk")
+            or not isinstance(grants, list)
+            or not all(
+                isinstance(v, str) and v.strip() and v == v.strip()
+                for v in grants
+            )
+            or _verify_tool_body_problem(("dispatch", grants), grants)
+        ):
             return False
 
     # pr_body is the fixer's PR-body-revision provenance: the fingerprint of the

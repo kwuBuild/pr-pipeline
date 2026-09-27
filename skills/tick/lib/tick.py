@@ -53,7 +53,7 @@ import time
 import tomllib
 import traceback
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -1850,6 +1850,38 @@ def _engine_result_summary(
     return details
 
 
+def _replace_evidence_file(
+    archive_dir: str,
+    filename: str,
+    write: Callable[[str], object],
+) -> bool:
+    """Write one archive file through a temporary sibling, then replace it.
+
+    A published report can already name the archive, so its files must stay
+    whole: a crash or failed write leaves the previous complete file, or no
+    file, never a partial one. A later attempt overwrites a leftover sibling.
+
+    Args:
+        archive_dir: The archive directory.
+        filename: The destination file name inside ``archive_dir``.
+        write: Writes the complete content to the path it receives.
+
+    Returns:
+        ``True`` once the complete file is in place.
+    """
+    partial = os.path.join(archive_dir, f".{filename}.partial")
+    try:
+        write(partial)
+        os.replace(partial, os.path.join(archive_dir, filename))
+    except OSError:
+        try:
+            os.unlink(partial)
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def _copy_evidence_file(wt_dir: str, archive_dir: str, filename: str) -> bool:
     """Copy one harvest evidence file if it exists.
 
@@ -1859,11 +1891,9 @@ def _copy_evidence_file(wt_dir: str, archive_dir: str, filename: str) -> bool:
     source = os.path.join(wt_dir, filename)
     if not os.path.isfile(source):
         return True
-    try:
-        shutil.copy2(source, os.path.join(archive_dir, filename))
-    except OSError:
-        return False
-    return True
+    return _replace_evidence_file(
+        archive_dir, filename, lambda partial: shutil.copy2(source, partial),
+    )
 
 
 def _write_git_snapshot(
@@ -1873,17 +1903,29 @@ def _write_git_snapshot(
     *args: str,
 ) -> bool:
     """Write a git diagnostic snapshot for a harvest archive."""
-    path = os.path.join(archive_dir, filename)
     try:
         output = git("-C", wt_dir, *args)
     except subprocess.CalledProcessError as exc:
         output = f"<unavailable: git {' '.join(args)} exited {exc.returncode}>"
-    try:
-        with open(path, "w", encoding="utf-8") as fh:
+
+    def write(partial: str) -> None:
+        with open(partial, "w", encoding="utf-8") as fh:
             fh.write(f"{output}\n")
-    except OSError:
-        return False
-    return True
+
+    return _replace_evidence_file(archive_dir, filename, write)
+
+
+def _harvest_evidence_path(wt_root: str, kind: str, number: int, dispatch_id: str) -> str:
+    """Return the stable evidence location used by a terminal intent and its report."""
+    safe_dispatch_id = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in dispatch_id
+    ) or "unknown"
+    return os.path.join(wt_root, ".harvest-evidence", f"{kind}-{number}-{safe_dispatch_id}")
+
+
+# Written last by _archive_harvest_evidence. A reused archive without it was
+# interrupted during preparation and is completed before anything names it.
+_ARCHIVE_PREPARED_MARKER = ".prepared"
 
 
 def _archive_harvest_evidence(
@@ -1910,7 +1952,12 @@ def _archive_harvest_evidence(
     retained prepared archive (e.g. after a failed release or final move) must
     not accumulate one directory per retry tick. The base name embeds the
     dispatch id, which is unique per dispatch, so an existing base directory
-    can only belong to this same transition's earlier attempt.
+    can only belong to this same transition's earlier attempt. Only a
+    directory with the prepared marker is returned as is. An earlier attempt
+    that stopped during preparation is completed in place from the retained
+    source, and is kept when that repair fails: a report may already name it.
+    Each file is replaced atomically (see :func:`_replace_evidence_file`), so
+    repairing a complete legacy archive never leaves a published file partial.
 
     Args:
         wt_root: The worktree root holding controller-owned state.
@@ -1924,37 +1971,37 @@ def _archive_harvest_evidence(
         required_files: Files that must exist in ``wt_dir`` or the archive is
             discarded.
         reuse_existing: When the base directory for this dispatch already
-            exists, return it without re-copying.
+            exists, return it without re-copying once it is marked prepared,
+            or complete it in place otherwise.
 
     Returns:
         The archive directory path, or ``""`` when evidence could not be
         preserved.
     """
-    safe_dispatch_id = "".join(
-        ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in dispatch_id
-    ) or "unknown"
-    archive_root = os.path.join(wt_root, ".harvest-evidence")
-    archive_base = os.path.join(
-        archive_root, f"{kind}-{number}-{safe_dispatch_id}",
-    )
-    if reuse_existing and os.path.isdir(archive_base):
-        return archive_base
-    try:
-        os.makedirs(archive_root, exist_ok=True)
-    except OSError:
-        return ""
-    archive_dir = archive_base
-    suffix = 2
-    while True:
+    archive_base = _harvest_evidence_path(wt_root, kind, number, dispatch_id)
+    archive_root = os.path.dirname(archive_base)
+    repairing = reuse_existing and os.path.isdir(archive_base)
+    if repairing:
+        if os.path.isfile(os.path.join(archive_base, _ARCHIVE_PREPARED_MARKER)):
+            return archive_base
+        archive_dir = archive_base
+    else:
         try:
-            os.mkdir(archive_dir)
-        except FileExistsError:
-            archive_dir = f"{archive_base}-{suffix}"
-            suffix += 1
-            continue
+            os.makedirs(archive_root, exist_ok=True)
         except OSError:
             return ""
-        break
+        archive_dir = archive_base
+        suffix = 2
+        while True:
+            try:
+                os.mkdir(archive_dir)
+            except FileExistsError:
+                archive_dir = f"{archive_base}-{suffix}"
+                suffix += 1
+                continue
+            except OSError:
+                return ""
+            break
 
     archive_ok = all(
         os.path.isfile(os.path.join(wt_dir, filename))
@@ -1979,8 +2026,19 @@ def _archive_harvest_evidence(
         wt_dir, archive_dir, "git-diff-stat.txt", "diff", "--stat",
     ):
         archive_ok = False
+    if archive_ok:
+        try:
+            with open(
+                os.path.join(archive_dir, _ARCHIVE_PREPARED_MARKER),
+                "w",
+                encoding="utf-8",
+            ):
+                pass
+        except OSError:
+            archive_ok = False
     if not archive_ok:
-        shutil.rmtree(archive_dir, ignore_errors=True)
+        if not repairing:
+            shutil.rmtree(archive_dir, ignore_errors=True)
         return ""
 
     if tick_log:
@@ -2000,9 +2058,10 @@ def _archive_harvest_evidence(
 def _discard_prepared_archive(archive_dir: str) -> None:
     """Remove a prepared evidence archive after a failed terminal transition.
 
-    The source scratch is retained by the caller, so the next retry archives
-    it again from the originals; keeping the prepared copy would leak one
-    uniquely named directory per tick for the duration of a GitHub outage.
+    Use only where no published report can reference this directory. The
+    caller retains source scratch so a retry can archive it again. Transitions
+    that may have published the path must retain it and use ``reuse_existing``
+    to avoid creating one directory per retry during a GitHub outage.
 
     Args:
         archive_dir: The archive directory created by
@@ -5667,10 +5726,9 @@ def _complete_terminal_escalation(
         release_label=release_label,
         hold_label=hold_label,
     ):
-        # The intent stays on disk so the next tick resumes this transition
-        # instead of recomputing one that would contradict the comment above.
-        # The archive is only discarded here, never destroyed.
-        _discard_prepared_archive(archive_dir)
+        # The cap can inherit an archive referenced by an earlier report,
+        # including an unreceipted post. Retain it with the intent until the
+        # relabel or hold release recovers; retries reuse this same directory.
         return
     # Terminal label landed: clear the counter before the archive move
     # deletes the marker (see _handle_transient_engine_result).
@@ -5850,8 +5908,8 @@ def _complete_escalate_transition(
 ) -> bool:
     """Complete a result-driven stage escalation for one dispatch.
 
-    Shared by the implementer (silent) and fixer (comment-bearing) escalate
-    branches, and re-entered by :func:`_resume_terminal_escalation` after a
+    Shared by the implementer, fixer, and reviewer escalate branches, and
+    re-entered by :func:`_resume_terminal_escalation` after a
     failed archive move. Every step is idempotent: the archive is re-prepared,
     a posted comment is suppressed by its receipt, and the relabel converges
     to the same target.
@@ -5909,7 +5967,8 @@ def _complete_escalate_transition(
         kind=_FIX_COMMENT_KIND,
         target_label=harvest_label,
     ):
-        _discard_prepared_archive(archive_dir)
+        # A previous post may have landed before its receipt was saved. Keep
+        # its evidence path even when this attempt fails; retries reuse it.
         _bound_failed_harvest(
             n, entity, _STAGE_IN_FLIGHT_LABELS.get(stage, ""), wt_dir,
             attempts, tick_log, stage,
@@ -5927,7 +5986,11 @@ def _complete_escalate_transition(
         release_label=release_label,
         hold_label=hold_label,
     ):
-        _discard_prepared_archive(archive_dir)
+        # A published report can point at this archive. Keep that path readable
+        # while relabel or hold release is retried; reuse_existing above keeps
+        # one prepared archive per dispatch. Silent escalations publish no path.
+        if not comment_body:
+            _discard_prepared_archive(archive_dir)
         return False
     # Terminal label landed: clear the counter before the archive move
     # deletes the marker (see _handle_transient_engine_result).
@@ -5942,7 +6005,7 @@ def _complete_escalate_transition(
         reason="retaining scratch after stage escalation",
         tick_log=tick_log,
     ):
-        # The recorded intent (and the fixer's comment receipt) stay on disk:
+        # The recorded intent and any comment receipt stay on disk:
         # a failed move resumes this same escalation next tick instead of
         # letting the generic hold branch republish the completed outcome as a
         # held result under the pipeline's own terminal label.
@@ -6930,7 +6993,7 @@ def _harvest_one_implementer(
     Reads ``result.json`` from the issue's worktree, calls
     ``pipeline.harvest_implementation``, and executes the prescribed side effects:
     ``create_pr`` → ``gh pr create`` + relabel + worktree rename;
-    ``escalate`` → relabel to ``ai:needs-human-decision``.
+    ``escalate`` → publish the reason and relabel to ``ai:needs-human-decision``.
 
     On any ``gh`` failure, the marker and scratch survive for the next tick.
     """
@@ -6957,6 +7020,8 @@ def _harvest_one_implementer(
     dispatch_id = ""
     engine = "claude"
     verification_unconfigured = False
+    permission_mode: object = None
+    verify_tools: object = None
     if os.path.isfile(dispatch_path):
         try:
             with open(dispatch_path) as fh:
@@ -6964,6 +7029,8 @@ def _harvest_one_implementer(
         except (OSError, json.JSONDecodeError):
             marker = None
         if isinstance(marker, dict):
+            permission_mode = marker.get("permission_mode")
+            verify_tools = marker.get("verify_tools")
             verification_unconfigured = marker.get("verification_unconfigured") is True
             mp = marker.get("pre_label")
             if isinstance(mp, str):
@@ -7184,6 +7251,14 @@ def _harvest_one_implementer(
                         attempts.clear(n)
 
     elif harvest_action == "escalate":
+        comment_body = pipeline.render_implementation_escalation_comment(
+            result=result_raw,
+            sentinel=harvest_result.get("sentinel"),
+            reason=str(harvest_result.get("reason", "")),
+            permission_mode=permission_mode,
+            verify_tools=verify_tools,
+            evidence_path=_harvest_evidence_path(wt_root, "issue", n, dispatch_id),
+        )
         # Record the decision before the transition starts, so a failed or
         # interrupted archive move resumes this same escalation next tick
         # instead of re-entering ordinary harvest and publishing the completed
@@ -7194,10 +7269,7 @@ def _harvest_one_implementer(
             wt_root, "issue", n, dispatch_id, _IMPLEMENTER_CONFIG.stage,
             kind="escalate",
             harvest_label=harvest_label,
-            # The implementer escalation is silent. The key is still written,
-            # because the resume validates the record against a closed schema
-            # and an absent field is indistinguishable from a corrupted one.
-            comment_body="",
+            comment_body=comment_body,
         ):
             if tick_log:
                 tick_log.log(
@@ -7218,7 +7290,7 @@ def _harvest_one_implementer(
             dispatch_id=dispatch_id,
             stage=_IMPLEMENTER_CONFIG.stage,
             harvest_label=harvest_label,
-            comment_body="",
+            comment_body=comment_body,
             attempts=attempts,
             tick_log=tick_log,
         )
@@ -7918,7 +7990,7 @@ def _harvest_one_fixer(
     Reads ``result.json`` from the PR's worktree, calls
     ``pipeline.harvest_fix``, and executes the prescribed side effects:
     ``recheck`` → relabel to ``ai:revised`` + bump iteration cache;
-    ``escalate`` → relabel to ``ai:needs-human-decision``.
+    ``escalate`` → publish the reason and relabel to ``ai:needs-human-decision``.
 
     On any ``gh`` failure, the marker and scratch survive for the next tick.
     """
@@ -10087,6 +10159,8 @@ def _dispatch_one_implementer(
         "dispatch_id": dispatch_id,
         "state": "launching",
         "verification_unconfigured": verification_unconfigured,
+        "permission_mode": permission_mode,
+        "verify_tools": list(config.verify_tools),
     }
     try:
         pipeline.atomic_write(
