@@ -167,6 +167,11 @@ _QUIESCENT_COUNTER_FILE = os.path.join(WT_ROOT, ".tick-state", "quiescent-counte
 # the wake-request file are advisory nudges only: they end the inter-tick sleep
 # early, and the tick that follows re-reads full state as always.
 WAKE_WATCH_POLL_SECONDS = 5
+# Keep handles for children this tick process launched. Dropping a Popen leaves
+# CPython to reap it only at a later spawn, which an idle loop may not do until
+# its cadence timer fires. This registry owns wait status, never marker custody.
+_ENGINE_CHILDREN: list[subprocess.Popen[bytes]] = []
+_ENGINE_CHILDREN_LOCK = threading.Lock()
 # Minimum spacing between a tick and a nudge-initiated successor, bounding the
 # tick rate a nudge storm (buggy toucher, flapping marker) can force.
 LOOP_NUDGE_FLOOR_SECONDS = 10
@@ -1041,7 +1046,7 @@ def _launch_claude_engine(
         prompt_fh = open(prompt_path, "rb")
         result_fh = open(result_path, "wb")
         stderr_fh = open(stderr_path, "wb")
-        return subprocess.Popen(
+        proc = subprocess.Popen(
             [
                 sys.executable, _CLAUDE_STREAM_WRAPPER,
                 "--heartbeat", _heartbeat_path(wt_dir),
@@ -1054,6 +1059,8 @@ def _launch_claude_engine(
             start_new_session=True,
             env=env,
         )
+        _track_engine_child(proc)
+        return proc
     except OSError:
         return None
     finally:
@@ -9583,6 +9590,7 @@ def _dispatch_one_reviewer(
             start_new_session=True,
             env=reviewer_env,
         )
+        _track_engine_child(proc)
     except OSError:
         cleanup_scratch(wt_dir)
         if tick_log:
@@ -11935,6 +11943,7 @@ def _scan_finished_engines(seen: set[str]) -> bool:
     Returns:
         ``True`` when at least one not-yet-seen engine looks finished.
     """
+    _reap_engine_children()
     nudge = False
     for wt_dir, marker in _iter_dispatch_markers():
         dispatch_id = marker.get("dispatch_id")
@@ -11945,6 +11954,26 @@ def _scan_finished_engines(seen: set[str]) -> bool:
         seen.add(dispatch_id)
         nudge = True
     return nudge
+
+
+def _track_engine_child(proc: subprocess.Popen[bytes]) -> None:
+    """Retain an owned child for nonblocking reaping between loop ticks."""
+    with _ENGINE_CHILDREN_LOCK:
+        _ENGINE_CHILDREN.append(proc)
+
+
+def _reap_engine_children() -> None:
+    """Collect exited direct children without trusting PIDs from marker files.
+
+    Popen.poll uses a nonblocking wait and preserves the child's return code.
+    It neither waits on unrelated children nor proves that an engine's process
+    group is dead. The wake scan and harvest still use their existing checks.
+    The lock serializes dispatch registration and concurrent watcher/tick polls.
+    """
+    with _ENGINE_CHILDREN_LOCK:
+        _ENGINE_CHILDREN[:] = [
+            proc for proc in _ENGINE_CHILDREN if proc.poll() is None
+        ]
 
 
 def _iter_dispatch_markers(
@@ -12935,6 +12964,9 @@ def _run_tick_body(
                 reason=str(exc),
             )
         return 1
+
+    # Also reap on timed ticks if the advisory watcher could not start or died.
+    _reap_engine_children()
 
     # Phase 0: Surface retained scratch dirs so orphaned state is visible.
     _surface_retained_scratch_dirs(WT_ROOT, tick_log)

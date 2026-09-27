@@ -113,6 +113,11 @@ channel that an advisory watcher can signal on engine-completion evidence, an
 operator/external `wake-request` file, or a detected engine stall — a `live`
 implementer/fixer whose progress heartbeat has not advanced past its threshold.
 The watcher holds no custody and fails open to the timer.
+The tick retains its engine child handles and polls them without blocking before
+completion scans. This reaps exited children during the idle wait; zombie PIDs
+therefore cannot suppress the completion nudge. The
+[completion-wake contract](../skills/tick/README.md#edge-triggered-wake-up-in-loop-mode)
+defines the reaping boundary and the unchanged harvest checks.
 
 The first two are nudges and nothing more, so they exist only in `--loop`,
 where there is a sleep to shorten. The stall source also *reports* to the
