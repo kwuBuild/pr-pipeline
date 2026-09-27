@@ -529,7 +529,41 @@ def test_status_reports_unavailable_when_vocabulary_output_is_invalid(tmp_path):
     assert "(none)" not in parked
 
 
+def test_shipped_jq_programs_bind_no_jq_keyword_as_a_variable() -> None:
+    """A keyword variable compiles under jq 1.7 and fails the program under 1.6.
+
+    jq 1.6 still ships with Ubuntu 22.04 and with Anaconda, while CI's runner
+    has 1.7, so running the scripts in CI cannot catch this. A failed program
+    only prints a compile error in place of its section, and the dashboard
+    still exits 0, so on a 1.6 host a full queue reads as empty.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    scripts = subprocess.run(
+        ["git", "-C", str(repo_root), "ls-files", "skills/*/*.sh"],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    keyword_variable = re.compile(r"\$(" + "|".join(JQ_KEYWORDS) + r")\b")
+
+    violations = [
+        f"{script}:{line_no}: {line.strip()}"
+        for script in scripts
+        if "jq" in (text := (repo_root / script).read_text())
+        for line_no, line in enumerate(text.splitlines(), start=1)
+        if keyword_variable.search(line)
+    ]
+
+    assert violations == []
+
+
 # --- Helpers ---
+
+
+# Reserved words of the jq 1.6 lexer. jq 1.7 accepts them as `$name` bindings;
+# 1.6 rejects the whole program with "unexpected <word>, expecting IDENT".
+JQ_KEYWORDS = (
+    "__loc__", "and", "as", "catch", "def", "elif", "else", "end", "foreach",
+    "if", "import", "include", "label", "module", "or", "reduce", "then", "try",
+)
 
 
 def stalled_quiet_seconds() -> float:
