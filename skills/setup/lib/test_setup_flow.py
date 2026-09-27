@@ -164,6 +164,8 @@ def test_probe_reports_success_under_both_modes_as_unmeasurable(doubles, monkeyp
     assert result["outcome"] == setup_flow.UNMEASURABLE
     assert result["outcome"] not in (setup_flow.PASS, setup_flow.AUTO_FAILED)
     assert "allowlist is not being enforced" in result["detail"]
+    assert "sandbox.autoAllowBashIfSandboxed" in result["detail"]
+    assert setup_flow.SANDBOX_OFF_REMEDY in result["detail"]
 
 
 def test_probe_treats_a_permitted_but_failed_control_as_unmeasurable(
@@ -182,7 +184,43 @@ def test_probe_treats_a_permitted_but_failed_control_as_unmeasurable(
 
     assert result["outcome"] == setup_flow.UNMEASURABLE
     assert "Operation not permitted" in result["detail"]
+    assert "sandbox.autoAllowBashIfSandboxed" in result["detail"]
+    assert setup_flow.SANDBOX_OFF_REMEDY in result["detail"]
     assert [mode_of(call) for call in claude_calls(doubles)] == ["dontAsk"]
+
+
+def test_probe_launches_both_runs_with_the_engine_settings_dispatch_will_use(
+    doubles, monkeypatch,
+) -> None:
+    """The #19 L3 host: sandboxed, with Bash auto-allowed inside the sandbox.
+
+    Without engine settings the control is let through and fails. With the
+    remedy setup names, the same route is measurable and passes, and the
+    record carries the settings so write-config can hold dispatch to them.
+    """
+    set_route(monkeypatch, dontAsk="fail", auto="run",
+              **{"dontAsk:unsandboxed": "deny"})
+    settings = '{"sandbox":{"enabled":false}}'
+
+    result = run_setup("probe", REPO, "--engine-settings", settings)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads(result.stdout)
+    assert report["outcome"] == setup_flow.PASS
+    assert report["engine_settings"] == settings
+    calls = claude_calls(doubles)
+    assert [mode_of(call) for call in calls] == ["dontAsk", "auto"]
+    for call in calls:
+        argv = call["argv"]
+        assert argv[argv.index("--settings") + 1] == settings
+
+
+def test_probe_refuses_engine_settings_the_tick_would_refuse(doubles) -> None:
+    result = run_setup("probe", REPO, "--engine-settings", "settings.json")
+
+    assert result.returncode == 1
+    assert "engine_settings" in result.stderr
+    assert not doubles["claude_log"].exists()
 
 
 def test_probe_reports_an_approved_but_failed_auto_run_as_inconclusive(
@@ -338,6 +376,42 @@ def test_write_config_refuses_grants_other_than_the_ones_probed(doubles) -> None
 
     assert result.returncode == 1
     assert "rerun the probe" in result.stderr
+
+
+def test_write_config_records_the_engine_settings_the_probe_used(
+    doubles, monkeypatch,
+) -> None:
+    set_route(monkeypatch, dontAsk="fail", auto="run",
+              **{"dontAsk:unsandboxed": "deny"})
+    settings = '{"sandbox":{"enabled":false}}'
+    assert run_setup("probe", REPO, "--engine-settings", settings).returncode == 0
+
+    result = run_setup("write-config", REPO, "--login", "operator-a",
+                       "--permission-mode", "auto", "--engine-settings", settings)
+
+    assert result.returncode == 0, result.stderr
+    config = pipeline.resolve_config(REPO)
+    assert config.errors == ()
+    assert config.permission_mode == "auto"
+    assert config.engine_settings == settings
+
+
+@pytest.mark.parametrize(("probed", "written"), [
+    ((), ("--engine-settings", '{"sandbox":{"enabled":false}}')),
+    (("--engine-settings", '{"sandbox":{"enabled":false}}'), ()),
+])
+def test_write_config_refuses_engine_settings_other_than_the_ones_probed(
+    doubles, probed: tuple[str, ...], written: tuple[str, ...],
+) -> None:
+    assert run_setup("probe", REPO, *probed).returncode == 0
+
+    result = run_setup("write-config", REPO, "--login", "operator-a",
+                       "--permission-mode", "auto", *written)
+
+    assert result.returncode == 1
+    assert "engine_settings" in result.stderr
+    assert "rerun the probe" in result.stderr
+    assert not pipeline.operator_config_path().exists()
 
 
 def test_write_config_refuses_without_any_probe(doubles) -> None:
@@ -811,7 +885,12 @@ if argv[:1] == ["--version"]:
     sys.exit(0)
 prompt = sys.stdin.read()
 mode = argv[argv.index("--permission-mode") + 1]
-behaviour = json.loads(os.environ["FAKE_CLAUDE_BEHAVIOUR"])[mode]
+behaviours = json.loads(os.environ["FAKE_CLAUDE_BEHAVIOUR"])
+behaviour = behaviours[mode]
+if "--settings" in argv:
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    if settings.get("sandbox", {}).get("enabled") is False:
+        behaviour = behaviours.get(mode + ":unsandboxed", behaviour)
 with open(os.environ["FAKE_CLAUDE_LOG"], "a") as log:
     log.write(json.dumps({
         "argv": argv, "stdin_isatty": sys.stdin.isatty(), "cwd": os.getcwd(),

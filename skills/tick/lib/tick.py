@@ -936,18 +936,28 @@ def claude_engine_argv(
     permission_mode: str,
     allowed_tools: str,
     model: str = "",
+    settings: str = "",
 ) -> list[str]:
     """Return the headless Claude argv every implementer and fixer runs.
 
     One definition shared with setup's route probe, which must launch the way
-    dispatch does — the same flags, and no ``--permission-prompt-tool`` — or
-    it measures a different permission path than the one engines take.
+    dispatch does — the same flags, the same settings, and no
+    ``--permission-prompt-tool`` — or it measures a different permission path
+    than the one engines take.
+
+    Without ``settings`` the engine loads the operator's Claude settings
+    hierarchy, which is written for interactive sessions. ``--settings`` layers
+    above the user, project and local files, so it can override a scalar such
+    as ``sandbox.enabled``. Permission rule lists merge across sources instead:
+    it can add deny rules but cannot remove a user allow rule.
 
     Args:
         engine_bin: The engine binary (``"claude"``).
         permission_mode: ``"auto"`` or ``"dontAsk"``.
         allowed_tools: The complete ``--allowedTools`` value.
         model: ``--model`` value; empty omits the flag.
+        settings: ``--settings`` value (the resolved ``engine_settings``);
+            empty omits the flag.
 
     Returns:
         The argv, without the stream wrapper dispatch places in front of it.
@@ -961,6 +971,8 @@ def claude_engine_argv(
     ]
     if model:
         argv += ["--model", model]
+    if settings:
+        argv += ["--settings", settings]
     return argv
 
 
@@ -975,6 +987,7 @@ def _launch_claude_engine(
     model: str = "",
     permission_mode: str = "auto",
     verify_tools: tuple[str, ...] | None = None,
+    engine_settings: str = "",
 ) -> subprocess.Popen[bytes] | None:
     """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
@@ -1008,6 +1021,8 @@ def _launch_claude_engine(
             ``"auto"`` (default) or ``"dontAsk"``. ``auto`` routes
             non-allowlisted tool calls through the auto-mode classifier while
             the bounded ``--allowedTools`` allowlist still resolves first.
+        engine_settings: The target's resolved ``engine_settings``, passed as
+            ``--settings``; empty (the default) omits the flag.
 
     Returns:
         The Popen handle, or ``None`` when target validation, prompt/result
@@ -1038,6 +1053,7 @@ def _launch_claude_engine(
         permission_mode=permission_mode,
         allowed_tools=_engine_allowed_tools(push_permission, verify_tools),
         model=model,
+        settings=engine_settings,
     )
     prompt_fh = result_fh = stderr_fh = None
     try:
@@ -10234,6 +10250,7 @@ def _dispatch_one_implementer(
         model=model,
         permission_mode=permission_mode,
         verify_tools=verify_tools,
+        engine_settings=config.engine_settings,
     )
     if proc is None:
         # Launch failed — clean up and leave label unchanged.
@@ -10977,6 +10994,7 @@ def _dispatch_one_fixer(
         model=model,
         permission_mode=permission_mode,
         verify_tools=verify_tools,
+        engine_settings=config.engine_settings,
     )
     if proc is None:
         cleanup_scratch(wt_dir)

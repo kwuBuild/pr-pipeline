@@ -3290,6 +3290,33 @@ def test_launch_claude_engine_permission_mode(
     )
 
 
+@pytest.mark.parametrize("settings", ["", '{"sandbox":{"enabled":false}}'])
+def test_launch_claude_engine_passes_engine_settings(
+    tmp_path: Path, settings: str,
+) -> None:
+    """Configured engine settings reach ``--settings``; unset omits the flag."""
+    from tick import _launch_claude_engine  # type: ignore[import-untyped]
+
+    with mock.patch("subprocess.Popen") as popen:
+        popen.return_value = mock.Mock(pid=12345)
+        _launch_claude_engine(
+            engine_bin="claude",
+            prompt="test prompt",
+            wt_dir=str(tmp_path),
+            result_path=str(tmp_path / "result.json"),
+            env={"HOME": "/tmp", "PATH": "/usr/bin"},
+            push_permission="Bash(git push origin HEAD)",
+            engine_settings=settings,
+        )
+
+    cmd = popen.call_args[0][0]
+    if settings:
+        assert cmd[cmd.index("--settings") + 1] == settings
+    else:
+        assert "--settings" not in cmd
+    assert "--setting-sources" not in cmd
+
+
 def test_launch_claude_engine_rejects_unknown_permission_mode(
     tmp_path: Path,
 ) -> None:

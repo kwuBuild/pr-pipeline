@@ -1717,6 +1717,7 @@ _CONFIG_KEYS = (
     "verify_tools",
     "base_ref",
     "permission_mode",
+    "engine_settings",
 )
 
 # Claude `--permission-mode` values; the first is the unconfigured default.
@@ -1782,6 +1783,9 @@ class ResolvedConfig:
         base_ref: The pinned base branch name. ``""`` means "resolve the
             target's default branch" and is not malformed.
         permission_mode: The engine ``--permission-mode`` value.
+        engine_settings: The implementer and fixer ``--settings`` value: a
+            JSON object or an absolute path to a settings file. ``""`` omits
+            the flag, so engines load only the Claude settings hierarchy.
         scan_repos: ``None`` when repository scope is unrestricted (the key is
             absent or an empty list — both operator-written states). A tuple
             restricts scope to exactly those repositories; a malformed value
@@ -1807,6 +1811,7 @@ class ResolvedConfig:
     errors: tuple[str, ...]
     warnings: tuple[str, ...]
     repo_configured: bool = False
+    engine_settings: str = ""
 
 
 def _operator_config_location() -> tuple[Path, str]:
@@ -2126,6 +2131,22 @@ def _resolve_string(
     return stripped, ""
 
 
+def valid_engine_settings(value: str) -> bool:
+    """Return whether ``value`` is a ``claude --settings`` value engines may get.
+
+    The flag takes a JSON string or a file path. JSON must be an object, the
+    shape of a settings file. A path must be absolute: engines run with their
+    cwd inside a checkout of the work under review, so a relative path would
+    let that checkout supply the settings its own engine loads.
+    """
+    if value.startswith("{"):
+        try:
+            return isinstance(json.loads(value), dict)
+        except ValueError:
+            return False
+    return os.path.isabs(value)
+
+
 def _valid_base_ref(value: str) -> bool:
     """Return whether ``value`` is a branch name safe to pass to git and gh.
 
@@ -2380,6 +2401,14 @@ def resolve_config(
     if problem:
         errors.append(problem)
 
+    engine_settings, problem = _resolve_string(
+        _pick(layers, "engine_settings"), "engine_settings", "",
+        valid_engine_settings,
+        blank_means="no --settings flag",
+    )
+    if problem:
+        errors.append(problem)
+
     login, problem, warning = _resolve_login(packaged, declared["operator"])
     if problem:
         errors.append(problem)
@@ -2393,6 +2422,7 @@ def resolve_config(
         verify_tools=verify_tools,
         base_ref=base_ref,
         permission_mode=permission_mode,
+        engine_settings=engine_settings,
         scan_repos=scan_repos,
         errors=tuple(errors),
         warnings=tuple(warnings),

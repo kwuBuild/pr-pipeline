@@ -5817,6 +5817,64 @@ def test_resolve_config_reports_a_blank_permission_mode(
         assert any("permission_mode" in e for e in config.errors), blank
 
 
+def test_resolve_config_leaves_engine_settings_unset_by_default(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Unset means no ``--settings`` flag: engines load the Claude hierarchy."""
+    operator_config(monkeypatch, tmp_path, "")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.engine_settings == ""
+    assert config.errors == ()
+
+
+@pytest.mark.parametrize("value", [
+    '{"sandbox": {"enabled": false}}',
+    "/Users/operator/.claude/pr-pipeline/engine-settings.json",
+])
+def test_resolve_config_accepts_engine_settings_json_or_absolute_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str,
+) -> None:
+    """Both shapes ``claude --settings`` takes are accepted per repository."""
+    operator_config(
+        monkeypatch, tmp_path,
+        f"[defaults]\nengine_settings = ''\n\n"
+        f"[repos.\"owner/name\"]\nengine_settings = '{value}'\n",
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.engine_settings == value
+    assert config.errors == ()
+
+
+@pytest.mark.parametrize("value", [
+    "engine-settings.json",
+    "./engine-settings.json",
+    '{"sandbox": ',
+    '["sandbox"]',
+])
+def test_resolve_config_reports_unusable_engine_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str,
+) -> None:
+    """A relative path or malformed JSON is an error, never a dropped flag.
+
+    A relative path resolves against the engine's cwd, which is a checkout of
+    the pull request under work: the PR would supply its own engine settings.
+    Malformed JSON dropped silently would launch engines under the very
+    interactive settings the operator configured this key to override.
+    """
+    operator_config(
+        monkeypatch, tmp_path, f"[defaults]\nengine_settings = '{value}'\n",
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("engine_settings" in e for e in config.errors)
+    assert config.engine_settings == ""
+
+
 def test_resolve_config_malformed_verify_tools_is_not_empty_verify_tools(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

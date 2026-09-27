@@ -82,6 +82,13 @@ UNMEASURABLE = "unmeasurable"
 # command, or the allowlist already grants it.
 INCONCLUSIVE = "inconclusive"
 
+# The supported remedy when the operator's interactive settings sandbox Bash
+# and auto-allow it there. `--settings` outranks user, project and local
+# settings, so this turns the sandbox off for engines only. Measured on the
+# #19 L3 host: with it, the control was denied and `auto` passed.
+SANDBOX_OFF_SETTINGS = '{"sandbox":{"enabled":false}}'
+SANDBOX_OFF_REMEDY = f"--engine-settings '{SANDBOX_OFF_SETTINGS}'"
+
 _ALLOWLIST_ENTRY_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\(([^()]*)\))?")
 
 
@@ -103,7 +110,11 @@ def probe_allowed_tools(verify_tools: Sequence[str]) -> str:
 
 
 def probe_argv(
-    engine_bin: str, permission_mode: str, allowed_tools: str, model: str,
+    engine_bin: str,
+    permission_mode: str,
+    allowed_tools: str,
+    model: str,
+    engine_settings: str = "",
 ) -> list[str]:
     """Return the probe's argv: dispatch's own, with nothing added."""
     return tick.claude_engine_argv(
@@ -111,6 +122,7 @@ def probe_argv(
         permission_mode=permission_mode,
         allowed_tools=allowed_tools,
         model=model,
+        settings=engine_settings,
     )
 
 
@@ -156,6 +168,7 @@ def run_probe(
     impl_engine: str,
     model: str,
     verify_tools: Sequence[str],
+    engine_settings: str = "",
 ) -> dict[str, object]:
     """Measure whether ``auto`` approves an ungranted command on this route.
 
@@ -169,6 +182,8 @@ def run_probe(
         model: The ``--model`` the tick will pass; empty for the operator's
             default (``deepseek-v4-pro[1m]`` for claude-ds, as at dispatch).
         verify_tools: The verification grants proposed for the repository.
+        engine_settings: The ``engine_settings`` proposed for the repository,
+            passed as ``--settings`` exactly as dispatch will pass it.
 
     Returns:
         A JSON-serialisable report with ``outcome`` and ``detail``.
@@ -179,6 +194,7 @@ def run_probe(
         "impl_engine": impl_engine,
         "model": model,
         "verify_tools": list(verify_tools),
+        "engine_settings": engine_settings,
         "allowed_tools": allowed,
         "probe_command": PROBE_COMMAND,
     }
@@ -199,12 +215,17 @@ def run_probe(
     env = {**tick._engine_env(), **extra_env}
     report["engine_version"] = _engine_version(engine_bin, env)
 
-    control = _probe_run(engine_bin, "dontAsk", allowed, model, env)
+    control = _probe_run(engine_bin, "dontAsk", allowed, model, env, engine_settings)
     report["control"] = control
     not_enforced = (
-        "so the allowlist is not being enforced (for example a sandbox with "
-        "autoAllowBashIfSandboxed, or a settings allow rule) and an auto "
-        "result would measure nothing"
+        "so the allowlist is not being enforced and an auto result would "
+        "measure nothing. The usual cause is `sandbox.autoAllowBashIfSandboxed` "
+        "in the Claude settings the engine loads (for example "
+        "~/.claude/settings.json): Bash then runs without the allowlist. Probe "
+        f"again with {SANDBOX_OFF_REMEDY} to launch engines unsandboxed without "
+        "editing those settings, and pass the same value to write-config. "
+        "Otherwise a settings `permissions.allow` rule grants the command; "
+        "remove it from the operator's settings"
     )
     if control["executed"]:
         return {**report, "outcome": UNMEASURABLE,
@@ -220,7 +241,7 @@ def run_probe(
             f"the control did not hold: {_run_summary(control)}"
         )}
 
-    auto = _probe_run(engine_bin, "auto", allowed, model, env)
+    auto = _probe_run(engine_bin, "auto", allowed, model, env, engine_settings)
     report["auto"] = auto
     if auto["executed"] and auto["output_returned"]:
         return {**report, "outcome": PASS, "detail": (
@@ -258,6 +279,7 @@ def _probe_run(
     allowed_tools: str,
     model: str,
     env: Mapping[str, str],
+    engine_settings: str = "",
 ) -> dict[str, object]:
     """Run one headless engine in a fresh throwaway directory.
 
@@ -273,7 +295,9 @@ def _probe_run(
         "output_returned": False, "denial": "", "stderr_tail": "",
     }
     try:
-        argv = probe_argv(engine_bin, permission_mode, allowed_tools, model)
+        argv = probe_argv(
+            engine_bin, permission_mode, allowed_tools, model, engine_settings,
+        )
         try:
             proc = subprocess.Popen(
                 argv, cwd=workdir, env=dict(env), stdin=subprocess.PIPE,
@@ -456,13 +480,14 @@ def plan_config(
     verify_tools: Sequence[str],
     permission_mode: str,
     base_ref: str | None,
+    engine_settings: str = "",
 ) -> tuple[str, dict[str, object], dict[str, object]]:
     """Merge one repository's settings into the operator config, or refuse.
 
     Enforces the probe's contract for the combination being written:
 
     - a probe result must exist for this repository, run with exactly these
-      verification grants;
+      verification grants and engine settings;
     - ``auto``, and an empty ``verify_tools``, need a passing probe;
     - ``dontAsk`` needs verification grants, because without them an engine
       is stranded mid-run.
@@ -489,6 +514,13 @@ def plan_config(
             f"the recorded probe for {repo} used verify_tools {probed!r}, not "
             f"{list(verify_tools)!r}; rerun the probe with the grants you mean "
             "to write"
+        )
+    probed_settings = record.get("engine_settings", "")
+    if probed_settings != engine_settings:
+        raise SetupRefused(
+            f"the recorded probe for {repo} used engine_settings "
+            f"{probed_settings!r}, not {engine_settings!r}; rerun the probe with "
+            "the engine settings you mean to write"
         )
     outcome = record.get("outcome")
     if not verify_tools and outcome != PASS:
@@ -527,6 +559,10 @@ def plan_config(
         raise SetupRefused(f'{path}: [repos."{section_key}"] must be a table')
     section["verify_tools"] = list(verify_tools)
     section["permission_mode"] = permission_mode
+    if engine_settings:
+        section["engine_settings"] = engine_settings
+    else:
+        section.pop("engine_settings", None)
     if base_ref is not None:
         section["base_ref"] = base_ref
     return str(path), existing, merged
@@ -548,6 +584,7 @@ def write_config(
     permission_mode: str,
     base_ref: str | None,
     dry_run: bool,
+    engine_settings: str = "",
 ) -> dict[str, object]:
     """Validate the merged configuration with the tick's resolver, then write it.
 
@@ -561,11 +598,13 @@ def write_config(
     path_text, existing, merged = plan_config(
         repo, login=login, verify_tools=verify_tools,
         permission_mode=permission_mode, base_ref=base_ref,
+        engine_settings=engine_settings,
     )
     path = Path(path_text)
     if merged == existing:
         errors = _resolved_errors(
             pipeline.resolve_config(repo), repo, verify_tools, permission_mode,
+            engine_settings,
         )
         if errors:
             raise SetupRefused(
@@ -592,6 +631,7 @@ def write_config(
             fh.write(text)
         errors = _resolved_errors(
             _resolve_staged(staged, repo), repo, verify_tools, permission_mode,
+            engine_settings,
         )
         if errors:
             raise SetupRefused("the merged configuration is invalid: " + "; ".join(errors))
@@ -612,6 +652,7 @@ def _resolved_errors(
     repo: str,
     verify_tools: Sequence[str],
     permission_mode: str,
+    engine_settings: str,
 ) -> list[str]:
     """Return why a tick would refuse, or misread, this repository's settings."""
     errors = list(config.errors)
@@ -621,6 +662,8 @@ def _resolved_errors(
         errors.append("verify_tools do not resolve as written")
     if config.permission_mode != permission_mode:
         errors.append("permission_mode does not resolve as written")
+    if config.engine_settings != engine_settings:
+        errors.append("engine_settings does not resolve as written")
     return errors
 
 
@@ -870,12 +913,14 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--impl-engine", default="claude", choices=("claude", "claude-ds"))
     probe.add_argument("--model", default="")
     probe.add_argument("--verify-tool", action="append", default=[])
+    probe.add_argument("--engine-settings", default="")
     write = commands.add_parser("write-config", help="record one repository")
     write.add_argument("repo")
     write.add_argument("--login", required=True)
     write.add_argument("--verify-tool", action="append", default=[])
     write.add_argument("--permission-mode", required=True, choices=("auto", "dontAsk"))
     write.add_argument("--base-ref")
+    write.add_argument("--engine-settings", default="")
     write.add_argument("--dry-run", action="store_true")
     deny = commands.add_parser("deny-rules", help="show or install deny rules")
     deny.add_argument("--install", action="store_true")
@@ -917,7 +962,8 @@ def _dispatch(args: argparse.Namespace) -> int:
         record = probe_record_path(args.repo)
         tools = _checked_tools(args.verify_tool)
         report = run_probe(args.repo, impl_engine=args.impl_engine,
-                           model=args.model, verify_tools=tools)
+                           model=args.model, verify_tools=tools,
+                           engine_settings=_checked_settings(args.engine_settings))
         report["recorded_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         record.parent.mkdir(parents=True, exist_ok=True)
         pipeline.atomic_write(str(record), json.dumps(report, indent=2) + "\n")
@@ -928,6 +974,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             args.repo, login=args.login, verify_tools=_checked_tools(args.verify_tool),
             permission_mode=args.permission_mode, base_ref=args.base_ref,
             dry_run=args.dry_run,
+            engine_settings=_checked_settings(args.engine_settings),
         ))
         return 0
     path = claude_settings_path()
@@ -945,6 +992,16 @@ def _checked_tools(tools: Sequence[str]) -> tuple[str, ...]:
             raise SetupRefused(
                 f"{tool!r} is not a permission body (no parentheses or newlines)"
             )
+    return cleaned
+
+
+def _checked_settings(settings: str) -> str:
+    cleaned = settings.strip()
+    if cleaned and not pipeline.valid_engine_settings(cleaned):
+        raise SetupRefused(
+            f"{settings!r} is not an engine_settings value: give a JSON object "
+            "or an absolute path to a settings file"
+        )
     return cleaned
 
 

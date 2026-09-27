@@ -361,10 +361,14 @@ guaranteed unattended completion. Open question 12.3 remains owned by that probe
 ### The operator's deny list is the floor
 
 `_engine_env()` (`tick.py:465`) returns `dict(os.environ)` for implementer and
-fixer engines, and the engine command (`tick.py:959`) passes no `--settings` and
-no `CLAUDE_CONFIG_DIR` redirect. Those engines therefore resolve A's normal
-settings hierarchy, and A's `~/.claude/settings.json` deny rules apply — deny
-outranks allow, in `auto` as in `dontAsk`. No new mechanism is required.
+fixer engines, and the engine command (`tick.claude_engine_argv`) passes no
+`CLAUDE_CONFIG_DIR` redirect and no `--setting-sources` restriction. Those
+engines therefore resolve A's normal settings hierarchy, and A's
+`~/.claude/settings.json` deny rules apply — deny outranks allow, in `auto` as
+in `dontAsk`. No new mechanism is required. The optional `engine_settings` key
+(#64) adds one `--settings` layer above that hierarchy; it can override scalar
+settings such as `sandbox.enabled` and add deny rules, but it does not remove
+A's rules.
 
 (The reviewer is different and should not be described with the same sentence: it
 runs under a scrub-dir with `HOME`/`CODEX_HOME` redirected, so it does not
