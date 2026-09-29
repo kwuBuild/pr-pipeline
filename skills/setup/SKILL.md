@@ -72,7 +72,9 @@ not work around it.
       ```
       `--engine-settings` is the `engine_settings` value that dispatch passes
       to engines as `--settings`. Omit it unless the operator chooses it in
-      step 5. Pass the same value to `write-config`.
+      step 5. Pass the same value to `write-config`. A path must name a
+      readable file that holds a JSON object; setup and each dispatch refuse
+      any other file.
       The probe asks a headless engine, launched as dispatch launches one, to
       run `git init` in a throwaway directory. That command is in no grant.
       The first run uses `dontAsk`, a negative control that must be denied.

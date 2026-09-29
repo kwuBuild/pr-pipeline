@@ -242,7 +242,8 @@ default branch". Issue dispatch reads it from the canonical target on GitHub and
 pins the selected branch for PR creation; failed discovery stops dispatch with an
 error naming the repository, and an explicit override skips discovery. A blank
 `permission_mode` is invalid. A blank `engine_settings` omits `--settings`; a
-value that is not a JSON object or an absolute path is invalid.
+value that is not a JSON object, or an absolute path to a readable file holding
+one, is invalid.
 `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
 name absolute locations.
 
@@ -908,7 +909,13 @@ which is usually written for interactive sessions. The `engine_settings` key
 gives engines a different layer without editing those files. Its value is
 passed to `claude --settings`: a JSON object, or an absolute path to a settings
 file. A relative path is refused because engines run inside a checkout of the
-work under review. Blank, the default, omits the flag.
+work under review. The file must be readable and hold a JSON object. Claude does
+not reject a malformed settings file, so the resolver reads it. Tick startup
+resolves config, so a file that is broken when a tick starts fails that tick
+with `startup_config_invalid` before harvest or dispatch. Each dispatch
+resolves config again before launch, so a file that breaks during a tick
+escalates the item before any engine or lease. Blank, the default, omits the
+flag.
 
 `--settings` outranks the user, project, and local settings files, so it
 overrides a scalar setting such as `sandbox.enabled`. Permission rule lists
@@ -928,7 +935,9 @@ engine_settings = '{"sandbox":{"enabled":false}}'
 
 The implementer, the fixer, and setup's probe build their argv with one
 function, `claude_engine_argv`, so they launch with the same settings. Setup
-records the probed value and `write-config` refuses a different one.
+records the probed value and `write-config` refuses a different one. It writes
+the value to the repository section even when blank, so a nonblank
+`[defaults]` value cannot replace the "no flag" the probe measured.
 
 #### Setup route probe
 

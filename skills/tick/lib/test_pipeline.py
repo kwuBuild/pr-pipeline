@@ -5831,12 +5831,16 @@ def test_resolve_config_leaves_engine_settings_unset_by_default(
 
 @pytest.mark.parametrize("value", [
     '{"sandbox": {"enabled": false}}',
-    "/Users/operator/.claude/pr-pipeline/engine-settings.json",
+    "SETTINGS_FILE",
 ])
 def test_resolve_config_accepts_engine_settings_json_or_absolute_path(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, value: str,
 ) -> None:
     """Both shapes ``claude --settings`` takes are accepted per repository."""
+    if value == "SETTINGS_FILE":
+        settings_file = tmp_path / "engine-settings.json"
+        settings_file.write_text('{"sandbox": {"enabled": false}}\n')
+        value = str(settings_file)
     operator_config(
         monkeypatch, tmp_path,
         f"[defaults]\nengine_settings = ''\n\n"
@@ -5867,6 +5871,37 @@ def test_resolve_config_reports_unusable_engine_settings(
     """
     operator_config(
         monkeypatch, tmp_path, f"[defaults]\nengine_settings = '{value}'\n",
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any("engine_settings" in e for e in config.errors)
+    assert config.engine_settings == ""
+
+
+@pytest.mark.parametrize("contents", [
+    None,
+    '{"sandbox": ',
+    '["sandbox"]',
+    "DIRECTORY",
+])
+def test_resolve_config_reports_unusable_engine_settings_files(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, contents: str | None,
+) -> None:
+    """A settings file must exist and hold a JSON object when config resolves.
+
+    ``claude --settings`` does not reject a file it cannot parse, so a
+    missing, malformed, or non-object file would launch engines under the
+    interactive settings the operator configured this key to override.
+    """
+    settings_file = tmp_path / "engine-settings.json"
+    if contents == "DIRECTORY":
+        settings_file.mkdir()
+    elif contents is not None:
+        settings_file.write_text(contents)
+    operator_config(
+        monkeypatch, tmp_path,
+        f"[defaults]\nengine_settings = '{settings_file}'\n",
     )
 
     config = pipeline.resolve_config("owner/name")

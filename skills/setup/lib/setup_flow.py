@@ -559,10 +559,9 @@ def plan_config(
         raise SetupRefused(f'{path}: [repos."{section_key}"] must be a table')
     section["verify_tools"] = list(verify_tools)
     section["permission_mode"] = permission_mode
-    if engine_settings:
-        section["engine_settings"] = engine_settings
-    else:
-        section.pop("engine_settings", None)
+    # Written even when blank: a missing key would inherit a nonblank
+    # [defaults] value, not the "no --settings flag" the probe measured.
+    section["engine_settings"] = engine_settings
     if base_ref is not None:
         section["base_ref"] = base_ref
     return str(path), existing, merged

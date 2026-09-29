@@ -2137,14 +2137,24 @@ def valid_engine_settings(value: str) -> bool:
     The flag takes a JSON string or a file path. JSON must be an object, the
     shape of a settings file. A path must be absolute: engines run with their
     cwd inside a checkout of the work under review, so a relative path would
-    let that checkout supply the settings its own engine loads.
+    let that checkout supply the settings its own engine loads. The file must
+    also be readable now and hold a JSON object: ``claude --settings`` does not
+    reject a file it cannot parse, so a broken file would launch engines under
+    the interactive settings this key exists to override. Dispatch resolves
+    config again before each launch, so that check runs per dispatch.
     """
-    if value.startswith("{"):
-        try:
-            return isinstance(json.loads(value), dict)
-        except ValueError:
+    if not value.startswith("{"):
+        if not os.path.isabs(value) or not os.path.isfile(value):
             return False
-    return os.path.isabs(value)
+        try:
+            with open(value, encoding="utf-8") as settings_file:
+                value = settings_file.read()
+        except (OSError, UnicodeDecodeError):
+            return False
+    try:
+        return isinstance(json.loads(value), dict)
+    except ValueError:
+        return False
 
 
 def _valid_base_ref(value: str) -> bool:

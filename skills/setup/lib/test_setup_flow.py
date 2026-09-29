@@ -223,6 +223,19 @@ def test_probe_refuses_engine_settings_the_tick_would_refuse(doubles) -> None:
     assert not doubles["claude_log"].exists()
 
 
+def test_probe_refuses_a_settings_file_that_is_not_a_json_object(
+    doubles, tmp_path: Path,
+) -> None:
+    settings_file = tmp_path / "engine-settings.json"
+    settings_file.write_text('{"sandbox": ')
+
+    result = run_setup("probe", REPO, "--engine-settings", str(settings_file))
+
+    assert result.returncode == 1
+    assert "engine_settings" in result.stderr
+    assert not doubles["claude_log"].exists()
+
+
 def test_probe_reports_an_approved_but_failed_auto_run_as_inconclusive(
     doubles, monkeypatch,
 ) -> None:
@@ -396,6 +409,27 @@ def test_write_config_records_the_engine_settings_the_probe_used(
     assert config.engine_settings == settings
 
 
+def test_write_config_keeps_blank_engine_settings_over_a_nonblank_default(
+    doubles,
+) -> None:
+    """A probe without settings pins "no flag", not whatever the default says."""
+    path = pipeline.operator_config_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        '[operator]\nlogin = "operator-a"\n'
+        "\n[defaults]\nengine_settings = '{\"sandbox\":{\"enabled\":false}}'\n",
+    )
+    assert run_setup("probe", REPO, "--engine-settings", "").returncode == 0
+
+    result = run_setup("write-config", REPO, "--login", "operator-a",
+                       "--permission-mode", "auto", "--engine-settings", "")
+
+    assert result.returncode == 0, result.stderr
+    config = pipeline.resolve_config(REPO)
+    assert config.errors == ()
+    assert config.engine_settings == ""
+
+
 @pytest.mark.parametrize(("probed", "written"), [
     ((), ("--engine-settings", '{"sandbox":{"enabled":false}}')),
     (("--engine-settings", '{"sandbox":{"enabled":false}}'), ()),
@@ -458,6 +492,7 @@ def test_write_config_keeps_everything_else_the_operator_wrote(doubles) -> None:
         "checklist_paths": ["docs/review.md"],
         "verify_tools": ["pnpm run test *"],
         "permission_mode": "auto",
+        "engine_settings": "",
     }
     assert path.with_name("config.toml.bak").exists()
 

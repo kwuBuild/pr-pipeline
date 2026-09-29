@@ -121,6 +121,8 @@ permission_mode = "auto"
 # it can add deny rules but cannot remove a user allow rule. For an operator
 # whose sessions sandbox Bash with autoAllowBashIfSandboxed, set
 # '{"sandbox":{"enabled":false}}' so the engine allowlist is enforced. A relative
-# path is refused: engines run inside a checkout of the work under review.
+# path is refused: engines run inside a checkout of the work under review. A
+# path must name a readable file holding a JSON object; each dispatch checks it
+# again before launch, because Claude does not reject a malformed settings file.
 # Blank omits the flag. Setup's probe launches with the same value.
 engine_settings = ""
