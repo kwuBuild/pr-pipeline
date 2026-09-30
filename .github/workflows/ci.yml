@@ -121,6 +121,9 @@ jobs:
           bash -n skills/tick/preflight.sh
           bash -n skills/status/status.sh
           bash -n skills/setup/setup.sh
+          for script in validation/*.sh validation/stubs/observer.sh; do
+            bash -n "$script"
+          done
 
       # -x follows the `# shellcheck source=` directives in tick.sh,
       # preflight.sh and status.sh into resolve-python.sh. Without it the
@@ -147,4 +150,6 @@ jobs:
             skills/tick/install-launcher.sh \
             skills/tick/preflight.sh \
             skills/status/status.sh \
-            skills/setup/setup.sh
+            skills/setup/setup.sh \
+            validation/*.sh \
+            validation/stubs/observer.sh
