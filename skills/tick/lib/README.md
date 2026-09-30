@@ -290,7 +290,10 @@ retires them.
 The guarantee is **at-least-once, not exactly-once**. If the post lands and the
 process dies before the receipt is written, the next tick posts one duplicate.
 Failing a landed post would be worse, so that crash window is accepted rather than
-closed.
+closed. Result-driven escalation retention follows the
+[operator recovery contract](../README.md#escalation-publication-coverage):
+an unreceipted post may already reference the prepared archive, so a failed
+repost must preserve that path.
 
 Engine-authored text is embedded on **both** terminal outcomes. An escalation asks
 a human to decide and they need the engine's words. A `recheck` needs it for a
@@ -325,6 +328,11 @@ terminal label on one more of them would pin the admission slot forever, which i
 the outcome the cap prevents. The label is the load-bearing signal and the comment
 is the explanation.
 
+The cap can inherit the evidence path from an earlier escalation report. It
+retains that archive through failed relabels and hold releases, even when no
+comment receipt exists, under the same
+[recovery contract](../README.md#escalation-publication-coverage).
+
 Because that comment is published before the relabel and claims to supersede the
 run's own outcome, the decision has to outlive a failed relabel. Before any
 remote mutation, the deciding branch writes a typed terminal intent to
@@ -346,7 +354,7 @@ human transition. The intent write is a required gate: a transition whose
 decision cannot be durably recorded is not started at all.
 
 `_harvest_one_reviewer`'s escalate branch records one too, and it is the only
-terminal transition with no comment in front of it. `decide_review_harvest`
+result-driven terminal intent with no comment in front of it. `decide_review_harvest`
 escalates an unvalidatable verdict, and changes-requested with no blocking
 finding, with `post_comment` false, so `review_already_posted` has no comment to
 recognise on a retry. Its target is a hold, so an interrupted transition leaves
@@ -354,8 +362,22 @@ a completed marker under a hold this pipeline set itself, and the generic hold
 branch would publish `render_held_completion_comment` over it — a notice
 asserting that a workflow hold was observed while the engine was running. The
 branch therefore records the intent and hands the transition to
-`_complete_escalate_transition` with an empty `comment_body`, exactly as the
-implementer's silent escalation does.
+`_complete_escalate_transition` with an empty `comment_body`. Implementer and
+fixer result escalations pass their rendered report through that same durable
+transition. See the [publication coverage map](../README.md#escalation-publication-coverage)
+for other silent paths.
+
+Once a result report post is attempted, `_complete_escalate_transition` retains
+its prepared archive under the recovery contract above. Recovery reuses that
+archive and any comment receipt, then moves the original scratch into it on
+completion. `_archive_harvest_evidence` writes the `.prepared` marker last; a
+reused directory without it is completed in place before any report names it,
+and is never deleted when that repair fails. `_replace_evidence_file` writes each
+file through a temporary sibling and `os.replace`, so repair never leaves a
+published file partial.
+Silent reviewer escalations still discard the prepared copy after failed
+relabel because no report references it. Completed archive retention belongs to
+the [operator contract](../README.md#retained-scratch-and-harvest-evidence).
 
 `_terminal_relabel_state` classifies the live label set into the four states
 that decide which mutation the resume may make, and `_land_terminal_transition`

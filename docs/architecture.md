@@ -390,7 +390,8 @@ dispatch marker}` and folds the current label into a single tested decision
 
 **Publication ordering.** Every terminal label transition that *reports an engine
 result, or fires before one was launched* publishes its explanation before the
-label moves — with two documented exceptions and the open gaps enumerated below —
+label moves — with two documented exceptions and the open gaps in the
+[publication coverage map](../skills/tick/README.md#escalation-publication-coverage) —
 and the post gates the transition: a failed post leaves the label untouched, so
 the next tick retries both. What it retains differs by path: the harvest-side
 transitions keep their marker and scratch, the ambiguous-marker path keeps the
@@ -399,7 +400,8 @@ no engine ran, and a retained lease would be reconciled to the terminal label
 before the retry could run. Posting after the relabel would leave a window where
 the item shows a new — possibly terminal — label with no stated reason, which is
 the audit gap the comment exists to close. This holds for the reviewer verdict
-comment, for both terminal fixer outcomes (`recheck` → `ai:revised`, `escalate` →
+comment, for implementer result escalations, for both terminal fixer outcomes
+(`recheck` → `ai:revised`, `escalate` →
 `ai:needs-human-decision`), for the transient path's exhaustion escalation, for a
 hold found beside a completed result — whose gated mutation is the release of the
 pipeline's own in-flight label rather than a move to a terminal one — and for
@@ -407,11 +409,10 @@ every pre-launch dispatch escalation. A transient `retry` that reverts to the
 pre-dispatch label posts nothing — no outcome has been decided yet.
 
 The scope is load-bearing, not hedging. `ai:needs-human-decision` is still
-reachable from transitions the gate does not cover — enumerated under **Silent
-escalations** below — and stating the rule unscoped is what kept those paths
-undocumented: a reader checking the invariant against the reviewer and fixer
-paths finds it holds and stops looking. What the two clauses leave out is the
-middle: an engine was launched, and the tick cannot read a result from it.
+reachable from transitions the gate does not cover. The publication coverage
+map distinguishes implemented gates from unresolved publication gaps, including
+invalid reviewer verdicts. A readable engine result alone does not prove that
+its transition publishes an explanation.
 
 The gate holds wherever a failed post can be *bounded*. Transient exhaustion is
 the case that makes this explicit: a failed post there discards the prepared
@@ -468,9 +469,10 @@ closed. Exactly two functions in `tick.py` run `gh <entity> comment`:
   publishing path where at-least-once is unbounded rather than bounded to one
   extra.
 - `_post_harvest_comment` posts everything else, under one of four receipted
-  kinds: `fix-comment` (fixer `recheck` and `escalate`), `cap-escalation` (the
-  attempt cap), `transient-escalation` (exhaustion and the counter-write
-  failure), and `dispatch-escalation` (every pre-launch dispatch escalation).
+  kinds: `fix-comment` (implementer `escalate`, fixer `recheck` and `escalate`),
+  `cap-escalation` (the attempt cap), `transient-escalation` (exhaustion and the
+  counter-write failure), and `dispatch-escalation` (every pre-launch dispatch
+  escalation).
 
 **Every other terminal transition publishes nothing.**
 
@@ -520,28 +522,12 @@ reading of another machine's live dispatch and cannot prove custody either way.
 Its closure condition is therefore met by the two surviving paths plus the
 four pre-launch escalations the census found while closing them.
 
-What is left is one shape: an engine was launched, and no result reached the
-tick. It divides by whether that engine is finished, which decides how to fix it:
-
-- **It finished and still says nothing** — a genuine hole in the gate above,
-  because the archive under `.harvest-evidence/` makes the item's only
-  explanation machine-local. One member remains: `_harvest_failed_reviewer`,
-  which escalates a wrapper-confirmed reviewer failure. Reconciliation's hold
-  escalation over a completed marker was the other, and it has since moved into
-  the gated set above — it now publishes its validated outcome before releasing
-  the in-flight label. The reviewer path has the same shape, is tracked by
-  nothing, and belongs with it.
-- **It may still be running**: the reconcile escalations (hung engine,
-  unverified live custody) and each stage's post-launch guard, which fires when
-  the in-flight relabel failed *and* the engine could not be killed. These are
-  not the same kind of gap. The label there is a duplicate-dispatch guard over
-  custody the tick could not prove it holds, the marker is deliberately
-  retained, and the run that engine is still in owns the explanation — so the
-  fix, if there is one, belongs to whatever proves that custody, not to the
-  publication gate.
-
-Nothing prevents bounding the first group's posts: no admission slot is pinned
-and no retry budget has been spent.
+The [silent-transition inventory](../skills/tick/README.md#silent-transitions)
+owns the remaining runtime paths, their evidence locations, and follow-up
+ownership. Their recovery requirements differ: a completed engine can publish
+its retained outcome, while a possibly live engine still requires custody
+checks before cleanup. A missing or invalid result also needs a controller-owned
+failure explanation. These gaps cannot all use the implementer result renderer.
 
 **Publication durability.** Replay safety is receipt-based, not comment-derived:
 nothing counts fixer comments, so a `gh` read to detect a prior post would only

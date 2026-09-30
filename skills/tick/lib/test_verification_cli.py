@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -54,7 +55,18 @@ elif args[:2] == ["issue", "view"]:
 elif args[:2] == ["issue", "list"]:
     label = args[args.index("--label") + 1] if "--label" in args else ""
     payload = [issue] if label in s["labels"] else []
+elif args[:2] == ["issue", "comment"]:
+    if s.get("fail_comment"):
+        raise SystemExit(1)
+    s.setdefault("comments", []).append(pathlib.Path(args[args.index("--body-file") + 1]).read_text())
+    path.write_text(json.dumps(s))
+    if s.get("crash_after_comment"):
+        import signal
+        os.kill(os.getppid(), signal.SIGKILL)
+    print("https://github.com/example/project/issues/7#issuecomment-1"); raise SystemExit
 elif args[:2] == ["issue", "edit"]:
+    if s.get("fail_label"):
+        raise SystemExit(1)
     if "--remove-label" in args:
         for label in args[args.index("--remove-label") + 1].split(","):
             if label in s["labels"]: s["labels"].remove(label)
@@ -91,6 +103,7 @@ if "-q" in args:
 else:
     print(json.dumps(payload))
 ''')
+    write_peer(bin_dir / "osascript", "raise SystemExit(0)\n")
     write_peer(bin_dir / "codex", 'print("codex-cli 0.100.0")\n')
     write_peer(bin_dir / "claude", '''
 import json, pathlib, sys
@@ -170,7 +183,365 @@ def test_cli_warning_survives_existing_pr_and_unclosed_html(offline_tick, existi
     assert not (wt / "dispatch.json").exists()
 
 
+@pytest.mark.parametrize("failure", ["", "comment", "label", "hold"])
+def test_cli_implementer_escalation_explains_denials_and_retries(offline_tick, failure):
+    root, state, cfg, env = offline_tick
+    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\npermission_mode="dontAsk"\nverify_tools=["sh ./check.sh"]\n[repos."example/project"]\n')
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", '''
+import json, pathlib, sys
+pathlib.Path("engine-argv.json").write_text(json.dumps(sys.argv[1:]))
+sys.stdin.read()
+print(json.dumps({"type": "result", "is_error": False,
+    "result": "Please grant Bash permission so I can run the tests.",
+    "permission_denials": [
+        {"tool_name": "Bash", "tool_input": {"command": "python3 -m pytest tests/"}},
+        {"tool_name": "Bash", "tool_input": {"command": "python3 -m unittest tests | head"}}
+    ]}))
+''')
+    run_tick(root, env)
+    wt_root = root / ".claude" / "worktrees"
+    wt = wt_root / "issue-7"
+    for _ in range(100):
+        if (wt / "result.json").exists() and (wt / "result.json").stat().st_size:
+            break
+        time.sleep(0.02)
+    assert (wt / "result.json").stat().st_size
+    marker = json.loads((wt / "dispatch.json").read_text())
+    argv = json.loads((wt / "engine-argv.json").read_text())
+    # Harvest must use the launch snapshot, not this later configuration.
+    cfg.write_text('[operator]\nlogin="operator"\n[defaults]\npermission_mode="auto"\nverify_tools=["changed-check *"]\n[repos."example/project"]\n')
+    if failure:
+        data = json.loads(state.read_text())
+        data["fail_" + ("label" if failure == "hold" else failure)] = True
+        state.write_text(json.dumps(data))
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    if failure:
+        assert data["labels"] == ["ai:implementing"]
+        assert (wt / "dispatch.json").exists()
+        assert (wt / "result.json").exists()
+        assert len(data.get("comments", [])) == (0 if failure == "comment" else 1)
+        if failure in ("label", "hold"):
+            body = data["comments"][0]
+            published_path = Path(next(
+                line for line in body.splitlines() if "/.harvest-evidence/" in line
+            ))
+            expected_result = (wt / "result.json").read_text()
+            assert (published_path / "result.json").read_text() == expected_result
+            if failure == "hold":
+                data["labels"].append("ai:blocked")
+                state.write_text(json.dumps(data))
+            # Keep the label write failing. A late hold must also retain the
+            # published evidence when releasing the in-flight label fails.
+            run_tick(root, env)
+            data = json.loads(state.read_text())
+            assert data["comments"] == [body]
+            expected_labels = ["ai:implementing"]
+            if failure == "hold":
+                expected_labels.append("ai:blocked")
+            assert data["labels"] == expected_labels
+            assert (wt / "dispatch.json").exists()
+            assert (wt / "result.json").read_text() == expected_result
+            assert (published_path / "result.json").read_text() == expected_result
+            assert list((wt_root / ".harvest-evidence").iterdir()) == [published_path]
+        data["fail_" + ("label" if failure == "hold" else failure)] = False
+        state.write_text(json.dumps(data))
+        run_tick(root, env)
+        data = json.loads(state.read_text())
+    assert len(data.get("comments", [])) == 1, data
+    body = data["comments"][0]
+    assert "ended without a completion sentinel" in body
+    assert "Please grant Bash permission" in body
+    assert "python3 -m pytest tests/" in body
+    assert "python3 -m unittest tests | head" in body
+    assert "dontAsk" in body and "sh ./check.sh" in body
+    assert "changed-check" not in body
+    assert marker["permission_mode"] == argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert marker["verify_tools"] == ["sh ./check.sh"]
+    assert "Bash(sh ./check.sh)" in argv[argv.index("--allowedTools") + 1]
+    archives = list((wt_root / ".harvest-evidence").iterdir())
+    assert len(archives) == 1
+    assert str(archives[0]) in body
+    assert (archives[0] / "result.json").exists()
+    assert (archives[0] / "scratch" / "engine-argv.json").exists()
+    assert data["labels"] == (["ai:blocked"] if failure == "hold" else ["ai:needs-human-decision"])
+    assert not wt.exists()
+    run_tick(root, env)
+    assert json.loads(state.read_text())["comments"] == [body]
+
+
+@pytest.mark.parametrize("recovery", ["repost", "cap", "cap_hold"])
+def test_cli_published_evidence_survives_unreceipted_post(offline_tick, recovery):
+    from pipeline import MAX_DISPATCH_ATTEMPTS
+
+    root, state, cfg, env = offline_tick
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", '''
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "result", "is_error": False,
+                  "result": "Please grant Bash permission."}))
+''')
+    run_tick(root, env)
+    wt_root = root / ".claude" / "worktrees"
+    wt = wt_root / "issue-7"
+    for _ in range(100):
+        if (wt / "result.json").exists() and (wt / "result.json").stat().st_size:
+            break
+        time.sleep(0.02)
+    expected_result = (wt / "result.json").read_text()
+    assert expected_result
+    data = json.loads(state.read_text())
+    data["crash_after_comment"] = True
+    state.write_text(json.dumps(data))
+    cli = Path(__file__).resolve().parent.parent / "tick.sh"
+    crashed = subprocess.run(["bash", str(cli), "#7"], cwd=root, env=env,
+                             capture_output=True, text=True, timeout=30)
+    assert crashed.returncode == -signal.SIGKILL
+    data = json.loads(state.read_text())
+    assert len(data["comments"]) == 1
+    body = data["comments"][0]
+    published = Path(next(line for line in body.splitlines() if "/.harvest-evidence/" in line))
+    assert (published / "result.json").read_text() == expected_result
+    assert not list((wt_root / ".receipts").glob("*fix-comment*.json"))
+    data.update(crash_after_comment=False, fail_comment=True)
+    state.write_text(json.dumps(data))
+
+    def assert_pending_evidence():
+        assert (published / "result.json").read_text() == expected_result
+        assert list(published.parent.iterdir()) == [published]
+        assert (wt / "result.json").read_text() == expected_result
+        assert (wt / "dispatch.json").is_file()
+        assert (wt_root / ".terminal" / "issue-7.json").is_file()
+
+    run_tick(root, env)
+    assert_pending_evidence()
+    data = json.loads(state.read_text())
+    assert data["comments"] == [body]
+    assert data["labels"] == ["ai:implementing"]
+    counter = wt_root / "issue-7-attempts"
+    assert int(counter.read_text()) > 0
+    if recovery != "repost":
+        # Reach the cap through real failed ticks, then fail its terminal write.
+        for _ in range(MAX_DISPATCH_ATTEMPTS):
+            if int(counter.read_text()) >= MAX_DISPATCH_ATTEMPTS:
+                break
+            run_tick(root, env)
+            assert_pending_evidence()
+        assert int(counter.read_text()) == MAX_DISPATCH_ATTEMPTS
+        data["fail_label"] = True
+        state.write_text(json.dumps(data))
+        run_tick(root, env)
+        assert_pending_evidence()
+        intent = json.loads((wt_root / ".terminal" / "issue-7.json").read_text())
+        assert intent["kind"] == "cap"
+        assert int(counter.read_text()) == MAX_DISPATCH_ATTEMPTS
+        data = json.loads(state.read_text())
+        assert data["comments"] == [body]
+        assert data["labels"] == ["ai:implementing"]
+        if recovery == "cap_hold":
+            data["labels"].append("ai:blocked")
+            state.write_text(json.dumps(data))
+        run_tick(root, env)
+        assert_pending_evidence()
+        assert int(counter.read_text()) == MAX_DISPATCH_ATTEMPTS
+        retried = json.loads(state.read_text())
+        assert retried["comments"] == [body]
+        assert retried["labels"] == data["labels"]
+    # Ordinary recovery may duplicate the unreceipted post. At the cap, a
+    # failed explanation must still allow the terminal label/hold release.
+    data = json.loads(state.read_text())
+    data.update(fail_comment=recovery == "cap_hold", fail_label=False)
+    state.write_text(json.dumps(data))
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    assert data["comments"][0] == body
+    if recovery == "repost":
+        assert data["comments"] == [body, body]
+    elif recovery == "cap":
+        assert len(data["comments"]) == 2
+        assert "supersedes" in data["comments"][1]
+    else:
+        assert data["comments"] == [body]
+    assert data["labels"] == (["ai:blocked"] if recovery == "cap_hold" else ["ai:needs-human-decision"])
+    assert (published / "result.json").read_text() == expected_result
+    assert (published / "scratch" / "result.json").read_text() == expected_result
+    assert list(published.parent.iterdir()) == [published]
+    assert not wt.exists()
+    assert not counter.exists()
+    assert not (wt_root / ".terminal" / "issue-7.json").exists()
+    assert not list((wt_root / ".receipts").glob("*.json"))
+    run_tick(root, env)
+    assert json.loads(state.read_text())["comments"] == data["comments"]
+
+
+@pytest.mark.parametrize("crash", ["after_mkdir", "torn_copy"])
+def test_cli_interrupted_archive_is_completed_before_publication(
+    offline_tick, tmp_path, crash,
+):
+    root, state, cfg, env = offline_tick
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", '''
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "result", "is_error": False,
+                  "result": "Please grant Bash permission."}))
+''')
+    run_tick(root, env)
+    wt_root = root / ".claude" / "worktrees"
+    wt = wt_root / "issue-7"
+    for _ in range(100):
+        if (wt / "result.json").exists() and (wt / "result.json").stat().st_size:
+            break
+        time.sleep(0.02)
+    expected_result = (wt / "result.json").read_text()
+    expected_marker = (wt / "dispatch.json").read_text()
+    assert expected_result
+    # Kill the real tick inside archive preparation, after the intent is saved.
+    crash_python = tmp_path / "crash-python"
+    write_peer(crash_python, CRASH_DURING_ARCHIVE)
+    cli = Path(__file__).resolve().parent.parent / "tick.sh"
+    crashed = subprocess.run(
+        ["bash", str(cli), "#7"], cwd=root,
+        env={**env, "PR_PIPELINE_PYTHON": str(crash_python), "CRASH_ARCHIVE": crash},
+        capture_output=True, text=True, timeout=30,
+    )
+    assert crashed.returncode == -signal.SIGKILL, crashed.stdout + crashed.stderr
+    [archive] = (wt_root / ".harvest-evidence").iterdir()
+    if crash == "after_mkdir":
+        assert list(archive.iterdir()) == []
+    else:
+        # The torn copy never completed, so the archive is not marked prepared.
+        assert not (archive / ".prepared").exists()
+    assert (wt_root / ".terminal" / "issue-7.json").is_file()
+    data = json.loads(state.read_text())
+    assert not data.get("comments")
+    data["fail_label"] = True
+    state.write_text(json.dumps(data))
+
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    assert len(data["comments"]) == 1
+    body = data["comments"][0]
+    published = Path(next(line for line in body.splitlines() if "/.harvest-evidence/" in line))
+    assert published == archive
+    assert (published / "result.json").read_text() == expected_result
+    assert (published / "dispatch.json").read_text() == expected_marker
+    assert data["labels"] == ["ai:implementing"]
+    assert (wt / "result.json").read_text() == expected_result
+
+    data["fail_label"] = False
+    state.write_text(json.dumps(data))
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    assert data["comments"] == [body]
+    assert data["labels"] == ["ai:needs-human-decision"]
+    assert (published / "result.json").read_text() == expected_result
+    assert (published / "scratch" / "result.json").read_text() == expected_result
+    assert list(published.parent.iterdir()) == [published]
+    assert not wt.exists()
+
+
+@pytest.mark.parametrize("failure", ["torn_copy", "copy_enospc"])
+def test_cli_archive_repair_keeps_published_contents(offline_tick, tmp_path, failure):
+    root, state, cfg, env = offline_tick
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", '''
+import json, sys
+sys.stdin.read()
+print(json.dumps({"type": "result", "is_error": False,
+                  "result": "Please grant Bash permission."}))
+''')
+    run_tick(root, env)
+    wt_root = root / ".claude" / "worktrees"
+    wt = wt_root / "issue-7"
+    for _ in range(100):
+        if (wt / "result.json").exists() and (wt / "result.json").stat().st_size:
+            break
+        time.sleep(0.02)
+    expected_result = (wt / "result.json").read_text()
+    assert expected_result
+    data = json.loads(state.read_text())
+    data["fail_label"] = True
+    state.write_text(json.dumps(data))
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    [body] = data["comments"]
+    published = Path(next(line for line in body.splitlines() if "/.harvest-evidence/" in line))
+    assert (published / "result.json").read_text() == expected_result
+    # Main's held-result path and earlier heads leave complete, published
+    # archives without the marker; recovery must repair them non-destructively.
+    (published / ".prepared").unlink()
+
+    crash_python = tmp_path / "crash-python"
+    write_peer(crash_python, CRASH_DURING_ARCHIVE)
+    cli = Path(__file__).resolve().parent.parent / "tick.sh"
+    repaired = subprocess.run(
+        ["bash", str(cli), "#7"], cwd=root,
+        env={**env, "PR_PIPELINE_PYTHON": str(crash_python), "CRASH_ARCHIVE": failure},
+        capture_output=True, text=True, timeout=30,
+    )
+    expected_code = -signal.SIGKILL if failure == "torn_copy" else 0
+    assert repaired.returncode == expected_code, repaired.stdout + repaired.stderr
+    assert (published / "result.json").read_text() == expected_result
+    assert not (published / ".prepared").exists()
+    data = json.loads(state.read_text())
+    assert data["comments"] == [body]
+    assert data["labels"] == ["ai:implementing"]
+    assert (wt / "result.json").read_text() == expected_result
+
+    data["fail_label"] = False
+    state.write_text(json.dumps(data))
+    run_tick(root, env)
+    data = json.loads(state.read_text())
+    assert data["comments"] == [body]
+    assert data["labels"] == ["ai:needs-human-decision"]
+    assert (published / "result.json").read_text() == expected_result
+    assert (published / "scratch" / "result.json").read_text() == expected_result
+    assert list(published.parent.iterdir()) == [published]
+    assert not wt.exists()
+
+
 # --- Helpers ---
+
+
+CRASH_DURING_ARCHIVE = '''
+import errno, os, runpy, shutil, signal, sys
+if sys.argv[1:2] == ["-c"]:
+    os.execv(sys.executable, [sys.executable, *sys.argv[1:]])
+mode = os.environ.get("CRASH_ARCHIVE")
+
+def crash():
+    os.kill(os.getpid(), signal.SIGKILL)
+
+if mode == "after_mkdir":
+    real_mkdir = os.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        real_mkdir(path, *args, **kwargs)
+        if "/.harvest-evidence/issue-7-" in os.fspath(path):
+            crash()
+
+    os.mkdir = mkdir
+elif mode in ("torn_copy", "copy_enospc"):
+    real_copy2 = shutil.copy2
+
+    # Match the destination by name so a temporary sibling is torn as well.
+    def copy2(src, dst, *args, **kwargs):
+        dst = os.fspath(dst)
+        if "/.harvest-evidence/" in dst and "result.json" in os.path.basename(dst):
+            with open(src, "rb") as fh:
+                data = fh.read()
+            with open(dst, "wb") as fh:
+                fh.write(data[: len(data) // 2])
+            if mode == "torn_copy":
+                crash()
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real_copy2(src, dst, *args, **kwargs)
+
+    shutil.copy2 = copy2
+script = sys.argv[1]
+sys.argv = sys.argv[1:]
+sys.path[0] = os.path.dirname(os.path.abspath(script))
+runpy.run_path(script, run_name="__main__")
+'''
 
 
 def write_peer(path, code):

@@ -294,7 +294,11 @@ floor is empty. Dispatch validates and resolves the grants, wraps each in
 `Bash(...)`, and passes that same tuple to the launcher while pinning
 `verification_unconfigured` in the implement/fix marker. A configuration edit
 between lease publication and launch cannot change those grants. The broader
-per-tick configuration snapshot remains issue #26.
+per-tick configuration snapshot remains issue #26. Implementer dispatch also
+pins `permission_mode` and the unwrapped `verify_tools` list in that lease.
+Harvest uses these optional fields for the [escalation report](../../skills/tick/README.md#escalation-publication-coverage),
+so the report describes the launch policy even if the operator later edits config.
+Old markers remain valid and report the missing policy as unknown.
 
 A malformed list (including parentheses/newlines in a permission body) is an
 error, never an empty grant. A valid empty list dispatches with a
@@ -334,7 +338,10 @@ terminal that launched the tick. This keeps dispatch terminal-agnostic: cmux
 variables are present when launched from cmux and absent elsewhere. The reviewer
 retains a separate scrubbed environment because it has a different trust posture.
 
-Publication surface: a fixer **escalation** echoes a bounded excerpt of the
+Publication surface: implementer result escalations publish
+`pipeline.render_implementation_escalation_comment`; its fields and limits are
+owned by the [operator report contract](../../skills/tick/README.md#escalation-publication-coverage).
+A fixer **escalation** echoes a bounded excerpt of the
 engine's `result` text into a PR comment (`pipeline.render_fix_comment`), so
 branch-controlled text reaches a public comment. This does not widen the trust
 boundary — a fixer already commits and pushes to the PR, an unbounded channel —
@@ -347,11 +354,11 @@ durable record of what the engine changed. The attempt-cap and transient
 escalations publish no engine text at all — they report a failed side effect and a
 spent retry budget respectively, both controller-owned facts.
 
-Publication ordering: the gate applies to a terminal transition that *reports an
-engine result, or fires before one was launched* — every such transition posts
-before the label moves. That is stated as a bound rather than a list because the
-gated side grows with each new terminal outcome, while the released side is
-closed by an argument: the gate holds wherever the retry can be bounded. It is
+Publication ordering: a transition that reports an engine result, or fires before
+one was launched, should explain itself before the label moves. The
+[coverage map](../../skills/tick/README.md#escalation-publication-coverage) names
+which paths meet that requirement and which remain silent. The comment gate
+holds on the implemented paths wherever the retry can be bounded. It is
 deliberately released in the two places where it cannot: the attempt cap (whose
 remote writes are what keep failing) and the transient path's attempt-counter
 write failure (whose retry budget is what failed to persist). Both log
@@ -404,21 +411,11 @@ have missed both reconcile escalations, which pass a bare string and a
 guard-proven variable respectively, and those are the shape a new silent path
 would copy.
 
-What stays silent is now one shape: an engine was launched and the tick could not
-read a result from it. **It finished and nothing is published** — now only
-`_harvest_failed_reviewer`'s wrapper-confirmed reviewer failure — is a hole in
-the gate; it archives under `.harvest-evidence/`, so the explanation is
-machine-local rather than absent. Reconciliation's hold escalation over a
-completed marker was the other member until a later change moved it into the
-gated set; the reviewer path has the same shape, is tracked by nothing, and
-belongs with it. **It may still be running** — the reconcile escalations (hung engine,
-unverified live custody) and each stage's post-launch guard, which fires when the
-in-flight relabel failed *and* the engine could not be killed. Those relabel
-through `_relabel_with_context`, whose only terminal side effect is
-`_notify_terminal_label`: stderr, a tick-log entry, and a local desktop
-notification. They are not a gap of the same kind: the label is a
-duplicate-dispatch guard over custody the tick could not prove it holds, the
-marker is retained, and the engine's own harvest still owns the explanation.
+The remaining silent escalation paths and their evidence locations are listed
+in the [coverage map](../../skills/tick/README.md#silent-transitions). Tick
+maintainers own those follow-on gaps. They include unreadable reviewer verdicts,
+wrapper-confirmed reviewer failures, reconciliation without a usable result,
+and post-launch label failures where the engine could not be terminated.
 
 Receipt custody: the "comment landed" receipts live under `WT_ROOT/.receipts/`,
 deliberately outside the item's scratch. A fixer scratch is a checked-out worktree

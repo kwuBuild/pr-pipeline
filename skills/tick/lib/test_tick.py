@@ -10529,6 +10529,90 @@ def test_archive_harvest_evidence_uses_explicit_reviewer_stage(
     assert evidence[0]["stage"] == "review"
 
 
+def test_archive_harvest_evidence_completes_interrupted_reuse(
+    tmp_path: Path,
+) -> None:
+    """An archive interrupted during preparation is repaired before reuse."""
+    wt_root = tmp_path / "worktrees"
+    wt_dir = wt_root / "issue-42"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "result.json").write_text('{"result": "full output"}')
+    (wt_dir / "dispatch.json").write_text('{"dispatch_id": "impl-42"}')
+    archive = wt_root / ".harvest-evidence" / "issue-42-impl-42"
+    archive.mkdir(parents=True)
+    (archive / "result.json").write_text('{"res')
+
+    prepared = archive_with_reuse(wt_root, wt_dir)
+
+    assert prepared == str(archive)
+    assert (archive / "result.json").read_text() == '{"result": "full output"}'
+    assert (archive / "dispatch.json").is_file()
+    assert list(archive.parent.iterdir()) == [archive]
+    # A completed archive is reused as prepared, not copied again.
+    (wt_dir / "result.json").write_text('{"result": "changed"}')
+    assert archive_with_reuse(wt_root, wt_dir) == str(archive)
+    assert (archive / "result.json").read_text() == '{"result": "full output"}'
+
+
+def test_archive_harvest_evidence_keeps_existing_archive_when_repair_fails(
+    tmp_path: Path,
+) -> None:
+    """A failed repair never deletes a directory a report may already name."""
+    wt_root = tmp_path / "worktrees"
+    wt_dir = wt_root / "issue-42"
+    wt_dir.mkdir(parents=True)
+    archive = wt_root / ".harvest-evidence" / "issue-42-impl-42"
+    archive.mkdir(parents=True)
+    (archive / "stderr.log").write_text("partial")
+
+    assert archive_with_reuse(wt_root, wt_dir) == ""
+    assert (archive / "stderr.log").read_text() == "partial"
+
+
+def test_archive_harvest_evidence_failed_copy_keeps_published_contents(
+    tmp_path: Path,
+) -> None:
+    """A copy that fails partway never shortens an already-published file."""
+    wt_root = tmp_path / "worktrees"
+    wt_dir = wt_root / "issue-42"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "result.json").write_text('{"result": "full output"}')
+    archive = wt_root / ".harvest-evidence" / "issue-42-impl-42"
+    archive.mkdir(parents=True)
+    # A complete archive written before the prepared marker existed.
+    (archive / "result.json").write_text('{"result": "full output"}')
+
+    with mock.patch("tick.shutil.copy2", side_effect=torn_copy_then_disk_full):
+        assert archive_with_reuse(wt_root, wt_dir) == ""
+
+    assert (archive / "result.json").read_text() == '{"result": "full output"}'
+    assert not [path for path in archive.iterdir() if path.name.startswith(".")]
+
+
+def test_archive_harvest_evidence_failed_snapshot_keeps_published_contents(
+    tmp_path: Path,
+) -> None:
+    """A snapshot write that fails partway leaves the previous snapshot whole."""
+    import tick  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_dir = wt_root / "issue-42"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "result.json").write_text('{"result": "full output"}')
+    archive = wt_root / ".harvest-evidence" / "issue-42-impl-42"
+    archive.mkdir(parents=True)
+    (archive / "git-status.txt").write_text("previous complete status\n")
+
+    with mock.patch.object(tick, "git", return_value=" M changed.py"):
+        with mock.patch.object(
+            tick, "open", create=True, side_effect=disk_full_open("git-status.txt"),
+        ):
+            assert archive_with_reuse(wt_root, wt_dir) == ""
+
+    assert (archive / "git-status.txt").read_text() == "previous complete status\n"
+    assert not [path for path in archive.iterdir() if path.name.startswith(".")]
+
+
 def test_existing_marker_blocks_dispatch_archives_before_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -11874,11 +11958,12 @@ def test_harvest_one_implementer_clears_custody_before_reviewer_dispatch(
 
 
 def test_harvest_one_implementer_escalates_on_escalate_action(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """_harvest_one_implementer relabels issue and cleans up on escalation."""
     from tick import _harvest_one_implementer  # type: ignore[import-untyped]
 
+    monkeypatch.setattr("tick.gh", allow_escalation_comment())
     wt_root = tmp_path / "worktrees"
     wt_root.mkdir()
     wt_dir = wt_root / "issue-7"
@@ -12271,10 +12356,13 @@ def test_harvest_one_implementer_archives_before_transient_exhaustion_label(
     assert (wt_dir / "result.json").is_file()
 
 
-def test_harvest_one_implementer_logs_skills_used(tmp_path: Path) -> None:
+def test_harvest_one_implementer_logs_skills_used(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """The harvest summary reports skills recorded in skill-usage.log."""
     from tick import TickLog, _harvest_one_implementer  # type: ignore[import-untyped]
 
+    monkeypatch.setattr("tick.gh", allow_escalation_comment())
     wt_root = tmp_path / "worktrees"
     wt_root.mkdir()
     wt_dir = wt_root / "issue-7"
@@ -12357,11 +12445,12 @@ def test_harvest_one_implementer_logs_empty_skills_when_log_missing(
 
 
 def test_harvest_one_implementer_archives_evidence_on_escalation(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Escalated implementer harvests preserve result evidence before cleanup."""
     from tick import TickLog, _harvest_one_implementer  # type: ignore[import-untyped]
 
+    monkeypatch.setattr("tick.gh", allow_escalation_comment())
     wt_root = tmp_path / "worktrees"
     wt_root.mkdir()
     wt_dir = wt_root / "issue-7"
@@ -12476,7 +12565,7 @@ def test_harvest_one_implementer_retains_scratch_when_evidence_copy_fails(
 
 
 def test_harvest_one_implementer_retains_label_when_archive_move_fails(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed full-tree move retains scratch custody for the next tick.
 
@@ -12486,6 +12575,7 @@ def test_harvest_one_implementer_retains_label_when_archive_move_fails(
     """
     from tick import _harvest_one_implementer  # type: ignore[import-untyped]
 
+    monkeypatch.setattr("tick.gh", allow_escalation_comment())
     wt_root = tmp_path / "worktrees"
     wt_root.mkdir()
     wt_dir = wt_root / "issue-7"
@@ -16362,13 +16452,12 @@ def test_transient_exhaustion_finalize_failure_resumes_next_tick_quietly(
 
 
 def test_implementer_escalate_finalize_failure_resumes_next_tick_not_held_replay(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A failed archive move after an implementer escalate resumes it next tick.
 
-    The implementer escalation is silent — no comment exists to contradict —
-    but replaying it as a held completion would still attribute the pipeline's
-    own terminal label to a workflow hold that was never there.
+    Replaying the published escalation as a held completion would attribute
+    the pipeline's own terminal label to a workflow hold that was never there.
     """
     from pipeline import (  # type: ignore[attr-defined]
         LABEL_NEEDS_HUMAN,
@@ -16382,6 +16471,7 @@ def test_implementer_escalate_finalize_failure_resumes_next_tick_not_held_replay
         _terminal_intent_path,
     )
 
+    monkeypatch.setattr("tick.gh", allow_escalation_comment())
     wt_root = tmp_path / "worktrees"
     wt_root.mkdir()
     wt_dir = wt_root / "issue-7"
@@ -22307,3 +22397,58 @@ def git_init_repo(path: Path) -> None:
     run("config", "user.email", "tick-test@example.com")
     run("config", "user.name", "tick test")
     run("commit", "--allow-empty", "-m", "root")
+
+
+def archive_with_reuse(wt_root: Path, wt_dir: Path) -> str:
+    """Prepare an implementer escalation archive the way recovery does."""
+    from tick import _archive_harvest_evidence  # type: ignore[import-untyped]
+
+    return _archive_harvest_evidence(
+        wt_root=str(wt_root),
+        wt_dir=str(wt_dir),
+        kind="issue",
+        number=42,
+        dispatch_id="impl-42",
+        tick_log=None,
+        stage="implement",
+        required_files=("result.json",),
+        reuse_existing=True,
+    )
+
+
+def torn_copy_then_disk_full(src: str, dst: str, *args: object, **kwargs: object) -> None:
+    """Write half of ``src`` to ``dst``, then fail as a full disk would."""
+    import errno
+
+    data = Path(src).read_bytes()
+    Path(dst).write_bytes(data[: len(data) // 2])
+    raise OSError(errno.ENOSPC, "No space left on device")
+
+
+def disk_full_open(basename: str) -> Callable[..., object]:
+    """Return an ``open`` whose writes to ``basename`` stop halfway and fail."""
+    import builtins
+    import errno
+
+    class HalfWriteFile:
+        def __init__(self, handle: io.TextIOBase) -> None:
+            self.handle = handle
+
+        def __enter__(self) -> "HalfWriteFile":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.handle.close()
+
+        def write(self, text: str) -> int:
+            self.handle.write(text[: len(text) // 2])
+            self.handle.flush()
+            raise OSError(errno.ENOSPC, "No space left on device")
+
+    def fake_open(path: str, mode: str = "r", *args: object, **kwargs: object) -> object:
+        handle = builtins.open(path, mode, *args, **kwargs)
+        if "w" in mode and basename in os.path.basename(path):
+            return HalfWriteFile(handle)
+        return handle
+
+    return fake_open

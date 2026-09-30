@@ -164,7 +164,7 @@ _ORDERING_SCOPE = "reports an engine result, or fires before one was launched"
 _PUBLISH_HELPER = "_post_harvest_comment"
 _COMMENT_POSTING_FUNCTIONS = frozenset({"_harvest_one_reviewer", _PUBLISH_HELPER})
 _PUBLISHED_COMMENT_KINDS = frozenset({
-    "_FIX_COMMENT_KIND",  # fixer recheck/escalate
+    "_FIX_COMMENT_KIND",  # implementer escalate, fixer recheck/escalate
     "_CAP_COMMENT_KIND",  # attempt cap
     "_ESCALATION_COMMENT_KIND",  # transient exhaustion, counter-write failure
     "_DISPATCH_COMMENT_KIND",  # every pre-launch dispatch escalation
@@ -294,9 +294,9 @@ _ORDERING_SURFACES: tuple[_OrderingSurface, ...] = (
     _OrderingSurface(
         name="README.md",
         path=README,
-        section_start="### Silent transitions",
+        section_start="### Escalation publication coverage",
         section_end="observability surfaces",
-        names_members=False,
+        names_members=True,
     ),
     _OrderingSurface(
         name="pr-pipeline-internals.md",

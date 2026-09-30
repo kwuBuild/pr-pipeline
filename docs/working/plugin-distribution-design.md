@@ -1367,11 +1367,9 @@ it is cheaper to fix than to recover from.
 
 Required before publication:
 
-- **Audit first.** There are ~30 `LABEL_NEEDS_HUMAN` / `LABEL_MAX_ITERATIONS`
-  sites and 162 `reason=` call sites in `tick.py`. `pipeline.py:2035` carries an
-  `escalation_reason` on the fixer-run comment renderer, which establishes that
-  at least one path does this and nothing about the other paths. The deliverable
-  is the coverage map; closing the gaps is the follow-on.
+- **Audit first.** The current [coverage map](../../skills/tick/README.md#escalation-publication-coverage)
+  names the publishing owners, best-effort exceptions, and deferred silent paths.
+  Keep that map current; closing the remaining gaps is follow-on work.
 - **Every escalation posts a reason comment**, not only a label.
 - **Posting is idempotent.** The tick is restartable by design, so a naive post
   duplicates on re-harvest.

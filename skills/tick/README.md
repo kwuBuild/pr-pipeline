@@ -1136,9 +1136,17 @@ evidence remain for a later tick. The
 `engine_result_summary` tick entry carries the parsed sentinel, structured error
 fields, and a bounded result excerpt.
 
-Raw model output stays out of GitHub comments with one deliberate exception: both
-**terminal fixer outcomes** embed a bounded excerpt of the engine's `result` text
-in the PR comment. An escalation needs it because the comment asks a human to make
+Result-driven **implementer escalations** publish the stop reason, parsed sentinel
+(or its absence), and a bounded excerpt of the engine's last message on the issue.
+The comment also shows denied commands from `permission_denials`, the dispatch-pinned
+permission mode and verification grants, and the local `.harvest-evidence/` path
+on the machine that ran the tick. Old markers without these policy fields report
+them as unknown; harvest does not substitute current configuration. Denials and
+grants each show at most ten entries and 3200 source characters, with truncation stated.
+Only tool names and command strings are included from denial records.
+
+Both **terminal fixer outcomes** also embed a bounded excerpt of the engine's
+`result` text in the PR comment. An escalation needs it because the comment asks a human to make
 a decision and they need the engine's own words; a `recheck` needs it because the
 recheck path archives no evidence and deletes the scratch that held `result.json`,
 so the comment is the run's only durable record of what was fixed. The fixer
@@ -1176,13 +1184,21 @@ The parser checks every reported block; it does not prove that the report
 covers every original finding or that a reason is correct. The prompt requires
 complete coverage, and the independent reviewer owns that judgement.
 
-A terminal transition that **reports an engine result, or fires before one was
-launched** posts a comment before the label moves. Every one of them is gated on
-that post landing, except the two below that cannot be bounded — those are
-best-effort. Today's outcomes:
+### Escalation publication coverage
+
+The following map records the harvest and dispatch publication paths. The silent
+paths below remain separate work under distribution design section 15; adding
+implementer reporting does not change their escalation conditions.
+
+The publication requirement covers a transition that reports an engine result,
+or fires before one was launched. The map distinguishes implemented posts from
+the remaining gaps. These comment-bearing transitions post before the label moves. Posts gate the
+transition except where the table states a bounded or best-effort exception:
 
 | Terminal transition | Post gates the relabel | On post failure |
 |---|---|---|
+| implementer result `escalate` → `ai:needs-human-decision` (`_harvest_one_implementer` → `_complete_escalate_transition`) | yes, and bounded | label held, scratch retained; repeated post failure reaches the attempt cap |
+| reviewer verdict → `ai:max-iterations` (`_harvest_one_reviewer`) | yes, and bounded | verdict post retried; repeated failure reaches the attempt cap |
 | fixer `recheck` → `ai:revised` | yes | label held, scratch retained, retried next tick |
 | fixer `escalate` → `ai:needs-human-decision` | yes | same |
 | transient retries exhausted → `ai:needs-human-decision` | yes, and bounded | label held; the failure burns an attempt, so repeated failure walks into the cap |
@@ -1236,36 +1252,49 @@ When the label does land, the counter is cleared so a later cycle for the same
 item starts fresh — except on the ambiguous-marker path, which retains the
 marker and therefore leaves the counter to whoever still owns it.
 
+Exactly two functions run `gh … comment`. The publication owners are
+`_post_harvest_comment` (implementer/fixer result,
+cap, transient, held-result, and dispatch comments) and `_harvest_one_reviewer`
+(review verdicts). `_publish_dispatch_escalation` serves setup failures,
+review-policy checks, and ambiguous markers. `_complete_terminal_escalation`
+owns the attempt-cap comment; `_complete_transient_exhaustion` owns transient
+exhaustion, and `_handle_transient_engine_result` publishes counter-write failures;
+`_publish_held_result_and_archive` owns held results. These paths already explain their outcomes and need no additional
+report in this change.
+
+Implementer reports reuse the terminal intent and controller-owned receipt. A
+failed label update or archive move resumes the same report without reposting a
+receipted comment. This follows the existing at-least-once contract: a process
+crash after GitHub accepts the post but before the local receipt is written can
+still produce a duplicate. A missing receipt does not prove that publication
+failed. Once a report post is attempted, failed reposts, label updates, and hold
+releases retain its evidence directory, including after the attempt-cap handoff.
+Retries reuse that same directory until archive finalization succeeds. A report
+names the directory only after its `.prepared` marker exists, so a crash during
+preparation cannot publish an empty or partial evidence path. See
+[Retained scratch and harvest evidence](#retained-scratch-and-harvest-evidence)
+for cleanup ownership.
+
+Every other terminal transition publishes nothing.
+
 ### Silent transitions
 
-The table above plus the reviewer's own verdict comment is the tick's *entire*
-publishing surface — exactly two functions in `tick.py` run `gh … comment`.
-**Every other terminal transition publishes nothing.**
+The following gaps remain owned by the tick maintainers as follow-on publication
+work under [distribution design section 15](../../docs/working/plugin-distribution-design.md#escalation-legibility-is-a-publication-requirement).
+They require their own reasons and recovery contracts; the implementer result
+renderer does not cover them.
 
-That is deliberately stated as a complement rather than a list. The silent
-transitions were enumerated three times and undercounted three times — they fire
-from reconcile, from harvest, and from dispatch, and the list was maintained by
-hand in three documents. The publishing side is two call sites, so this direction
-cannot go stale.
+| Runtime owner | Silent escalation | Evidence and consequence |
+|---|---|---|
+| `_harvest_one_reviewer` → `_complete_escalate_transition` | Invalid reviewer verdict, or changes requested with no blocking finding | Archived review result; the PR has no explanation for the validation failure. |
+| `_harvest_failed_reviewer` | Wrapper-confirmed reviewer failure | `.harvest-evidence/` bundle; the PR has no explanation for the engine failure. |
+| `_reconcile_one` → `_execute_reconcile_actions` | Launch timeout, hung engine, unknown live process identity, conflicting pipeline labels, or resultless dispatch attempt cap | Tick log and retained scratch when custody requires it; no published reason. Reconcile does not require a readable result and cannot use the implementer report. |
+| `_dispatch_one_implementer`, `_dispatch_one_fixer`, `_dispatch_one_reviewer` | In-flight label write fails and engine termination also fails | Tick log and retained marker/scratch; the terminal label prevents duplicate dispatch while an engine may still run. |
 
-Every silent transition left is one where an engine *was* launched and the tick
-could not read a result from it. For triage, what matters is whether that engine
-finished — that is what decides where the explanation lives:
-
-| | Silent transitions | Where the explanation is | Tracked by |
-|---|---|---|---|
-| **An engine finished** | wrapper-confirmed reviewer failure | `.harvest-evidence/` bundle — machine-local, not on the item | untracked. The sibling case is closed (a hold beside a completed marker, now the gated row above); this path has the same shape and needs the same treatment |
-| **An engine may still be running** | reconcile escalations (hung engine, unverified live custody); each stage's post-launch guard, when the in-flight relabel failed *and* the engine could not be killed | tick log only — no evidence bundle is written, and the scratch is retained because a live engine may still own it | untracked; the marker is retained, so harvest still owns the item |
-
-The top row is unfinished work, not an exemption: nothing bounds its post today
-and nothing prevents bounding it. It is also the one that surprises operators —
-an engine finished its work and the run still reports `harvested: 0`. A hold
-found beside a *completed* marker has the same shape and still resolves in the
-hold's favour rather than being harvested, but it is no longer silent: it
-publishes the validated outcome before releasing the in-flight label. The bottom
-row is different: the label there is a duplicate-dispatch guard over a possibly
-live engine, not a verdict on the item, and the run that engine is still in owns
-the explanation.
+A hold found beside a completed result is covered by the gated held-completion
+row above. It publishes the validated outcome before releasing the in-flight
+label. The remaining silent paths are gaps, not exemptions from the publication
+requirement.
 
 **Recovering the reason for an unexplained hold.** An item at
 `ai:needs-human-decision` with no comment usually means an engine was launched
@@ -1274,14 +1303,14 @@ for it — but not always, so check the cheapest disqualifier first:
 1. The tick log at `.claude/worktrees/.tick-log`, filtered to that item's number.
    An `escalation_comment_failed` entry means the comment is missing because it
    could not be posted, not because the path is silent — the reason is in that
-   entry, and no engine need ever have run. This is also the only record anywhere
-   for the bottom row of the table above.
+   entry, and no engine need ever have run. The tick log also records the
+   silent reconcile and post-launch failures in the table above.
 2. Its scratch under `.claude/worktrees/`. A retained scratch with a marker means
-   the bottom row — read `dispatch.json` for the engine's identity and check
+   possible live custody — read `dispatch.json` for the engine's identity and check
    whether that process is still alive before touching anything.
-3. `.harvest-evidence/` for that item's bundle. A bundle exists only when an
-   engine actually finished (the top row). If it is there, it holds what the
-   engine did.
+3. `.harvest-evidence/` for that item's bundle. A bundle exists only when a
+   result or other scratch evidence was retained. Inspect its `dispatch.json`,
+   result, and stderr files to determine how far the run progressed.
 
 An empty `.harvest-evidence/` does **not** mean nothing ran — it means no engine
 result was retained. And with no `escalation_comment_failed` entry for the item,
@@ -1562,7 +1591,9 @@ A marker at launch (before the engine PID is published):
   "pr_number": 439,
   "base_ref": "main",
   "base_sha": "abc123...",
-  "head_sha": "def456..."
+  "head_sha": "def456...",
+  "permission_mode": "dontAsk",
+  "verify_tools": ["sh ./check.sh"]
 }
 ```
 
@@ -1670,11 +1701,29 @@ worktree metadata that would otherwise pin a SHA. `worktree_prune_failed` report
 deferred metadata garbage collection without undoing the already-safe archive move.
 An evidence directory without `scratch/` is an incomplete pre-transition copy;
 the original worktree remains authoritative until a later retry completes the move.
+The tick writes a `.prepared` marker after every evidence copy and snapshot
+succeeds. A recovery retry returns an existing directory for this dispatch as is
+only when that marker exists. Otherwise, preparation was interrupted, or an
+older release left the archive unmarked, and the tick copies the evidence again
+into the same directory before any report names it. Each evidence file and
+snapshot is written to a temporary `.<name>.partial` sibling and replaces its
+destination only when complete, so a crash or failed write never shortens a file
+that a posted report already names. A failed repair keeps that directory and
+retains the source scratch.
 If archive creation, artifact copy, snapshot write, or the final scratch move fails,
 the tick emits `archive_failed` and retains the original scratch. It makes no further
 label transition; a terminal relabel that already succeeded remains authoritative.
 Do not manually delete the source directory until the archive contains the evidence
 needed for the incident.
+
+The tick owns archive preparation and finalization during recovery. Operators
+must preserve both the source scratch and its prepared evidence while a terminal
+transition is pending. After finalization, old completed archives remain on disk
+until the repository operator deliberately removes them after investigation.
+`git worktree prune` removes stale Git registrations, not archived files. There
+is no automatic archive expiry today; operator-controlled retention is tracked
+in [#69](https://github.com/kwuBuild/pr-pipeline/issues/69). A published local
+evidence path is subject to that operator cleanup, not a permanent hosted link.
 
 A dispatch-bound failed reviewer completion is not a retry signal. HARVEST archives
 its completion evidence, relabels the PR from `ai:reviewing` to
@@ -1810,7 +1859,8 @@ a reviewer (Codex).
    functions are fully implemented:
    - Implementer: reads `result.json`, creates PR via `gh pr create`, clears its
      completed `issue-N` scratch, and transitions labels. Reviewer dispatch owns a
-     fresh `pr-PR` worktree.
+     fresh `pr-PR` worktree. Result-driven escalations publish the report
+     described in [Escalation publication coverage](#escalation-publication-coverage).
    - Reviewer: reads `review.json`, detects base/head drift, posts review comment,
      enforces idempotent replay, transitions labels.
    - Fixer: reads `result.json`, posts the fixer-run comment (head before → after,
