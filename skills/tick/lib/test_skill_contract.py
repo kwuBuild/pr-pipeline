@@ -128,6 +128,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "issue_body": "body",
         "branch_name": "worktree-i1",
         "pr_body_source_file": "pr-body.md",
+        "definition_of_done_skill_doc": "some/skill/SKILL.md",
     },
     "fixer": {
         "target_remote": "upstream",

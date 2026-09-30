@@ -4723,6 +4723,205 @@ def test_dispatch_one_fixer_escalates_when_the_install_lacks_a_bound_skill(
     ]
 
 
+def test_dispatch_one_implementer_resolves_definition_of_done_from_the_install(
+    tmp_path: Path,
+) -> None:
+    """A target without its own skill copy still gets the completion gate.
+
+    The implementer runs in a fresh checkout of the target's base branch, which
+    has no reason to carry the pipeline's guidance. The prompt must name the
+    install's doc — the same string dispatch probes — and a bare checkout must
+    not trip the probe.
+    """
+    import pipeline  # type: ignore[import-untyped]
+    from tick import TickLog, _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    tick_log = TickLog.open(str(tmp_path / "logs"))
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)):
+        with mock.patch("tick.git", side_effect=bare_implementer_git(repo_root)):
+            with mock.patch("tick._publish_marker_or_revert", return_value=True):
+                with mock.patch("tick.relabel"):
+                    with mock.patch("subprocess.Popen") as popen:
+                        popen.return_value.pid = 12345
+                        _dispatch_one_implementer(
+                            issue_number=461,
+                            issue_title="PWA icons",
+                            tick_log=tick_log,
+                        )
+
+    popen.assert_called_once()
+    assert not [
+        entry for entry in tick_log.tail() if entry["action"] == "skill_unresolved"
+    ], "a bare target checkout escalated on the implementer skill probe"
+
+    prompt = (wt_root / "issue-461" / "prompt.txt").read_text()
+    doc = pipeline.skill_doc_path("definition-of-done")
+    assert Path(doc).is_file()
+    assert f"read `{doc}`" in prompt, (
+        f"the implementer prompt does not name the installed doc {doc}"
+    )
+    assert not (wt_root / "issue-461" / "skills").exists()
+
+
+def test_dispatch_one_implementer_prompt_gates_completion_on_definition_of_done(
+    tmp_path: Path,
+) -> None:
+    """The rendered prompt pins both invocation moments and the evidence gate.
+
+    A skill binding is discretionary reading unless the executed prompt names
+    when it must run. Phase A has to come before the first edit, Phase B before
+    the commit, the block has to land in the PR body the harvest publishes, and
+    the sentinel has to wait for it.
+    """
+    import pipeline  # type: ignore[import-untyped]
+    from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)):
+        with mock.patch("tick.git", side_effect=bare_implementer_git(repo_root)):
+            with mock.patch("tick._publish_marker_or_revert", return_value=True):
+                with mock.patch("tick.relabel"):
+                    with mock.patch("subprocess.Popen") as popen:
+                        popen.return_value.pid = 12345
+                        _dispatch_one_implementer(
+                            issue_number=461,
+                            issue_title="PWA icons",
+                            tick_log=None,
+                        )
+
+    prompt = (wt_root / "issue-461" / "prompt.txt").read_text()
+    doc = pipeline.skill_doc_path("definition-of-done")
+    phase_a = prompt.index(f"Before your first edit, read `{doc}` and run its Phase A")
+    phase_b = prompt.index("before you commit, run the skill's Phase B")
+    commit = prompt.index("Commit, then push")
+    assert phase_a < phase_b < commit, (
+        "the prompt must order Phase A, then Phase B, then the commit"
+    )
+    assert (
+        "put the skill's Phase B evidence block, with `Proved at:` naming the "
+        "pushed head, under `## Test coverage`"
+    ) in prompt
+    assert (
+        "Only output IMPLEMENTATION_COMPLETE after every verification command "
+        "the repository prescribes passes, the push succeeds, and "
+        "`.pr-body.md` carries the Phase B evidence block"
+    ) in prompt
+    # The skill's own exit for a change with no runtime claim, so a doc-only
+    # issue is not forced to invent an entry point.
+    assert "`Definition of done: n/a` line" in prompt
+
+    assert "If you cannot read the skill or a reference it requires" in prompt
+    assert "cannot complete any required Phase A or Phase B step" in prompt
+    assert (
+        "output NEEDS_HUMAN_DECISION; do not output IMPLEMENTATION_COMPLETE"
+    ) in prompt
+    assert "not run — <command> denied" in prompt
+    assert "never claim their results or use n/a to excuse missing evidence" in prompt
+    assert "re-run the affected Phase B steps" in prompt
+    assert "If the skill's Scope exempts the change, record its n/a decision before editing" in prompt
+
+
+def test_dispatch_one_implementer_escalates_when_the_install_lacks_definition_of_done(
+    tmp_path: Path,
+) -> None:
+    """An unreadable installed doc fails closed before any engine launch.
+
+    Without the doc the engine reads nothing, skips both phases, and still
+    emits its sentinel. Dispatch must escalate instead: no lease, no engine,
+    no scratch worktree left behind, and a ``skill_unresolved`` entry naming
+    the probed path.
+    """
+    from tick import TickLog, _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    empty_install = tmp_path / "install-without-the-doc"
+    empty_install.mkdir()
+    tick_log = TickLog.open(str(tmp_path / "logs"))
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)):
+        with mock.patch("pipeline.INSTALL_SKILLS_ROOT", empty_install):
+            with mock.patch(
+                "tick.git", side_effect=bare_implementer_git(repo_root),
+            ):
+                with mock.patch(
+                    "tick.gh", side_effect=allow_escalation_comment(),
+                ), mock.patch("tick._relabel_with_context") as relabel_mock:
+                    with mock.patch("tick.relabel"):
+                        with mock.patch("subprocess.Popen") as popen:
+                            popen.return_value.pid = 12345
+                            _dispatch_one_implementer(
+                                issue_number=461,
+                                issue_title="PWA icons",
+                                tick_log=tick_log,
+                            )
+
+    popen.assert_not_called()
+    relabel_mock.assert_called_once()
+    assert relabel_mock.call_args.args[:2] == ("issue", 461)
+    assert relabel_mock.call_args.args[3] == "ai:needs-human-decision"
+    assert not (wt_root / "issue-461").exists(), (
+        "an escalated dispatch left its scratch worktree behind"
+    )
+
+    unresolved = next(
+        entry for entry in tick_log.tail() if entry["action"] == "skill_unresolved"
+    )
+    assert unresolved["pr"] == 461
+    assert unresolved["stage"] == "implement"
+    assert unresolved["details"]["skills"] == ["definition-of-done"]
+    assert unresolved["details"]["probe_paths"] == [
+        str(empty_install / "definition-of-done" / "SKILL.md"),
+    ]
+
+
+def test_implementer_pr_body_carrying_the_definition_of_done_block_is_published(
+    tmp_path: Path,
+) -> None:
+    """The harvest publishes a body whose `## Test coverage` holds the evidence.
+
+    The block is taken from the installed skill itself, so a later change to
+    its shape that the harvest's structural check rejects — a `## ` line, say —
+    fails here instead of silently swapping the engine's body for the generated
+    fallback, which carries no evidence at all.
+    """
+    import pipeline  # type: ignore[import-untyped]
+    from tick import _implementation_pr_create_args  # type: ignore[import-untyped]
+
+    skill = Path(pipeline.skill_doc_path("definition-of-done")).read_text()
+    required_output = skill.split("## Required Output", 1)[1]
+    evidence = required_output.split("```", 2)[1].strip()
+    assert evidence.startswith("Phase A:"), "the skill's output block moved"
+
+    for block in (evidence, "Definition of done: n/a — docs-only wording fix"):
+        (tmp_path / ".pr-body.md").write_text(
+            "feat: add the thing\n\n"
+            "## Summary\nCloses #461\n- Problem: missing thing.\n\n"
+            "## Why this approach\n- How this solves the issue: adds it.\n\n"
+            "## What changed\n- Structure: one module.\n- Impact: thing exists.\n\n"
+            f"## Test coverage\n```\n{block}\n```\n\n"
+            "## Test plan\n- [x] tests\n"
+        )
+        args = _implementation_pr_create_args(str(tmp_path), 461)
+
+        assert args[:2] == ["--title", "feat: add the thing"], (
+            f"the harvest fell back to its generated body for block {block!r}"
+        )
+        published = Path(args[args.index("--body-file") + 1]).read_text()
+        assert block in published
+
+
 def test_reviewer_dispatch_includes_unattended_flags(
     tmp_path: Path,
 ) -> None:
@@ -6152,6 +6351,29 @@ FIXER_PROMPT_ISSUE: dict[str, object] = {
     "body": "## Scope\n1. The marker survives a failed relabel.\n",
 }
 FIXER_PROMPT_ISSUES: tuple[dict[str, object], ...] = (FIXER_PROMPT_ISSUE,)
+
+
+def bare_implementer_git(repo_root: Path) -> Callable[..., str]:
+    """Return a ``tick.git`` double whose worktree carries no skill docs.
+
+    ``worktree add`` creates only the empty directory, so any skill the
+    implementer finds must come from the install rather than the checkout.
+
+    Args:
+        repo_root: The directory reported as the checkout root.
+
+    Returns:
+        A side effect for ``mock.patch("tick.git", side_effect=...)``.
+    """
+    def fake_git(*args: str) -> str:
+        if "worktree" in args and "add" in args:
+            Path(args[-2]).mkdir(parents=True, exist_ok=True)
+            return ""
+        if "rev-parse" in args and "--show-toplevel" not in args:
+            return "abc123"
+        return str(repo_root)
+
+    return fake_git
 
 
 def render_fixer_prompt(

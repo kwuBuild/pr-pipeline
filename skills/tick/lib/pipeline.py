@@ -238,11 +238,12 @@ PROMPTS_DIR = _LIB_DIR / "prompts"
 # hardcoded in the .txt) — a later change can move the binding into config
 # without rewriting prompts.
 REVISION_HYGIENE_SKILL = "review-response-hygiene"
+DEFINITION_OF_DONE_SKILL = "definition-of-done"
 
 # Every skill doc bound into a prompt, from every stage. This is the set the
 # policy gate derives its entries from, so a skill bound by a future stage is
 # protected by adding it here rather than by remembering to restate its path.
-BOUND_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
+BOUND_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL, DEFINITION_OF_DONE_SKILL)
 
 
 def skill_doc_path(name: str) -> str:

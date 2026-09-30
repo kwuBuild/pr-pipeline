@@ -153,14 +153,23 @@ compatibility with those routes and older clients; a qualifying ancestor
 [Claude's instruction-loading documentation](https://code.claude.com/docs/en/memory#agentsmd).
 These are host discovery rules, not extra reads performed by the pipeline.
 
-The fixer additionally gets a **prompt-bound skill doc**: its prompt names the
-install's `skills/review-response-hygiene/SKILL.md` as an absolute path (from
-`tick.FIXER_SKILLS` via `pipeline.skill_doc_path`, substituted at render) and
-requires it to be read before editing. This is a doc path rather than a `Skill`
-invocation because the allowlist in §5 carries `Read` and no `Skill` tool. The
+The fixer and the implementer each additionally get a **prompt-bound skill
+doc**: the prompt names an install's `skills/<name>/SKILL.md` as an absolute path
+(from `tick.FIXER_SKILLS` or `tick.IMPLEMENTER_SKILLS` via
+`pipeline.skill_doc_path`, substituted at render) and requires it to be read
+before editing. The fixer binds `review-response-hygiene`. The implementer binds
+`definition-of-done`: Phase A before its first edit, Phase B before its commit,
+and the Phase B evidence block (or the skill's `n/a` line) under
+`## Test coverage` in `.pr-body.md` before `IMPLEMENTATION_COMPLETE`. The harvest
+checks that body's section structure only, not the block's content, so the
+evidence gate is a prompt obligation whose result is published in the PR body,
+not a harvest validation. The implementer must escalate if required guidance
+or proof is unavailable; see [Prompt-bound skills](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
+for the permission, exemption, and evidence-refresh contract. This is a doc
+path rather than a `Skill` invocation because the allowlist in §5 carries `Read` and no `Skill` tool. The
 doc ships with the pipeline, so the operator's installed copy governs every
-target repository — a target that has never heard of the skill still gets a
-fixer that can open it, and a branch cannot hand its own fixer a rewritten copy
+target repository — a target that has never heard of the skill still gets an
+engine whose prompt names it, and a branch cannot hand its fixer a rewritten copy
 of the rules. Dispatch resolves the path against the install before launching;
 a doc missing from the install is a packaging defect, and it logs
 `skill_unresolved` and escalates instead of running an engine that would
@@ -282,6 +291,7 @@ The `--allowedTools` list supplies narrow pre-approved grants
 ```
 Read Edit Write
 Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *)
+Bash(git status *) Bash(git rev-parse *) Bash(git merge-base *)
 Bash(git log *) Bash(git push <remote> HEAD)
 <one Bash(...) entry per resolved verify_tools value>
 ```
