@@ -1230,6 +1230,17 @@ def test_reconcile_routes_bound_failure_to_terminal_failure_action() -> None:
     assert d == {"action": "fail", "kill": False, "label": "ai:needs-human-decision"}
 
 
+def test_reconcile_cleans_up_failed_out_of_custody() -> None:
+    """A failed engine outside pipeline custody leaves the human label alone."""
+    decision = pipeline.reconcile_dispatch(
+        current_label="ai:ready-for-human",
+        marker_valid=True,
+        classify_state="failed",
+        pre_label="ai:implemented",
+    )
+    assert decision == {"action": "cleanup", "kill": False, "label": ""}
+
+
 def test_reconcile_cleans_up_stale_when_human_took_over() -> None:
     d = pipeline.reconcile_dispatch(
         current_label="ai:changes-requested",
