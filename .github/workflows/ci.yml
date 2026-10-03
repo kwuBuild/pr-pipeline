@@ -95,6 +95,35 @@ jobs:
       - name: Test
         run: python -m pytest skills/ -q
 
+  plugin-manifests:
+    # Users install this repository with `/plugin install`, which enforces Claude
+    # Code's manifest schema. The contract tests check the fields this
+    # repository relies on; this job runs the validator that install runs, so a
+    # malformed manifest fails here instead of on a user's machine.
+    #
+    # The CLI is unpinned on purpose: users install the current release, so the
+    # current validator is the one a manifest has to pass. Validation needs no
+    # credentials and makes no model call.
+    #
+    # Not --strict: the plugin check warns that the root CLAUDE.md is not loaded
+    # as plugin context. That file is contributor guidance, not plugin content,
+    # so the warning is expected. Errors still fail the job.
+    #
+    # test_skill_contract.py holds this job to both manifests.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Validate marketplace manifest
+        run: claude plugin validate .claude-plugin/marketplace.json
+
+      - name: Validate plugin manifest
+        run: claude plugin validate .claude-plugin/plugin.json
+
   shellcheck:
     # Every shell script the pipeline ships carries real control-flow:
     # interpreter resolution, path anchoring, probe gating, argument
