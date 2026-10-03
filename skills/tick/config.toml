@@ -37,6 +37,7 @@
 #   verify_tools    = ["uv run pytest *"]
 #   base_ref        = ""
 #   permission_mode = "auto"
+#   engine_settings = ""
 #
 #   [scan]
 #   repos = []                        # empty or absent = unrestricted
@@ -112,3 +113,16 @@ base_ref = ""
 # forbidden operations. The Codex reviewer keeps its separate read-only policy.
 # Blank or malformed values are startup errors naming this key.
 permission_mode = "auto"
+
+# Claude implementer/fixer `--settings`: a JSON object, or an absolute path to a
+# settings file. Engines otherwise load only the operator's Claude settings
+# hierarchy, which is written for interactive sessions. It outranks the user,
+# project and local files for scalar settings; permission rule lists merge, so
+# it can add deny rules but cannot remove a user allow rule. For an operator
+# whose sessions sandbox Bash with autoAllowBashIfSandboxed, set
+# '{"sandbox":{"enabled":false}}' so the engine allowlist is enforced. A relative
+# path is refused: engines run inside a checkout of the work under review. A
+# path must name a readable file holding a JSON object; each dispatch checks it
+# again before launch, because Claude does not reject a malformed settings file.
+# Blank omits the flag. Setup's probe launches with the same value.
+engine_settings = ""

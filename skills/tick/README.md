@@ -196,6 +196,7 @@ checklist_paths = []          # the target's own review checklists, repo-relativ
 verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
 base_ref        = ""          # "" = discover the target's GitHub default branch
 permission_mode = "auto"      # Claude implementer/fixer --permission-mode
+engine_settings = ""          # Claude implementer/fixer --settings; "" = omit
 
 [scan]
 repos = []                    # empty or absent = unrestricted
@@ -240,7 +241,10 @@ A blank `base_ref` is not malformed; it is the documented "resolve the target's
 default branch". Issue dispatch reads it from the canonical target on GitHub and
 pins the selected branch for PR creation; failed discovery stops dispatch with an
 error naming the repository, and an explicit override skips discovery. A blank
-`permission_mode` is invalid. `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
+`permission_mode` is invalid. A blank `engine_settings` omits `--settings`; a
+value that is not a JSON object, or an absolute path to a readable file holding
+one, is invalid.
+`$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
 name absolute locations.
 
 The operator login is reloaded for each tick; a blank login stops the loop.
@@ -896,7 +900,44 @@ settings only on an explicit yes, where they also bind the operator's own
 sessions. Short-form deletion (`git push <remote> :branch`) has no rule: a rule
 ending in `:*` is Claude Code's legacy prefix form and would deny every stage's
 own push. Implementers/fixers still inherit the operator's environment and
-settings.
+Claude settings; see [Engine settings](#engine-settings).
+
+#### Engine settings
+
+Headless `claude -p` engines load the operator's Claude settings hierarchy,
+which is usually written for interactive sessions. The `engine_settings` key
+gives engines a different layer without editing those files. Its value is
+passed to `claude --settings`: a JSON object, or an absolute path to a settings
+file. A relative path is refused because engines run inside a checkout of the
+work under review. The file must be readable and hold a JSON object. Claude does
+not reject a malformed settings file, so the resolver reads it. Tick startup
+resolves config, so a file that is broken when a tick starts fails that tick
+with `startup_config_invalid` before harvest or dispatch. Each dispatch
+resolves config again before launch, so a file that breaks during a tick
+escalates the item before any engine or lease. Blank, the default, omits the
+flag.
+
+`--settings` outranks the user, project, and local settings files, so it
+overrides a scalar setting such as `sandbox.enabled`. Permission rule lists
+merge across sources instead: engine settings can add deny rules but cannot
+remove an allow rule from the user settings. Settings sources are not isolated;
+user deny rules still apply to engines.
+
+The common case is an operator whose interactive sessions enable the Claude
+sandbox with `autoAllowBashIfSandboxed: true`. Engines inherit it, Bash runs
+without the allowlist, and the setup probe reports `unmeasurable`. Record this
+per repository to run engines unsandboxed:
+
+```toml
+[repos."owner/project"]
+engine_settings = '{"sandbox":{"enabled":false}}'
+```
+
+The implementer, the fixer, and setup's probe build their argv with one
+function, `claude_engine_argv`, so they launch with the same settings. Setup
+records the probed value and `write-config` refuses a different one. It writes
+the value to the repository section even when blank, so a nonblank
+`[defaults]` value cannot replace the "no flag" the probe measured.
 
 #### Setup route probe
 
@@ -909,8 +950,9 @@ tick will use (`--impl-engine`, `--model`) for each repository:
    the repository's confirmed `verify_tools`, and the exact push grant. Refuse
    to measure (`inconclusive`) if any entry grants the probe command.
 2. **Negative control.** Launch `claude -p --permission-mode dontAsk` with
-   dispatch's own argv: the same `--allowedTools`, no
-   `--permission-prompt-tool`, and the prompt on a stdin pipe (no TTY). Ask it
+   dispatch's own argv: the same `--allowedTools`, the proposed
+   `engine_settings` as `--settings`, no `--permission-prompt-tool`, and the
+   prompt on a stdin pipe (no TTY). Ask it
    to run `git init` in a fresh throwaway directory. The command must be
    attempted and denied.
 3. **Measurement.** Repeat under `--permission-mode auto`. The route passes
@@ -926,14 +968,14 @@ fails if the base grants ever cover the probe command.
 |---|---|---|
 | `pass` | Denied under `dontAsk`, run under `auto` | `auto`, including empty `verify_tools` |
 | `auto_failed` | Control held; `auto` denied, rejected, failed, or timed out | Another route, or `dontAsk` with named grants |
-| `unmeasurable` | Ran under `dontAsk` too: the host does not enforce the allowlist (for example sandbox `autoAllowBashIfSandboxed`) | Another route, or `dontAsk` with named grants |
+| `unmeasurable` | Not denied under `dontAsk`: the host does not enforce the allowlist (for example sandbox `autoAllowBashIfSandboxed`) | Another route, `dontAsk` with named grants, or a new probe with [engine settings](#engine-settings) that disable the sandbox |
 | `inconclusive` | Nothing measured: route cannot launch, control never attempted the command, or the probe command is granted | Another route, or `dontAsk` with named grants |
 
 The operator chooses the fallback; setup never picks one. The result is
 recorded per repository as `permission_mode` in `[repos."owner/name"]`, and the
 probe evidence is kept under `setup-probes/` beside the operator config.
 `write-config` refuses `auto`, or an empty `verify_tools`, without a passing
-probe for exactly the grants being written. It also refuses `dontAsk` with no
+probe for exactly the grants and engine settings being written. It also refuses `dontAsk` with no
 grants, because that combination strands an engine mid-run. The probe does not
 settle what a denied command does to an otherwise healthy headless run (design
 open question 12.3); it records only whether the command ran.

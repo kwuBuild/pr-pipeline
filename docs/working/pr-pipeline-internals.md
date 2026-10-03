@@ -772,8 +772,9 @@ Malformation splits two ways:
 - **Has a safe direction** (`allow_touching`) — resolves to the conservative
   reading and appends to `ResolvedConfig.warnings`. The tick logs
   `startup_config_warning` and runs.
-- **Has none** (`base_ref`, `permission_mode`, `[operator] login`,
-  `verify_tools`, `checklist_paths`, `[scan] repos`) — appends to
+- **Has none** (`base_ref`, `permission_mode`, `engine_settings`,
+  `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`) —
+  appends to
   `ResolvedConfig.errors`. The tick logs `startup_config_invalid` and exits 3,
   naming the key. So does a container declared as something other than a table:
   `[[defaults]]` read as absent would replace every setting under it with the

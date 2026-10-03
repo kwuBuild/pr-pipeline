@@ -3592,6 +3592,135 @@ def test_implementer_dispatch_honors_permission_mode_auto(
     )
 
 
+def test_implementer_dispatch_launches_with_configured_engine_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The implementer reads ``engine_settings`` from the target's config.
+
+    Setup's probe launches with the value it records; dispatch must launch
+    with the same one, or the probe measured a different engine.
+    """
+    from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    configure_engine_settings(monkeypatch, tmp_path, ENGINE_SETTINGS)
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", return_value=str(repo_root)), \
+            mock.patch("tick.relabel"), \
+            mock.patch("tick.pipeline.atomic_write", side_effect=write_through), \
+            mock.patch("subprocess.Popen") as popen_mock:
+        popen_mock.return_value = mock.MagicMock(pid=12345)
+        _dispatch_one_implementer(
+            issue_number=463, issue_title="Settings", tick_log=None,
+        )
+
+    popen_mock.assert_called_once()
+    engine_cmd = popen_mock.call_args[0][0]
+    assert engine_cmd[engine_cmd.index("--settings") + 1] == ENGINE_SETTINGS
+
+
+def test_fixer_dispatch_launches_with_configured_engine_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixer reads ``engine_settings`` exactly as the implementer does."""
+    from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
+
+    configure_engine_settings(monkeypatch, tmp_path, ENGINE_SETTINGS)
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", side_effect=fixer_git(repo_root)), \
+            mock.patch("tick.gh_text", side_effect=["main", "abc123", "fix-branch"]), \
+            mock.patch("tick.gh_json", side_effect=fixer_gh_json(
+                pr_body=FIXER_PROMPT_PR_BODY, issues=FIXER_PROMPT_ISSUES,
+            )), \
+            mock.patch("tick.pipeline.atomic_write", side_effect=write_through), \
+            mock.patch("tick._publish_marker_or_revert", return_value=True), \
+            mock.patch("tick.relabel"), \
+            mock.patch("subprocess.Popen") as popen_mock:
+        popen_mock.return_value = mock.MagicMock(pid=12345)
+        _dispatch_one_fixer(pr_number=43, tick_log=None)
+
+    popen_mock.assert_called_once()
+    engine_cmd = popen_mock.call_args[0][0]
+    assert engine_cmd[engine_cmd.index("--settings") + 1] == ENGINE_SETTINGS
+
+
+def test_implementer_dispatch_refuses_a_broken_engine_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A settings file that broke after setup escalates before any custody.
+
+    ``claude --settings`` would not reject it, so launching would run the
+    engine under the settings the operator configured this key to replace.
+    """
+    from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    settings_file = tmp_path / "engine-settings.json"
+    settings_file.write_text('{"sandbox": ')
+    configure_engine_settings(monkeypatch, tmp_path, str(settings_file))
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", return_value=str(repo_root)), \
+            mock.patch("tick.relabel") as relabel_mock, \
+            mock.patch("tick.pipeline.atomic_write") as write_mock, \
+            mock.patch("tick._escalate_dispatch_setup_failure") as escalate_mock, \
+            mock.patch("subprocess.Popen") as popen_mock:
+        _dispatch_one_implementer(
+            issue_number=463, issue_title="Settings", tick_log=None,
+        )
+
+    popen_mock.assert_not_called()
+    relabel_mock.assert_not_called()
+    write_mock.assert_not_called()
+    escalate_mock.assert_called_once()
+    assert "engine_settings" in escalate_mock.call_args[1]["reason"]
+
+
+def test_fixer_dispatch_refuses_a_missing_engine_settings_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fixer re-checks the settings file exactly as the implementer does."""
+    from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
+
+    configure_engine_settings(
+        monkeypatch, tmp_path, str(tmp_path / "engine-settings.json"),
+    )
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", side_effect=fixer_git(repo_root)), \
+            mock.patch("tick.gh_text", side_effect=["main", "abc123", "fix-branch"]), \
+            mock.patch("tick.gh_json", side_effect=fixer_gh_json(
+                pr_body=FIXER_PROMPT_PR_BODY, issues=FIXER_PROMPT_ISSUES,
+            )), \
+            mock.patch("tick._publish_marker_or_revert") as publish_mock, \
+            mock.patch("tick.relabel") as relabel_mock, \
+            mock.patch("tick._escalate_dispatch_setup_failure") as escalate_mock, \
+            mock.patch("subprocess.Popen") as popen_mock:
+        _dispatch_one_fixer(pr_number=43, tick_log=None)
+
+    popen_mock.assert_not_called()
+    publish_mock.assert_not_called()
+    relabel_mock.assert_not_called()
+    escalate_mock.assert_called_once()
+    assert "engine_settings" in escalate_mock.call_args[1]["reason"]
+
+
 def test_implementer_dispatch_sets_sixty_minute_deadline(
     tmp_path: Path,
 ) -> None:
@@ -6109,6 +6238,28 @@ def codex_positionals(codex_argv: list[str]) -> list[str]:
             positionals.append(arg)
             i += 1
     return positionals
+
+
+ENGINE_SETTINGS = '{"sandbox":{"enabled":false}}'
+
+
+def configure_engine_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, settings: str,
+) -> None:
+    """Point the resolver at a config giving the stubbed target ``settings``."""
+    config_path = tmp_path / "operator.toml"
+    config_path.write_text(
+        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n'
+        f'\n[repos."{TRUSTED_AUTHOR}/test-repo"]\n'
+        f"engine_settings = '{settings}'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(config_path))
+
+
+def write_through(path: str, data: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(data)
 
 
 # --- Operator-configured verification permissions ---

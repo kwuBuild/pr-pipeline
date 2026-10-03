@@ -68,8 +68,13 @@ not work around it.
       tick run outside the session sandbox, so a sandboxed probe would measure a
       different environment. Tell the operator it makes two short model calls.
       ```bash
-      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude-ds] [--model <model>] [--verify-tool '<grant>' ...]
+      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude-ds] [--model <model>] [--verify-tool '<grant>' ...] [--engine-settings '<json-or-absolute-path>']
       ```
+      `--engine-settings` is the `engine_settings` value that dispatch passes
+      to engines as `--settings`. Omit it unless the operator chooses it in
+      step 5. Pass the same value to `write-config`. A path must name a
+      readable file that holds a JSON object; setup and each dispatch refuse
+      any other file.
       The probe asks a headless engine, launched as dispatch launches one, to
       run `git init` in a throwaway directory. That command is in no grant.
       The first run uses `dontAsk`, a negative control that must be denied.
@@ -86,13 +91,21 @@ not work around it.
            If the list is empty, the operator must name the target's
            verification commands, then probe again with them.
 
-        `unmeasurable` means the command also ran under `dontAsk`: the host
-        does not enforce the allowlist (for example a Claude sandbox with
-        `autoAllowBashIfSandboxed`, or a settings allow rule). `inconclusive`
-        means nothing was measured; fix the cause in `detail` first.
+        `unmeasurable` means the command was not denied under `dontAsk`:
+        the host does not enforce the allowlist. The usual cause is
+        `sandbox.autoAllowBashIfSandboxed` in the operator's Claude settings,
+        which auto-allows Bash inside the sandbox. For that cause, offer a
+        third outcome: probe again with
+        `--engine-settings '{"sandbox":{"enabled":false}}'`. Engines then run
+        unsandboxed, like the tick's own process, and the operator's
+        interactive settings stay unchanged. A settings `permissions.allow`
+        rule that grants `git init` is the other cause; engine settings
+        cannot remove it, so the operator must remove it from their settings.
+        `inconclusive` means nothing was measured; fix the cause in `detail`
+        first.
    6. Preview, then write:
       ```bash
-      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh write-config <owner/name> --login <login> --permission-mode <auto|dontAsk> [--verify-tool '<grant>' ...] [--base-ref <branch>] --dry-run
+      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh write-config <owner/name> --login <login> --permission-mode <auto|dontAsk> [--verify-tool '<grant>' ...] [--engine-settings '<value>'] [--base-ref <branch>] --dry-run
       ```
       Show `diff`. The rewrite keeps every value but normalises formatting
       and drops comments. The previous file is kept as `config.toml.bak`. On
