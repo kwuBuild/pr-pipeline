@@ -410,6 +410,40 @@ def test_skill_md_is_lean_operator_sop() -> None:
         assert heading in text, f"SOP heading not found: {heading}"
 
 
+def test_skill_md_defaults_unattended_runs_to_background_native_loop() -> None:
+    """Unattended runs must default to the in-process loop, not model-paced /loop.
+
+    The native ``--loop`` makes no model calls between ticks and wakes on engine
+    completion. ``/loop`` spends a model turn per tick, so the SOP must present
+    it only as the opt-in for per-tick reports.
+    """
+    text = SKILL.read_text()
+    procedure = text.split("## Run Procedure")[1].split("## Outcome Check")[0]
+    loop_section = text.split("## Running Under /loop")[1]
+
+    assert "run_in_background: true" in procedure
+    assert f"bash {PLUGIN_ROOT_VAR}/skills/tick/tick.sh --loop" in procedure
+    assert "no model calls" in procedure
+    assert "Optional" in loop_section.split("Paste this prompt into /loop")[0]
+
+
+def test_skill_md_loops_keep_the_operators_target_and_flags() -> None:
+    """Both loop paths must carry the operator's target and flags forward.
+
+    ``parse_cli_args`` starts every process with no target and no overrides,
+    so a loop launched without them silently widens ``pr:N`` to the whole
+    queue and drops ``--permission-mode``, ``--model``, and engine choices.
+    """
+    text = SKILL.read_text()
+    procedure = text.split("## Run Procedure")[1].split("## Outcome Check")[0]
+    loop_intro = text.split("## Running Under /loop")[1].split(
+        "Paste this prompt into /loop"
+    )[0]
+
+    assert "same target and flags" in procedure
+    assert "append the same target and flags" in loop_intro
+
+
 def test_skill_md_loop_section_has_paste_ready_iteration_prompt() -> None:
     """Loop supervision must schedule the compact tick contract, not reinvoke the skill."""
     text = SKILL.read_text()

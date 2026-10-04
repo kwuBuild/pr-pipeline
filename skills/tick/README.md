@@ -278,7 +278,10 @@ dot, underscore, or hyphen, start with a letter or digit, and cannot contain
 `..` or end in `.` or `.lock`.
 
 A startup failure exits 3 in both single-tick and `--loop` mode; loop cadence
-does not issue GitHub requests after a rejected target or configuration.
+does not issue GitHub requests after a rejected target or configuration. A tick
+that crashes (`tick_crash`, exit 4) also ends `--loop` before the next wait, so
+a persistent exception reaches the operator instead of retrying in the
+background.
 
 ### Unconfigured targets
 

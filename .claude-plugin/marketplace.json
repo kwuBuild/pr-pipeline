@@ -20,10 +20,17 @@
       "license": "MIT",
       "category": "workflow",
       "keywords": [
+        "ai-agents",
+        "ai-code-review",
         "automation",
+        "autonomous-coding",
+        "claude-code",
         "code-review",
+        "codex",
         "github",
+        "multi-agent",
         "orchestration",
+        "pull-requests",
         "unattended"
       ]
     }

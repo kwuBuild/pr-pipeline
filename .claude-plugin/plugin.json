@@ -9,10 +9,17 @@
   "repository": "https://github.com/kwuBuild/pr-pipeline",
   "license": "MIT",
   "keywords": [
+    "ai-agents",
+    "ai-code-review",
     "automation",
+    "autonomous-coding",
+    "claude-code",
     "code-review",
+    "codex",
     "github",
+    "multi-agent",
     "orchestration",
+    "pull-requests",
     "unattended"
   ],
   "skills": "./skills"

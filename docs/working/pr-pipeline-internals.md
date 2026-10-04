@@ -704,7 +704,8 @@ use the resolved remote, and implementer/fixer prompts and push grants carry the
 same remote. Qualified issue reads may use `gh_json(..., repo="owner/other")`;
 the explicit read repository is separate from the target used for mutations.
 Repository comparisons in configuration, scan scope, and reviewer admission
-ignore case. `--loop` exits on startup rejection before observing remote cadence.
+ignore case. `--loop` exits on startup rejection or a `tick_crash` (exit 4) before observing
+remote cadence.
 
 `pipeline.validate_target_context` invokes the helper's `--check-remote` mode
 without changing the supplied working directory. `_launch_claude_engine` runs
