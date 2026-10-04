@@ -69,13 +69,11 @@ Versions follow [Semantic Versioning](https://semver.org/):
    `test_changelog_records_the_manifest_version` fails if step 4 is missing.
    The plugin validation reports one expected warning about the root
    `CLAUDE.md`.
-6. Do the [smoke test preparation](#1-before-the-merge-prepare). It installs
-   the previous release, so it must run before the merge.
-7. Open the release PR with the subject `chore: release X.Y.Z`. Use the
+6. Open the release PR with the subject `chore: release X.Y.Z`. Use the
    changelog section as the summary.
-8. After the owner merges, [tag the merge commit](#tagging-the-release).
-9. Do the [smoke test checks](#2-after-the-merge-update-and-check) and record
-   the result in a comment on the release PR.
+7. After the owner merges, [tag the merge commit](#tagging-the-release).
+8. Run the [upgrade smoke test](#upgrade-smoke-test) against the new tag and
+   record the result in a comment on the release PR.
 
 ## Tagging the release
 
@@ -115,8 +113,19 @@ why. The test has two modes:
 
 | Mode | When | What it proves |
 |---|---|---|
-| Upgrade | A previous release exists | The previous install updates to the new version and keeps its configuration |
+| Upgrade | A previous release exists | The previous release updates to the new version and keeps its configuration |
 | First install | Only for 0.1.0 | The new version installs and runs. It does not prove an upgrade |
+
+Run the test after you [tag the release](#tagging-the-release). The test
+installs from a local clone of this repository, checked out at release tags.
+Do not install from `main` instead. A change can merge to `main` without a
+version change. A fresh install from `main` gets that change under the previous
+version number, but an existing install does not have it. A check that starts
+from `main` can therefore pass while the previous release fails. With the tags,
+the test starts from exactly the previous release and ends at exactly the new
+one. The tag is also the oldest code that carries the previous version number:
+users who installed after it run a later commit under the same number. The test
+does not cover how `marketplace update` fetches from GitHub.
 
 The test uses a temporary `CLAUDE_CONFIG_DIR`, so your own Claude Code
 installation and operator configuration do not change. It does not run
@@ -124,47 +133,76 @@ installation and operator configuration do not change. It does not run
 `CLAUDE_CONFIG_DIR` is set. The test copies the launcher into the temporary
 directory instead.
 
-You need a target repository that your operator configuration already
-contains (run `/pr-pipeline:setup` once), and a local checkout of that
-repository.
+The test also unsets `PR_PIPELINE_HOME` and `PR_PIPELINE_CONFIG`. When
+`PR_PIPELINE_HOME` is set, the launcher runs that checkout and does not read
+the plugin inventory. When `PR_PIPELINE_CONFIG` is set, it selects the operator
+configuration instead of `$CLAUDE_CONFIG_DIR/pr-pipeline/config.toml`. With
+either variable set, a check can pass against code or configuration that the
+test did not install. Run all of the commands in one shell. Check 0 fails if
+the shell sets either variable again.
 
-### 1. Before the merge: prepare
+You need:
 
-In the upgrade mode, this installs the previous release, which is still on
-`main`. In the first-install mode, run this part after the merge instead.
+- A target repository that your operator configuration already contains (run
+  `/pr-pipeline:setup` once), and a local checkout of that repository.
+- The path of the operator configuration that you use. This is
+  `$PR_PIPELINE_CONFIG` if you set it. Otherwise it is
+  `pr-pipeline/config.toml` in your `CLAUDE_CONFIG_DIR`, or in `~/.claude` if
+  you do not set `CLAUDE_CONFIG_DIR`. Find the path before you run the commands
+  below, because they change these variables.
+
+### 1. Install the previous release
+
+Set `PREVIOUS` to the previous release version. The command
+`git describe --tags --abbrev=0 vX.Y.Z^` prints its tag. In the first-install
+mode, set `PREVIOUS` to the new version.
 
 ```bash
-export CLAUDE_CONFIG_DIR="$(mktemp -d)"
+VERSION=X.Y.Z; PREVIOUS=<previous release version>
 TARGET=<owner/name>; TARGET_CHECKOUT=<absolute path to its checkout>
-claude plugin marketplace add kwuBuild/pr-pipeline
+SOURCE_CONFIG=<absolute path to your operator configuration>
+SMOKE="$(mktemp -d)"
+export CLAUDE_CONFIG_DIR="$SMOKE/claude"
+unset PR_PIPELINE_HOME PR_PIPELINE_CONFIG
+mkdir -p "$CLAUDE_CONFIG_DIR/pr-pipeline/bin"
+git clone --quiet https://github.com/kwuBuild/pr-pipeline.git "$SMOKE/marketplace"
+git -C "$SMOKE/marketplace" checkout --quiet "v$PREVIOUS"
+claude plugin marketplace add "$SMOKE/marketplace"
 claude plugin install pr-pipeline@pr-pipeline
 OLD="$(claude plugin list --json | jq -r '.[] | select(.id == "pr-pipeline@pr-pipeline") | .installPath')"
-mkdir -p "$CLAUDE_CONFIG_DIR/pr-pipeline/bin"
-cp ~/.claude/pr-pipeline/config.toml "$CLAUDE_CONFIG_DIR/pr-pipeline/config.toml"
+claude plugin list --json | jq -e --arg v "$PREVIOUS" '.[] | select(.id == "pr-pipeline@pr-pipeline") | .version == $v'
+diff -rq -x .git "$SMOKE/marketplace" "$OLD"
+cp "$SOURCE_CONFIG" "$CLAUDE_CONFIG_DIR/pr-pipeline/config.toml"
 install -m 755 "$OLD/skills/tick/pr-pipeline.sh" "$CLAUDE_CONFIG_DIR/pr-pipeline/bin/pr-pipeline"
 (cd "$CLAUDE_CONFIG_DIR" && shasum -a 256 pr-pipeline/config.toml > config.sha256)
 ```
 
-The copied launcher comes from the previous release. This matches a user's
-machine after an update: the launcher copy stays at the old version and must
-find the new install.
+The `jq` and `diff` commands must succeed. They prove that the install is the
+previous version and holds exactly the code of its tag. The copied launcher
+comes from that install. This matches a user's machine after an update: the
+launcher copy stays at the old version and must find the new install.
 
-### 2. After the merge: update and check
+### 2. Update to the new release and check
 
-In the same shell, update the install. Skip the two update commands in the
+In the same shell, update the install. Skip these commands in the
 first-install mode.
 
 ```bash
-VERSION=X.Y.Z
+git -C "$SMOKE/marketplace" checkout --quiet "v$VERSION"
 claude plugin marketplace update pr-pipeline
 claude plugin update pr-pipeline@pr-pipeline
 ```
 
-Then run the four checks. Each one must succeed:
+Then run the checks. Each one must succeed:
 
 ```bash
-# 1. Exactly one enabled install, at the new version and path.
+# 0. No override replaces the install or the configuration under test.
+test -z "${PR_PIPELINE_HOME+x}${PR_PIPELINE_CONFIG+x}" && test "$CLAUDE_CONFIG_DIR" = "$SMOKE/claude"
+
+# 1. Exactly one enabled install, at the new version and path, with the code of the new tag.
 claude plugin list --json | jq -e --arg v "$VERSION" '[.[] | select(.id == "pr-pipeline@pr-pipeline" and .enabled)] | length == 1 and .[0].version == $v and (.[0].installPath | endswith("/" + $v))'
+NEW="$(claude plugin list --json | jq -r '.[] | select(.id == "pr-pipeline@pr-pipeline") | .installPath')"
+diff -rq -x .git "$SMOKE/marketplace" "$NEW"
 
 # 2. Claude loads the new version's skills.
 claude plugin details pr-pipeline | grep -x "pr-pipeline $VERSION"
@@ -175,26 +213,33 @@ claude plugin details pr-pipeline | grep 'Skills ('
 
 # 4. The operator configuration is unchanged and the new code parses it.
 (cd "$CLAUDE_CONFIG_DIR" && shasum -a 256 -c config.sha256)
-NEW="$(claude plugin list --json | jq -r '.[] | select(.id == "pr-pipeline@pr-pipeline") | .installPath')"
 bash "$NEW/skills/setup/setup.sh" inspect "$TARGET" | jq -e '.configured and (.config_errors | length == 0)'
 ```
 
 Compare the skill list from check 2 with the `skills/*/SKILL.md` directories of
 the release. The update leaves the previous version's cache directory in
-place. Check 1 is what ties checks 3 and 4 to the new code: the launcher runs
-the single enabled install, and check 1 proves that this install is the new
-version.
+place. Checks 0 and 1 tie checks 3 and 4 to the new code and the copied
+configuration. With no override set, the launcher runs the single enabled
+install, and check 1 proves that this install is the new tag. The `inspect`
+command reads `$CLAUDE_CONFIG_DIR/pr-pipeline/config.toml`, which is the file
+that the checksum covers.
 
-The checks fail in these known fault cases: a disabled install fails checks 1
-and 3, a changed configuration fails check 4, and an invalid configuration
-fails check 4.
+The checks fail in these known fault cases:
+
+| Fault | Failing check |
+|---|---|
+| The install is disabled | 1 and 3 |
+| A change after the previous tag breaks the launcher contract, for example a renamed entry script | 3 |
+| The shell sets `PR_PIPELINE_HOME` or `PR_PIPELINE_CONFIG` again | 0 |
+| The configuration changed | 4 |
+| The configuration is not valid | 4 |
 
 The test does not run a skill inside a Claude model session. That needs
 credentials in the temporary directory and model calls. If the release changes
 a skill body, run that skill in a new Claude Code session after you update your
 own install, and record the result on the release PR.
 
-Remove the temporary directory afterwards.
+Remove the temporary directory afterwards: `rm -rf "$SMOKE"`.
 
 ## When a release is broken
 
