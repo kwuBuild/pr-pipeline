@@ -1006,6 +1006,11 @@ still the old cache entry, the marker says so.
 - A CI job validating the plugin manifests, so a malformed `plugin.json` fails
   here rather than on an adopter's machine.
 
+Status: `CHANGELOG.md`, the `plugin-manifests` CI job, and the
+[release process](release-process.md) have landed. No `VERSION` file was added:
+`plugin.json` is the only version field (see L4 above), and the contract tests
+tie the changelog to it. The root `README.md` remains open.
+
 This section lists the artifacts. Section 15 covers what goes in them, what the
 project claims about itself, and the gate that has to pass before any of it is
 published.

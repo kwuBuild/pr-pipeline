@@ -69,6 +69,7 @@ INTERNALS = REPO_ROOT / "docs/working/pr-pipeline-internals.md"
 SKILLS_ROOT = REPO_ROOT / "skills"
 PLUGIN_MANIFEST = REPO_ROOT / ".claude-plugin" / "plugin.json"
 MARKETPLACE_MANIFEST = REPO_ROOT / ".claude-plugin" / "marketplace.json"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 
 # The plugin's own name. Claude Code namespaces a plugin's skills by it, so this
 # is the prefix on every command the plugin publishes: `/pr-pipeline:tick`.
@@ -1930,6 +1931,56 @@ def test_marketplace_manifest_makes_this_repository_its_own_source() -> None:
         "the plugin source must be this repository itself, not "
         f"{entry.get('source')!r}"
     )
+
+
+def test_plugin_manifest_is_the_only_version_field() -> None:
+    """``plugin.json`` holds the one version that installed users update to.
+
+    An installed plugin updates only when this version changes, so it is the
+    release key. A second ``version`` on the marketplace entry can drift from it,
+    and then the catalog and the installed manifest disagree about what a user
+    has.
+    """
+    version = json.loads(PLUGIN_MANIFEST.read_text()).get("version")
+    assert isinstance(version, str) and re.fullmatch(
+        r"\d+\.\d+\.\d+", version
+    ), f"plugin.json version must be MAJOR.MINOR.PATCH, not {version!r}"
+
+    entry = json.loads(MARKETPLACE_MANIFEST.read_text())["plugins"][0]
+    assert "version" not in entry, (
+        "the marketplace entry must not declare its own version; "
+        "plugin.json is the only release key"
+    )
+
+
+def test_changelog_records_the_manifest_version() -> None:
+    """``CHANGELOG.md`` must have a section for the version being shipped.
+
+    A version bump without a changelog entry gives updating users no record of
+    what changed or which upgrade step the release needs.
+    """
+    version = json.loads(PLUGIN_MANIFEST.read_text())["version"]
+    assert CHANGELOG.exists(), "no CHANGELOG.md at the repository root"
+    headings = re.findall(r"^## \[([^\]]+)\]", CHANGELOG.read_text(), re.M)
+    assert version in headings, (
+        f"CHANGELOG.md has no '## [{version}]' section for the version in "
+        f"plugin.json; found {headings}"
+    )
+
+
+def test_ci_validates_both_plugin_manifests() -> None:
+    """CI must run Claude Code's own validator on both manifests.
+
+    The structural tests above check the fields this repository relies on. The
+    validator checks the schema that ``/plugin install`` enforces, so a
+    malformed manifest fails here instead of on a user's machine.
+    """
+    workflow = (REPO_ROOT / ".github/workflows/ci.yml").read_text()
+    for manifest in (MARKETPLACE_MANIFEST, PLUGIN_MANIFEST):
+        target = manifest.relative_to(REPO_ROOT)
+        assert f"claude plugin validate {target}" in workflow, (
+            f"ci.yml does not run 'claude plugin validate {target}'"
+        )
 
 
 def test_published_skill_set_is_exactly_the_intended_commands() -> None:
