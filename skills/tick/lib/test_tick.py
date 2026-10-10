@@ -8,6 +8,7 @@ out cleanly. Run with::
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
 import io
 import json
@@ -211,7 +212,7 @@ def test_run_loop_locked_stops_on_quiescent_limit_without_sleep(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 0,
             "nearest_engine_deadline": None,
             "actionable_queue": False,
@@ -395,7 +396,7 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
 
     def fake_tick(
         *_args: object, count_quiescent_heartbeat: bool = True,
-        unattended: bool = False,
+        unattended: bool = False, admission_cap: list[int] | None = None,
     ) -> int:
         assert unattended
         heartbeat_flags.append(count_quiescent_heartbeat)
@@ -405,7 +406,7 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 0,
             "nearest_engine_deadline": None,
             "actionable_queue": False,
@@ -451,7 +452,7 @@ def test_run_loop_locked_nudge_wakes_do_not_advance_quiescent_stop(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 0,
             "nearest_engine_deadline": None,
             "actionable_queue": False,
@@ -1852,7 +1853,7 @@ def test_run_loop_locked_survives_watcher_start_failure(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 0,
             "nearest_engine_deadline": None,
             "actionable_queue": False,
@@ -2110,7 +2111,7 @@ def test_run_loop_locked_preserves_a_nudge_that_arrives_during_a_tick(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 1,
             "nearest_engine_deadline": None,
             "actionable_queue": True,
@@ -2140,7 +2141,7 @@ def test_run_loop_locked_observes_state_under_its_target(
 
     observed: list[object] = []
 
-    def capture_observe(target: object = None) -> object:
+    def capture_observe(target: object = None, **_kwargs: object) -> object:
         observed.append(target)
         return {
             "in_flight_count": 0,
@@ -2191,7 +2192,7 @@ def test_run_loop_locked_stop_signal_interrupts_a_long_wait(
     monkeypatch.setattr(
         tick,
         "_observe_loop_state",
-        lambda _target=None: {
+        lambda _target=None, **_kwargs: {
             "in_flight_count": 1,
             "nearest_engine_deadline": None,
             "actionable_queue": True,
@@ -4339,7 +4340,7 @@ def test_one_held_slot_keeps_the_loop_running_and_still_dispatches() -> None:
                     ):
                         state = tick._observe_loop_state()
                     admission = tick.can_dispatch_now(
-                        max_in_flight=tick.MAX_IN_FLIGHT,
+                        max_in_flight=tick.pipeline.DEFAULT_MAX_IN_FLIGHT,
                     )
 
     # The held engine is discounted from supervision but not from spend.
@@ -4587,7 +4588,7 @@ def test_observe_loop_state_human_hold_read_failure_is_not_quiescent() -> None:
                     ):
                         state = tick._observe_loop_state()
 
-    assert state["in_flight_count"] == tick.MAX_IN_FLIGHT
+    assert state["in_flight_count"] == tick.pipeline.DEFAULT_MAX_IN_FLIGHT
     assert state["actionable_queue"] is True
     assert state["quiescent"] is False
 
@@ -4628,7 +4629,7 @@ def test_read_authoritative_in_flight_labels_rejects_malformed_payload(
 
 
 def test_can_dispatch_now_returns_true_when_slots_free() -> None:
-    """can_dispatch_now() allows dispatch below MAX_IN_FLIGHT."""
+    """can_dispatch_now() allows dispatch below max_in_flight."""
     from tick import can_dispatch_now  # type: ignore[import-untyped]
 
     with mock.patch("tick._scan_marker_identities") as scan:
@@ -4640,7 +4641,7 @@ def test_can_dispatch_now_returns_true_when_slots_free() -> None:
 
 
 def test_can_dispatch_now_returns_false_at_max_in_flight() -> None:
-    """can_dispatch_now() denies dispatch at MAX_IN_FLIGHT."""
+    """can_dispatch_now() denies dispatch at max_in_flight."""
     import pipeline as _pipeline
     from tick import can_dispatch_now  # type: ignore[import-untyped]
 
@@ -7272,7 +7273,7 @@ def test_launching_lease_under_a_hold_releases_a_surviving_in_flight_label(
     Distinct from the escalation case: here ``ai:blocked`` arrives from the
     operator before any reconcile ran, so the pipeline's own in-flight label is
     still on the item and every authoritative read counts it against
-    ``MAX_IN_FLIGHT``. Reclaiming the scratch without retracting that receipt
+    ``max_in_flight``. Reclaiming the scratch without retracting that receipt
     would leave the slot burned.
     """
     from pipeline import StageConfig  # type: ignore[attr-defined]
@@ -7391,7 +7392,7 @@ def test_proven_dead_hold_releases_in_flight_label_before_cleanup(
     The scratch-destroying branch already trusts two negative process probes.
     Leaving the in-flight label behind would keep the item in every
     authoritative in-flight read forever, permanently consuming a
-    MAX_IN_FLIGHT slot with no process and no marker behind it. Releasing it
+    max_in_flight slot with no process and no marker behind it. Releasing it
     is not a custody mutation: the human hold is untouched.
 
     Parametrised across all three engine types and both hold labels — the
@@ -15282,7 +15283,7 @@ def test_terminal_resume_under_a_hold_releases_instead_of_pinning_the_slot(
     ``_converge_pipeline_labels`` refuses to mutate under a hold by design, so
     a transition still carrying its stage's in-flight label can never converge
     while one is present. Re-attempting it every tick leaves ``ai:reviewing``
-    on the item forever — one of MAX_IN_FLIGHT slots consumed with no engine
+    on the item forever — one of max_in_flight slots consumed with no engine
     behind it — and the resume runs ahead of the hold branch that used to
     release it. The hold owns the label, so the pipeline drops only its own
     in-flight receipt and finishes local custody.
@@ -19208,7 +19209,7 @@ def test_run_tick_body_dispatches_past_four_foreign_in_flight_labels(
 
     Four hand-set ``ai:implementing`` issues and an empty marker root is the
     exact repo state that starved every dispatch: the union contract counted
-    them as four paid engines against ``MAX_IN_FLIGHT = 3``.
+    them as four paid engines against the default ``max_in_flight = 3``.
 
     Nothing on the admission path is stubbed here. ``dispatch_reviewers`` runs
     for real and its own ``can_dispatch_now`` call decides; the run is stopped
@@ -22079,7 +22080,322 @@ def test_liveness_guard_hides_a_real_foreign_process_start_time() -> None:
         reap(proc)
 
 
+@pytest.mark.parametrize("raw", ["0", "-1", "true", "2.5", '"4"'])
+def test_main_refuses_a_malformed_max_in_flight_before_harvest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str,
+) -> None:
+    """A cap that is not an integer of at least 1 stops the tick at startup.
+
+    No HARVEST and no DISPATCH run, and the error names the key: falling back
+    to the shipped cap would run engines at a concurrency nobody chose.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_cap_config(monkeypatch, tmp_path, raw)
+
+    with mock.patch("tick.git", return_value=str(tmp_path)):
+        with mock.patch("tick._startup_probe"):
+            with mock.patch("tick.harvest_reviewers") as harvest:
+                with mock.patch("tick._run_tick_body") as body:
+                    stderr = io.StringIO()
+                    with mock.patch("sys.stderr", stderr):
+                        rc = tick.main()
+
+    assert rc == 3
+    assert "invalid configuration" in stderr.getvalue()
+    assert "max_in_flight" in stderr.getvalue()
+    body.assert_not_called()
+    harvest.assert_not_called()
+
+
+def test_tick_never_admits_past_the_configured_cap_across_stages(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Every stage admits against the one configured cap, counting old markers.
+
+    Two engines from earlier ticks already hold markers, and each of the three
+    stages has two eligible items. With ``max_in_flight = 4`` the tick may
+    launch exactly two more, wherever they fall, and every later candidate is
+    skipped on admission. The shipped cap of three would admit only one, so
+    the launch count tells the configured value from the constant.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_cap_config(monkeypatch, tmp_path, "4")
+    markers = earlier_tick_markers(2)
+    launched: list[tuple[str, int]] = []
+    fakes = cap_queue_fakes({
+        81: ["ai:implemented"], 82: ["ai:implemented"],
+        71: ["ai:available"], 72: ["ai:available"],
+        91: ["ai:changes-requested"], 92: ["ai:changes-requested"],
+    })
+
+    def launch(kind: str, label: str) -> Callable[..., None]:
+        def record(**kwargs: object) -> None:
+            number = int(kwargs.get("pr_number") or kwargs["issue_number"])  # type: ignore[call-overload]
+            launched.append((kind, number))
+            markers.append((kind, number, label, "launching", "matched", True))
+        return record
+
+    with mock.patch("tick._startup_probe"):
+        with cap_tick_patches(markers, fakes):
+            with mock.patch(
+                "tick._dispatch_one_reviewer",
+                side_effect=launch("pr", "ai:reviewing"),
+            ):
+                with mock.patch(
+                    "tick._dispatch_one_implementer",
+                    side_effect=launch("issue", "ai:implementing"),
+                ):
+                    with mock.patch(
+                        "tick._dispatch_one_fixer",
+                        side_effect=launch("pr", "ai:fixing"),
+                    ):
+                        with mock.patch("sys.stderr", io.StringIO()):
+                            rc = tick._run_single_tick_locked(None, "claude", "")
+
+    assert rc == 0
+    assert len(launched) == 2, launched
+    admission_skips = [
+        e for e in read_tick_log_entries(Path(tick.TICK_LOG_DIR))
+        if e.get("action") == "skip"
+        and e.get("reason") == "admission: max_in_flight"
+    ]
+    assert len(admission_skips) == 4, admission_skips
+    assert {e["details"]["max"] for e in admission_skips} == {4}  # type: ignore[index]
+
+
+def test_tick_cadence_judges_capacity_against_the_configured_cap(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Three engines are not at capacity when the operator configured five.
+
+    Cadence must use the cap admission used: a tick that reports itself at
+    capacity while admission would still launch paces as if nothing could
+    start.
+    """
+    import pipeline  # type: ignore[import-untyped]
+    import tick  # type: ignore[import-untyped]
+
+    write_cap_config(monkeypatch, tmp_path, "5")
+    markers = earlier_tick_markers(3)
+
+    with mock.patch("tick._startup_probe"):
+        with cap_tick_patches(markers, cap_queue_fakes({})):
+            with mock.patch(
+                "tick.pipeline.compute_next_wake",
+                wraps=pipeline.compute_next_wake,
+            ) as next_wake:
+                with mock.patch("sys.stderr", io.StringIO()):
+                    rc = tick._run_single_tick_locked(None, "claude", "")
+
+    assert rc == 0
+    assert next_wake.call_args.kwargs["in_flight_count"] == 3
+    assert next_wake.call_args.kwargs["at_capacity"] is False
+
+
+def test_observe_loop_state_uses_the_configured_cap() -> None:
+    """Loop occupancy and its fail-closed fallback both use the passed cap."""
+    import tick  # type: ignore[import-untyped]
+
+    with mock.patch("tick.read_authoritative_in_flight_labels", return_value=[]):
+        with mock.patch("tick.read_authoritative_human_holds", return_value={}):
+            with mock.patch(
+                "tick._scan_marker_identities",
+                return_value=earlier_tick_markers(3),
+            ):
+                with mock.patch("tick._has_actionable_queue", return_value=True):
+                    with mock.patch(
+                        "tick._nearest_actionable_engine_deadline",
+                        return_value=None,
+                    ):
+                        below = tick._observe_loop_state(max_in_flight=5)
+            with mock.patch(
+                "tick._scan_marker_identities",
+                side_effect=RuntimeError("unreadable marker root"),
+            ):
+                with mock.patch(
+                    "tick._nearest_actionable_engine_deadline",
+                    return_value=None,
+                ):
+                    unknown = tick._observe_loop_state(max_in_flight=5)
+
+    assert below["in_flight_count"] == 3
+    assert below["at_cap"] is False
+    # Unknown occupancy assumes the configured cap is full, not the shipped one.
+    assert unknown["in_flight_count"] == 5
+    assert unknown["at_cap"] is True
+    assert unknown["quiescent"] is False
+
+
+def test_loop_observes_cadence_with_the_cap_its_tick_admitted_against(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``--loop`` hands the startup-validated cap to the tick and to cadence.
+
+    The cap is read once, at the startup gate, so the observation after the
+    tick cannot pick up a different value than the one admission used.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_cap_config(monkeypatch, tmp_path, "5")
+    observed: list[object] = []
+
+    def observe(_target: object = None, **kwargs: object) -> object:
+        observed.append(kwargs.get("max_in_flight"))
+        return {
+            "in_flight_count": 0,
+            "nearest_engine_deadline": None,
+            "actionable_queue": False,
+            "at_cap": False,
+            "quiescent": True,
+        }
+
+    def edit_config_mid_tick(*_args: object, **_kwargs: object) -> int:
+        # The operator lowers the cap while this tick runs; the edit is for
+        # the next tick, not for this tick's cadence.
+        write_cap_config(monkeypatch, tmp_path, "1")
+        return 0
+
+    monkeypatch.setattr(tick, "_observe_loop_state", observe)
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_a: None)
+    monkeypatch.setattr(tick, "_wait_next_tick", lambda *_a: (False, True))
+
+    with mock.patch("tick._startup_probe"):
+        with mock.patch(
+            "tick._run_tick_body", side_effect=edit_config_mid_tick,
+        ) as body:
+            with mock.patch("tick._notify_loop_quiescent_stop"):
+                with mock.patch("sys.stderr", io.StringIO()):
+                    tick._run_loop_locked(None, "claude", "", quiescent_stop_after=1)
+
+    assert body.call_args.kwargs["max_in_flight"] == 5
+    assert observed == [5]
+
+
 # --- Helpers ---
+
+
+def write_cap_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str,
+) -> None:
+    """Point the resolver at an operator config with one ``max_in_flight``.
+
+    ``[defaults]`` holds a different valid cap, so a test passes only when the
+    repository override is the value the tick used.
+
+    Args:
+        monkeypatch: The test's monkeypatch fixture.
+        tmp_path: The test's temporary directory.
+        raw: The TOML literal for the stubbed target's ``max_in_flight``.
+    """
+    cfg = tmp_path / "cap-config.toml"
+    cfg.write_text(
+        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n\n'
+        '[defaults]\nmax_in_flight = 2\n\n'
+        f'[repos."{TRUSTED_AUTHOR}/test-repo"]\nmax_in_flight = {raw}\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+
+
+def earlier_tick_markers(
+    count: int,
+) -> list[tuple[str, int, str, str, str, bool]]:
+    """Return live reviewer markers that earlier ticks left in the marker root.
+
+    Args:
+        count: How many engines are already running.
+
+    Returns:
+        Marker identities in the ``_scan_marker_identities`` shape, numbered
+        away from any candidate a test queues.
+    """
+    return [
+        ("pr", 500 + n, "ai:reviewing", "live", "matched", True)
+        for n in range(count)
+    ]
+
+
+def cap_queue_fakes(
+    labels_by_number: dict[int, list[str]],
+) -> tuple[Callable[..., str], Callable[..., object]]:
+    """Return ``gh_text`` and ``gh_json`` fakes serving one label snapshot.
+
+    Each queue listing returns the numbers carrying its label; each point-read
+    returns that item's labels; every candidate is the operator's own,
+    same-repository work.
+
+    Args:
+        labels_by_number: The workflow labels each open item carries.
+
+    Returns:
+        ``(fake_gh_text, fake_gh_json)``.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    def numbers_for(args: tuple[str, ...]) -> list[int]:
+        label = args[args.index("--label") + 1]
+        return [n for n, ls in labels_by_number.items() if label in ls]
+
+    def fake_gh_text(*args: str) -> str:
+        if "list" in args:
+            return "\n".join(str(n) for n in numbers_for(args))
+        if "body" in args:
+            return ""
+        return "\n".join(labels_by_number.get(int(args[2]), []))
+
+    def fake_gh_json(*args: str) -> object:
+        if "search" in args:
+            return []
+        if "list" in args:
+            return [
+                {"number": n, "title": f"Candidate {n}",
+                 "author": {"login": TRUSTED_AUTHOR}}
+                for n in numbers_for(args)
+            ]
+        return {
+            "author": {"login": tick.TRUSTED_REVIEW_AUTHOR},
+            "headRepository": {"nameWithOwner": tick.TRUSTED_HEAD_REPO},
+            "isCrossRepository": False,
+            "labels": [{"name": label} for label in labels_by_number.get(int(args[2]), [])],
+        }
+
+    return fake_gh_text, fake_gh_json
+
+
+def cap_tick_patches(
+    markers: list[tuple[str, int, str, str, str, bool]],
+    fakes: tuple[Callable[..., str], Callable[..., object]],
+) -> contextlib.ExitStack:
+    """Patch a whole tick down to its GitHub reads and its marker scan.
+
+    HARVEST reports success with nothing to reap, and the marker scan returns
+    ``markers`` as it stands at each call, so a launch that appends to it is
+    counted by every admission check after it.
+
+    Args:
+        markers: The live marker identities, shared with the launch stubs.
+        fakes: ``(gh_text, gh_json)`` fakes from :func:`cap_queue_fakes`.
+
+    Returns:
+        An exit stack holding the patches; enter it with ``with``.
+    """
+    fake_gh_text, fake_gh_json = fakes
+    stack = contextlib.ExitStack()
+    for target, kwargs in (
+        ("tick.gh_text", {"side_effect": fake_gh_text}),
+        ("tick.gh_json", {"side_effect": fake_gh_json}),
+        ("tick.verify_codex_bin", {}),
+        ("tick.harvest_reviewers", {"return_value": True}),
+        ("tick.harvest_implementers", {"return_value": True}),
+        ("tick.harvest_fixers", {"return_value": True}),
+        ("tick.read_authoritative_in_flight_labels", {"return_value": []}),
+        ("tick.read_authoritative_human_holds", {"return_value": {}}),
+        ("tick._scan_marker_identities", {"side_effect": lambda: list(markers)}),
+    ):
+        stack.enter_context(mock.patch(target, **kwargs))
+    return stack
 
 
 def spawn_foreign_process() -> subprocess.Popen[bytes]:

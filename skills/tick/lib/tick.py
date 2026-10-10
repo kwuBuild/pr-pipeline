@@ -161,7 +161,6 @@ LOCK_HELD_EXIT_CODE = 5
 # it. Distinct from 3 because the remedy is an interactive step, not a fix to a
 # value the operator already wrote.
 UNCONFIGURED_TARGET_EXIT_CODE = 6
-MAX_IN_FLIGHT = 3
 REVIEW_TIMEOUT = 20 * 60  # seconds
 # Quiescence counter tracks consecutive quiescent heartbeats across ticks.
 # Written to a file under WT_ROOT so it survives worktree cleanup.
@@ -2902,11 +2901,11 @@ def read_authoritative_human_holds(
 
     The cost tracks occupancy, and occupancy is this machine's dispatch
     markers alone — a markerless in-flight label is a deliberate no-op that
-    no tick clears and consumes no slot. Admission gates new markers at
-    ``MAX_IN_FLIGHT``, so the read count is bounded by the live marker set
-    rather than by ``gh list``'s page size across the in-flight labels. A
-    backlog of human-held or stranded labels no longer shows up here as tick
-    latency, because those items are never read.
+    no tick clears and consumes no slot. Admission gates new markers at the
+    configured ``max_in_flight``, so the read count is bounded by the live
+    marker set rather than by ``gh list``'s page size across the in-flight
+    labels. A backlog of human-held or stranded labels no longer shows up here
+    as tick latency, because those items are never read.
 
     Args:
         occupied: The ``(kind, number, label)`` identities currently holding an
@@ -3419,7 +3418,8 @@ def can_dispatch_now(
     counted.
 
     Args:
-        max_in_flight: The configured ceiling (``MAX_IN_FLIGHT``).
+        max_in_flight: The configured ceiling: the ``max_in_flight`` value
+            this tick's startup gate resolved and validated.
 
     Returns:
         An ``AdmissionResult`` with the admission decision.
@@ -9088,6 +9088,7 @@ def dispatch_reviewers(
     review_model: str = "",
     review_effort: str = "",
     trusted_author: str = "",
+    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
 ) -> None:
     """Dispatch reviewer engines for PRs at ai:implemented / ai:revised.
 
@@ -9114,6 +9115,8 @@ def dispatch_reviewers(
             The tick always passes it, so admission uses the identity startup
             checked. Empty falls back to :data:`TRUSTED_REVIEW_AUTHOR`, bound
             at successful startup, for direct callers.
+        max_in_flight: The admission cap. The tick always passes the value
+            its startup gate validated; the default serves direct callers.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     # Target type gate: only dispatch for pr targets.
@@ -9208,7 +9211,7 @@ def dispatch_reviewers(
             continue
 
         # Admission check
-        admission = can_dispatch_now(max_in_flight=MAX_IN_FLIGHT)
+        admission = can_dispatch_now(max_in_flight=max_in_flight)
         if not admission.can_dispatch:
             if tick_log:
                 tick_log.log(
@@ -9836,6 +9839,7 @@ def dispatch_implementers(
     impl_engine: str = "claude",
     model: str = "",
     permission_mode: str = "auto",
+    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
 ) -> None:
     """Dispatch implementer engines for issues at ai:available.
 
@@ -9864,6 +9868,8 @@ def dispatch_implementers(
             the ``--model`` CLI flag and ``ANTHROPIC_MODEL`` (for claude-ds).
         permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
+        max_in_flight: The admission cap. The tick always passes the value
+            its startup gate validated; the default serves direct callers.
     """
     # Target type gate: only dispatch for issue targets.
     if target is not None and target[0] != "issue":
@@ -9967,7 +9973,7 @@ def dispatch_implementers(
             continue
 
         # Admission check
-        admission = can_dispatch_now(max_in_flight=MAX_IN_FLIGHT)
+        admission = can_dispatch_now(max_in_flight=max_in_flight)
         if not admission.can_dispatch:
             if tick_log:
                 tick_log.log(
@@ -10367,6 +10373,7 @@ def dispatch_fixers(
     impl_engine: str = "claude",
     model: str = "",
     permission_mode: str = "auto",
+    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
 ) -> None:
     """Dispatch fixer engines for PRs at ai:changes-requested.
 
@@ -10392,6 +10399,8 @@ def dispatch_fixers(
             the ``--model`` CLI flag and ``ANTHROPIC_MODEL`` (for claude-ds).
         permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
+        max_in_flight: The admission cap. The tick always passes the value
+            its startup gate validated; the default serves direct callers.
     """
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
@@ -10476,7 +10485,7 @@ def dispatch_fixers(
             continue
 
         # Admission check
-        admission = can_dispatch_now(max_in_flight=MAX_IN_FLIGHT)
+        admission = can_dispatch_now(max_in_flight=max_in_flight)
         if not admission.can_dispatch:
             if tick_log:
                 tick_log.log(
@@ -11436,6 +11445,7 @@ def _run_single_tick_locked(
     *,
     count_quiescent_heartbeat: bool = True,
     unattended: bool = False,
+    admission_cap: list[int] | None = None,
 ) -> int:
     """Run one tick while the caller owns the tick mutex.
 
@@ -11454,6 +11464,9 @@ def _run_single_tick_locked(
             the in-process loop passes ``False``, for a nudge-initiated tick.
         unattended: True under the in-process loop, where nobody can answer a
             setup prompt; an unconfigured target is logged as skipped.
+        admission_cap: When given, receives the ``max_in_flight`` value this
+            tick admits against, once every startup gate has passed. The loop
+            reads it so cadence judges capacity against the same cap.
 
     Returns:
         Process exit code (0 through 4, or 6 — same semantics as ``main()``).
@@ -11485,13 +11498,14 @@ def _run_single_tick_locked(
             pass
 
     # Fail fast on a configuration value that has no conservative reading —
-    # base_ref, permission_mode, [operator] login, verify_tools, [scan] repos.
-    # Each of those either names a branch, grants a permission, or decides whose
-    # work is trusted, so a malformed one cannot be coerced into something the
-    # operator did not write: the resolver reports it and the tick refuses here,
-    # naming the key. A malformed verify_tools in particular must never be read
-    # as an empty one, which would dispatch with no verification and still award
-    # ai:ready-for-human.
+    # base_ref, permission_mode, [operator] login, verify_tools, max_in_flight,
+    # [scan] repos.
+    # Each of those names a branch, grants a permission, decides whose work is
+    # trusted, or bounds paid concurrency, so a malformed one cannot be coerced
+    # into something the operator did not write: the resolver reports it and
+    # the tick refuses here, naming the key. A malformed verify_tools in
+    # particular must never be read as an empty one, which would dispatch with
+    # no verification and still award ai:ready-for-human.
     TRUSTED_HEAD_REPO = TARGET_REMOTE = ""
     try:
         resolved_target = resolve_target()
@@ -11638,12 +11652,19 @@ def _run_single_tick_locked(
         return 3
 
     TRUSTED_REVIEW_AUTHOR = trusted_author
+    # The one cap this tick admits and paces against. It is read here, from
+    # the configuration the gate above validated, and never resolved again
+    # later in the tick: a config edit made mid-tick waits for the next one.
+    max_in_flight = config.max_in_flight
+    if admission_cap is not None:
+        admission_cap.append(max_in_flight)
     try:
         return _run_tick_body(
             tick_log, parsed_target, impl_engine, model,
             review_model, review_effort, permission_mode,
             trusted_author=trusted_author,
             count_quiescent_heartbeat=count_quiescent_heartbeat,
+            max_in_flight=max_in_flight,
         )
     except Exception:
         exc_value = sys.exc_info()[1]
@@ -11903,11 +11924,13 @@ def _run_loop_locked(
             # Clear before the tick so a nudge arriving during it is preserved
             # for the next wait instead of being consumed by this iteration.
             wake_event.clear()
+            admission_cap: list[int] = []
             last_rc = _run_single_tick_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
+                admission_cap=admission_cap,
             )
             if last_rc in (
                 3, TICK_CRASH_EXIT_CODE, UNCONFIGURED_TARGET_EXIT_CODE,
@@ -11918,7 +11941,17 @@ def _run_loop_locked(
                 # retried crash would hide behind a background task that is
                 # only reported when it exits.
                 return last_rc
-            state = _observe_loop_state(parsed_target)
+            # Every return that reaches here passed the startup gate, which
+            # recorded the cap the tick admitted against; cadence judges
+            # capacity against that same value. The default answers only a
+            # caller that replaces the tick and records nothing.
+            state = _observe_loop_state(
+                parsed_target,
+                max_in_flight=(
+                    admission_cap[-1] if admission_cap
+                    else pipeline.DEFAULT_MAX_IN_FLIGHT
+                ),
+            )
             if not state["quiescent"]:
                 consecutive_quiescent = 0
             sleep_seconds, stop = pipeline.decide_loop_cadence(
@@ -12644,7 +12677,11 @@ def _log_stall_scan_failed(reason: str) -> None:
     )
 
 
-def _observe_loop_state(target: tuple[str, int] | None = None) -> LoopState:
+def _observe_loop_state(
+    target: tuple[str, int] | None = None,
+    *,
+    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
+) -> LoopState:
     """Read current pipeline state for loop cadence decisions.
 
     Args:
@@ -12652,6 +12689,8 @@ def _observe_loop_state(target: tuple[str, int] | None = None) -> LoopState:
             When set, the actionable-queue probe is restricted to that
             target's own work so a targeted loop reaches quiescence once its
             item is done, instead of spinning on the global queue.
+        max_in_flight: The admission cap the preceding tick admitted against.
+            The loop always passes it; the default serves direct callers.
 
     Returns:
         The observed loop state consumed by ``decide_loop_cadence``.
@@ -12700,11 +12739,11 @@ def _observe_loop_state(target: tuple[str, int] | None = None) -> LoopState:
     except (RuntimeError, ValueError, subprocess.CalledProcessError):
         # Unknown marker or hold state is not proof that nothing is held: stay
         # warm, and never claim quiescence or free a slot from it.
-        in_flight_count = MAX_IN_FLIGHT
+        in_flight_count = max_in_flight
         held_items = ()
         actionable_queue = True
 
-    at_cap = in_flight_count >= MAX_IN_FLIGHT
+    at_cap = in_flight_count >= max_in_flight
     return {
         "in_flight_count": in_flight_count,
         "nearest_engine_deadline": _nearest_actionable_engine_deadline(),
@@ -13042,6 +13081,7 @@ def _run_tick_body(
     trusted_author: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
+    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
 ) -> int:
     """Run the HARVEST → DISPATCH → Summary body of a tick.
 
@@ -13065,6 +13105,9 @@ def _run_tick_body(
             in-process loop passes ``False``, for a nudge-initiated tick that
             followed no scheduled interval. See
             :func:`_advance_quiescent_counter`.
+        max_in_flight: The admission cap startup validated. Every dispatch
+            stage admits against it and cadence judges capacity against it;
+            the default serves direct callers.
 
     Returns:
         Process exit code (0, 1, or 2 — same semantics as ``main()``).
@@ -13213,12 +13256,15 @@ def _run_tick_body(
         authoritative_in_flight = None
 
     if authoritative_in_flight is not None:
+        # All three stages admit against the one cap startup validated, over
+        # this machine's dispatch markers
         dispatch_reviewers(
             tick_log=tick_log, target=stage_targets["reviewer"],
             authoritative_in_flight=authoritative_in_flight,
             review_model=review_model,
             review_effort=review_effort,
             trusted_author=trusted_author,
+            max_in_flight=max_in_flight,
         )
         dispatch_implementers(
             tick_log=tick_log, target=stage_targets["implementer"],
@@ -13226,6 +13272,7 @@ def _run_tick_body(
             impl_engine=impl_engine,
             model=model,
             permission_mode=permission_mode,
+            max_in_flight=max_in_flight,
         )
         dispatch_fixers(
             tick_log=tick_log, target=stage_targets["fixer"],
@@ -13233,6 +13280,7 @@ def _run_tick_body(
             impl_engine=impl_engine,
             model=model,
             permission_mode=permission_mode,
+            max_in_flight=max_in_flight,
         )
     else:
         if tick_log:
@@ -13280,7 +13328,7 @@ def _run_tick_body(
         nearest_deadline_s=nearest_deadline_s,
         has_actionable_queue=has_queue,
         at_capacity=(
-            in_flight_count is not None and in_flight_count >= MAX_IN_FLIGHT
+            in_flight_count is not None and in_flight_count >= max_in_flight
         ),
         is_quiescent=is_quiescent,
         consecutive_quiescent_ticks=prior_quiescent,

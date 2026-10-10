@@ -67,7 +67,7 @@ Each tick runs two fast phases. Engines run *between* ticks, not during them.
 │  DISPATCH phase:                                 │
 │    gh issue list --label ai:available            │
 │    gh pr list --label ai:implemented,...          │
-│    For each item, up to MAX_IN_FLIGHT:           │
+│    For each item, up to max_in_flight:           │
 │      → ensure worktree exists                    │
 │      → write prompt to file                      │
 │      → launch engine as background process       │
@@ -102,7 +102,7 @@ amortizing it):
 |---|---|
 | ≥1 engine in-flight (live dispatch, no result) | `min(nearest actionable deadline, 270s)` — cache-warm |
 | No engine in-flight, actionable queue non-empty | ~270s |
-| At `MAX_IN_FLIGHT` with work in-flight | ~270s (harvest to free a slot) |
+| At `max_in_flight` with work in-flight | ~270s (harvest to free a slot) |
 | Quiescent: no live dispatch, all items terminal | ~1800s heartbeat |
 | Quiescent for N consecutive heartbeats | stop + notify developer |
 
@@ -149,7 +149,8 @@ one-shot path, so it has to keep measuring quiet time rather than tick count.
 The harness `/loop` + `ScheduleWakeup` path has no in-process sleep to interrupt
 and stays purely timer-paced.
 
-Concurrency is bounded by `MAX_IN_FLIGHT` (default 3): the dispatch phase never
+Concurrency is bounded by the operator's `max_in_flight` cap (shipped default
+3, set per target in the operator config): the dispatch phase never
 launches beyond it, and the cadence tightens to ~270s while saturated so slots
 free promptly. Quiescence is the loop's fixed point — every tracked item in a
 terminal label (`ai:ready-for-human`, `ai:needs-human-decision`,
@@ -199,7 +200,7 @@ terminal items share one contract without a `--state all` scan. The cost tracks
 occupancy, and occupancy is this machine's dispatch markers alone: manual
 `ai:implementing` pickups and the markerless labels reconciliation
 deliberately leaves in place hold no slot and are never read here, so the bound is the live marker set
-that admission already gates at `MAX_IN_FLIGHT`. No local *custody* receipt is
+that admission already gates at `max_in_flight`. No local *custody* receipt is
 written. The completed-result publication
 uses a short-lived comment receipt for replay suppression, but ownership remains
 the remote hold plus the source marker until release succeeds. A failed hold read
@@ -1757,11 +1758,11 @@ subsequent ticks from the emitted cadence decision.
 A tick is not two modes it switches between — **every tick runs HARVEST then
 DISPATCH, in that order, unconditionally.** HARVEST reaps whatever engines
 finished since the last tick (advancing labels); DISPATCH then launches new
-engines for whatever is now actionable, up to `MAX_IN_FLIGHT`. Engines run
+engines for whatever is now actionable, up to `max_in_flight`. Engines run
 *between* ticks as detached processes; the tick itself never waits on one.
 
 The walkthrough below follows two issues (#50, #51) through the pipeline with
-`MAX_IN_FLIGHT=3`. "in-flight" is this machine's own dispatch markers — those
+the default `max_in_flight = 3`. "in-flight" is this machine's own dispatch markers — those
 classified `live`, `launching`, or `hung`, or whose process group is still
 alive — keyed by `(kind, number, stage label)`. A shared `ai:` in-flight label
 holds no slot; see "Loop and cadence" above for why.
@@ -1861,7 +1862,7 @@ load-bearing constraints on new work:
 The dedicated-repo boundary matters most for the **scoped bot token**. It is the
 piece of the safety model that becomes load-bearing when the loop runs truly
 unattended (overnight, no human watching), which is the opposite of the
-supervised first milestone: a low `MAX_IN_FLIGHT`, the developer present, one PR
+supervised first milestone: a low `max_in_flight`, the developer present, one PR
 taken through implement → review → fix without stranding or overspending. At
 that stage the human in the loop is the blast-radius boundary; after it, the
 token is.

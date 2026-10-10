@@ -79,7 +79,7 @@ Debugging notes:
   probed. A dead wrapper PID does not release custody while its paid child group
   lives. An overdue group with unprovable wrapper identity escalates to
   `ai:needs-human-decision` without an unsafe kill; later ticks retain its
-  marker and scratch and count it against `MAX_IN_FLIGHT` until group death is
+  marker and scratch and count it against `max_in_flight` until group death is
   proved. That escalation also records the engine as **held**, which is what
   lets the loop stop instead of supervising a slot forever — see
   [Held engines](#held-engines). A non-empty `result.json` is
@@ -277,7 +277,7 @@ hold to own the item. The published explanation still names the terminal label
 the transition decided — the item is at the operator's hold instead, which means
 the same thing. The alternative is worse: re-attempting the converge every tick
 never finishes local custody, so the dispatch marker stays in the admission
-root and costs one of the `MAX_IN_FLIGHT` slots with no engine behind it.
+root and costs one of the `max_in_flight` slots with no engine behind it.
 
 Stale in-flight labels are reconciled only when the local marker scan and required
 GitHub reads succeed. An `ai:implementing` issue loses that label only after an
@@ -301,7 +301,7 @@ cadence observation the tick re-reads the labels of each occupied identity with 
 bounded `gh <kind> view --json labels`, which resolves open, closed, and merged
 items alike.
 
-A held slot keeps counting against `MAX_IN_FLIGHT` (a paid process may still be
+A held slot keeps counting against `max_in_flight` (a paid process may still be
 running under it) but is excluded from loop quiescence, so a queue of only held
 items can still reach the terminal stop. The stop notification, the
 `loop_quiescent_stop` entry, and the `tick-cadence:` reason all name the held
@@ -421,7 +421,7 @@ it and holds nothing of its own. Remove or replace
 the GitHub hold only when the operator has made the corresponding custody
 decision.
 
-If `held` equals `MAX_IN_FLIGHT` the pipeline cannot dispatch at all, even
+If `held` equals `max_in_flight` the pipeline cannot dispatch at all, even
 though `in_flight` reads 0 — the `tick-cadence:` reason names the holders in
 that state, so match them against the log and resolve one to unblock dispatch.
 A held item whose scratch is already gone (`identity: markerless`) keeps its
@@ -602,7 +602,8 @@ is still captured in `stderr.log`.
 - Stall threshold: 1800s of no engine output (3x the 600s longest legitimate
   silence, `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`); 300s extra startup grace
   when no heartbeat file exists yet
-- Admission cap: `MAX_IN_FLIGHT=3`
+- Admission cap: `max_in_flight` from the operator config (shipped default 3),
+  read once at tick startup
 - Timeouts: reviewer 1200s, implementer 3600s, fixer 3600s
 - Engine skill bindings: `tick.FIXER_SKILLS` and `tick.IMPLEMENTER_SKILLS`,
   resolved as `<install>/skills/<name>/SKILL.md` before launch — the install's

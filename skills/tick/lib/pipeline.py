@@ -816,7 +816,7 @@ def compute_next_wake(
     ======================================  ===================================
     ≥1 engine in-flight                    ``min(nearest deadline, 270s)``
     Actionable queue non-empty             ~270s
-    At ``MAX_IN_FLIGHT`` with work           ~270s (harvest to free a slot)
+    At ``max_in_flight`` with work           ~270s (harvest to free a slot)
     Quiescent                              ~1800s heartbeat
     Quiescent for N consecutive heartbeats  stop (caller notifies developer)
     ======================================  ===================================
@@ -831,7 +831,7 @@ def compute_next_wake(
             value means the deadline lapsed while the caller was scanning.
         has_actionable_queue: ``True`` when any item carries a
             dispatch-eligible label, or ``None`` when queue reads failed.
-        at_capacity: ``True`` when ``in_flight_count >= MAX_IN_FLIGHT``;
+        at_capacity: ``True`` when ``in_flight_count >= max_in_flight``;
             ``None`` is treated as unknown.
         is_quiescent: ``True`` when every tracked item is in a terminal
             label and no engines are in flight.
@@ -1719,7 +1719,12 @@ _CONFIG_KEYS = (
     "base_ref",
     "permission_mode",
     "engine_settings",
+    "max_in_flight",
 )
+
+# The admission cap when no layer names ``max_in_flight``. The packaged floor
+# ships the same value; this only answers for an install whose floor omits it.
+DEFAULT_MAX_IN_FLIGHT = 3
 
 # Claude `--permission-mode` values; the first is the unconfigured default.
 _PERMISSION_MODES = ("auto", "dontAsk")
@@ -1787,6 +1792,10 @@ class ResolvedConfig:
         engine_settings: The implementer and fixer ``--settings`` value: a
             JSON object or an absolute path to a settings file. ``""`` omits
             the flag, so engines load only the Claude settings hierarchy.
+        max_in_flight: The admission cap: how many engines this checkout's
+            dispatch markers may hold at once. At least 1; a malformed value
+            lands in :attr:`errors` and this holds the shipped default, which
+            the startup gate never runs under.
         scan_repos: ``None`` when repository scope is unrestricted (the key is
             absent or an empty list — both operator-written states). A tuple
             restricts scope to exactly those repositories; a malformed value
@@ -1813,6 +1822,7 @@ class ResolvedConfig:
     warnings: tuple[str, ...]
     repo_configured: bool = False
     engine_settings: str = ""
+    max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
 
 
 def _operator_config_location() -> tuple[Path, str]:
@@ -2420,6 +2430,10 @@ def resolve_config(
     if problem:
         errors.append(problem)
 
+    max_in_flight, problem = _resolve_max_in_flight(_pick(layers, "max_in_flight"))
+    if problem:
+        errors.append(problem)
+
     login, problem, warning = _resolve_login(packaged, declared["operator"])
     if problem:
         errors.append(problem)
@@ -2434,11 +2448,45 @@ def resolve_config(
         base_ref=base_ref,
         permission_mode=permission_mode,
         engine_settings=engine_settings,
+        max_in_flight=max_in_flight,
         scan_repos=scan_repos,
         errors=tuple(errors),
         warnings=tuple(warnings),
         repo_configured=repo_configured,
     )
+
+
+def _resolve_max_in_flight(
+    picked: tuple[str, object] | None,
+) -> tuple[int, str]:
+    """Resolve the admission cap, reporting any value other than an int >= 1.
+
+    The cap has no conservative reading. A lower cap starves a queue the
+    operator sized for, a higher one spends what they did not budget, and
+    ``0`` would stop all dispatch while the tick still reported a clean run.
+    TOML ``true`` is a Python ``int``, so it is rejected by name.
+
+    Args:
+        picked: The ``(label, value)`` pair from :func:`_pick`, or ``None``.
+
+    Returns:
+        ``(value, problem)``. On a problem the value is
+        :data:`DEFAULT_MAX_IN_FLIGHT`, for a caller that refuses to start.
+    """
+    if picked is None:
+        return DEFAULT_MAX_IN_FLIGHT, ""
+    label, value = picked
+    if isinstance(value, bool) or not isinstance(value, int):
+        return DEFAULT_MAX_IN_FLIGHT, (
+            f"{label} max_in_flight: expected an integer of at least 1, got "
+            f"{type(value).__name__}"
+        )
+    if value < 1:
+        return DEFAULT_MAX_IN_FLIGHT, (
+            f"{label} max_in_flight: expected an integer of at least 1, got "
+            f"{value}"
+        )
+    return value, ""
 
 
 def _resolve_login(
@@ -4092,7 +4140,7 @@ def can_dispatch(*, in_flight: int, max_in_flight: int) -> bool:
     Args:
         in_flight: Engines currently holding a slot — the size of
             :func:`in_flight_refs`, which is the only admission count.
-        max_in_flight: The configured ceiling (``MAX_IN_FLIGHT`` in the skill).
+        max_in_flight: The configured ceiling (``ResolvedConfig.max_in_flight``).
 
     Returns:
         ``True`` if ``in_flight`` is below ``max_in_flight``.

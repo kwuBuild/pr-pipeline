@@ -97,8 +97,9 @@ Stop babysitting your agents. Here is how a day can look. Write five
 well-scoped issues in the morning, label them `ai:available`, and start the
 loop. Then do something else.
 
-1. The pipeline starts three Claude Code agents at once, its limit for each
-   repository, each in its own git worktree. The other two issues queue.
+1. The pipeline starts three Claude Code agents at once, its default limit
+   for each repository, each in its own git worktree. The other two issues
+   queue.
 2. When an agent pushes its branch, the pipeline opens the pull request and
    starts a Codex review.
 3. The pipeline posts Codex's findings on the pull request. A new Claude Code
@@ -149,7 +150,7 @@ work in worktrees. What an ad hoc session lacks is an enforced workflow.
 | Record of the work | The session transcript, which only you can read | Pull requests, reviews, fix replies, and label history on GitHub |
 | Model turns while agents work | The coordinator's turns, on a context that keeps growing | None while the loop runs |
 | When the next step starts | When the coordinator next takes a turn | In loop mode, within seconds of an agent finishing |
-| Limits | Whatever you configure for each subagent; nothing caps review rounds | At most three agents for each repository, five reviews for each pull request, and a deadline for each agent |
+| Limits | Whatever you configure for each subagent; nothing caps review rounds | Three agents at once for each repository by default (`max_in_flight` in your config), five reviews for each pull request, and a deadline for each agent |
 
 Hosted coding agents also turn an issue into a pull request. They usually run
 in the vendor's cloud with the vendor's model. pr-pipeline runs on your

@@ -1420,7 +1420,7 @@ report distrusting the reviewer.
   `.claude/worktrees/`; and the cost and blast-radius summary below.
 - **Cost and blast radius.** Nobody runs an unattended agent loop without knowing
   what it spends and what it can reach. State the human merge gate, the
-  `MAX_IN_FLIGHT` cap, and the L3 cost figure. On pushes, state only what is
+  `max_in_flight` cap, and the L3 cost figure. On pushes, state only what is
   enforced: `implementer.txt` declares `git push origin HEAD` the only allowed
   push form, and the worktree is on a feature branch. That is a prompt convention
   plus branch isolation, not a guard. Either add a guard or describe it as what

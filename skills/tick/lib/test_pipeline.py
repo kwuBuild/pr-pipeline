@@ -4952,7 +4952,7 @@ def test_next_wake_actionable_queue_returns_270() -> None:
 
 
 def test_next_wake_at_capacity_returns_270() -> None:
-    """At MAX_IN_FLIGHT → ~270s to harvest and free a slot."""
+    """At max_in_flight → ~270s to harvest and free a slot."""
     d = pipeline.compute_next_wake(
         in_flight_count=3,
         nearest_deadline_s=500.0,
@@ -5877,6 +5877,60 @@ def test_resolve_config_reports_unusable_engine_settings(
 
     assert any("engine_settings" in e for e in config.errors)
     assert config.engine_settings == ""
+
+
+@pytest.mark.parametrize("use_packaged_floor", [False, True])
+def test_resolve_config_defaults_max_in_flight_to_three(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_packaged_floor: bool,
+) -> None:
+    """With no operator override the admission cap stays at three."""
+    operator_config(monkeypatch, tmp_path, "")
+    if use_packaged_floor:
+        monkeypatch.setattr(
+            pipeline, "_PACKAGED_CONFIG_PATH",
+            Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+        )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.max_in_flight == 3
+    assert config.errors == ()
+    assert not [w for w in config.warnings if "max_in_flight" in w]
+
+
+def test_resolve_config_layers_max_in_flight_per_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A repository override beats ``[defaults]``, which beats the floor."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nmax_in_flight = 2\n\n'
+        '[repos."owner/busy"]\nmax_in_flight = 5\n',
+    )
+
+    assert pipeline.resolve_config("owner/busy").max_in_flight == 5
+    assert pipeline.resolve_config("owner/other").max_in_flight == 2
+    assert pipeline.resolve_config("owner/busy").errors == ()
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "true", "2.5", '"4"'])
+def test_resolve_config_reports_unusable_max_in_flight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, raw: str,
+) -> None:
+    """A malformed cap is an error naming the key, never a different cap.
+
+    No reading of ``0``, ``true`` or ``"4"`` is the one the operator wrote, and
+    coercing any of them to the shipped default would let the tick run at a
+    concurrency the operator did not choose.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        f'[defaults]\nmax_in_flight = 4\n\n[repos."owner/name"]\nmax_in_flight = {raw}\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert [e for e in config.errors if "max_in_flight" in e], config.errors
 
 
 @pytest.mark.parametrize("contents", [
