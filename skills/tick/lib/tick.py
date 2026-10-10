@@ -153,6 +153,9 @@ def _resolve_wt_root() -> str:
 WT_ROOT = _resolve_wt_root()
 TICK_LOG_DIR = os.path.join(WT_ROOT, ".tick-log")
 TICK_LOCK_PATH = os.path.join(WT_ROOT, ".tick.lock")
+# An unhandled exception escaped the tick body; ``tick_crash`` has the
+# traceback. The SOP stops on it, so ``--loop`` must not retry it either.
+TICK_CRASH_EXIT_CODE = 4
 LOCK_HELD_EXIT_CODE = 5
 # The resolved target has no [repos."owner/name"] section: setup never ran for
 # it. Distinct from 3 because the remedy is an interactive step, not a fix to a
@@ -11654,7 +11657,7 @@ def _run_single_tick_locked(
             pass
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return 4
+        return TICK_CRASH_EXIT_CODE
 
 
 def _nearest_actionable_engine_deadline() -> float | None:
@@ -11888,10 +11891,14 @@ def _run_loop_locked(
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
             )
-            if last_rc in (3, UNCONFIGURED_TARGET_EXIT_CODE):
-                # Startup refused this target/configuration, or skipped a
-                # target setup never ran for. Cadence reads GitHub too, so
-                # observing here would bypass that refusal.
+            if last_rc in (
+                3, TICK_CRASH_EXIT_CODE, UNCONFIGURED_TARGET_EXIT_CODE,
+            ):
+                # Startup refused this target/configuration, skipped a target
+                # setup never ran for, or the tick crashed. Cadence reads
+                # GitHub too, so observing here would bypass that refusal; a
+                # retried crash would hide behind a background task that is
+                # only reported when it exits.
                 return last_rc
             state = _observe_loop_state(parsed_target)
             if not state["quiescent"]:

@@ -1,0 +1,126 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="450" viewBox="0 0 960 450" role="img" aria-labelledby="title desc">
+  <title id="title">pr-pipeline label state machine</title>
+  <desc id="desc">An issue labelled ai:available moves to ai:implementing while Claude Code writes the code. The pipeline opens a pull request labelled ai:implemented. Codex reviews it at ai:reviewing. With no blocking findings the pull request goes to ai:ready-for-human and you merge it. With findings it goes to ai:changes-requested, Claude Code fixes it at ai:fixing, it becomes ai:revised, and Codex reviews it again. Three labels stop automation and wait for you: ai:max-iterations, ai:needs-human-decision, and ai:blocked.</desc>
+  <style>
+    .bg { fill: #ffffff; }
+    .text { fill: #1f2328; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+    .muted { fill: #59636e; }
+    .label { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; font-weight: 600; }
+    .small { font-size: 12px; }
+    .heading { font-size: 13px; font-weight: 600; letter-spacing: 0.04em; }
+    .line { stroke: #8c959f; stroke-width: 1.6; fill: none; }
+    .bracket { stroke: #8c959f; stroke-width: 1.2; fill: none; }
+    .head { fill: #8c959f; }
+    .queue { fill: #f6f8fa; stroke: #8c959f; }
+    .claude { fill: #fbeee6; stroke: #d97757; }
+    .codex { fill: #e6f6f0; stroke: #10a37f; }
+    .human { fill: #e8f0fe; stroke: #3b82f6; }
+    .hold { fill: #fff4e0; stroke: #d4a72c; }
+    .panel { fill: none; stroke: #d0d7de; stroke-dasharray: 4 4; }
+    .box { stroke-width: 1.6; }
+    @media (prefers-color-scheme: dark) {
+      .bg { fill: #0d1117; }
+      .text { fill: #e6edf3; }
+      .muted { fill: #9198a1; }
+      .line, .bracket { stroke: #6e7681; }
+      .head { fill: #6e7681; }
+      .queue { fill: #161b22; stroke: #6e7681; }
+      .claude { fill: #3a2219; stroke: #e08a6a; }
+      .codex { fill: #0f2e25; stroke: #2fbf91; }
+      .human { fill: #142542; stroke: #5b9bf8; }
+      .hold { fill: #33280f; stroke: #d4a72c; }
+      .panel { stroke: #3d444d; }
+    }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path class="head" d="M0 0 L10 5 L0 10 z"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="960" height="450" rx="12"/>
+
+  <!-- Where the label lives -->
+  <path class="bracket" d="M20 46 V38 H350 V46"/>
+  <text class="text muted heading" x="185" y="28" text-anchor="middle">ON THE ISSUE</text>
+  <path class="bracket" d="M400 46 V38 H940 V46"/>
+  <text class="text muted heading" x="670" y="28" text-anchor="middle">ON THE PULL REQUEST</text>
+
+  <!-- Main path -->
+  <rect class="queue box" x="20" y="60" width="140" height="44" rx="8"/>
+  <text class="text label" x="90" y="87" text-anchor="middle">ai:available</text>
+  <text class="text muted small" x="90" y="124" text-anchor="middle">you add this label</text>
+
+  <path class="line" d="M160 82 H206" marker-end="url(#arrow)"/>
+
+  <rect class="claude box" x="210" y="60" width="140" height="44" rx="8"/>
+  <text class="text label" x="280" y="87" text-anchor="middle">ai:implementing</text>
+
+  <path class="line" d="M350 82 H396" marker-end="url(#arrow)"/>
+  <text class="text muted small" x="375" y="124" text-anchor="middle">pipeline opens PR</text>
+
+  <rect class="queue box" x="400" y="60" width="140" height="44" rx="8"/>
+  <text class="text label" x="470" y="87" text-anchor="middle">ai:implemented</text>
+
+  <path class="line" d="M540 82 H586" marker-end="url(#arrow)"/>
+
+  <rect class="codex box" x="590" y="60" width="140" height="44" rx="8"/>
+  <text class="text label" x="660" y="87" text-anchor="middle">ai:reviewing</text>
+
+  <path class="line" d="M730 82 H776" marker-end="url(#arrow)"/>
+  <text class="text muted small" x="755" y="124" text-anchor="middle">approved</text>
+
+  <rect class="human box" x="780" y="60" width="160" height="44" rx="8"/>
+  <text class="text label" x="860" y="87" text-anchor="middle">ai:ready-for-human</text>
+  <text class="text small" x="860" y="124" text-anchor="middle" font-weight="600">you merge</text>
+
+  <!-- Review and fix loop -->
+  <path class="line" d="M690 104 V160 H850 V196" marker-end="url(#arrow)"/>
+  <text class="text muted small" x="770" y="152" text-anchor="middle">findings to fix</text>
+
+  <rect class="queue box" x="760" y="200" width="180" height="44" rx="8"/>
+  <text class="text label" x="850" y="227" text-anchor="middle">ai:changes-requested</text>
+
+  <path class="line" d="M850 244 V322 H734" marker-end="url(#arrow)"/>
+
+  <rect class="claude box" x="590" y="300" width="140" height="44" rx="8"/>
+  <text class="text label" x="660" y="327" text-anchor="middle">ai:fixing</text>
+
+  <path class="line" d="M590 322 H470 V248" marker-end="url(#arrow)"/>
+  <text class="text muted small" x="530" y="314" text-anchor="middle">fixes pushed</text>
+
+  <rect class="queue box" x="400" y="200" width="140" height="44" rx="8"/>
+  <text class="text label" x="470" y="227" text-anchor="middle">ai:revised</text>
+
+  <path class="line" d="M470 200 V160 H630 V108" marker-end="url(#arrow)"/>
+  <text class="text muted small" x="550" y="152" text-anchor="middle">review again</text>
+
+  <text class="text heading" x="660" y="218" text-anchor="middle">review ↻ fix</text>
+  <text class="text muted small" x="660" y="236" text-anchor="middle">up to 5 reviews</text>
+
+  <!-- Holds -->
+  <rect class="panel" x="20" y="176" width="356" height="168" rx="10"/>
+  <text class="text muted heading" x="36" y="200">STOPS AND WAITS FOR YOU</text>
+  <rect class="hold box" x="36" y="214" width="150" height="28" rx="6"/>
+  <text class="text label" x="111" y="233" text-anchor="middle" font-size="12">ai:max-iterations</text>
+  <text class="text muted small" x="196" y="232">review limit reached</text>
+  <rect class="hold box" x="36" y="252" width="204" height="28" rx="6"/>
+  <text class="text label" x="138" y="271" text-anchor="middle" font-size="12">ai:needs-human-decision</text>
+  <text class="text muted small" x="250" y="266">a question agents</text>
+  <text class="text muted small" x="250" y="280">must not decide</text>
+  <rect class="hold box" x="36" y="290" width="150" height="28" rx="6"/>
+  <text class="text label" x="111" y="309" text-anchor="middle" font-size="12">ai:blocked</text>
+  <text class="text muted small" x="196" y="308">you hold the item</text>
+
+  <!-- Legend -->
+  <rect class="claude box" x="20" y="398" width="14" height="14" rx="3"/>
+  <text class="text small" x="42" y="410">Claude Code works</text>
+  <rect class="codex box" x="172" y="398" width="14" height="14" rx="3"/>
+  <text class="text small" x="194" y="410">Codex reviews</text>
+  <rect class="queue box" x="308" y="398" width="14" height="14" rx="3"/>
+  <text class="text small" x="330" y="410">queued for the next tick</text>
+  <rect class="human box" x="508" y="398" width="14" height="14" rx="3"/>
+  <text class="text small" x="530" y="410">your turn</text>
+  <rect class="hold box" x="618" y="398" width="14" height="14" rx="3"/>
+  <text class="text small" x="640" y="410">held for you</text>
+</svg>

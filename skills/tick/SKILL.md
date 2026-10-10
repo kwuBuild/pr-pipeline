@@ -21,7 +21,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
    bash ${CLAUDE_PLUGIN_ROOT}/skills/tick/tick.sh [--loop] [pr:N | '#N'] [--impl-engine claude|claude-ds] [--model <model>] [--review-model <model>] [--review-effort <effort>] [--permission-mode dontAsk|auto]
    ```
    Claude implementers/fixers default to `auto`: calls needing approval beyond explicit grants reach the classifier; denial can fail the run. `permission_mode` resolves packaged floor → operator `[defaults]` → `[repos."owner/name"]` → CLI. `/pr-pipeline:setup` records `dontAsk` for a route that fails its probe; tick performs no automatic route fallback. Under `auto`, the allowlist is not a ceiling: use operator-owned deny rules for forbidden operations. The Codex reviewer retains its separate read-only policy; see [permission modes](README.md#engine-permission-modes).
-3. With `--loop`, cadence is an upper bound: engine completion or `touch .claude/worktrees/.tick-state/wake-request` starts the next tick early. Nudges change only timing, never what a tick concludes. See README "Edge-triggered wake-up".
+3. For unattended runs, the default is the native loop: start `bash ${CLAUDE_PLUGIN_ROOT}/skills/tick/tick.sh --loop` with the same target and flags the operator chose (a targeted first tick stays targeted; `--permission-mode`, `--model`, and engine flags are not sticky) as one Bash call with `run_in_background: true` and `dangerouslyDisableSandbox: true`. It makes no model calls between ticks; do not poll it. Its cadence is an upper bound: engine completion or `touch .claude/worktrees/.tick-state/wake-request` starts the next tick early, and nudges change only timing, never what a tick concludes (README "Edge-triggered wake-up"). When the task notification reports its exit, run the Outcome Check and report as "Stop or Escalate" directs.
 4. Use `pr:N` or `'#N'` only for a targeted harvest/dispatch. For `#N`, implementation stays scoped to issue `N`; zero or one open closing PR scopes the reviewer and fixer. `pr:N` stays direct PR scope. An ambiguous or malformed closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log and tick lock are excepted. Targeting does not bypass reconciliation, admission, trust, or label-safety gates.
 
 ## Outcome Check
@@ -41,7 +41,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 | 1 | Reconcile failed or target parse failed; dispatch gated |
 | 2 | Reconcile OK, authoritative in-flight label read failed; dispatch gated |
 | 3 | Startup rejected: missing tools/Python >= 3.11, invalid target/config, or missing/unreadable label vocabulary |
-| 4 | Unhandled exception; traceback written to tick log when possible |
+| 4 | Unhandled exception; traceback written to tick log when possible; `--loop` returns without another tick |
 | 5 | Tick mutex already held by another invocation |
 | 6 | Target has no `[repos."owner/name"]` section: setup never ran for it; `--loop` logs `startup_repo_unconfigured` and returns |
 
@@ -63,9 +63,8 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 
 ## Running Under /loop
 
-Invoke this skill once when setting up the loop. The recurring loop prompt must
-run the compact command contract below; it must not reinvoke the slash command or
-reload this skill text each iteration.
+Optional: use `/loop` only when the operator wants a report after every tick; each iteration costs a model turn, wake nudges cannot start a tick early, and the harness clamps each wake to 60–3600 s, so shorter `next_wake` values run late. The prompt runs the whole queue with configured defaults: append the same target and flags to its `tick.sh` line before pasting.
+Invoke this skill once when setting up the loop. The recurring loop prompt must run the compact command contract below; it must not reinvoke the slash command or reload this skill text each iteration.
 
 Each iteration is a one-shot tick scheduled from the emitted `tick-cadence:` line, with no in-process sleep to interrupt: wake nudges do not apply here. Follow `next_wake` exactly. Detection that only *shortens* a sleep (engine-completion and wake-request nudges) is inert in this mode; detection that reports to the operator is not — the tick runs its own stall scan, so `engine_stalled` reaches the log here exactly as it does under `--loop`, and reporting it is this prompt's job.
 

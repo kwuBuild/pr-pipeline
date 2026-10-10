@@ -20273,6 +20273,40 @@ def test_loop_skips_an_unconfigured_target_without_blocking_on_input(
     assert "test-owner/test-repo" in str(skipped[0]["reason"])
 
 
+def test_loop_exits_on_a_crashed_tick_without_starting_another(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``tick_crash`` ends ``--loop`` with code 4 before the next wait.
+
+    The SOP stops and diagnoses on code 4, and a background loop is only
+    reported when it exits. Retrying a persistent exception would loop
+    silently with an actionable queue and never reach the operator.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    monkeypatch.setattr(tick.labels, "verify", mock.Mock())
+    observe = mock.Mock(side_effect=AssertionError("observed cadence"))
+    monkeypatch.setattr(tick, "_observe_loop_state", observe)
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_args: None)
+    wait = mock.Mock(side_effect=AssertionError("waited for another tick"))
+    monkeypatch.setattr(tick, "_wait_next_tick", wait)
+
+    with mock.patch("tick._startup_probe"):
+        with mock.patch(
+            "tick._run_tick_body", side_effect=RuntimeError("persistent"),
+        ) as body:
+            with mock.patch("sys.stderr", io.StringIO()):
+                rc = tick._run_loop_locked(None, "claude", "")
+
+    assert rc == 4
+    body.assert_called_once()
+    crashes = [
+        e for e in read_tick_log_entries(Path(tick.TICK_LOG_DIR))
+        if e["action"] == "tick_crash"
+    ]
+    assert len(crashes) == 1
+
+
 def test_main_reports_a_fail_closed_config_warning_and_still_ticks(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

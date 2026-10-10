@@ -11,7 +11,7 @@
     {
       "name": "pr-pipeline",
       "source": "./",
-      "description": "Drive GitHub issues through implement, review, fix, and re-review with Claude Code and Codex engines, unattended.",
+      "description": "Label a GitHub issue. Claude Code implements it, Codex reviews it, and Claude Code fixes the findings until the pull request is ready for you to merge.",
       "author": {
         "name": "Keith Wu"
       },
@@ -20,10 +20,17 @@
       "license": "MIT",
       "category": "workflow",
       "keywords": [
+        "ai-agents",
+        "ai-code-review",
         "automation",
+        "autonomous-coding",
+        "claude-code",
         "code-review",
+        "codex",
         "github",
+        "multi-agent",
         "orchestration",
+        "pull-requests",
         "unattended"
       ]
     }
