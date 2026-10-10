@@ -604,9 +604,10 @@ is still captured in `stderr.log`.
   when no heartbeat file exists yet
 - Admission cap: `MAX_IN_FLIGHT=3`
 - Timeouts: reviewer 1200s, implementer 3600s, fixer 3600s
-- Fixer skill bindings: `tick.FIXER_SKILLS`, resolved as
-  `<install>/skills/<name>/SKILL.md` before launch — the install's own copy, not
-  the fixer worktree's, so a target repository needs no copy of its own;
+- Engine skill bindings: `tick.FIXER_SKILLS` and `tick.IMPLEMENTER_SKILLS`,
+  resolved as `<install>/skills/<name>/SKILL.md` before launch — the install's
+  own copy, not the engine worktree's, so a target repository needs no copy of
+  its own;
   unreadable means the install is missing a file its prompt names, which logs
   `skill_unresolved` and escalates (see README "Prompt-bound skills")
 - Fixer injected context: PR body + every `closingIssuesReferences` issue body,

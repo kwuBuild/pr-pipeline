@@ -1014,29 +1014,50 @@ evaluates the decision instead of reconstructing it from the diff. The decisions
 are re-checked against the pushed diff before the completion sentinel, which now
 needs them alongside the three green commands.
 
+The implementer prompt binds `definition-of-done` the same way. The engine runs
+Phase A (claim, production entry point and authoritative mode, invariant owner,
+shared boundary, exclusions) before its first edit and Phase B before its commit.
+If the skill exempts the change, the engine records that decision before editing
+instead of running either phase. After a relevant edit, rebase, or revision, it
+re-runs the affected Phase B steps and updates the evidence before commit or push.
+It puts the Phase B evidence block, or the skill's `Definition of done: n/a` line
+for a change with no runtime claim, under `## Test coverage` in `.pr-body.md`.
+`IMPLEMENTATION_COMPLETE` requires that block in addition to green verification
+and a successful push. The target's own guides still name the verification
+commands. If the engine cannot read required guidance or complete a required
+Phase A or Phase B step, the prompt requires `NEEDS_HUMAN_DECISION`. Denied
+commands must be recorded as `not run — <command> denied`; missing evidence
+cannot be replaced by an n/a claim. The harvest checks only the body's section
+structure. It neither validates the evidence nor adds a warning when the block
+is missing, including when it publishes a generated fallback body.
+
 The binding is a doc path rather than a skill invocation on purpose: the explicit
-grants include `Read` and no `Skill` tool. Reading the installed doc works with
-both `auto` (the default) and `dontAsk`, without depending on classifier approval
-of a skill invocation.
+grants include `Read` and no `Skill` tool. Both `auto` (the default) and
+`dontAsk` receive read-only Git grants for `status`, `rev-parse`, and `merge-base`
+to support the scope re-check. These grants do not guarantee that the engine can
+read an absolute install path or run an arbitrary production entry point. Host
+policy can deny reads; additional commands depend on operator `verify_tools` or
+approval in `auto`. A required step that remains unavailable blocks completion.
 
 The path is the **install's** — an absolute path into the pipeline's own
-`skills/` directory, not a path inside the fixer's worktree. The guidance ships
+`skills/` directory, not a path inside the engine's worktree. The guidance ships
 with the pipeline, so the operator's installed copy is the right one for every
 target by construction: a repository that has never heard of the skill still
-gets a fixer that can open it, and a PR branch cannot hand its own fixer a
+gets that installed path in its prompt, and a PR branch cannot hand its fixer a
 rewritten copy of the rules it will be revised under. The same doc is published
 as `/pr-pipeline:review-response-hygiene` for interactive sessions.
 
 Because it is a path, dispatch resolves it before spending anything. An
 unreadable doc means the *install* is missing a file its own prompt names — a
-packaging defect, not anything about the PR. It logs `skill_unresolved` (with the
-skill names and the probed paths), escalates the PR to `ai:needs-human-decision`,
-and removes the worktree — no lease, no relabel to `ai:fixing`, no engine
-launched. The escalation is per item because an item left at
-`ai:changes-requested` would otherwise be retried every tick against an install
-that cannot satisfy it. Recover by repairing the install — reinstall or update
-the plugin, or check out the missing doc in a development checkout — then relabel
-the PR back to `ai:changes-requested`.
+packaging defect, not anything about the item. It logs `skill_unresolved` (with
+the skill names and the probed paths), escalates the item to
+`ai:needs-human-decision`, and removes the worktree — no lease, no relabel to
+`ai:fixing` or `ai:implementing`, no engine launched. The escalation is per item
+because an item left at `ai:changes-requested` or `ai:available` would otherwise
+be retried every tick against an install that cannot satisfy it. Recover by
+repairing the install — reinstall or update the plugin, or check out the missing
+doc in a development checkout — then relabel the PR back to
+`ai:changes-requested`, or the issue back to `ai:available`.
 
 ### Governing context the fixer is handed
 

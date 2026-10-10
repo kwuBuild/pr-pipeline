@@ -142,6 +142,76 @@ def test_cli_dispatch_and_harvest_empty_verification(offline_tick):
 
 
 
+@pytest.mark.parametrize("permission_mode", ["auto", "dontAsk"])
+def test_cli_implementer_scope_proof_grants(offline_tick, permission_mode):
+    """Real dispatch supplies scope checks without granting arbitrary Git writes."""
+    import re
+    from fnmatch import fnmatchcase
+
+    root, state, cfg, env = offline_tick
+    cfg.write_text(
+        '[operator]\nlogin="operator"\n[defaults]\n'
+        f'permission_mode="{permission_mode}"\n'
+        'verify_tools=["sh ./check.sh"]\n[repos."example/project"]\n'
+    )
+    run_tick(root, env)
+    wt = root / ".claude" / "worktrees" / "issue-7"
+    for _ in range(100):
+        if (wt / "result.json").exists() and (wt / "result.json").stat().st_size:
+            break
+        time.sleep(0.02)
+    argv = json.loads((wt / "engine-argv.json").read_text())
+    assert argv[argv.index("--permission-mode") + 1] == permission_mode
+    grants = re.findall(r"Bash\(([^)]+)\)", argv[argv.index("--allowedTools") + 1])
+    for command in ("git status --porcelain", "git rev-parse HEAD",
+                    "git merge-base --is-ancestor BASE HEAD"):
+        assert any(fnmatchcase(command, grant) for grant in grants), (command, grants)
+    for command in ("git init", "git reset --hard", "git push origin HEAD --force"):
+        assert not any(fnmatchcase(command, grant) for grant in grants), (command, grants)
+    assert [grant for grant in grants if grant.startswith("git push")] == ["git push origin HEAD"]
+    assert not (wt / "skills").exists()
+
+
+@pytest.mark.parametrize("missing_doc", [False, True])
+def test_cli_implementer_uses_installed_completion_guidance(offline_tick, tmp_path, missing_doc):
+    """An installed tick binds its own guidance before launch in a bare target."""
+    root, state, cfg, env = offline_tick
+    install = tmp_path / "plugin-cache" / "pr-pipeline" / "skills"
+    source = Path(__file__).resolve().parents[2]
+    shutil.copytree(source, install, ignore=shutil.ignore_patterns("__pycache__"))
+    doc = install / "definition-of-done" / "SKILL.md"
+    launch_receipt = tmp_path / "engine-launched"
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", f'''
+import json, pathlib, sys
+pathlib.Path({str(launch_receipt)!r}).write_text(sys.stdin.read())
+print(json.dumps({{"type": "result", "is_error": False,
+                  "result": "NEEDS_HUMAN_DECISION"}}))
+''')
+    if missing_doc:
+        doc.unlink()
+    result = subprocess.run(
+        ["bash", str(install / "tick" / "tick.sh"), "#7"],
+        cwd=root, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    wt = root / ".claude" / "worktrees" / "issue-7"
+    data = json.loads(state.read_text())
+    if missing_doc:
+        assert data["labels"] == ["ai:needs-human-decision"]
+        assert not launch_receipt.exists()
+        assert not wt.exists()
+        assert str(doc) in "\n".join(data["comments"])
+    else:
+        for _ in range(100):
+            if launch_receipt.exists():
+                break
+            time.sleep(0.02)
+        assert f"read `{doc}`" in launch_receipt.read_text()
+        assert data["labels"] == ["ai:implementing"]
+        assert (wt / "dispatch.json").is_file()
+        assert not (wt / "skills").exists()
+
+
 def test_cli_malformed_verification_is_a_startup_error(offline_tick):
     root, state, cfg, env = offline_tick
     cfg.write_text('[operator]\nlogin="operator"\n[defaults]\nverify_tools=7\n')

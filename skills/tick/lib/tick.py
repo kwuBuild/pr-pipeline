@@ -307,11 +307,12 @@ _PROMPTS_DIR = str(pipeline.PROMPTS_DIR)
 # definition, so a doc the install supplies to an engine cannot be bound here
 # and left outside the gate there.
 REVISION_HYGIENE_SKILL = pipeline.REVISION_HYGIENE_SKILL
+DEFINITION_OF_DONE_SKILL = pipeline.DEFINITION_OF_DONE_SKILL
 
-# The skills `_dispatch_one_fixer` resolves before launch. The implementer half
-# adds its own tuple against the same resolver; `pipeline.BOUND_SKILLS` is the
-# union every stage's tuple draws from.
+# The skills each engine stage resolves before launch, against the same
+# resolver; `pipeline.BOUND_SKILLS` is the union every stage's tuple draws from.
 FIXER_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
+IMPLEMENTER_SKILLS: tuple[str, ...] = (DEFINITION_OF_DONE_SKILL,)
 
 # Ceiling on each governing document injected into a fixer prompt (the PR body,
 # and the linked issue contract as a whole). The documents are engine- and
@@ -443,11 +444,12 @@ def unresolved_skill_docs(names: Sequence[str]) -> list[str]:
     """Return the skills whose installed doc is missing or unreadable.
 
     The docs ship with the pipeline, so the probe reads the install rather than
-    the engine's worktree: the fixer's cwd is a detached checkout of a PR head
-    in a repository the pipeline does not own, which has no reason to carry a
-    copy of the operator's guidance. What this catches is therefore a packaging
-    defect — a doc bound by a prompt and absent from the install — rather than
-    anything about the item being dispatched.
+    the engine's worktree: an engine's cwd is a checkout (a PR head for the
+    fixer, the base tip for the implementer) of a repository the pipeline does
+    not own, which has no reason to carry a copy of the operator's guidance.
+    What this catches is therefore a packaging defect — a doc bound by a prompt
+    and absent from the install — rather than anything about the item being
+    dispatched.
 
     Args:
         names: Skill directory names to resolve.
@@ -746,6 +748,7 @@ def _reviewer_safe_value(key: str, value: object, source: str) -> str:
 _ENGINE_ALLOWED_TOOLS_BASE = (
     "Read Edit Write "
     "Bash(git add *) Bash(git commit *) Bash(git status) Bash(git diff *) "
+    "Bash(git status *) Bash(git rev-parse *) Bash(git merge-base *) "
     "Bash(git log *)"
 )
 
@@ -10148,6 +10151,20 @@ def _dispatch_one_implementer(
         )
         return
 
+    # Resolve every skill the implementer prompt binds against the install that
+    # supplies them, before any lease or launch — the same gate the fixer runs.
+    if not _bound_skills_resolve(
+        wt_dir=wt_dir,
+        skills=IMPLEMENTER_SKILLS,
+        entity="issue",
+        number=issue_number,
+        pre_label=pipeline.LABEL_AVAILABLE,
+        stage="implement",
+        engine=impl_engine,
+        tick_log=tick_log,
+    ):
+        return
+
     config = pipeline.resolve_config(TRUSTED_HEAD_REPO)
     if config.errors:
         _escalate_dispatch_setup_failure(
@@ -10212,6 +10229,7 @@ def _dispatch_one_implementer(
         "issue_body": issue_body,
         "branch_name": branch_name,
         "pr_body_source_file": _PR_BODY_SOURCE_FILE,
+        "definition_of_done_skill_doc": skill_doc_path(DEFINITION_OF_DONE_SKILL),
     })
 
     result_path = os.path.join(wt_dir, "result.json")
