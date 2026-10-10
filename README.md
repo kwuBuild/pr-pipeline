@@ -6,13 +6,13 @@
 
 **Smart agents, dumb pipes.**
 
-**You scope it. Agents ship it. You merge it.**
+You scope it. Agents ship it. You merge it.
 
 pr-pipeline is a Claude Code plugin that turns a GitHub issue into a reviewed
-pull request. Claude Code writes the change, Codex reviews it, and Claude Code
+pull request. Claude Code writes the change. Codex reviews it. Claude Code
 answers the review, round after round, until the pull request is ready for you
-to merge. A plain, predictable pipeline moves the work between them, so you
-don't have to.
+to merge. Every step happens on GitHub, where you can follow it and step in. A
+small Python pipeline carries the work between the agents, so you don't.
 
 <!-- Demo recording goes here: a short terminal capture of /pr-pipeline:tick
      and /pr-pipeline:status, or a screenshot of a PR's label history. -->
@@ -26,14 +26,13 @@ again. The agents do the thinking. You carry their messages.
 **Don't be the messenger. Be the manager.** Write the issue. Delegate it.
 Review what comes back. pr-pipeline carries every message in between.
 
-**And don't hire a model to be the messenger either.** You can ask one Claude
-Code session to manage subagents, and it works for an afternoon. Then the plan
-lives in one model's context, where a crash, `/clear`, or compaction can lose
-it. The prompt alone decides who reviews and when to stop. And the manager
-spends model turns to check on its workers, on a context that keeps growing.
-Carrying messages is a job for a pipe, not a model.
+**And don't hire a model to be the messenger either.** A Claude Code session
+that coordinates subagents works, until it crashes, gets `/clear`ed, or
+compacts, and the plan in its context goes with it. Meanwhile, every check-in
+on its workers costs a model turn. Carrying messages is a job for a pipe, not
+a model.
 
-## Smart agents, dumb pipes
+## Dumb pipes, on purpose
 
 The intelligence lives at the edges, in the agents. The pipe in the middle is
 deliberately dumb: a small Python program that reads GitHub labels and starts
@@ -44,58 +43,62 @@ out of its rules.
 
 - **The agents make the judgment calls.** Each implementer and fixer is a full
   Claude Code session with your settings, plugins, and skills, in its own git
-  worktree with a fresh context. The agents decide what to change, which review
-  findings matter, and how to fix them.
-- **A different provider reviews every change.** Codex reviews under a
-  read-only policy, so the agent that wrote the code never approves it.
+  worktree with a fresh context. The agents decide what to change and how. A
+  fixer can even push back on a finding with evidence, and the next review
+  decides.
+- **No agent grades its own work.** Claude Code writes and Codex reviews. Codex
+  runs read-only: it can judge the code but not change it.
 - **The pipe never forgets.** Each item's state is a GitHub label plus a small
-  record on disk, not a conversation. A crash or `/clear` loses nothing; the
-  next run continues where the last one stopped.
+  record on disk, not a conversation. A crash or `/clear` in your session
+  loses no workflow state; the next run picks up where the last one stopped.
 - **The rules are code, not a prompt.** A pull request gets at most five
-  reviews. Every agent has a deadline. An item whose agent keeps failing
-  without a result goes to you after three attempts. A usage limit pauses new
-  work for that provider until the limit resets. An agent that goes silent for
-  30 minutes is flagged.
-- **You pay for the work, not the supervision.** No model sits in the control
-  loop, so your tokens go to the agents that write and review code, not to a
-  manager that watches them.
+  reviews. An agent that runs past its deadline (60 minutes to write or fix,
+  20 to review) is stopped, and the item comes to you. An agent that fails
+  three times without a result hands the item to you instead of retrying
+  forever. When Claude Code hits a usage limit, no new Claude Code work starts
+  until the limit resets.
+- **You pay for the work, not the relay.** No model decides the next step or
+  waits on the agents, so your tokens go to writing and reviewing code. The
+  tick log records each run's token use, so you can check.
 - **It keeps moving while you're away.** In loop mode, the next step starts
   within seconds of an agent finishing. On macOS, you get a notification when
-  an item needs you.
-- **Better agents, same pipe.** Add a skill or switch models, and every run
-  uses it. The pipeline does not change.
+  an item needs you, or when a Claude Code agent produces no output for 30
+  minutes.
+- **Better agents, same pipe.** Add a skill or switch models, and the next
+  agent uses it, with no pipeline change.
 
 ## Assign it like a teammate. Review it like a teammate.
 
 pr-pipeline does not invent a new workflow. It runs the one your team already
-uses: an issue, a pull request, a code review, a revision. The AI engineer
-works inside it.
+uses: an issue, a pull request, a code review, a revision. The agents work
+inside it.
 
-- **You own the planning.** pr-pipeline does not plan. You write and scope the
-  issue, as you would for a colleague. To turn a vague idea into a clear issue
-  first, try an interview skill such as
+- **You own the plan.** Scope the issue as you would for a colleague, and the
+  agents build what it says. To turn a vague idea into a clear issue first,
+  try an interview skill such as
   [grill-me](https://github.com/mattpocock/skills/tree/main/skills/productivity/grill-me).
-- **No black box.** Every step is a label, a commit, or a comment on GitHub:
-  the Codex review, the fixer's reply to each finding, and every label change.
-  Your team can follow along without access to your terminal, and a later
-  reader can see why the change has its final form.
+- **No black box.** Every review, every fix reply, and every label change is on
+  GitHub. When an implementing agent stops to ask you something, the issue
+  gets its reason. Your team can follow along without access to your terminal,
+  and months later, anyone can see why the code looks the way it does.
 - **Step in at any time.**
-  - *Pause:* add `ai:blocked`, and the pipeline stops advancing that item,
-    even while an agent works on it.
-  - *Take over:* pick up an item yourself, and the pipeline leaves it alone.
-  - *Redirect:* leave line comments in GitHub's diff view, then ask a Claude
-    Code session that you direct to address all of them in one pass. The
-    pipeline's own fixer answers only the Codex review.
-- **You merge.** The pipeline never merges. It stops at `ai:ready-for-human`.
+  - *Hold:* add `ai:blocked`. A running agent finishes and its result is
+    posted as a comment, but the item does not move until you remove the
+    label.
+  - *Take over:* label the issue `ai:implementing` yourself. The pipeline has
+    no record of starting it, so it leaves it alone.
+  - *Redirect:* the pipeline's fixer answers Codex's review, not yours. Leave
+    line comments in GitHub's diff view, then have your own Claude Code
+    session address them all in one pass.
 
 ## A day with pr-pipeline
 
-Stop babysitting your agents. Write five well-scoped issues in the morning,
-label them `ai:available`, and start the loop. Then do something else.
+Stop babysitting your agents. Here is how a day can look. Write five
+well-scoped issues in the morning, label them `ai:available`, and start the
+loop. Then do something else.
 
-1. The pipeline starts three Claude Code agents, its limit for each local
-   repository, each in its own git worktree. The other two issues wait for a
-   free slot.
+1. The pipeline starts three Claude Code agents at once, its limit for each
+   repository, each in its own git worktree. The other two issues queue.
 2. When an agent pushes its branch, the pipeline opens the pull request and
    starts a Codex review.
 3. The pipeline posts Codex's findings on the pull request. A new Claude Code
@@ -103,9 +106,9 @@ label them `ai:available`, and start the loop. Then do something else.
 4. This continues until each pull request passes review or needs you.
 
 When you come back, three pull requests are at `ai:ready-for-human`, each with
-its review history in the comments. One is at `ai:needs-human-decision` with
-the question that the agent could not answer. One is still in review. You read
-the finished pull requests and merge them.
+its review history in the comments. One waits for you with the question that
+its agent could not answer. One is still in review. You read the finished pull
+requests and merge them.
 
 ## Is it for you?
 
@@ -118,30 +121,35 @@ or changes that must deploy without a human review.
 
 **Know before you start:**
 
-- You need a Codex CLI login as well as Claude Code. Codex is the reviewer.
-- It runs on your machine, from a Claude Code session or a terminal that stays
-  open while the loop runs. It is not a hosted service.
-- Only issues and pull requests that your GitHub login wrote enter the
-  pipeline.
-- It does not wait for your CI. The agents run the test commands that you
-  approve during setup, and your CI still runs on each pull request.
+- **Two providers.** You need a Codex CLI login as well as Claude Code. Codex
+  is the reviewer.
+- **Your machine.** It runs from a Claude Code session or a terminal that
+  stays open while the loop runs. It is not a hosted service.
+- **One operator.** Only issues and pull requests that your GitHub login wrote
+  enter the pipeline, so a stranger's issue can never start an agent.
+- **No CI wait.** Before an agent reports done, it must run your repository's
+  own checks until they pass. The pipeline does not wait for CI or confirm
+  those runs itself, and your CI still runs on every pull request.
+- **Outside the sandbox.** The pipeline runs outside Claude Code's sandbox,
+  because it must manage the agent processes it starts. See
+  [Safety and trust](#safety-and-trust).
 
-## Why not one session that manages subagents?
+## Why not one session that coordinates subagents?
 
 Claude Code subagents are capable: they can resume, use their own model, and
 work in worktrees. What an ad hoc session lacks is an enforced workflow.
 
-| | One session that manages subagents | pr-pipeline |
+| | One session that coordinates subagents | pr-pipeline |
 |---|---|---|
-| What decides the next step | The manager model, from its context | A Python program that reads GitHub labels |
-| Where the plan lives | In the manager's conversation, which a crash, `/clear`, or compaction can lose | In GitHub labels and on disk. The next run continues from them. |
+| What decides the next step | The coordinator model, from its context | A Python program that reads GitHub labels |
+| Where the plan lives | In the coordinator's conversation, which a crash, `/clear`, or compaction can lose | In GitHub labels and on disk. The next run continues from them. |
 | Who reviews the code | Whoever the prompt names, often the same model | Always a different provider (Codex), with a read-only policy |
 | Isolation | Worktrees, if you set them up | A git worktree and a fresh context for each agent, always |
 | Where you watch progress | Terminal output | Labels, pull requests, and review comments on GitHub |
 | Record of the work | The session transcript, which only you can read | Pull requests, reviews, fix replies, and label history on GitHub |
-| Cost of coordination | The manager's model turns, on a context that keeps growing | None. Coordination is code. |
-| When the next step starts | When the manager next takes a turn | In loop mode, within seconds of an agent finishing |
-| Limits | Whatever you configure for each subagent; nothing caps review rounds | At most three agents for each local repository, five reviews for each pull request, and a deadline for each agent |
+| Model turns while agents work | The coordinator's turns, on a context that keeps growing | None while the loop runs |
+| When the next step starts | When the coordinator next takes a turn | In loop mode, within seconds of an agent finishing |
+| Limits | Whatever you configure for each subagent; nothing caps review rounds | At most three agents for each repository, five reviews for each pull request, and a deadline for each agent |
 
 Hosted coding agents also turn an issue into a pull request. They usually run
 in the vendor's cloud with the vendor's model. pr-pipeline runs on your
@@ -166,9 +174,12 @@ records each event.
 1. Install the plugin. This repository is its own plugin marketplace.
 
    ```text
-   /plugin marketplace add kwuBuild/pr-pipeline
-   /plugin install pr-pipeline
+   /plugin install pr-pipeline --marketplace kwuBuild/pr-pipeline
    ```
+
+   Before Claude Code 2.1.275, add the marketplace first:
+   `/plugin marketplace add kwuBuild/pr-pipeline`, then
+   `/plugin install pr-pipeline`.
 
 2. Run setup once for each repository that the pipeline will work on. Setup
    confirms your GitHub login, creates the `ai:` labels, proposes test commands
@@ -262,7 +273,7 @@ Three labels stop automation and wait for you:
 
 | Label | Meaning |
 |---|---|
-| `ai:needs-human-decision` | An agent or the pipeline found a scope or design question, or a conflict over who owns the item, that it must not decide alone. |
+| `ai:needs-human-decision` | An agent or the pipeline found a scope or design question, or a conflict over who owns the item, that it must not decide alone. An agent that ran past its deadline or kept failing also lands here. |
 | `ai:max-iterations` | The pull request reached five completed reviews without approval. |
 | `ai:blocked` | You set this to hold an item for a dependency or a decision. |
 
@@ -277,7 +288,8 @@ phases:
    each one in its own git worktree.
 
 The agents run between ticks, not during them. A tick never asks a model what
-to do: the same labels and agent results always lead to the same next step.
+to do. Fixed rules in code choose the next step from the labels, the local
+records, and the agents' results.
 The loop runs ticks often while agents work, checks every 30 minutes when the
 queue is idle, and stops after three quiet checks in a row.
 
@@ -291,12 +303,14 @@ recovery; the [diagnostics guide](skills/tick/DEBUG.md) explains how.
   `ai:ready-for-human`.
 - **Only your work enters the pipeline.** Implementation starts only for
   issues written by the GitHub login that you confirm during setup. Review
-  starts only for pull requests by that login from the same repository, so
-  pull requests from forks never reach an agent.
-- **Changes to the reviewer's own rules can need your review.** Set
-  `allow_touching = false` to send pull requests that edit `CLAUDE.md`,
-  `AGENTS.md`, or the reviewer's configured checklists to
-  `ai:needs-human-decision`.
+  starts only for pull requests by that login from the same repository, so the
+  pipeline does not review pull requests from forks.
+- **Decide who reviews changes to the reviewer's rules.** Codex reviews inside
+  the pull request's own worktree, so a pull request that edits `CLAUDE.md`,
+  `AGENTS.md`, or your configured checklists could steer its own review. This
+  gate is off by default, because only your own issues and pull requests enter
+  the pipeline. Set `allow_touching = false` to send those pull requests to
+  `ai:needs-human-decision` instead.
 - **Review cycles have a limit.** The pipeline stops a pull request at
   `ai:max-iterations` instead of letting the review and fix cycle continue.
 - **Manual work is left alone.** If you, or an agent that you direct, take an
@@ -304,14 +318,17 @@ recovery; the [diagnostics guide](skills/tick/DEBUG.md) explains how.
 - **Setup does not change your repository's files.** It creates the `ai:`
   labels on GitHub. On your machine, it writes only under `~/.claude/`: the
   operator configuration, the launcher, and the deny rules that you approve.
+  The deny rules go into your Claude Code user settings, so they also apply to
+  your own sessions.
 
-**Use auto mode.** Auto mode is the default for the Claude Code agents, and we
-suggest it for the Claude Code session that runs the loop. In auto mode, a call
+**Use auto mode.** Auto mode is the default for the Claude Code agents. Use it
+for the Claude Code session that runs the loop too. In auto mode, a call
 outside the explicit grants goes to Claude Code's permission classifier instead
 of a prompt that nobody is present to answer. Add deny rules for operations
 that you forbid. Setup offers rules for force-push and remote branch deletion.
-If auto mode fails setup's probe for your model or provider, setup records
-`dontAsk`, which denies every call that would prompt.
+If auto mode fails setup's probe for your model or provider, setup offers
+`dontAsk` with named commands instead. `dontAsk` denies every call that would
+prompt.
 
 **The tick runs outside the Claude Code sandbox.** The tick must run with
 `dangerouslyDisableSandbox: true`. Under the default sandbox, it cannot inspect
@@ -331,7 +348,7 @@ single tick, a hosted service, and replacing your CI.
 |---|---|
 | `/pr-pipeline:setup` | Connect the pipeline to a repository and write your operator configuration. |
 | `/pr-pipeline:tick` | Run one pass: harvest finished agents, then dispatch waiting work. |
-| `/pr-pipeline:status` | Show a read-only dashboard of running agents and items grouped by `ai:` label. Status does not move work forward. |
+| `/pr-pipeline:status` | Show a read-only dashboard: each running agent with its stage and the time left to its deadline, and every item grouped by `ai:` label. Status does not move work forward. |
 
 The plugin also includes skills that the pipeline's agents and maintainers
 use: `definition-of-done`, `review-response-hygiene`,

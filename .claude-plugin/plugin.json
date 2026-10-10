@@ -1,6 +1,6 @@
 {
   "name": "pr-pipeline",
-  "description": "An unattended control plane that drives GitHub issues through implement, review, fix, and re-review using Claude Code and Codex engines. GitHub labels are the only source of truth for what stage a work item is in.",
+  "description": "Smart agents, dumb pipes. Label a GitHub issue: Claude Code implements it, Codex reviews it, and Claude Code fixes the findings until the pull request is ready for you to merge. Every step is visible on GitHub.",
   "version": "0.1.0",
   "author": {
     "name": "Keith Wu"
