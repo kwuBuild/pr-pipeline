@@ -601,6 +601,18 @@ def test_inspect_refuses_malformed_manifest_content(doubles, manifest, body) -> 
     assert not result.stdout
 
 
+def test_inspect_reads_a_manifest_spanning_several_wrapped_lines(doubles) -> None:
+    pyproject = '[project]\nname = "widget"\ndescription = "' + "x" * 200 + '"\n'
+    state = json.loads(doubles["state"].read_text())
+    state["repo"]["files"] = {"pyproject.toml": pyproject}
+    doubles["state"].write_text(json.dumps(state))
+
+    result = run_setup("inspect", REPO)
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["proposed_verify_tools"] == ["python -m pytest *"]
+
+
 @pytest.mark.parametrize(("files", "expected"), [
     ({"pom.xml": "", "mvnw": ""}, ["./mvnw test *", "./mvnw verify *"]),
     ({"build.gradle.kts": ""}, ["gradle test *", "gradle check *"]),
@@ -899,8 +911,11 @@ elif args[0] == "api" and "/contents/" in args[1]:
     if state.get("malformed_manifest") and name == "package.json":
         out({"encoding": "base64", "content": "%%%"})
     else:
+        # GitHub wraps the base64 content with a newline every 60 characters.
+        encoded = base64.b64encode(repo["files"][name].encode()).decode()
         out({"encoding": "base64",
-             "content": base64.b64encode(repo["files"][name].encode()).decode()})
+             "content": "".join(encoded[i:i + 60] + "\n"
+                                for i in range(0, len(encoded), 60))})
 elif args[0] == "api" and "/contents?" in args[1]:
     if state.get("malformed_listing"):
         out({"unexpected": "payload"})
