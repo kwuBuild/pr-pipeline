@@ -4,7 +4,7 @@
 set -uo pipefail
 
 usage() {
-  echo 'Usage: pr-pipeline {tick|status|preflight|labels} [arguments...]'
+  echo 'Usage: pr-pipeline {tick|status|events|preflight|labels} [arguments...]'
 }
 
 setup_error() {
@@ -18,6 +18,7 @@ case "${1:-}" in
   -h|--help) usage; exit 0 ;;
   tick) target=skills/tick/tick.sh ;;
   status) target=skills/status/status.sh ;;
+  events) target=skills/status/events.sh ;;
   preflight) target=skills/tick/preflight.sh ;;
   labels) target=skills/tick/lib/labels.py ;;
   *) usage >&2; exit 2 ;;

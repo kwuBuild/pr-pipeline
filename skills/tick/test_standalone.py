@@ -52,6 +52,34 @@ def test_install_and_real_tick_from_foreign_cwd(installed):
     assert not launcher.is_symlink()
 
 
+
+def test_installed_events_reads_target_logs_without_engine_or_github_calls(installed):
+    home, target, install, listing, env = installed
+    launcher = install_launcher(installed)
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    subprocess.run(["git", "-C", str(target), "remote", "add", "origin",
+                    "https://github.com/example/consumer.git"], check=True)
+    logs = target / ".claude/worktrees/.tick-log"
+    logs.mkdir(parents=True)
+    entry = {"ts": 1, "pr": 27, "phase": "dispatch", "stage": "implement",
+             "action": "launch", "engine": "claude", "dispatch_id": "d1",
+             "details": {"model": "sonnet"}}
+    (logs / "tick-001.jsonl").write_text(json.dumps(entry) + "\n")
+    commands = Path(env["PATH"].split(os.pathsep)[0])
+    calls = home / "unexpected-calls"
+    env["EVENT_CALLS"] = str(calls)
+    for name in ("gh", "codex"):
+        write_executable(commands / name, '#!/bin/sh\nprintf called >> "$EVENT_CALLS"\nexit 99\n')
+    # The fixture's Claude shim permits plugin discovery only, never a model run.
+    before = {str(p.relative_to(target)): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+    result = run(launcher, "events", "--json", cwd=target, env=env)
+    assert result.returncode == 0, result.stderr
+    event = json.loads(result.stdout)
+    assert (event["repo"], event["event"], event["number"]) == ("example/consumer", "launch", 27)
+    assert not calls.exists()
+    assert before == {str(p.relative_to(target)): p.read_bytes() for p in target.rglob("*") if p.is_file()}
+
+
 def test_upgrade_resolves_again_without_reinstall(installed):
     home, target, install, listing, env = installed
     launcher = install_launcher(installed)

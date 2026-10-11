@@ -149,6 +149,7 @@ jobs:
           bash -n skills/tick/install-launcher.sh
           bash -n skills/tick/preflight.sh
           bash -n skills/status/status.sh
+          bash -n skills/status/events.sh
           bash -n skills/setup/setup.sh
 
       # -x follows the `# shellcheck source=` directives in tick.sh,
@@ -176,4 +177,5 @@ jobs:
             skills/tick/install-launcher.sh \
             skills/tick/preflight.sh \
             skills/status/status.sh \
+            skills/status/events.sh \
             skills/setup/setup.sh

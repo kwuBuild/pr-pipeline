@@ -79,6 +79,11 @@ path. Missing, disabled, malformed, or ambiguous installs fail with setup
 guidance. Install `claude` and `jq` on PATH. After a plugin upgrade the next
 invocation resolves the new path; an already running tick keeps its loaded code.
 
+When an upgrade adds a subcommand, such as `events`, rerun
+`skills/tick/install-launcher.sh` from the current install to refresh the copied
+launcher's command list. This is the Launcher step of setup; it does not require
+rerunning engine probes or rewriting configuration.
+
 `CLAUDE_PLUGIN_ROOT` is substituted only in plugin skill content, not in this
 file or a separate terminal. No install-root export is needed for these shell
 commands. Development from a checkout remains supported through an explicit
@@ -91,7 +96,7 @@ export PR_PIPELINE_HOME=/absolute/path/to/pr-pipeline
 An empty or relative override is an error. Unset it to return to the plugin
 install. Paths with spaces are supported; quote the value when exporting it.
 The launcher forwards arguments, cwd, signals, and exit status to the existing
-entry points. `tick` accepts all tick subcommands and flags; `status`,
+entry points. `tick` accepts all tick subcommands and flags; `status`, `events`,
 `preflight`, and `labels` select their respective scripts. Use
 `~/.claude/pr-pipeline/bin/pr-pipeline --help` for the command list.
 
@@ -1604,6 +1609,27 @@ LAST TICK AUDIT LOG
 | `claude-ds` / `codex` / `claude` / *(blank)* | Engine used (blank for harvest entries) |
 
 This is the **audit trail** — replay the tick's decisions without re-reading SKILL.md.
+
+### Local event feed — `events`
+
+Run this in the target repository, or one of its linked worktrees:
+
+```bash
+~/.claude/pr-pipeline/bin/pr-pipeline events --follow
+~/.claude/pr-pipeline/bin/pr-pipeline events '#27'
+~/.claude/pr-pipeline/bin/pr-pipeline events --json pr:81
+```
+
+The feed shows retained local progress and confirmed handoffs. It reads logs
+without changing pipeline state, calling GitHub, or invoking a model. Following
+it in a terminal adds no model-token usage. It does not supervise an AI session
+or change desktop notifications. Existing alerts remain in place.
+
+History is bounded by tick-log retention and may lack old issue-to-PR links.
+An engine result is an observation; a proposed PR creation is not confirmation
+that the PR opened. Scripts should use the versioned JSON-lines format, not
+parse human text. See [Event feed contract](../status/EVENTS.md) for event kinds,
+filters, follow/restart behavior, failure handling, and the output schema.
 
 ### 2. Tick log — `.claude/worktrees/.tick-log/` (structured, queryable)
 
