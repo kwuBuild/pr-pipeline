@@ -723,7 +723,10 @@ def _file_text(repo: str, name: str, ref: str) -> str:
         if (not isinstance(payload, dict) or payload.get("encoding") != "base64"
                 or not isinstance(payload.get("content"), str)):
             raise ValueError("unexpected content response")
-        return base64.b64decode(payload["content"], validate=True).decode("utf-8")
+        # GitHub wraps the content in lines; strict decoding refuses anything
+        # else that is not base64.
+        content = "".join(payload["content"].split())
+        return base64.b64decode(content, validate=True).decode("utf-8")
     except (ValueError, OSError, UnicodeError) as exc:
         raise ValueError(f"cannot inspect {repo}/{name}: {exc}") from exc
 
