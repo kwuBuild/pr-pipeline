@@ -83,6 +83,7 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
         "review_model": "",
         "review_effort": "",
         "trusted_author": "",
+        "max_in_flight": 3,
     }
     assert di.call_args.kwargs["target"] == ("issue", 462)
     assert di.call_args.kwargs["authoritative_in_flight"] is authoritative

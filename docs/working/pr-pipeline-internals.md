@@ -764,6 +764,16 @@ each tick resolves and validates. Successful startup binds
 also passes the login explicitly to `dispatch_reviewers`. The next tick adopts
 a later config edit. No issue author gate rereads config during a tick.
 
+The admission cap follows the same rule. `max_in_flight` must be an integer of
+at least 1; a boolean, float, string, zero, or negative value is a startup error
+naming the key, never a fallback to the shipped default of 3. After every startup
+gate passes, `_run_single_tick_locked` reads `ResolvedConfig.max_in_flight` once
+and passes it to `_run_tick_body`, which hands it to all three dispatchers'
+`can_dispatch_now` calls and to the cadence `at_capacity` input. Under `--loop`
+the same value reaches `_observe_loop_state`, including its fail-closed
+occupancy fallback, which assumes that cap is full. No consumer resolves the cap
+again later in the tick.
+
 `trusted_issue_candidate` requires an exact operator login and refuses missing
 or mistyped authors. Global dispatch and cadence read only that author's
 issues using bounded `--author` queries. Targeted issue reads include `author`
@@ -784,7 +794,7 @@ Malformation splits two ways:
   reading and appends to `ResolvedConfig.warnings`. The tick logs
   `startup_config_warning` and runs.
 - **Has none** (`base_ref`, `permission_mode`, `engine_settings`,
-  `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`) —
+  `max_in_flight`, `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`) —
   appends to
   `ResolvedConfig.errors`. The tick logs `startup_config_invalid` and exits 3,
   naming the key. So does a container declared as something other than a table:

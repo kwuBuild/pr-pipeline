@@ -197,13 +197,15 @@ verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced whol
 base_ref        = ""          # "" = discover the target's GitHub default branch
 permission_mode = "auto"      # Claude implementer/fixer --permission-mode
 engine_settings = ""          # Claude implementer/fixer --settings; "" = omit
+max_in_flight   = 3           # admission cap: engines running at once per target
 
 [scan]
 repos = []                    # empty or absent = unrestricted
 
 [repos."owner/notes-app"]     # overrides any [defaults] key, for one target
-base_ref     = "master"
-verify_tools = ["<that repo's test command> *"]
+base_ref      = "master"
+verify_tools  = ["<that repo's test command> *"]
+max_in_flight = 5
 ```
 
 The verification commands are whatever the target repository's own
@@ -246,6 +248,19 @@ value that is not a JSON object, or an absolute path to a readable file holding
 one, is invalid.
 `$PR_PIPELINE_CONFIG` and `$CLAUDE_CONFIG_DIR` must
 name absolute locations.
+
+`max_in_flight` is the admission cap: the most engines (implementer, reviewer,
+and fixer combined) that a tick keeps running at once for one target checkout.
+The shipped default is 3. Set it in `[defaults]`, or in `[repos."owner/name"]`
+for one target, to match your plan limits, machine, and queue size. The cap
+counts this checkout's own dispatch markers, so it is not shared across
+repositories or machines. The value must be an integer of at least 1. Zero, a
+negative number, a float, a string, or a boolean stops the tick at startup with
+an error that names the key; the tick never substitutes a different cap. Each
+tick reads the cap once, at startup. Every dispatch stage admits against that
+value, and the tick's cadence (and, under `--loop`, the observation after the
+tick) judges capacity against the same value. A config edit takes effect at the
+next tick.
 
 The operator login is reloaded for each tick; a blank login stops the loop.
 Issue pickup and reviewer admission both compare against this identity. It
@@ -342,7 +357,7 @@ only the issue implementation scope is active. An ambiguous or malformed
 closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log and tick lock are excepted. Invalid target syntax has the same workflow-mutation boundary and exits `1`.
 
 HARVEST, stale-label reconciliation, and DISPATCH use those resolved stage scopes.
-Safety gates (`reconcile_failed`, `MAX_IN_FLIGHT` admission cap) still apply
+Safety gates (`reconcile_failed`, `max_in_flight` admission cap) still apply
 globally, and targeting never changes labels or scratch for unrelated work.
 
 Cadence follows the same scope. Under a target, the actionable-queue probe reads
@@ -360,7 +375,7 @@ tick can take, so counting either would hold the loop short of its quiescent
 stop forever; an engine this machine owns keeps cadence warm through its own
 marker instead. Unknown
 state still stays warm — a failed scope resolution or item read reads as
-unknown, never as quiescence. In-flight count and the `MAX_IN_FLIGHT` cap stay
+unknown, never as quiescence. In-flight count and the `max_in_flight` cap stay
 global, so a targeted loop never mistakes a saturated pipeline for a quiet one.
 
 ### Looped (autonomous polling)
@@ -383,7 +398,7 @@ possible, and does no harvest or dispatch work.
 | ≥1 engine in-flight, deadline > 0 | `min(nearest deadline, 270s)` cache-warm poll |
 | ≥1 engine in-flight, deadline lapsed mid-scan | 1s — immediate retry to harvest/escalate |
 | No engine in-flight, queue non-empty | ~270s cache-warm poll |
-| At `MAX_IN_FLIGHT`, saturated | ~270s cache-warm poll |
+| At `max_in_flight`, saturated | ~270s cache-warm poll |
 | Quiescent (all in-scope items terminal) | ~1800s heartbeat |
 | Quiescent for N consecutive heartbeats | stop + notify |
 
@@ -445,7 +460,7 @@ a sleep into an early tick:
    watcher, harvest, reconciliation, and redispatch retain custody while that
    group lives. If its deadline expires after wrapper identity is lost, the
    item escalates to `ai:needs-human-decision`, but its marker and scratch stay
-   in custody and the item continues to occupy a `MAX_IN_FLIGHT` slot until the
+   in custody and the item continues to occupy a `max_in_flight` slot until the
    group dies. That escalation is also the point the engine becomes *held*
    (see [Held engines](#held-engines)), so it stops holding loop cadence
    awake. Only validated positive
@@ -679,7 +694,7 @@ Consequences for the loop:
 - With nothing actionable and every occupied slot held, the loop reaches
   quiescence and stops after the usual heartbeat count — on both the in-process
   `--loop` path and the one-shot `tick-cadence:` path.
-- One held slot out of `MAX_IN_FLIGHT` does **not** stop a loop that still has
+- One held slot out of `max_in_flight` does **not** stop a loop that still has
   actionable work; the other slots keep dispatching. If *every* slot is held
   while a queue is still actionable, the loop legitimately stays warm and cannot
   dispatch until the operator acts — so the cadence reason names the holders in
@@ -1899,7 +1914,7 @@ a reviewer (Codex).
 | HARVEST then DISPATCH, unconditionally | Observe-then-act reconcile ordering |
 | Lease-before-label; marker survives a failed label edit | Write-ahead intent: record intent before acting so a crash mid-operation is recoverable |
 | Fail closed on every external read and malformed response; one corrupt marker blocks all dispatch | Crash-only design: prefer doing nothing over acting on garbage state |
-| `MAX_IN_FLIGHT` counts this machine's dispatch markers | Admission control bounding local spend, not shared workflow state |
+| `max_in_flight` counts this machine's dispatch markers | Admission control bounding local spend, not shared workflow state |
 | Structured per-decision tick log | Reconcile audit trail |
 | Detached engines + identity-verified PID supervision | Orphan supervision with PID-reuse protection (the cost of a crash-safe ephemeral ticker) |
 

@@ -38,13 +38,15 @@
 #   base_ref        = ""
 #   permission_mode = "auto"
 #   engine_settings = ""
+#   max_in_flight   = 3
 #
 #   [scan]
 #   repos = []                        # empty or absent = unrestricted
 #
 #   [repos."owner/notes-app"]
-#   base_ref     = "master"
-#   verify_tools = ["npm test *"]
+#   base_ref      = "master"
+#   verify_tools  = ["npm test *"]
+#   max_in_flight = 5
 
 # The target comes from the working directory's Git remote. PIPELINE_REPO
 # selects a matching local remote; no repository identity belongs in config.
@@ -126,3 +128,13 @@ permission_mode = "auto"
 # again before launch, because Claude does not reject a malformed settings file.
 # Blank omits the flag. Setup's probe launches with the same value.
 engine_settings = ""
+
+# The admission cap: the most engines (implementer, reviewer and fixer combined)
+# that a tick keeps running at once for this target checkout. It counts this
+# checkout's own dispatch markers, so it bounds local spend; it is not shared
+# across repositories or machines. Each dispatch stage checks it before a launch,
+# and the tick's cadence uses the same value to decide when it is at capacity.
+# Raise it to match your plan limits, machine and queue size. It must be an
+# integer of at least 1. Zero, a negative number, a float, a string or a boolean
+# is a startup error naming this key; the tick never substitutes another cap.
+max_in_flight = 3
