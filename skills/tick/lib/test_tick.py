@@ -33,8 +33,10 @@ from conftest import (  # type: ignore[import-untyped]
     REVISED_PR_BODY,
     STALE_PR_BODY,
     allow_escalation_comment,
+    comment_pages,
     fixer_body_provenance,
     fixer_gh_json,
+    reviewer_gh_json,
     fixer_git,
     fixer_harvest_gh,
     fixer_harvest_marker,
@@ -3661,7 +3663,7 @@ def test_dispatch_one_fixer_resolves_model_for_claude_ds(
                         "tick.gh_json",
                         side_effect=fixer_gh_json(
                             comments=[
-                                {"body": "<!-- pr-pipeline:review -->\nfixes"},
+                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfixes"},
                             ],
                         ),
                     ):
@@ -13090,7 +13092,7 @@ def test_harvest_one_reviewer_posts_fresh_comment_when_same_shas_new_base_ref(
     def gh_json_side_effect(*args: str) -> object:
         if "baseRefName,headRefOid" in args:
             return {"baseRefName": "main", "headRefOid": "h1"}
-        return [{"body": stale_comment}]
+        return comment_pages([{"author": {"login": "test-owner"}, "body": stale_comment}])
 
     posted_bodies: list[str] = []
 
@@ -13123,8 +13125,9 @@ def test_harvest_one_reviewer_posts_fresh_comment_when_same_shas_new_base_ref(
     assert len(posted_bodies) == 1
     assert "boom" in posted_bodies[0]
     assert pipeline.review_already_posted(
-        [{"body": posted_bodies[0]}],
+        [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": posted_bodies[0]}],
         "mb1", "h1", base_tip_sha="t1", base_ref="main",
+        trusted_author="test-owner",
     ) is True
     converge_mock.assert_called_once_with(
         "pr", 17, "ai:changes-requested",
@@ -13177,7 +13180,8 @@ def test_harvest_one_reviewer_threads_base_refs_to_pipeline(
             with mock.patch("tick.gh_json") as gh_json_mock:
                 gh_json_mock.side_effect = [
                     {"baseRefName": "main", "headRefOid": "h1"},
-                    [],  # comments
+                    comment_pages([]),  # first complete comment traversal
+                    comment_pages([]),  # matching confirmation traversal
                 ]
                 with mock.patch(
                     "tick._converge_pipeline_labels", return_value=True,
@@ -13266,7 +13270,8 @@ def test_reviewer_escalation_finalize_failure_resumes_next_tick_not_held_replay(
             with mock.patch("tick.gh_json") as gh_json_mock:
                 gh_json_mock.side_effect = [
                     {"baseRefName": "main", "headRefOid": "h1"},
-                    [],  # comments
+                    comment_pages([]),  # first complete comment traversal
+                    comment_pages([]),  # matching confirmation traversal
                     {"labels": [{"name": "ai:reviewing"}]},  # converge read
                     {"labels": [{"name": LABEL_NEEDS_HUMAN}]},  # verification
                 ]
@@ -13367,7 +13372,8 @@ def test_reviewer_escalation_is_gated_on_its_terminal_intent(
             with mock.patch("tick.gh_json") as gh_json_mock:
                 gh_json_mock.side_effect = [
                     {"baseRefName": "main", "headRefOid": "h1"},
-                    [],  # comments
+                    comment_pages([]),  # first complete comment traversal
+                    comment_pages([]),  # matching confirmation traversal
                 ]
                 with mock.patch(
                     "tick._record_terminal_intent", return_value=False,
@@ -18074,9 +18080,9 @@ def test_dispatch_one_reviewer_policy_gate_fails_closed_on_diff_error(
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch("tick.git", side_effect=fake_git):
             with mock.patch("tick.gh_text", side_effect=fake_gh_text), \
-                    mock.patch("tick.gh_json", return_value={
+                    mock.patch("tick.gh_json", side_effect=reviewer_gh_json({
                         "title": "feat: reviewed change", "body": "context",
-                    }):
+                    })):
                 with mock.patch(
                     "tick.gh", side_effect=allow_escalation_comment(),
                 ), mock.patch("tick.relabel") as relabel_mock:
@@ -18122,9 +18128,9 @@ def test_dispatch_one_reviewer_policy_gate_diff_error_relabel_failure_does_not_p
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch("tick.git", side_effect=fake_git):
             with mock.patch("tick.gh_text", side_effect=fake_gh_text), \
-                    mock.patch("tick.gh_json", return_value={
+                    mock.patch("tick.gh_json", side_effect=reviewer_gh_json({
                         "title": "feat: reviewed change", "body": "context",
-                    }):
+                    })):
                 with mock.patch(
                     "tick.gh", side_effect=allow_escalation_comment(),
                 ), mock.patch(
@@ -18167,9 +18173,9 @@ def test_dispatch_one_reviewer_policy_touch_relabel_failure_does_not_propagate(
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch("tick.git", side_effect=fake_git):
             with mock.patch("tick.gh_text", side_effect=fake_gh_text), \
-                    mock.patch("tick.gh_json", return_value={
+                    mock.patch("tick.gh_json", side_effect=reviewer_gh_json({
                         "title": "feat: reviewed change", "body": "context",
-                    }):
+                    })):
                 with mock.patch("tick.pipeline.touches_review_policy", return_value=True):
                     with mock.patch(
                         "tick.gh", side_effect=allow_escalation_comment(),
@@ -18454,7 +18460,7 @@ def test_dispatch_one_fixer_escalates_when_label_flip_fails_and_kill_fails(
     with mock.patch("tick.git", side_effect=fixer_git(tmp_path)):
         with mock.patch("tick.gh_text", return_value="main"):
             with mock.patch("tick.gh_json", side_effect=fixer_gh_json(comments=[
-                {"body": "<!-- ai-pipeline-review -->\nFindings: none"},
+                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- ai-pipeline-review -->\nFindings: none"},
             ])):
                 with mock.patch("tick.pipeline.REVIEW_MARKER", "<!-- ai-pipeline-review -->"):
                     with mock.patch("tick.pipeline.atomic_write"):
@@ -18505,7 +18511,7 @@ def test_dispatch_one_fixer_escalates_when_engine_resolve_fails(
                         "tick.gh_json",
                         side_effect=fixer_gh_json(
                             comments=[
-                                {"body": "<!-- pr-pipeline:review -->\nfixes"},
+                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfixes"},
                             ],
                         ),
                     ):
@@ -22759,12 +22765,12 @@ def reviewer_live_identity(base_ref: str, head: str) -> Callable[..., object]:
 
     The live-identity call (``--json baseRefName,headRefOid``) returns a
     dict; every other gh_json call in the harvest is the comments read and
-    returns an empty array.
+    returns a complete empty GraphQL connection.
     """
     def side_effect(*args: str) -> object:
         if "baseRefName,headRefOid" in args:
             return {"baseRefName": base_ref, "headRefOid": head}
-        return []
+        return comment_pages([])
     return side_effect
 
 

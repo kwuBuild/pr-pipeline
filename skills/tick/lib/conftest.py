@@ -856,7 +856,7 @@ def fixer_gh_json(
     import pipeline  # type: ignore[import-untyped]
 
     if comments is None:
-        comments = [{"body": f"{pipeline.REVIEW_MARKER}\nfindings"}]
+        comments = [{"author": {"login": TRUSTED_AUTHOR}, "body": f"{pipeline.REVIEW_MARKER}\nfindings"}]
     repository = {"name": "test-repo", "owner": {"login": TRUSTED_AUTHOR}}
     refs = [
         {"number": issue.get("number", 7), "repository": repository}
@@ -865,12 +865,32 @@ def fixer_gh_json(
     by_number = {str(issue.get("number", 7)): issue for issue in issues}
 
     def side_effect(*args: str, repo: str | None = None) -> object:
-        fields = args[args.index("--json") + 1] if "--json" in args else ""
         if args[0] == "issue":
             assert repo == f"{TRUSTED_AUTHOR}/test-repo"
             return by_number.get(args[2], {})
-        if "comments" in fields:
-            return {"comments": comments}
+        if args[:2] == ("api", "graphql"):
+            return comment_pages(comments)
         return {"body": pr_body, "closingIssuesReferences": refs}
 
     return side_effect
+
+
+def reviewer_gh_json(metadata: object) -> Callable[..., object]:
+    """Return title/body metadata and a complete empty GraphQL comment history."""
+    def read(*args: str) -> object:
+        if args[:2] == ("api", "graphql"):
+            return comment_pages([])
+        return metadata
+    return read
+
+
+def comment_pages(comments: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Complete GraphQL response for dispatch/harvest transport doubles."""
+    nodes = [{"id": str(i + 1), "lastEditedAt": None, "editor": None,
+              "includesCreatedEdit": False, **comment} for i, comment in enumerate(comments)]
+    chunks = [nodes[i:i + 100] for i in range(0, len(nodes), 100)] or [[]]
+    return [{"data": {"repository": {"pullRequest": {"comments": {
+        "totalCount": len(nodes), "nodes": chunk,
+        "pageInfo": {"hasNextPage": i < len(chunks) - 1,
+                     "endCursor": f"cursor-{i}" if chunk else None},
+    }}}}} for i, chunk in enumerate(chunks)]

@@ -11,6 +11,7 @@ from unittest import mock
 import pipeline
 import pytest
 
+from conftest import comment_pages
 from tick import TickOutcome
 
 pytestmark = pytest.mark.real_target
@@ -315,7 +316,7 @@ def test_reviewer_harvest_refuses_worktree_destination_and_retains_custody(repos
               "dispatch_id": "review-44", "pre_label": "ai:implemented"}
     (worktree / "dispatch.json").write_text(json.dumps(marker))
     (worktree / "review.json").write_text("{}")
-    monkeypatch.setattr(tick, "gh_json", lambda *args: [] if "comments" in args else {
+    monkeypatch.setattr(tick, "gh_json", lambda *args: comment_pages([]) if args[:2] == ("api", "graphql") else {
         "baseRefName": "main", "headRefOid": head,
     })
     with mock.patch.object(pipeline, "harvest_review", side_effect=RuntimeError("verdict seam")) as verdict:

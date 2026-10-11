@@ -43,7 +43,13 @@ PIPELINE=$PR_PIPELINE_HOME/skills/tick/lib/pipeline.py
 PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 
 # Decide a finished review's outcome (prints a decision JSON object).
-# --comments accepts the bare array (gh ... -q .comments) or the {"comments": [...]} object.
+# --comments requires complete history with body and author.login for every entry,
+# as a bare array or {"comments": [...]}. Operator comments must also carry explicit
+# lastEditedAt: null, editor: null, includesCreatedEdit: false from GitHub GraphQL.
+# The I/O caller owns completeness/consistency; the tick compares two complete
+# cursor traversals and validates counts and page boundaries. Unknown/edited input
+# fails. See the operator README's comment trust contract for the full policy.
+# --trusted-author is the operator posting identity already validated by the caller.
 # Two-SHA model: --pinned-base is the base tip snapshot from dispatch.json
 # (base_tip_sha) compared against --current-base for drift; --diff-base-sha is the
 # merge-base (dispatch.json base_sha) the reviewer's diff was actually anchored to,
@@ -58,7 +64,7 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 # no-change fixer; omit it for other reviews. Distinct no-change dispatches count
 # as new rounds at the same head, while replaying one dispatch counts once.
 "$PY" "$PIPELINE" harvest-review \
-  --review review.json --comments comments.json \
+  --review review.json --comments comments.json --trusted-author <login> \
   --pinned-base <sha> --current-base <sha> \
   --diff-base-sha <sha> \
   --pinned-head <sha> --current-head <sha> \
@@ -302,10 +308,11 @@ a successful fixer run archives nothing and `cleanup_scratch` deletes the worktr
 holding `result.json`. Omitting the excerpt there would leave the run recorded
 nowhere but a truncated tick-log line — and the recheck comment has to name
 what was fixed, not just that a head moved. The excerpt is neutralised for
-`<!--`, `-->`, ` ``` `, and `</details>` before rendering. The first two matter for
-correctness, not tidiness: `count_review_rounds` matches the raw `REVIEW_MARKER`
-substring in a comment body, so a fixer quoting a reviewer comment back at us would
-otherwise add a phantom round to the iteration cap.
+`<!--`, `-->`, ` ``` `, and `</details>` before rendering. The delimiters protect
+the published report layout. Marker consumers separately
+require operator authorship and an exact first-line header; quoted markers do not
+count as reviews. See [comment trust](../README.md#comment-trust-and-incomplete-history)
+for history validation and replay authority.
 
 ### Attempt-cap escalation comments
 

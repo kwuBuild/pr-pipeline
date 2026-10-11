@@ -1152,6 +1152,111 @@ def _launch_claude_engine(
                     pass
 
 
+_COMMENT_HISTORY_QUERY = """query(
+    $owner: String!, $name: String!, $number: Int!, $endCursor: String
+) {
+    repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+            comments(first: 100, after: $endCursor) {
+                totalCount
+                nodes { id body author { login } lastEditedAt editor { login } includesCreatedEdit }
+                pageInfo { hasNextPage endCursor }
+            }
+        }
+    }
+}"""
+
+
+def _comment_history_snapshot(number: int) -> list[object]:
+    """Read a cursor traversal with consistent counts and unique records.
+
+    GraphQL supplies edit provenance, which REST authorship/timestamps cannot
+    establish. Cardinality checks detect deletion during traversal even if a
+    cursor implementation were to skip a shifted record.
+    """
+    owner, name = TRUSTED_HEAD_REPO.split("/", 1)
+    pages = gh_json(
+        "api", "graphql", "--hostname", "github.com", "--paginate", "--slurp",
+        "-f", f"query={_COMMENT_HISTORY_QUERY}", "-f", f"owner={owner}",
+        "-f", f"name={name}", "-F", f"number={number}",
+    )
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("comment pagination returned no page array")
+    comments: list[object] = []
+    seen: set[str] = set()
+    cursors: set[str] = set()
+    total: int | None = None
+    for index, page in enumerate(pages):
+        try:
+            if page.get("errors"):
+                raise ValueError("comment query returned GraphQL errors")
+            connection = page["data"]["repository"]["pullRequest"]["comments"]
+            nodes = connection["nodes"]
+            count = connection["totalCount"]
+            info = connection["pageInfo"]
+            more, cursor = info["hasNextPage"], info["endCursor"]
+        except (AttributeError, KeyError, TypeError) as exc:
+            raise ValueError("comment pagination returned a malformed page") from exc
+        if not isinstance(nodes, list) or len(nodes) > 100:
+            raise ValueError("comment pagination returned malformed nodes")
+        if type(count) is not int or count < 0 or (total is not None and count != total):
+            raise ValueError("comment count changed during pagination or is invalid")
+        total = count
+        if type(more) is not bool or more != (index < len(pages) - 1):
+            raise ValueError("comment pagination ended before the final page")
+        if more and len(nodes) != 100:
+            raise ValueError("comment pagination returned an incomplete page")
+        if nodes:
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise ValueError("comment pagination has an invalid or repeated cursor")
+            cursors.add(cursor)
+        elif cursor is not None or len(pages) != 1:
+            raise ValueError("comment pagination returned an unexpected empty page")
+        for entry in nodes:
+            if not isinstance(entry, dict):
+                raise ValueError("comment pagination contains a malformed entry")
+            comment_id = entry.get("id")
+            if not isinstance(comment_id, str) or not comment_id or comment_id in seen:
+                raise ValueError("comment pagination contains an invalid or repeated id")
+            seen.add(comment_id)
+            comments.append(entry)
+    if len(comments) != total:
+        raise ValueError("comment pagination did not return the declared total")
+    return comments
+
+
+def _read_comment_history(
+    number: int, *, phase: str, stage: str, tick_log: TickLog | None,
+    trusted_author: str | None = None,
+) -> list[object] | None:
+    """Require two matching complete traversals before trusting comment history.
+
+    A changing history is retained for a later tick, never retried until it
+    happens to permit progress. This detects observed races; GitHub supplies no
+    atomic snapshot spanning reads and subsequent dispatch/publication.
+    """
+    author = TRUSTED_REVIEW_AUTHOR if trusted_author is None else trusted_author
+    try:
+        comments = _comment_history_snapshot(number)
+        trusted = pipeline.trusted_comment_history(comments, trusted_author=author)
+        confirmed = _comment_history_snapshot(number)
+        pipeline.trusted_comment_history(confirmed, trusted_author=author)
+        if confirmed != comments:
+            raise ValueError("comment history changed between complete reads")
+    except (subprocess.CalledProcessError, ValueError) as exc:
+        reason = f"comment history unavailable or untrusted: {exc} — retained for retry"
+        print(f"tick: PR #{number}: {reason}", file=sys.stderr)
+        if tick_log:
+            tick_log.log(pr=number, phase=phase, stage=stage,
+                         action="comment_history_refused", reason=reason)
+        return None
+    if len(trusted) != len(comments) and tick_log:
+        tick_log.log(pr=number, phase=phase, stage=stage,
+                     action="comment_authors_ignored",
+                     reason=f"ignored {len(comments) - len(trusted)} comments from other authors")
+    return comments
+
+
 # --- gh / git helpers ---
 
 
@@ -6324,18 +6429,15 @@ def _harvest_one_reviewer(
         if not current_base:
             return
 
-    # Fetch PR comments (iteration-count authority)
-    try:
-        comments = gh_json("pr", "view", str(n), "--json", "comments",
-                           "-q", ".comments")
-    except (subprocess.CalledProcessError, ValueError):
-        return
-    if not isinstance(comments, list):
+    # A failed or incomplete history must never reset the spend valve.
+    comments = _read_comment_history(n, phase="harvest", stage="review", tick_log=tick_log)
+    if comments is None:
         return
 
     # Decide outcome
     try:
         harvest_result = pipeline.harvest_review(
+            trusted_author=TRUSTED_REVIEW_AUTHOR,
             review=review_raw,
             comments=json.dumps(comments),
             pinned_base=pinned_base,
@@ -7794,8 +7896,9 @@ def harvest_implementers(
 # Controller-owned receipts proving a harvest comment already landed.
 #
 # The reviewer dedupes against the PR's comment history because its comment
-# doubles as the iteration counter and must be exact; nothing counts fixer or
-# escalation comments, so those need only replay-safety across a harvest's own
+# doubles as the iteration counter and must be exact. Fixer comments also feed
+# authenticated re-review context, but their publication and escalation comments
+# need only local replay-safety across a harvest's own
 # retry window. A local receipt covers that window without adding a `gh` read
 # whose failure would stall the harvest.
 #
@@ -9893,17 +9996,19 @@ def _dispatch_one_reviewer(
     # Pin the published reasoning and its round token from one snapshot. A
     # failed read must not launch a reviewer that never saw why nothing moved.
     fix_round, fixer_summary, original_review = "", "", ""
+    fix_comments = _read_comment_history(
+        pr_number, phase="dispatch", stage="review", tick_log=tick_log,
+        trusted_author=trusted_author,
+    )
+    if fix_comments is None:
+        return
     if pre_label == pipeline.LABEL_REVISED:
-        try:
-            fix_comments = gh_json(
-                "pr", "view", str(pr_number), "--json", "comments", "-q", ".comments",
-            )
-        except (subprocess.CalledProcessError, ValueError):
-            return
-        if not isinstance(fix_comments, list):
-            return
-        fix_round, fixer_summary = pipeline.latest_fixer_context(fix_comments)
-        original_review = pipeline.fixer_original_review(fix_comments, fixer_summary)
+        fix_round, fixer_summary = pipeline.latest_fixer_context(
+            fix_comments, trusted_author=trusted_author,
+        )
+        original_review = pipeline.fixer_original_review(
+            fix_comments, fixer_summary, trusted_author=trusted_author,
+        )
         if fix_round and not original_review:
             if tick_log:
                 tick_log.log(
@@ -11404,6 +11509,25 @@ def _dispatch_one_fixer(
             )
         return
 
+    # Authenticate history before creating scratch or acquiring a launch lease.
+    comments = _read_comment_history(
+        pr_number, phase="dispatch", stage="fix", tick_log=tick_log,
+    )
+    if comments is None:
+        return
+    reviews = pipeline.trusted_marker_comments(
+        comments, pipeline.REVIEW_MARKER, trusted_author=TRUSTED_REVIEW_AUTHOR,
+    )
+    review_body = reviews[-1]["body"] if reviews else ""
+    if not review_body:
+        _escalate_dispatch_setup_failure(
+            entity="pr", number=pr_number,
+            pre_label=pipeline.LABEL_CHANGES_REQUESTED, stage="fix",
+            reason="no trusted pipeline review comment found — nothing to fix",
+            engine=impl_engine, tick_log=tick_log,
+        )
+        return
+
     # Create an isolated git worktree at the remote tip of the PR branch in
     # detached HEAD mode. Detached HEAD avoids the "branch already checked
     # out in another worktree" error that occurs when a stale implementer
@@ -11483,40 +11607,6 @@ def _dispatch_one_fixer(
     # corruption, not a legacy marker, and has to be rejected as a unit.
     if pr_context.body_provenance is not None:
         lease_marker["pr_body"] = pr_context.body_provenance.as_marker_field()
-
-    # Extract the pipeline review comment so the fixer has specific findings.
-    review_body = ""
-    try:
-        comments_data = gh_json("pr", "view", str(pr_number), "--json", "comments")
-    except (subprocess.CalledProcessError, ValueError):
-        comments_data = None
-
-    if isinstance(comments_data, dict):
-        comments_list = comments_data.get("comments")
-        if isinstance(comments_list, list):
-            for comment in reversed(comments_list):
-                if isinstance(comment, dict):
-                    body = comment.get("body")
-                    if isinstance(body, str) and pipeline.REVIEW_MARKER in body:
-                        review_body = body
-                        break
-
-    if not review_body:
-        # Escalate: a fixer dispatched without review findings has nothing to
-        # fix. The helper swallows a failed relabel, so a gh failure cannot
-        # crash the fixer dispatch loop, and the transition is idempotent (the
-        # label edit is a no-op if the item is already escalated).
-        _escalate_dispatch_setup_failure(
-            entity="pr",
-            number=pr_number,
-            pre_label=pipeline.LABEL_CHANGES_REQUESTED,
-            stage="fix",
-            reason="no pipeline review comment found — nothing to fix",
-            engine=impl_engine,
-            tick_log=tick_log,
-            cleanup_dir=wt_dir,
-        )
-        return
 
     # Bind the exact finding set before spawning. Its content fingerprint travels
     # through harvest's comment so re-review cannot substitute a later review.
