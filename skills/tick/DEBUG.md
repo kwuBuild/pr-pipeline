@@ -92,12 +92,13 @@ Debugging notes:
   cycle. It will still be revisited on the normal cadence.
 - A nudge-initiated tick waits out a 10s floor from the end of the previous
   tick unless the scheduled cadence deadline arrives first. That deadline
-  remains the upper bound. The nudged tick advances neither quiescent counter
-  — not the loop's in-memory streak, and not
-  `.tick-state/quiescent-counter.txt`. If a loop stops on quiescence, or a
-  later one-shot tick reports `stop=true`, the documented N heartbeats of quiet
-  (`loop_quiescent_stop_after` × `loop_heartbeat_seconds`; 3 × 1800s shipped)
-  really did elapse.
+  remains the upper bound. The nudged tick does not advance its scope file
+  under `.tick-state/quiescent-counters/`, which supplies the quiet streak for
+  both native and one-shot ticks. A quiescent stop means the configured number
+  of qualifying quiet ticks was counted, including the invocation's first tick
+  and any retained streak. It does not prove that N full intervals elapsed in
+  this process. Terminal targets instead stop immediately; see the authoritative
+  [counter and completion rules](README.md#target-completion-and-cadence).
 - Suspect the watcher is over-nudging? `jq -s '[.[] | select(.action=="tick_complete")]' .claude/worktrees/.tick-log/tick-*.jsonl`
   and check tick spacing; nudged ticks appear as normal ticks closer together
   than the preceding `cadence.next_wake_seconds`.
@@ -170,8 +171,8 @@ Debugging notes:
   commits into a permanently silent stall; the attempt can therefore retry on
   the next scan. The macOS notification itself remains best effort.
 
-  The file is on disk for the same reason `quiescent-counter.txt` is: the two
-  executable loop paths are different process models, and in-process memory
+  The file is on disk for the same reason as the per-scope quiescent counters:
+  the two executable loop paths are different process models, and in-process memory
   cannot dedupe across one-shot ticks. It needs no pruning rules of its own —
   each scan drops entries for dispatches that no longer exist, so it stays
   bounded by in-flight work. Delete it freely: the cost is at most one repeated
@@ -607,8 +608,9 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
 - Tick log directory: `.claude/worktrees/.tick-log`
 - Tick mutex: `.claude/worktrees/.tick.lock`
 - Wake-request file: `.claude/worktrees/.tick-state/wake-request`
-- Quiescent streak: `.claude/worktrees/.tick-state/quiescent-counter.txt`
-  (counts heartbeat intervals, not ticks — see the wake watcher section)
+- Quiescent streak: `.claude/worktrees/.tick-state/quiescent-counters/{queue,issue-N,pr-N}.txt`
+  (counts qualifying quiet observations — see the
+  [counter rules](README.md#target-completion-and-cadence))
 - Wake watcher poll: 5s; nudge debounce floor: 10s, capped by the scheduled
   cadence deadline (`--loop` only)
 - Engine progress heartbeat: `<worktree>/heartbeat` (mtime only), written at

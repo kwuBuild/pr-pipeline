@@ -168,9 +168,11 @@ UNCONFIGURED_TARGET_EXIT_CODE = 6
 # its startup gate validated (ResolvedConfig) and passes them to every
 # consumer; these names serve direct callers and tests.
 REVIEW_TIMEOUT = pipeline.REVIEW_TIMEOUT_SECONDS
-# Quiescence counter tracks consecutive quiescent heartbeats across ticks.
-# Written to a file under WT_ROOT so it survives worktree cleanup.
-_QUIESCENT_COUNTER_FILE = os.path.join(WT_ROOT, ".tick-state", "quiescent-counter.txt")
+# Per-scope quiescent streaks survive worktree cleanup. The old shared
+# quiescent-counter.txt has no known scope, so it is deliberately not migrated.
+_QUIESCENT_COUNTER_FILE = os.path.join(
+    WT_ROOT, ".tick-state", "quiescent-counters", "queue.txt",
+)
 # Edge-triggered wake channel for in-process --loop mode. The watcher scan and
 # the wake-request file are advisory nudges only: they end the inter-tick sleep
 # early, and the tick that follows re-reads full state as always.
@@ -347,6 +349,18 @@ _RESET_HINT_RE = re.compile(
 _RAW_DEEPSEEK_TOKEN_RE = re.compile(r"sk-[A-Za-z0-9_-]{16,}")
 
 
+class TickOutcome(NamedTuple):
+    """Exit status and the exact cadence already reported by one tick.
+
+    Startup refusal and crashes have no cadence. A completed body supplies
+    its validated decision even on a recoverable failure (which stays warm).
+    """
+
+    exit_code: int
+    cadence: pipeline.CadenceDecision | None = None
+    held_items: tuple[str, ...] = ()
+
+
 class LoopState(TypedDict):
     """Observed work state that drives loop cadence."""
 
@@ -356,6 +370,7 @@ class LoopState(TypedDict):
     at_cap: bool
     quiescent: bool
     held_items: tuple[str, ...]
+    target_state: pipeline.TargetCadenceState | None
 
 
 class StageTargets(TypedDict):
@@ -11660,7 +11675,7 @@ def main(
         return _run_single_tick_locked(
             parsed_target, impl_engine, model, review_model, review_effort,
             permission_mode, fix_engine=fix_engine, fix_model=fix_model,
-        )
+        ).exit_code
     finally:
         tick_lock.release()
 
@@ -11710,8 +11725,8 @@ def _run_single_tick_locked(
     fix_model: str = "",
     count_quiescent_heartbeat: bool = True,
     unattended: bool = False,
-    resolved_config: list[pipeline.ResolvedConfig] | None = None,
-) -> int:
+    quiescent_stop_after: int | None = None,
+) -> TickOutcome:
     """Run one tick while the caller owns the tick mutex.
 
     Every engine-route and permission argument is the typed CLI flag, and
@@ -11734,12 +11749,11 @@ def _run_single_tick_locked(
             the in-process loop passes ``False``, for a nudge-initiated tick.
         unattended: True under the in-process loop, where nobody can answer a
             setup prompt; an unconfigured target is logged as skipped.
-        resolved_config: When given, receives the configuration this tick
-            runs on once every startup gate has passed. The in-process loop
-            paces from it, so its cadence and the tick agree.
+        quiescent_stop_after: Optional test override, applied to the same
+            cadence decision the tick reports and the native loop consumes.
 
     Returns:
-        Process exit code (0 through 4, or 6 — same semantics as ``main()``).
+        Exit status and the cadence reported by the completed tick, if any.
     """
     global TRUSTED_HEAD_REPO, TARGET_REMOTE, TRUSTED_REVIEW_AUTHOR
 
@@ -11789,7 +11803,7 @@ def _run_single_tick_locked(
         tick_state = pipeline.derive_tick_state(status="FAILED")
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
-        return 3
+        return TickOutcome(3)
     TRUSTED_HEAD_REPO = resolved_target.repo
     TARGET_REMOTE = resolved_target.remote
     typed_flags = {
@@ -11831,7 +11845,7 @@ def _run_single_tick_locked(
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return 3
+        return TickOutcome(3)
     # From here on the resolved values are the ones the engines run under: the
     # flag if one was typed, else the operator's configured value. Every
     # tuning value is read from this one validated configuration, never
@@ -11863,7 +11877,7 @@ def _run_single_tick_locked(
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return 3
+        return TickOutcome(3)
 
     # A target with no section of its own was never set up: nobody proposed its
     # verification grants or probed its engine route, and [defaults] answering
@@ -11895,7 +11909,7 @@ def _run_single_tick_locked(
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return UNCONFIGURED_TARGET_EXIT_CODE
+        return TickOutcome(UNCONFIGURED_TARGET_EXIT_CODE)
 
     # Fail fast when a required binary is missing.
     missing = [name for name in ("gh", "git", "codex")
@@ -11913,7 +11927,7 @@ def _run_single_tick_locked(
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return 3
+        return TickOutcome(3)
 
     # Harvest can relabel too. Verify before either phase, on every loop tick,
     # without creating or modifying any repository labels here.
@@ -11929,13 +11943,11 @@ def _run_single_tick_locked(
         _log_tick_summary(tick_log, reconcile_ok=False, tick_state=tick_state)
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return 3
+        return TickOutcome(3)
 
     _report_unprobed_route(config, tick_log)
 
     TRUSTED_REVIEW_AUTHOR = trusted_author
-    if resolved_config is not None:
-        resolved_config.append(config)
     try:
         return _run_tick_body(
             tick_log, parsed_target, config.impl_engine, config.model,
@@ -11943,6 +11955,7 @@ def _run_single_tick_locked(
             trusted_author=trusted_author,
             count_quiescent_heartbeat=count_quiescent_heartbeat,
             config=config,
+            quiescent_stop_after=quiescent_stop_after,
         )
     except Exception:
         exc_value = sys.exc_info()[1]
@@ -11974,7 +11987,7 @@ def _run_single_tick_locked(
             pass
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
-        return TICK_CRASH_EXIT_CODE
+        return TickOutcome(TICK_CRASH_EXIT_CODE)
 
 
 def _report_unprobed_route(
@@ -12107,55 +12120,76 @@ def _compute_nearest_deadline_s() -> float | None:
     return None if nearest is None else nearest - time.time()
 
 
-def _read_quiescent_counter() -> int:
+def _quiescent_counter_path(target: tuple[str, int] | None) -> str:
+    """Return the queue counter or the parsed target's private counter."""
+    if target is None:
+        return _QUIESCENT_COUNTER_FILE
+    entity, number = target
+    return os.path.join(
+        os.path.dirname(_QUIESCENT_COUNTER_FILE), f"{entity}-{number}.txt",
+    )
+
+
+def _read_quiescent_counter(target: tuple[str, int] | None = None) -> int:
     """Read the consecutive quiescent ticks counter from disk.
 
     Returns 0 when the counter file does not exist or is unparseable.
     """
     try:
-        with open(_QUIESCENT_COUNTER_FILE) as fh:
-            return int(fh.read().strip())
+        with open(_quiescent_counter_path(target)) as fh:
+            return max(0, int(fh.read().strip()))
     except (OSError, ValueError):
         return 0
 
 
-def _write_quiescent_counter(value: int) -> None:
+def _write_quiescent_counter(
+    value: int, target: tuple[str, int] | None = None,
+) -> None:
     """Atomically write the consecutive quiescent ticks counter to disk."""
-    os.makedirs(os.path.dirname(_QUIESCENT_COUNTER_FILE), exist_ok=True)
-    pipeline.atomic_write(_QUIESCENT_COUNTER_FILE, str(value))
+    path = _quiescent_counter_path(target)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pipeline.atomic_write(path, str(value))
 
 
-def _advance_quiescent_counter(*, is_quiescent: bool, count_heartbeat: bool) -> int:
+def _advance_quiescent_counter(
+    *, is_quiescent: bool, count_heartbeat: bool,
+    target: tuple[str, int] | None = None,
+) -> int:
     """Update the persisted quiescent streak and return prior heartbeats.
 
-    The counter measures *heartbeat intervals of quiet*, not ticks. One-shot
-    ticks are only ever scheduled a heartbeat apart, so they always count. The
-    in-process loop can additionally run nudge-initiated ticks that follow no
-    interval at all; those must hold the counter steady, or the persisted value
-    would reach the stop threshold in seconds and the next one-shot tick — and
-    the harness ``/loop`` path reading its ``tick-cadence:`` line — would stop
-    with no quiet elapsed.
+    The counter counts qualifying quiet observations, including the first
+    tick of an invocation and every one-shot tick. Later native-loop ticks
+    count only after a full scheduled wait. Nudge-initiated ticks hold the
+    streak steady so that nudges cannot accelerate the stop. The counter does
+    not prove elapsed time, and both modes reuse the scope's retained streak.
 
     Args:
+        target: Parsed CLI target, or ``None`` for the queue. Only this scope
+            is read and reset.
         is_quiescent: Whether this tick observed a quiescent pipeline. A
             non-quiescent tick resets the streak whatever woke it.
-        count_heartbeat: Whether this tick followed a full scheduled interval.
+        count_heartbeat: True for the invocation's first tick, one-shot ticks,
+            or a native-loop tick after a full scheduled wait.
 
     Returns:
-        The number of *prior* consecutive quiescent heartbeats, which is what
-        :func:`pipeline.compute_next_wake` expects.
+        The number of qualifying quiet observations before this tick. Pass
+        ``count_heartbeat`` with it to :func:`pipeline.compute_next_wake` so a
+        nudge does not invent a counted observation when the streak is zero.
     """
-    counter = _read_quiescent_counter()
+    counter = _read_quiescent_counter(target)
+    prior = counter if is_quiescent else 0
     if not is_quiescent:
         counter = 0
     elif count_heartbeat:
         counter += 1
-    _write_quiescent_counter(counter)
-    return max(0, counter - 1) if is_quiescent else 0
+    _write_quiescent_counter(counter, target)
+    return prior
 
 
 def _compute_post_dispatch_state(
     target: tuple[str, int] | None = None,
+    *,
+    target_state: pipeline.TargetCadenceState | None = None,
 ) -> tuple[int | None, bool | None, tuple[str, ...]]:
     """Compute in-flight count and queue state after dispatch.
 
@@ -12169,6 +12203,8 @@ def _compute_post_dispatch_state(
             When set, the queue probe is restricted to that target's scope so
             the emitted tick-state line describes the same work the tick was
             allowed to dispatch.
+        target_state: Reuse the tick's target observation for both the queue
+            and terminal decision. Direct callers can omit it.
 
     Returns:
         ``(supervisable_in_flight, has_actionable_queue, held_items)`` —
@@ -12186,7 +12222,8 @@ def _compute_post_dispatch_state(
         held_items = ()
 
     if target is not None:
-        return in_flight_count, _target_actionable_state(target), held_items
+        state = target_state or _observe_target_state(target)
+        return in_flight_count, state.actionable, held_items
 
     has_queue: bool | None = False
     any_failed = False
@@ -12217,7 +12254,7 @@ def _run_loop_locked(
     fix_model: str = "",
     quiescent_stop_after: int | None = None,
 ) -> int:
-    """Run ticks in-process until interrupted or quiescent stop fires.
+    """Run until interrupted, the target is terminal, or the queue is quiescent.
 
     The flags are forwarded unresolved (empty means none was typed): each
     tick resolves the operator's config for itself, so a config edit mid-loop
@@ -12241,11 +12278,8 @@ def _run_loop_locked(
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    consecutive_quiescent = 0
-    # The loop's own start counts as following a heartbeat; after that only a
-    # wait that ran its full scheduled interval does. Both the in-memory
-    # counter below and the tick's persisted counter are gated on this, so
-    # they cannot drift apart under nudge traffic.
+    # After startup, only full scheduled waits advance the quiet streak.
+    # There is no second in-memory streak or post-summary state observation.
     after_heartbeat = True
     last_rc = 0
     watcher = _start_wake_watcher(stop_event, wake_event)
@@ -12255,15 +12289,15 @@ def _run_loop_locked(
             # Clear before the tick so a nudge arriving during it is preserved
             # for the next wait instead of being consumed by this iteration.
             wake_event.clear()
-            tick_config: list[pipeline.ResolvedConfig] = []
-            last_rc = _run_single_tick_locked(
+            outcome = _run_single_tick_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
                 fix_engine=fix_engine, fix_model=fix_model,
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
-                resolved_config=tick_config,
+                quiescent_stop_after=quiescent_stop_after,
             )
+            last_rc = outcome.exit_code
             if last_rc in (
                 3, TICK_CRASH_EXIT_CODE, UNCONFIGURED_TARGET_EXIT_CODE,
             ):
@@ -12273,54 +12307,27 @@ def _run_loop_locked(
                 # retried crash would hide behind a background task that is
                 # only reported when it exits.
                 return last_rc
-            # Every return that reaches here passed the startup gate, which
-            # recorded the cap the tick admitted against; cadence judges
-            # capacity against that same value. The default answers only a
-            # caller that replaces the tick and records nothing.
-            state = _observe_loop_state(
-                parsed_target,
-                max_in_flight=(
-                    tick_config[-1].max_in_flight if tick_config
-                    else pipeline.DEFAULT_MAX_IN_FLIGHT
-                ),
-            )
-            if not state["quiescent"]:
-                consecutive_quiescent = 0
-            # Every return that reaches here passed the startup gate, which
-            # recorded the configuration the tick ran on. Only a stand-in for
-            # the tick records nothing, and gets the shipped cadence.
-            cadence: pipeline.CadenceSettings = (
-                tick_config[-1].cadence() if tick_config else {}
-            )
-            if quiescent_stop_after is not None:
-                cadence["quiescent_stop_after"] = quiescent_stop_after
-            sleep_seconds, stop = pipeline.decide_loop_cadence(
-                in_flight_count=state["in_flight_count"],
-                nearest_engine_deadline=state["nearest_engine_deadline"],
-                actionable_queue=state["actionable_queue"],
-                at_cap=state["at_cap"],
-                quiescent=state["quiescent"],
-                consecutive_quiescent=(
-                    consecutive_quiescent + 1 if state["quiescent"] else 0
-                ),
-                held_items=state.get("held_items", ()),
-                **cadence,
-            )
-            if stop:
-                _notify_loop_quiescent_stop(state.get("held_items", ()))
+            # The tick owns both observation and cadence. Re-reading here
+            # could contradict the stop/retry decision already emitted.
+            decision = outcome.cadence
+            if decision is None:
+                # A tick without a complete summary cannot authorize a wait
+                # or a successful stop. Startup/crash gates above return first.
+                return last_rc or TICK_CRASH_EXIT_CODE
+            if decision.stop:
+                if parsed_target is not None:
+                    _notify_loop_target_stop(decision.reason)
+                else:
+                    _notify_loop_quiescent_stop(outcome.held_items)
                 return last_rc
             stopped, timer_expired = _wait_next_tick(
-                sleep_seconds, stop_event, wake_event,
+                decision.next_wake_seconds, stop_event, wake_event,
             )
             if stopped:
                 return last_rc
-            # The quiescent-stop contract counts heartbeat intervals, not
-            # ticks: only a wait that ran its full scheduled interval proves
-            # the pipeline stayed quiet that long. A nudge-initiated tick
-            # must not accelerate the stop.
+            # After the first tick, only a full scheduled wait qualifies
+            # the next quiet observation. Nudges must not advance the streak.
             after_heartbeat = timer_expired
-            if timer_expired and state["quiescent"]:
-                consecutive_quiescent += 1
     finally:
         signal.signal(signal.SIGINT, old_sigint)
         signal.signal(signal.SIGTERM, old_sigterm)
@@ -13041,19 +13048,22 @@ def _observe_loop_state(
     *,
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
 ) -> LoopState:
-    """Read current pipeline state for loop cadence decisions.
+    """Read pipeline state for direct callers of ``decide_loop_cadence``.
+
+    Native loops consume ``TickOutcome.cadence`` instead of this extra read.
 
     Args:
         target: The loop's parsed CLI target, or ``None`` for a full scan.
             When set, the actionable-queue probe is restricted to that
-            target's own work so a targeted loop reaches quiescence once its
-            item is done, instead of spinning on the global queue.
-        max_in_flight: The admission cap the preceding tick admitted against.
-            The loop always passes it; the default serves direct callers.
+            target's own work. Terminal target state is recorded separately
+            from global occupancy so unrelated engines cannot postpone its stop.
+        max_in_flight: The admission cap to use for this observation.
 
     Returns:
         The observed loop state consumed by ``decide_loop_cadence``.
     """
+    target_state = _observe_target_state(target) if target is not None else None
+    reads_ok = True
     try:
         # Not occupancy — that is the marker scan below, and this read's value
         # is deliberately unused. It stays as a health probe on a surface the
@@ -13065,7 +13075,7 @@ def _observe_loop_state(
         # exact about, because it is narrower than it looks: both queue probes
         # already fail warm on their own errors — `_has_actionable_queue`
         # returns True from its own except clause, and
-        # `_target_has_actionable_queue` collapses an unreadable scope to True
+        # the target observation collapses an unreadable scope to True
         # via `is not False` — so neither can reach a quiescence claim on a
         # read it failed. What this adds is the refusal to claim quiescence
         # while *any* authoritative read is failing, not only the two that
@@ -13073,10 +13083,11 @@ def _observe_loop_state(
         read_authoritative_in_flight_labels()
     except (subprocess.CalledProcessError, ValueError):
         actionable_queue = True
+        reads_ok = False
     else:
         actionable_queue = (
             _has_actionable_queue() if target is None
-            else _target_has_actionable_queue(target)
+            else target_state.actionable is not False
         )
     # This scan is the same one can_dispatch_now performs, so cadence derives
     # its own occupancy rather than paying for a second identity-verified pass:
@@ -13101,7 +13112,12 @@ def _observe_loop_state(
         in_flight_count = max_in_flight
         held_items = ()
         actionable_queue = True
+        reads_ok = False
 
+    if target is not None and not reads_ok:
+        target_state = pipeline.TargetCadenceState(
+            None, False, f"target {target[0]} #{target[1]}: control-plane state unknown",
+        )
     at_cap = in_flight_count >= max_in_flight
     return {
         "in_flight_count": in_flight_count,
@@ -13110,6 +13126,7 @@ def _observe_loop_state(
         "at_cap": at_cap,
         "quiescent": in_flight_count == 0 and not actionable_queue and not at_cap,
         "held_items": held_items,
+        "target_state": target_state,
     }
 
 
@@ -13185,7 +13202,7 @@ def _target_has_actionable_queue(target: tuple[str, int]) -> bool:
     """Return whether a targeted loop's own scope still has dispatchable work.
 
     A targeted loop only ever dispatches against the items ``target`` resolves
-    to, so its quiescence must be computed from those items alone. The scope is
+    to, so its actionable queue covers those items alone. The scope is
     resolved through the same ``_resolve_stage_targets`` dispatch uses, so an
     issue target whose closing PR is still in review keeps the loop awake.
 
@@ -13200,80 +13217,75 @@ def _target_has_actionable_queue(target: tuple[str, int]) -> bool:
 
 
 def _target_actionable_state(target: tuple[str, int]) -> bool | None:
-    """Return the tri-state actionable-queue reading for a targeted scope.
+    """Return the target's tri-state dispatch eligibility."""
+    return _observe_target_state(target).actionable
 
-    The scope is resolved through the same ``_resolve_stage_targets`` dispatch
-    uses, so an issue target whose closing PR is still in review reads as
-    actionable.
 
-    Args:
-        target: The tick's or loop's parsed CLI target.
+def _observe_target_state(target: tuple[str, int]) -> pipeline.TargetCadenceState:
+    """Read every resolved stage scope before claiming target completion.
 
-    Returns:
-        ``True`` when any item in the target's scope is dispatchable, ``False``
-        when every item in scope is proven non-dispatchable, and ``None`` when
-        the scope or an item's state could not be read.
+    An open issue with no workflow label has handed implementation to its
+    open closing PR. Its remaining active scope is that PR. Any remaining
+    issue workflow label still participates, including blocked/in-flight work.
+    Unknown or ambiguous reads never prove completion.
     """
+    name = f"target {target[0]} #{target[1]}"
     try:
-        stage_targets = _resolve_stage_targets(target)
+        stages = _resolve_stage_targets(target)
+        scope = sorted({scoped for scoped in stages.values() if scoped is not None})
+        if not scope:
+            raise ValueError("empty target scope")
+        observations = []
+        observed_states = {}
+        # Observe the selected PR before deciding whether an open issue may
+        # hand off to it. Resolution's earlier OPEN read is not sufficient.
+        for entity, number in sorted(scope, key=lambda scoped: scoped[0] == "issue"):
+            payload = gh_json(
+                entity, "view", str(number),
+                "--json", "labels,state,author" if entity == "issue" else "labels,state",
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("invalid target payload")
+            state = payload.get("state")
+            if state not in ("OPEN", "CLOSED", "MERGED"):
+                raise ValueError("invalid target state")
+            observed_states[(entity, number)] = state
+            if state != "OPEN":
+                observations.append((False, True, f"{entity} #{number} {state}"))
+                continue
+            labels = _pipeline_labels(payload)
+            if labels is None:
+                raise ValueError("invalid target labels")
+            label_text = ", ".join(sorted(labels)) or "no ai: label"
+            detail = f"{entity} #{number} {label_text}"
+            if entity == "issue" and not labels and stages["reviewer"] != target:
+                if observed_states.get(stages["reviewer"]) != "OPEN":
+                    raise ValueError("closing PR changed state during target observation")
+                observations.append((False, True, f"{detail} (handed off to closing PR)"))
+                continue
+            # A human-decision hold already outranks other workflow labels,
+            # including a live engine's label. Other mixed states are unfinished.
+            terminal = pipeline.LABEL_NEEDS_HUMAN in labels or (
+                len(labels) == 1 and labels[0] in {
+                    pipeline.LABEL_READY_FOR_HUMAN, pipeline.LABEL_MAX_ITERATIONS,
+                }
+            )
+            actionable = bool(
+                pipeline.resolve_pickup_eligibility(labels, entity=entity).label,
+            )
+            if entity == "issue" and not terminal:
+                trusted = _issue_author_trust(payload)
+                if trusted is None:
+                    raise ValueError("unknown issue author")
+                actionable = actionable and trusted
+            observations.append((actionable, terminal, detail))
     except (subprocess.CalledProcessError, ValueError):
-        return None
-    scope = {
-        stage_targets["implementer"],
-        stage_targets["reviewer"],
-        stage_targets["fixer"],
-    }
-    try:
-        for scoped in sorted(item for item in scope if item is not None):
-            if _target_item_is_dispatchable(*scoped):
-                return True
-    except (subprocess.CalledProcessError, ValueError):
-        return None
-    return False
-
-
-def _target_item_is_dispatchable(entity: str, number: int) -> bool:
-    """Return whether one targeted issue or PR is currently dispatchable.
-
-    Mirrors dispatch pickup exactly, through the same
-    :func:`pipeline.resolve_pickup_eligibility` the dispatch gate calls: the
-    item must be open and its label set must resolve to a single pickup label
-    for its entity type, with no human hold and no in-flight label. No stage
-    is supplied — a targeted loop stays awake for work any stage can take.
-
-    Args:
-        entity: ``"issue"`` or ``"pr"``.
-        number: The issue or PR number.
-
-    Returns:
-        ``True`` when the item is dispatchable, or when its payload is
-        unreadable (unknown state stays warm).
-
-    Raises:
-        subprocess.CalledProcessError: When the ``gh`` read fails.
-        ValueError: When ``gh`` returns malformed JSON.
-    """
-    payload = gh_json(
-        entity, "view", str(number),
-        "--json", "labels,state,author" if entity == "issue" else "labels,state",
+        return pipeline.TargetCadenceState(None, False, f"{name}: state unknown")
+    return pipeline.TargetCadenceState(
+        any(row[0] for row in observations),
+        all(row[1] for row in observations),
+        f"{name}: " + "; ".join(row[2] for row in observations),
     )
-    if not isinstance(payload, dict):
-        return True
-    state = payload.get("state")
-    if not isinstance(state, str) or state not in {"OPEN", "CLOSED", "MERGED"}:
-        return True
-    if state != "OPEN":
-        # A merged or closed item is invisible to dispatch's open-state scans,
-        # so a stale pre-label on it can never become work.
-        return False
-    if entity == "issue":
-        trusted = _issue_author_trust(payload)
-        if trusted is not True:
-            return trusted is None
-    labels = _pipeline_labels(payload)
-    if labels is None:
-        return True
-    return bool(pipeline.resolve_pickup_eligibility(labels, entity=entity).label)
 
 
 def _issue_author_trust(metadata: object) -> bool | None:
@@ -13376,6 +13388,21 @@ def _wait_next_tick(
     return False, timer_expired
 
 
+def _notify_loop_target_stop(reason: str) -> None:
+    """Report the terminal target reason without claiming queue quiescence."""
+    print(f"tick: {reason}", file=sys.stderr)
+    try:
+        os.makedirs(TICK_LOG_DIR, exist_ok=True)
+        tick_log = TickLog.open(TICK_LOG_DIR)
+    except (OSError, FileExistsError):
+        tick_log = None
+    if tick_log is not None:
+        tick_log.log(
+            pr=None, phase="loop", stage="", action="loop_target_stop", reason=reason,
+        )
+    _emit_operator_notification(title="PR pipeline target stopped", message=reason)
+
+
 def _notify_loop_quiescent_stop(held_items: Sequence[str] = ()) -> None:
     """Notify the operator that loop mode stopped after quiescence."""
     reason = "PR pipeline loop stopped after consecutive quiescent heartbeats"
@@ -13441,7 +13468,8 @@ def _run_tick_body(
     *,
     count_quiescent_heartbeat: bool = True,
     config: pipeline.ResolvedConfig | None = None,
-) -> int:
+    quiescent_stop_after: int | None = None,
+) -> TickOutcome:
     """Run the HARVEST → DISPATCH → Summary body of a tick.
 
     Extracted from ``main()`` so the try/except wrapper in ``main()``
@@ -13464,13 +13492,14 @@ def _run_tick_body(
             in-process loop passes ``False``, for a nudge-initiated tick that
             followed no scheduled interval. See
             :func:`_advance_quiescent_counter`.
+        quiescent_stop_after: Optional test override shared with the loop.
         config: The configuration the startup gate validated. Every stage
             reads its deadlines, stall limits, round limit, cooldowns, fixer
             route and cadence from it. ``None`` — direct callers only — runs
             the shipped defaults with the fixer on the implementer's route.
 
     Returns:
-        Process exit code (0, 1, or 2 — same semantics as ``main()``).
+        Exit status and the exact cadence supplied to both summary outputs.
     """
     tuning = config if config is not None else _SHIPPED_CONFIG
     fix_engine, fix_model = (
@@ -13478,6 +13507,8 @@ def _run_tick_body(
         else (impl_engine, model)
     )
     cadence = tuning.cadence()
+    if quiescent_stop_after is not None:
+        cadence["quiescent_stop_after"] = quiescent_stop_after
     max_in_flight = tuning.max_in_flight
     try:
         stage_targets = _resolve_stage_targets(parsed_target)
@@ -13490,7 +13521,15 @@ def _run_tick_body(
                 action="target_resolution_failed",
                 reason=str(exc),
             )
-        return 1
+        _write_quiescent_counter(0, parsed_target)
+        tick_state = pipeline.derive_tick_state(status="FAILED")
+        decision = pipeline.compute_next_wake(
+            in_flight_count=None, has_actionable_queue=None, at_capacity=None,
+            **cadence,
+        )
+        _log_tick_summary(tick_log, False, tick_state=tick_state, cadence=decision)
+        _print_summary(tick_log, False, tick_state=tick_state, cadence=decision)
+        return TickOutcome(1, decision)
 
     # Also reap on timed ticks if the advisory watcher could not start or died.
     _reap_engine_children()
@@ -13621,14 +13660,14 @@ def _run_tick_body(
             at_capacity=None,
             **cadence,
         )
-        _write_quiescent_counter(0)
+        _write_quiescent_counter(0, parsed_target)
         _log_tick_summary(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
         _print_summary(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
-        return 1
+        return TickOutcome(1, decision)
 
     authoritative_in_flight: list[pipeline.InFlightRef] | None = None
     try:
@@ -13686,7 +13725,7 @@ def _run_tick_body(
             at_capacity=None,
             **cadence,
         )
-        _write_quiescent_counter(0)
+        _write_quiescent_counter(0, parsed_target)
         _log_tick_summary(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
@@ -13694,11 +13733,14 @@ def _run_tick_body(
             tick_log, reconcile_ok, dispatch_skipped=True,
             tick_state=tick_state, cadence=decision,
         )
-        return 2
+        return TickOutcome(2, decision)
 
     # Phase 3: Summary — compute post-dispatch state for the tick-state line.
+    target_state = (
+        _observe_target_state(parsed_target) if parsed_target is not None else None
+    )
     in_flight_count, has_queue, held_items = _compute_post_dispatch_state(
-        parsed_target,
+        parsed_target, target_state=target_state,
     )
     tick_state = pipeline.derive_tick_state(
         status="ok",
@@ -13713,6 +13755,7 @@ def _run_tick_body(
     prior_quiescent = _advance_quiescent_counter(
         is_quiescent=is_quiescent,
         count_heartbeat=count_quiescent_heartbeat,
+        target=parsed_target,
     )
     decision = pipeline.compute_next_wake(
         in_flight_count=in_flight_count,
@@ -13723,7 +13766,9 @@ def _run_tick_body(
         ),
         is_quiescent=is_quiescent,
         consecutive_quiescent_ticks=prior_quiescent,
+        count_quiescent_heartbeat=count_quiescent_heartbeat,
         held_items=held_items,
+        target_state=target_state,
         **cadence,
     )
 
@@ -13734,7 +13779,7 @@ def _run_tick_body(
         tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
     )
 
-    return 0
+    return TickOutcome(0, decision, held_items)
 
 
 def _log_tick_summary(

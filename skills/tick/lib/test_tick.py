@@ -25,6 +25,8 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from tick import TickOutcome
+
 from conftest import (  # type: ignore[import-untyped]
     FIXER_HARVEST_HEAD,
     TRUSTED_AUTHOR,
@@ -207,19 +209,9 @@ def test_run_loop_locked_stops_on_quiescent_limit_without_sleep(
     monkeypatch.setattr(
         tick,
         "_run_single_tick_locked",
-        lambda *_args, **_kwargs: tick_calls.append("tick") or 0,
-    )
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-            "held_items": ("pr #42 ai:reviewing (ai:needs-human-decision)",),
-        },
+        lambda *_args, **_kwargs: tick_calls.append("tick") or quiet_tick(
+            held_items=("pr #42 ai:reviewing (ai:needs-human-decision)",), **_kwargs,
+        ),
     )
     monkeypatch.setattr(
         tick,
@@ -275,7 +267,7 @@ def test_advance_quiescent_counter_holds_steady_for_a_nudged_tick(
 
     The persisted counter is what the one-shot ``tick-cadence:`` line and the
     harness ``/loop`` path read, so it has to measure the same thing the
-    in-process loop measures: elapsed heartbeat intervals, not ticks.
+    in-process loop measures: qualifying quiet observations. Nudges do not count.
     """
     import tick  # type: ignore[import-untyped]
 
@@ -287,7 +279,7 @@ def test_advance_quiescent_counter_holds_steady_for_a_nudged_tick(
             is_quiescent=True, count_heartbeat=False,
         )
 
-    assert prior == 0
+    assert prior == 1
     assert counter.read_text() == "1"
 
 
@@ -369,7 +361,7 @@ def test_run_tick_body_does_not_advance_counter_for_nudged_quiescent_tick(
                                                 rc = _run_tick_body(
                                                     tick_log, None, "claude", "",
                                                     count_quiescent_heartbeat=False,
-                                                )
+                                                ).exit_code
 
     assert rc == 0
     assert counter.read_text() == "1", (
@@ -385,10 +377,8 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
 ) -> None:
     """The loop tells each tick whether it follows a full heartbeat interval.
 
-    Without this the persisted counter counts ticks while the loop's own
-    counter counts heartbeats: three nudged ticks would leave the file at the
-    stop threshold, making the next one-shot tick (and the harness ``/loop``
-    path that consumes its ``tick-cadence:`` line) stop with no quiet elapsed.
+    Without this, nudges advance the shared persisted counter and make both
+    native mode and one-shot wrappers stop before the scheduled waits finish.
     """
     import tick  # type: ignore[import-untyped]
 
@@ -397,23 +387,12 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
     def fake_tick(
         *_args: object, count_quiescent_heartbeat: bool = True,
         unattended: bool = False, **_flags: object,
-    ) -> int:
+    ) -> TickOutcome:
         assert unattended
         heartbeat_flags.append(count_quiescent_heartbeat)
-        return 0
+        return quiet_tick(count_quiescent_heartbeat=count_quiescent_heartbeat, **_flags)
 
     monkeypatch.setattr(tick, "_run_single_tick_locked", fake_tick)
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-        },
-    )
     # Startup tick, then a nudge wake, then a timer wake, then stop.
     waits = iter([(False, False), (False, True), (True, False)])
     monkeypatch.setattr(
@@ -436,8 +415,8 @@ def test_run_loop_locked_nudge_wakes_do_not_advance_quiescent_stop(
 ) -> None:
     """Only full-interval timer wakes count toward the quiescent-stop limit.
 
-    The documented contract is "stop after N consecutive quiescent
-    heartbeats" — roughly N heartbeat intervals of quiet. Nudge-initiated
+    The documented contract counts qualifying quiet observations, including
+    the invocation's first tick. Nudge-initiated
     ticks that observe quiescence must leave the counter unchanged, or a
     spurious nudge burst would stop the loop in seconds instead.
     """
@@ -447,18 +426,7 @@ def test_run_loop_locked_nudge_wakes_do_not_advance_quiescent_stop(
     monkeypatch.setattr(
         tick,
         "_run_single_tick_locked",
-        lambda *_args, **_kwargs: tick_calls.append("tick") or 0,
-    )
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-        },
+        lambda *_args, **_kwargs: tick_calls.append("tick") or quiet_tick(**_kwargs),
     )
     # Two nudge wakes between the first and last tick, then a timer wake.
     waits = iter([(False, False), (False, False), (False, True)])
@@ -483,6 +451,41 @@ def test_run_loop_locked_nudge_wakes_do_not_advance_quiescent_stop(
     notify_stop.assert_called_once()
 
 
+def test_run_loop_locked_one_heartbeat_limit_waits_for_counted_quiet_tick(monkeypatch):
+    import tick
+
+    flags = []
+    decisions = []
+    counts = []
+
+    def run_tick(*_args, count_quiescent_heartbeat, **_kwargs):
+        flags.append(count_quiescent_heartbeat)
+        state = (1, False, ()) if len(flags) == 1 else (0, False, ())
+        with tick_stage_mocks(Path(tick.TICK_LOG_DIR).parent), mock.patch.object(
+            tick, "_compute_post_dispatch_state", return_value=state,
+        ):
+            outcome = tick._run_tick_body(
+                None, None, "claude", quiescent_stop_after=1,
+                count_quiescent_heartbeat=count_quiescent_heartbeat,
+            )
+        decisions.append(outcome.cadence)
+        counts.append(tick._read_quiescent_counter())
+        return outcome
+
+    waits = iter([(False, False), (False, False), (False, True)])
+    monkeypatch.setattr(tick, "_run_single_tick_locked", run_tick)
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_: None)
+    monkeypatch.setattr(tick, "_wait_next_tick", lambda *_: next(waits))
+    with mock.patch.object(tick, "_notify_loop_quiescent_stop") as notify:
+        assert tick._run_loop_locked(None, "claude", "") == 0
+    assert flags == [True, False, False, True]
+    assert counts == [0, 0, 0, 1]
+    assert [decision.stop for decision in decisions] == [False, False, False, True]
+    assert "heartbeat 0/1" in decisions[1].reason
+    assert "heartbeat 1/1" in decisions[-1].reason
+    notify.assert_called_once()
+
+
 def test_run_single_tick_locked_forwards_count_quiescent_heartbeat(
     tmp_path: Path,
 ) -> None:
@@ -497,10 +500,10 @@ def test_run_single_tick_locked_forwards_count_quiescent_heartbeat(
     import tick  # type: ignore[import-untyped]
 
     with mock.patch.object(tick, "TICK_LOG_DIR", str(tmp_path / ".tick-log")):
-        with mock.patch("tick._run_tick_body", return_value=0) as run_tick_body:
+        with mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as run_tick_body:
             rc = tick._run_single_tick_locked(
                 None, "claude", "", count_quiescent_heartbeat=False,
-            )
+            ).exit_code
 
     assert rc == 0
     run_tick_body.assert_called_once()
@@ -1879,18 +1882,7 @@ def test_run_loop_locked_survives_watcher_start_failure(
     monkeypatch.setattr(
         tick,
         "_run_single_tick_locked",
-        lambda *_args, **_kwargs: tick_calls.append("tick") or 0,
-    )
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-        },
+        lambda *_args, **_kwargs: tick_calls.append("tick") or quiet_tick(**_kwargs),
     )
     monkeypatch.setattr(
         tick,
@@ -1953,6 +1945,7 @@ def test_observe_loop_state_counts_hung_marker_after_human_escalation(
                                 state = tick._observe_loop_state()
 
     assert state == {
+        "target_state": None,
         "in_flight_count": 1,
         "nearest_engine_deadline": None,
         "actionable_queue": False,
@@ -2030,6 +2023,7 @@ def test_observe_loop_state_reaches_quiescence_past_four_foreign_labels(
             state = tick._observe_loop_state()
 
     assert state == {
+        "target_state": None,
         "in_flight_count": 0,
         "nearest_engine_deadline": None,
         "actionable_queue": False,
@@ -2043,18 +2037,7 @@ def test_run_loop_locked_stops_quiescent_despite_foreign_in_flight_labels(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The loop reaches its normal quiescent stop with foreign labels present.
-
-    ``_observe_loop_state`` is left real — backed by an empty marker root and
-    the incident's four ``ai:implementing`` issues — so the whole observation →
-    cadence → stop progression runs against the production occupancy contract.
-    Only the tick body, the inter-tick wait, and the wake watcher are stubbed:
-    none of them decides quiescence.
-
-    The stop must land after exactly ``LOOP_QUIESCENT_STOP_AFTER`` heartbeats.
-    If foreign labels re-entered occupancy, every observation would report
-    ``quiescent=False`` and this loop would never return.
-    """
+    """Real tick cadence stops after three quiet observations of foreign labels."""
     import pipeline  # type: ignore[import-untyped]
     import tick  # type: ignore[import-untyped]
 
@@ -2064,7 +2047,7 @@ def test_run_loop_locked_stops_quiescent_despite_foreign_in_flight_labels(
     ticks = 0
     stop_notifications: list[object] = []
 
-    def fake_tick(*_args: object, **_kwargs: object) -> int:
+    def fake_tick(*_args: object, **_kwargs: object) -> TickOutcome:
         nonlocal ticks
         ticks += 1
         if ticks > pipeline.LOOP_QUIESCENT_STOP_AFTER + 2:
@@ -2072,7 +2055,7 @@ def test_run_loop_locked_stops_quiescent_despite_foreign_in_flight_labels(
                 "loop did not reach quiescent stop; foreign in-flight labels "
                 "are holding occupancy again"
             )
-        return 0
+        return quiet_tick(observe_queue=True, **_kwargs)
 
     monkeypatch.setattr(tick, "_run_single_tick_locked", fake_tick)
     # A full scheduled interval elapsed and no nudge arrived: the only shape
@@ -2113,13 +2096,13 @@ def test_run_loop_locked_preserves_a_nudge_that_arrives_during_a_tick(
     seen_set_at_wait: list[bool] = []
     ticks = 0
 
-    def fake_tick(*_args: object, **_kwargs: object) -> int:
+    def fake_tick(*_args: object, **_kwargs: object) -> TickOutcome:
         nonlocal ticks
         ticks += 1
         if ticks == 1:
             # A wake-request arrives while the first tick is still running.
             wake_events[0].set()
-        return 0
+        return quiet_tick(**_kwargs)
 
     wake_events: list[threading.Event] = []
 
@@ -2139,17 +2122,6 @@ def test_run_loop_locked_preserves_a_nudge_that_arrives_during_a_tick(
         return None
 
     monkeypatch.setattr(tick, "_run_single_tick_locked", fake_tick)
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 1,
-            "nearest_engine_deadline": None,
-            "actionable_queue": True,
-            "at_cap": False,
-            "quiescent": False,
-        },
-    )
     monkeypatch.setattr(tick, "_start_wake_watcher", capture_watcher)
     monkeypatch.setattr(tick, "_wait_next_tick", capture_wait)
 
@@ -2160,43 +2132,23 @@ def test_run_loop_locked_preserves_a_nudge_that_arrives_during_a_tick(
     assert seen_set_at_wait == [True, False]
 
 
-def test_run_loop_locked_observes_state_under_its_target(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Cadence must be scoped to the same target dispatch is scoped to.
+def test_run_loop_locked_consumes_target_outcome_without_another_observation(monkeypatch):
+    import pipeline
+    import tick
 
-    Without this the loop dispatches against one PR while computing
-    quiescence from the global queue, so a targeted loop never exits.
-    """
-    import tick  # type: ignore[import-untyped]
-
-    observed: list[object] = []
-
-    def capture_observe(target: object = None, **_kwargs: object) -> object:
-        observed.append(target)
-        return {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-        }
-
-    monkeypatch.setattr(
-        tick, "_run_single_tick_locked", lambda *_a, **_k: 0,
-    )
-    monkeypatch.setattr(tick, "_observe_loop_state", capture_observe)
-    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_a: None)
-    monkeypatch.setattr(
-        tick, "_wait_next_tick", lambda *_a: (False, True),
-    )
-
-    with mock.patch("tick._notify_loop_quiescent_stop"):
-        tick._run_loop_locked(
-            ("pr", 578), "claude", "", quiescent_stop_after=1,
-        )
-
-    assert observed == [("pr", 578)]
+    reason = "target pr #578: pr #578 ai:ready-for-human → stop"
+    outcome = TickOutcome(0, pipeline.CadenceDecision(0, True, reason))
+    run = mock.Mock(return_value=outcome)
+    monkeypatch.setattr(tick, "_run_single_tick_locked", run)
+    monkeypatch.setattr(tick, "_observe_loop_state", mock.Mock(side_effect=AssertionError("re-read")))
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_: None)
+    wait = mock.Mock(side_effect=AssertionError("slept after stop"))
+    monkeypatch.setattr(tick, "_wait_next_tick", wait)
+    with mock.patch.object(tick, "_notify_loop_target_stop") as notify:
+        assert tick._run_loop_locked(("pr", 578), "claude", "") == 0
+    assert run.call_args.args[0] == ("pr", 578)
+    notify.assert_called_once_with(reason)
+    wait.assert_not_called()
 
 
 def test_run_loop_locked_stop_signal_interrupts_a_long_wait(
@@ -2212,25 +2164,14 @@ def test_run_loop_locked_stop_signal_interrupts_a_long_wait(
 
     import tick  # type: ignore[import-untyped]
 
-    def fake_tick(*_args: object, **_kwargs: object) -> int:
+    def fake_tick(*_args: object, **_kwargs: object) -> TickOutcome:
         # Deliver the signal the way the OS would, mid-tick.
         handler = signal_mod.getsignal(signal_mod.SIGINT)
         assert callable(handler)
         handler(signal_mod.SIGINT, None)
-        return 0
+        return quiet_tick(**_kwargs)
 
     monkeypatch.setattr(tick, "_run_single_tick_locked", fake_tick)
-    monkeypatch.setattr(
-        tick,
-        "_observe_loop_state",
-        lambda _target=None, **_kwargs: {
-            "in_flight_count": 1,
-            "nearest_engine_deadline": None,
-            "actionable_queue": True,
-            "at_cap": False,
-            "quiescent": False,
-        },
-    )
     monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_args: None)
 
     start = time.monotonic()
@@ -2383,8 +2324,8 @@ def test_has_actionable_queue_ignores_an_ambiguous_pickup_pair() -> None:
 
 
 def test_target_has_actionable_queue_skips_an_ambiguous_pickup_pair() -> None:
-    """The targeted loop shares the rule: an item dispatch permanently
-    refuses must not hold that loop short of its quiescent stop."""
+    """An ambiguous target is non-actionable; target completion is a separate
+    check and must not treat that ambiguity as finished work."""
     import tick  # type: ignore[import-untyped]
 
     payload = {"state": "OPEN", "labels": [
@@ -20054,7 +19995,7 @@ def test_main_rejects_missing_vocabulary_before_harvest(tmp_path, capsys, existi
     with (
         mock.patch("tick.repo_root", return_value=str(tmp_path)),
         mock.patch("labels.read_labels", return_value=existing) as read,
-        mock.patch("tick._run_tick_body", return_value=0) as body,
+        mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body,
     ):
         result = tick.main()
 
@@ -20077,7 +20018,7 @@ def test_main_rejects_unreadable_vocabulary_before_harvest(tmp_path, capsys):
     with (
         mock.patch("tick.repo_root", return_value=str(tmp_path)),
         mock.patch("labels.read_labels", side_effect=ValueError("permission denied")),
-        mock.patch("tick._run_tick_body", return_value=0) as body,
+        mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body,
     ):
         result = tick.main()
 
@@ -20095,7 +20036,7 @@ def test_main_checks_vocabulary_each_tick_and_accepts_unknown_labels(tmp_path):
         mock.patch("labels.read_labels", side_effect=[
             pipeline.WORKFLOW_LABELS | {"ai:parked"}, frozenset(),
         ]) as read,
-        mock.patch("tick._run_tick_body", return_value=0) as body,
+        mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body,
     ):
         assert tick.main() == 0
         assert tick.main() == 3
@@ -20160,7 +20101,7 @@ def test_main_ticks_under_the_login_the_config_now_names(
         git_mock.return_value = str(tmp_path)
         with mock.patch("tick._startup_probe"):
             with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "old-user"):
-                with mock.patch("tick._run_tick_body", return_value=0) as body:
+                with mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body:
                     result = main()
 
     assert result == 0
@@ -20181,7 +20122,7 @@ def test_main_refuses_a_login_removed_from_the_config(
         git_mock.return_value = str(tmp_path)
         with mock.patch("tick._startup_probe"):
             with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "old-user"):
-                with mock.patch("tick._run_tick_body", return_value=0) as body:
+                with mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body:
                     import io
                     stderr = io.StringIO()
                     with mock.patch("sys.stderr", stderr):
@@ -20271,7 +20212,7 @@ def test_main_refuses_a_malformed_permission_mode_before_any_dispatch(
     with mock.patch("tick.git") as git_mock:
         git_mock.return_value = str(tmp_path)
         with mock.patch("tick._startup_probe"):
-            with mock.patch("tick._run_tick_body", return_value=0) as body:
+            with mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body:
                 import io
                 stderr = io.StringIO()
                 with mock.patch("sys.stderr", stderr):
@@ -20495,44 +20436,18 @@ def test_main_reports_an_implementer_route_setup_did_not_probe(
     assert actions.count("startup_route_unprobed") == int(reported)
 
 
-def test_loop_paces_from_the_configuration_its_tick_validated(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """The in-process loop paces from the same validated configuration."""
-    import pipeline  # type: ignore[import-untyped]
-    import tick  # type: ignore[import-untyped]
+def test_loop_paces_from_the_configuration_its_tick_validated(monkeypatch, tmp_path):
+    import tick
 
     write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
-    waits: list[int] = []
-    cadence_inputs: list[dict[str, object]] = []
-    real_decide = pipeline.decide_loop_cadence
-
-    def recording_decide(**kwargs: object) -> tuple[int, bool]:
-        cadence_inputs.append(kwargs)
-        return real_decide(**kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(tick.pipeline, "decide_loop_cadence", recording_decide)
-    monkeypatch.setattr(tick, "_run_tick_body", lambda *_a, **_k: 0)
-    monkeypatch.setattr(tick, "_startup_probe", lambda: {
-        "gh_found": True, "git_found": True, "codex_found": True,
-    })
-    monkeypatch.setattr(tick, "_observe_loop_state", lambda _target=None, **_kw: {
-        "in_flight_count": 0, "nearest_engine_deadline": None,
-        "actionable_queue": False, "at_cap": False, "quiescent": True,
-    })
-    monkeypatch.setattr(
-        tick, "_wait_next_tick",
-        lambda seconds, *_a, **_k: waits.append(seconds) or (False, True),
-    )
-    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_a, **_k: None)
-    monkeypatch.setattr(tick, "_notify_loop_quiescent_stop", lambda _held: None)
-
-    rc = tick._run_loop_locked(None, "", "")
-
-    assert rc == 0
-    # Five quiescent heartbeats stop the loop: four waits, each the heartbeat.
+    waits = []
+    monkeypatch.setattr(tick, "_wait_next_tick", lambda seconds, *_: waits.append(seconds) or (False, True))
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_: None)
+    with tick_stage_mocks(tmp_path), mock.patch.object(
+        tick, "_compute_post_dispatch_state", return_value=(0, False, ()),
+    ), mock.patch.object(tick, "_notify_loop_quiescent_stop"):
+        assert tick._run_loop_locked(None, "", "") == 0
     assert waits == [3600] * 4
-    assert all(inputs["quiescent_stop_after"] == 5 for inputs in cadence_inputs)
 
 
 def test_lock_held_cadence_uses_the_configured_short_poll(
@@ -20752,7 +20667,7 @@ def test_main_reports_a_fail_closed_config_warning_and_still_ticks(
         with mock.patch("tick._startup_probe"):
             with mock.patch("tick.TRUSTED_HEAD_REPO", "owner/name"):
                 with mock.patch("tick.TRUSTED_REVIEW_AUTHOR", "userA"):
-                    with mock.patch("tick._run_tick_body", return_value=0) as body:
+                    with mock.patch("tick._run_tick_body", return_value=TickOutcome(0)) as body:
                         import io
                         stderr = io.StringIO()
                         with mock.patch("sys.stderr", stderr):
@@ -20956,7 +20871,7 @@ def test_run_tick_body_one_shot_stop_names_held_items(
                                                     ):
                                                         rc = _run_tick_body(
                                                             tick_log, None, "claude",
-                                                        )
+                                                        ).exit_code
 
     assert rc == 0
     output = stderr.getvalue()
@@ -21180,7 +21095,7 @@ def test_run_tick_body_unknown_post_dispatch_state_uses_cache_warm_cadence(
                                         with mock.patch("sys.stderr", stderr):
                                             rc = _run_tick_body(
                                                 tick_log, None, "claude", "",
-                                            )
+                                            ).exit_code
 
     output = stderr.getvalue()
     assert rc == 0
@@ -21672,7 +21587,7 @@ def test_quiescent_counter_resets_on_reconcile_failure(
                     "tick.read_authoritative_in_flight_labels", return_value=[],
                 ):
                     with mock.patch("sys.stderr", stderr):
-                        rc = _run_tick_body(tick_log, None, "claude", "")
+                        rc = _run_tick_body(tick_log, None, "claude", "").exit_code
 
     assert rc == 1
     assert _read_quiescent_counter() == 0
@@ -21706,7 +21621,7 @@ def test_quiescent_counter_resets_on_auth_labels_failure(
                     side_effect=subprocess.CalledProcessError(1, "gh"),
                 ):
                     with mock.patch("sys.stderr", stderr):
-                        rc = _run_tick_body(tick_log, None, "claude", "")
+                        rc = _run_tick_body(tick_log, None, "claude", "").exit_code
 
     assert rc == 2
     assert _read_quiescent_counter() == 0
@@ -22330,6 +22245,7 @@ def test_observe_loop_state_admission_error_forces_non_quiescent() -> None:
                     state = tick._observe_loop_state()
 
     assert state == {
+        "target_state": None,
         "in_flight_count": 3,
         "nearest_engine_deadline": None,
         "actionable_queue": True,
@@ -22570,7 +22486,7 @@ def test_tick_never_admits_past_the_configured_cap_across_stages(
                         side_effect=launch("pr", "ai:fixing"),
                     ):
                         with mock.patch("sys.stderr", io.StringIO()):
-                            rc = tick._run_single_tick_locked(None, "claude", "")
+                            rc = tick._run_single_tick_locked(None, "claude", "").exit_code
 
     assert rc == 0
     assert len(launched) == 2, launched
@@ -22605,7 +22521,7 @@ def test_tick_cadence_judges_capacity_against_the_configured_cap(
                 wraps=pipeline.compute_next_wake,
             ) as next_wake:
                 with mock.patch("sys.stderr", io.StringIO()):
-                    rc = tick._run_single_tick_locked(None, "claude", "")
+                    rc = tick._run_single_tick_locked(None, "claude", "").exit_code
 
     assert rc == 0
     assert next_wake.call_args.kwargs["in_flight_count"] == 3
@@ -22646,49 +22562,32 @@ def test_observe_loop_state_uses_the_configured_cap() -> None:
     assert unknown["quiescent"] is False
 
 
-def test_loop_observes_cadence_with_the_cap_its_tick_admitted_against(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """``--loop`` hands the startup-validated cap to the tick and to cadence.
-
-    The cap is read once, at the startup gate, so the observation after the
-    tick cannot pick up a different value than the one admission used.
-    """
-    import tick  # type: ignore[import-untyped]
+def test_loop_uses_the_cap_validated_before_a_mid_tick_config_edit(monkeypatch, tmp_path):
+    import pipeline
+    import tick
 
     write_cap_config(monkeypatch, tmp_path, "5")
-    observed: list[object] = []
+    inputs = []
+    real_compute = pipeline.compute_next_wake
 
-    def observe(_target: object = None, **kwargs: object) -> object:
-        observed.append(kwargs.get("max_in_flight"))
-        return {
-            "in_flight_count": 0,
-            "nearest_engine_deadline": None,
-            "actionable_queue": False,
-            "at_cap": False,
-            "quiescent": True,
-        }
+    def compute(**kwargs):
+        inputs.append(kwargs)
+        return real_compute(**kwargs)
 
-    def edit_config_mid_tick(*_args: object, **_kwargs: object) -> int:
-        # The operator lowers the cap while this tick runs; the edit is for
-        # the next tick, not for this tick's cadence.
+    def post_dispatch(*_args, **_kwargs):
         write_cap_config(monkeypatch, tmp_path, "1")
-        return 0
+        return 3, True, ()
 
-    monkeypatch.setattr(tick, "_observe_loop_state", observe)
-    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_a: None)
-    monkeypatch.setattr(tick, "_wait_next_tick", lambda *_a: (False, True))
-
-    with mock.patch("tick._startup_probe"):
-        with mock.patch(
-            "tick._run_tick_body", side_effect=edit_config_mid_tick,
-        ) as body:
-            with mock.patch("tick._notify_loop_quiescent_stop"):
-                with mock.patch("sys.stderr", io.StringIO()):
-                    tick._run_loop_locked(None, "claude", "", quiescent_stop_after=1)
-
-    assert body.call_args.kwargs["config"].max_in_flight == 5
-    assert observed == [5]
+    waits = []
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_: None)
+    monkeypatch.setattr(tick, "_wait_next_tick", lambda seconds, *_: waits.append(seconds) or (True, False))
+    with tick_stage_mocks(tmp_path), mock.patch.object(
+        tick, "_compute_post_dispatch_state", side_effect=post_dispatch,
+    ), mock.patch.object(pipeline, "compute_next_wake", side_effect=compute):
+        assert tick._run_loop_locked(None, "claude", "") == 0
+    assert len(inputs) == 1
+    assert inputs[0]["at_capacity"] is False
+    assert waits == [pipeline.LOOP_MAX_POLL_SECONDS]
 
 
 # --- Helpers ---
@@ -23296,3 +23195,18 @@ def tick_stage_mocks(tmp_path: Path) -> Iterator[dict[str, mock.MagicMock]]:
                 "dispatch_reviewers", "dispatch_implementers", "dispatch_fixers",
             )
         }
+
+
+def quiet_tick(*, held_items=(), observe_queue=False, **kwargs):
+    """Run the real summary/counter path with harvest and dispatch isolated."""
+    import tick
+
+    observe = tick._compute_post_dispatch_state
+    with tick_stage_mocks(Path(tick.TICK_LOG_DIR).parent):
+        state = observe() if observe_queue else (0, False, held_items)
+        with mock.patch.object(tick, "_compute_post_dispatch_state", return_value=state):
+            return tick._run_tick_body(
+                None, None, "claude",
+                count_quiescent_heartbeat=kwargs.get("count_quiescent_heartbeat", True),
+                quiescent_stop_after=kwargs.get("quiescent_stop_after"),
+            )

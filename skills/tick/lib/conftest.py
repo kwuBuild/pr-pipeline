@@ -200,7 +200,7 @@ def isolate_marker_root(
     monkeypatch.setattr(
         tick,
         "_QUIESCENT_COUNTER_FILE",
-        str(root / ".tick-state" / "quiescent-counter.txt"),
+        str(root / ".tick-state" / "quiescent-counters" / "queue.txt"),
     )
     monkeypatch.setattr(
         tick, "WAKE_REQUEST_PATH", str(root / ".tick-state" / "wake-request"),

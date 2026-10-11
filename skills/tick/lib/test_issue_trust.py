@@ -129,7 +129,7 @@ def test_issue_trust_count_failure_stays_silent(bad_count):
 
 
 @pytest.mark.parametrize("target", [None, ("issue", 42)])
-def test_issue_trust_loop_quiesces_on_full_foreign_page(target):
+def test_issue_trust_loop_distinguishes_foreign_target_from_quiet_queue(target):
     foreign = [issue(n, "stranger") for n in range(1, tick._ACTIONABLE_QUEUE_SCAN_LIMIT + 1)]
     reads = []
 
@@ -151,24 +151,36 @@ def test_issue_trust_loop_quiesces_on_full_foreign_page(target):
     def run_tick(*args, **kwargs):
         ticks.append(True)
         assert len(ticks) <= 2, "foreign issues kept the loop awake"
-        return 0
+        with mock.patch.object(tick, "harvest_reviewers", return_value=True), \
+             mock.patch.object(tick, "harvest_implementers", return_value=True), \
+             mock.patch.object(tick, "harvest_fixers", return_value=True), \
+             mock.patch.object(tick, "dispatch_reviewers"), \
+             mock.patch.object(tick, "dispatch_implementers"), \
+             mock.patch.object(tick, "dispatch_fixers"):
+            return tick._run_tick_body(None, target, "claude", quiescent_stop_after=2)
 
     with (
         mock.patch.object(tick, "gh_json", side_effect=read),
         mock.patch.object(tick, "read_authoritative_in_flight_labels", return_value=[]),
         mock.patch.object(tick, "_run_single_tick_locked", side_effect=run_tick),
         mock.patch.object(tick, "_start_wake_watcher", return_value=None),
-        mock.patch.object(tick, "_wait_next_tick", return_value=(False, True)) as wait,
+        mock.patch.object(tick, "_wait_next_tick", side_effect=lambda *_: (
+            target is not None and len(ticks) == 2, True,
+        )) as wait,
         mock.patch.object(tick, "_notify_loop_quiescent_stop") as notify,
     ):
         assert tick._compute_post_dispatch_state(target) == (0, False, ())
         assert tick._run_loop_locked(target, "claude", "", quiescent_stop_after=2) == 0
     assert len(ticks) == 2
     assert wait.call_args.args[0] == 1800
-    notify.assert_called_once()
     if target:
+        # An explicit foreign target is unfinished even though trust refuses
+        # dispatch. Only the simulated operator interruption ends this loop.
+        assert wait.call_count == 2
+        notify.assert_not_called()
         assert any("labels,state,author" in args for args in reads)
     else:
+        notify.assert_called_once()
         assert any("labels,author" in args for args in reads)
 
 
@@ -183,7 +195,12 @@ def test_issue_trust_cadence_stays_warm_on_unreadable_author(author, target):
         return candidate if "view" in args else [candidate]
 
     with mock.patch.object(tick, "gh_json", side_effect=read):
-        assert tick._compute_post_dispatch_state(target)[1] is True
+        queue = tick._compute_post_dispatch_state(target)[1]
+        assert queue is (None if target else True)
+        decision = pipeline.compute_next_wake(
+            in_flight_count=0, has_actionable_queue=queue,
+        )
+        assert not decision.stop and decision.next_wake_seconds == 270
 
 
 def test_issue_trust_cadence_keeps_pr_queries_unchanged():
@@ -209,7 +226,7 @@ def test_issue_trust_tick_binds_reloaded_login_through_following_cadence(tmp_pat
         cfg.write_text('[operator]\nlogin = "next-user"\n' + SECTION)
         tick.dispatch_implementers(authoritative_in_flight=[])
         tick._compute_post_dispatch_state()
-        return 0
+        return tick.TickOutcome(0)
 
     cfg.write_text('[operator]\nlogin = "current-user"\n' + SECTION)
     with (
@@ -220,7 +237,7 @@ def test_issue_trust_tick_binds_reloaded_login_through_following_cadence(tmp_pat
     ):
         for login in ["current-user", "next-user"]:
             queries.clear()
-            assert tick._run_single_tick_locked(None, "claude", "") == 0
+            assert tick._run_single_tick_locked(None, "claude", "").exit_code == 0
             tick._observe_loop_state()
             issue_reads = [args for args in queries if args[:2] == ("issue", "list")]
             assert len(issue_reads) == 3
@@ -230,7 +247,7 @@ def test_issue_trust_tick_binds_reloaded_login_through_following_cadence(tmp_pat
 
 @pytest.mark.real_gh_helper
 @pytest.mark.parametrize("target", [None, ("issue", 42)])
-def test_issue_trust_real_ticks_quiesce_with_gh_subprocess(target, tmp_path, monkeypatch):
+def test_issue_trust_real_ticks_keep_foreign_target_unfinished(target, tmp_path, monkeypatch):
     """Run startup, harvest, dispatch, and loop cadence against an offline gh.
 
     Only external GitHub and engine peers and elapsed waits are replaced. The
@@ -264,9 +281,9 @@ print("" if "-q" in args else json.dumps(payload))
     def wait(*args):
         nonlocal wait_count
         wait_count += 1
-        assert wait_count <= 1, "the loop did not reach its quiescent stop"
+        assert wait_count <= (2 if target else 1)
         assert args[0] == 1800
-        return False, True
+        return target is not None and wait_count == 2, True
 
     with (
         mock.patch.object(tick, "_startup_probe", return_value={
@@ -279,8 +296,12 @@ print("" if "-q" in args else json.dumps(payload))
         mock.patch.object(tick, "_launch_claude_engine") as launch,
     ):
         assert tick._run_loop_locked(target, "claude", "", quiescent_stop_after=2) == 0
-    waits.assert_called_once()
-    notify.assert_called_once()
+    if target:
+        assert waits.call_count == 2
+        notify.assert_not_called()
+    else:
+        waits.assert_called_once()
+        notify.assert_called_once()
     launch.assert_not_called()
     calls = [json.loads(line) for line in calls_path.read_text().splitlines()]
     assert all("--repo" in args for args in calls)
@@ -288,7 +309,12 @@ print("" if "-q" in args else json.dumps(payload))
     assert not list(Path(tick.WT_ROOT).glob("issue-*"))
     logs = [json.loads(line) for path in Path(tick.TICK_LOG_DIR).glob("*.jsonl")
             for line in path.read_text().splitlines()]
-    if target is None:
+    if target is not None:
+        cadences = [entry["details"]["cadence"] for entry in logs
+                    if entry["action"] == "tick_complete"]
+        assert len(cadences) == 2
+        assert all(not value["stop"] and "not terminal" in value["reason"] for value in cadences)
+    else:
         assert sum(entry.get("action") == "issue_authors_filtered" for entry in logs) == 2
         assert all(entry["reason"] == "200 or more available issues not authored by the operator."
                    for entry in logs if entry.get("action") == "issue_authors_filtered")

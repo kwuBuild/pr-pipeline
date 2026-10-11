@@ -100,11 +100,12 @@ amortizing it):
 
 | State at end of tick | Next wake |
 |---|---|
+| Target scopes terminal or closed | stop immediately; [target completion rules](../skills/tick/README.md#target-completion-and-cadence) |
 | ≥1 engine in-flight (live dispatch, no result) | `min(nearest actionable deadline, 270s)` — cache-warm |
 | No engine in-flight, actionable queue non-empty | ~270s |
 | At `max_in_flight` with work in-flight | ~270s (harvest to free a slot) |
-| Quiescent: no live dispatch, all items terminal | ~1800s heartbeat |
-| Quiescent for N consecutive heartbeats | stop + notify developer |
+| Quiescent: no supervisable engines or actionable work | ~1800s heartbeat |
+| Full queue quiescent for N consecutive heartbeats | stop + notify developer |
 
 The values above are the shipped defaults. Operators tune them per repository
 (`loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`,
@@ -147,21 +148,24 @@ already-delivered `SIGKILL` at 1s cannot accelerate death, and the wake watcher
 nudges within 5s once both PID and group are gone. A fixed past deadline therefore
 cannot pin the loop to the overdue floor. A
 nudge observes a 10s floor unless the already-scheduled cadence deadline
-arrives first, so the cadence decision remains an upper bound. Only ticks that
-followed a full-interval wait count toward the quiescent stop, so the heartbeat
-contract above is unchanged. That gate applies to the persisted quiescent
-streak as well as the loop's in-memory one — the streak is shared with the
-one-shot path, so it has to keep measuring quiet time rather than tick count.
+arrives first, so the cadence decision remains an upper bound. After the
+invocation's first tick, only ticks that followed a full-interval wait count
+toward the quiescent stop; nudges do not advance the streak. That gate applies
+to the persisted streak shared by native and one-shot ticks within each
+requested scope. The streak counts qualifying observations, not elapsed time.
+Native mode consumes the tick's emitted cadence decision without a second
+observation or stop counter.
+Targeted runs stop from target completion; quiet heartbeats alone never mark an
+unfinished target as done. See the [counter and completion rules](../skills/tick/README.md#target-completion-and-cadence).
 The harness `/loop` + `ScheduleWakeup` path has no in-process sleep to interrupt
 and stays purely timer-paced.
 
 Concurrency is bounded by the operator's `max_in_flight` cap (shipped default
 3, set per target in the operator config): the dispatch phase never
 launches beyond it, and the cadence tightens to ~270s while saturated so slots
-free promptly. Quiescence is the loop's fixed point — every tracked item in a
-terminal label (`ai:ready-for-human`, `ai:needs-human-decision`,
-`ai:max-iterations`, merged, or closed) with no live dispatch — at which point
-the loop heartbeats slowly and then stops.
+free promptly. The full queue reaches quiescence when no supervisable engines
+or actionable work remain. It then heartbeats slowly and stops at the configured
+quiet threshold. Targeted runs use the target completion rule instead.
 
 Admission counts **local dispatch markers only** — those classified `live`,
 `launching`, or `hung`, or whose process group is still alive — keyed by

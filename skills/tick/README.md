@@ -430,29 +430,67 @@ success, 1 when reconciliation failed and dispatch was skipped.
 same-number issue scope. For `#N`, implementation stays scoped to issue `N`, while
 zero or one open closing PR scopes the reviewer and fixer. With no open closing PR,
 only the issue implementation scope is active. An ambiguous or malformed
-closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log and tick lock are excepted. Invalid target syntax has the same workflow-mutation boundary and exits `1`.
+closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log, tick lock, and target quiet counter are excepted. Invalid target syntax has the same workflow-mutation boundary and exits `1`.
 
 HARVEST, stale-label reconciliation, and DISPATCH use those resolved stage scopes.
 Safety gates (`reconcile_failed`, `max_in_flight` admission cap) still apply
 globally, and targeting never changes labels or scratch for unrelated work.
 
-Cadence follows the same scope. Under a target, the actionable-queue probe reads
-only the resolved stage scopes instead of the global queues, so `quiescent`
-describes the targeted work and `--loop pr:N` stops once `N` is terminal or
-non-dispatchable — even while unrelated PRs still carry `ai:changes-requested`.
-An item counts as actionable on exactly dispatch's own terms, through the same
-`pipeline.resolve_pickup_eligibility` the dispatch gate calls (asked with no
-stage, so cadence stays awake for work *any* stage can take): open, free of
-both a human hold and an in-flight label, and carrying exactly one pickup label
-across all stages for its entity. An item mid-transition (pickup label plus
-in-flight label), and an ambiguously labelled one (`ai:implemented` +
-`ai:revised`, or `ai:implemented` + `ai:changes-requested`), are both work no
-tick can take, so counting either would hold the loop short of its quiescent
-stop forever; an engine this machine owns keeps cadence warm through its own
-marker instead. Unknown
-state still stays warm — a failed scope resolution or item read reads as
-unknown, never as quiescence. In-flight count and the `max_in_flight` cap stay
-global, so a targeted loop never mistakes a saturated pipeline for a quiet one.
+### Target completion and cadence
+
+Both a one-shot targeted tick and `--loop` check the target after harvest and
+dispatch. When every active stage scope is closed, merged, or carries exactly
+one terminal label (`ai:ready-for-human`, `ai:needs-human-decision`, or
+`ai:max-iterations`), the cadence line reports `next_wake=0 stop=true`. Its reason
+names the requested target, each resolved item, and its label or closed state.
+The tick returns its exit status and the same cadence decision it emits.
+`--loop` consumes that decision without another target or queue read, so a later
+read failure cannot override an advertised stop. It reports the terminal target
+reason through stderr, the `loop_target_stop` log event, and a best-effort
+operator notification. This stop does not wait for quiet heartbeats or
+unrelated engines. It releases no engine
+custody; unrelated work still needs its own ticks.
+
+An issue target follows the same closing PR that dispatch resolves. When an open
+issue has no `ai:` label and has one open closing PR, implementation has handed
+off to that PR. The PR determines completion. If the issue still has a workflow
+label, both the issue and the PR must be terminal or closed. A blocked or
+in-flight issue therefore cannot be hidden by a terminal PR. Handoff requires
+the selected PR to remain open in the completion observation. If it closed or
+merged after scope resolution while the issue remains open and unlabelled,
+completion is unknown; the next tick resolves the scope again.
+
+The existing human-hold priority applies: `ai:needs-human-decision` is terminal
+even beside another workflow label, including a live engine's label. The reason
+names all observed labels, and stopping does not release the marker.
+
+Non-dispatchable does not mean finished. A target with `ai:blocked`, no `ai:`
+label and no closing PR, or conflicting workflow labels reports `not terminal`
+and continues polling. Quiet heartbeats do not stop an unfinished target.
+Unreadable scope, item, or control-plane state stays on the short poll and
+cannot prove completion. No target check bypasses startup or reconciliation
+failures.
+
+The actionable-queue probe reads only resolved stage scopes, using
+`pipeline.resolve_pickup_eligibility` just as dispatch does. In-flight count and
+admission capacity remain global. Thus `tick-state` can report an unrelated
+engine in flight while `tick-cadence` reports that the requested target stopped.
+
+Quiet streaks live under `.claude/worktrees/.tick-state/quiescent-counters/`:
+`queue.txt` for the full queue, `issue-N.txt` for `#N`, and `pr-N.txt` for `pr:N`.
+Each tick reads, advances, or resets only its own scope, including on failures.
+The target key remains the requested issue even after handoff to its closing PR.
+The former shared `quiescent-counter.txt` is ignored because its prior scope
+cannot be recovered; the new counters start at zero. Missing or malformed
+counters, including negative values, also start at zero. Writes are atomic and
+ticks use the existing mutex. Native loops use this same persisted streak;
+there is no separate in-memory stop counter. The invocation's first tick
+counts toward the streak; later native-loop ticks count only after a full
+scheduled wait. With a fresh queue counter and the shipped threshold of three,
+three quiet ticks stop the loop after two 1800-second waits. A retained streak
+can stop it sooner. Nudge-triggered ticks do not advance that streak.
+If a nudge first observes a quiet queue after activity, the count stays zero
+and the loop waits, even when the configured stop threshold is one.
 
 ### Looped (autonomous polling)
 
@@ -461,8 +499,9 @@ global, so a targeted loop never mistakes a saturated pipeline for a quiet one.
 ```
 
 Runs ticks inside one Python process. `--loop` keeps the same HARVEST →
-DISPATCH ordering as one-shot mode, but self-paces between ticks and exits when
-the pipeline has stayed quiescent for the configured heartbeat count.
+DISPATCH ordering as one-shot mode and self-paces between ticks. A targeted loop
+uses the [target completion rule](#target-completion-and-cadence). The full queue
+exits after the configured number of quiescent heartbeats.
 
 Every tick invocation, looped or one-shot, takes a non-blocking mutex at
 `.claude/worktrees/.tick.lock`. If another tick is running, the new invocation
@@ -471,12 +510,13 @@ possible, and does no harvest or dispatch work.
 
 | State at end of tick | Next wake (shipped default) |
 |---|---|
+| Target scopes terminal or closed | stop immediately; see [target completion](#target-completion-and-cadence) |
 | ≥1 engine in-flight, deadline > 0 | `min(nearest deadline, loop_max_poll_seconds)` (270s) cache-warm poll |
 | ≥1 engine in-flight, deadline lapsed mid-scan | 1s — immediate retry to harvest/escalate |
 | No engine in-flight, queue non-empty | `loop_short_poll_seconds` (270s) cache-warm poll |
 | At `max_in_flight`, saturated | `loop_short_poll_seconds` (270s) |
-| Quiescent (all in-scope items terminal) | `loop_heartbeat_seconds` (1800s) heartbeat |
-| Quiescent for `loop_quiescent_stop_after` (3) consecutive heartbeats | stop + notify |
+| Quiescent (no supervisable engines or actionable work) | `loop_heartbeat_seconds` (1800s) heartbeat |
+| Full queue quiescent for `loop_quiescent_stop_after` (3) consecutive heartbeats | stop + notify |
 
 The intervals are [operator configuration](#deadlines-stall-limits-routing-and-cadence).
 Both loop paths — the one-shot `tick-cadence:` line and `--loop` — pace from the
@@ -500,9 +540,9 @@ In `--loop` mode these intervals are an **upper bound**: a wake nudge can start
 the next tick sooner (see [Edge-triggered wake-up](#edge-triggered-wake-up-in-loop-mode)).
 The one-shot `tick-cadence:` line and the harness `/loop` prompt that consumes it
 are unchanged — that path has no external interrupt and stays purely timer-paced.
-The two paths do share the persisted quiescent streak, so `--loop` marks a
-nudge-initiated tick as not-a-heartbeat and the counter keeps measuring quiet
-time for whichever path reads it next.
+The two paths share persisted quiescent streaks within each scope, so `--loop`
+marks a nudge-initiated tick as not-a-heartbeat. Each counter retains qualifying
+quiet observations for whichever path reads that scope next.
 
 Both paths derive the quiescent reason from the same helper, so a stop caused by
 a human-held engine names it identically: `--loop` in its notification, the
@@ -595,10 +635,10 @@ Two properties keep this from becoming a control-plane risk:
   and exits, and the loop continues on its unmodified timer schedule.
 - **Nudges cannot accelerate the quiescent stop.** Only a tick that followed a
   wait running its full scheduled interval counts toward the
-  consecutive-quiescent heartbeat limit, so "stop after N quiescent heartbeats"
-  keeps meaning roughly N heartbeat intervals of quiet (3 × 1800s shipped) that cannot be accelerated by nudge traffic. This
-  gate covers *both* counters: the loop's in-memory streak and the
-  `.tick-state/quiescent-counter.txt` the one-shot `tick-cadence:` line reads.
+  consecutive-quiescent heartbeat limit. The invocation's first tick also
+  counts; see [counter and target completion rules](#target-completion-and-cadence).
+  This gate covers the per-scope files shared by native and one-shot ticks.
+  A terminal target stops immediately.
   A nudge-initiated tick is also held to a 10s floor measured from the end of
   the previous tick, bounding the rate a nudge storm can force. The previously
   scheduled cadence deadline remains the upper bound: if it arrives before the
@@ -607,8 +647,9 @@ Two properties keep this from becoming a control-plane risk:
 Terminal transitions into `ai:ready-for-human`, `ai:needs-human-decision`, or
 `ai:max-iterations` emit a best-effort macOS notification, a stderr line, and a
 `notify_terminal_label` tick-log entry. Notification failure is non-fatal. The
-loop's quiescent stop emits the same operator-facing signals with
-`loop_quiescent_stop`, and a detected engine stall with `engine_stalled`. The
+loop's full-queue quiescent stop emits the same operator-facing signals with
+`loop_quiescent_stop`, a terminal target stop with `loop_target_stop`, and a
+detected engine stall with `engine_stalled`. The
 quiescent stop also names any held item occupying a slot when it stops.
 
 ### Held engines
@@ -774,9 +815,9 @@ surface on the status dashboard; they no longer cost dispatch.
 
 Consequences for the loop:
 
-- With nothing actionable and every occupied slot held, the loop reaches
-  quiescence and stops after the usual heartbeat count — on both the in-process
-  `--loop` path and the one-shot `tick-cadence:` path.
+- With nothing actionable and every occupied slot held, an untargeted loop
+  reaches quiescence and stops after the usual heartbeat count on both paths.
+  Targeted runs use the [target completion rule](#target-completion-and-cadence).
 - One held slot out of `max_in_flight` does **not** stop a loop that still has
   actionable work; the other slots keep dispatching. If *every* slot is held
   while a queue is still actionable, the loop legitimately stays warm and cannot
