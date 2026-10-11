@@ -74,6 +74,8 @@ elif args[:2] == ["issue", "edit"]:
         s["labels"].extend(args[args.index("--add-label") + 1].split(","))
     path.write_text(json.dumps(s)); payload = {}
 elif args[:2] == ["pr", "create"]:
+    s["title"] = args[args.index("--title") + 1]
+    s["existing_pr"] = True
     s["body"] = pathlib.Path(args[args.index("--body-file") + 1]).read_text() if "--body-file" in args else args[args.index("--body") + 1]
     path.write_text(json.dumps(s)); print("https://github.com/example/project/pull/12"); raise SystemExit
 elif args[:2] == ["pr", "view"]:
@@ -81,9 +83,18 @@ elif args[:2] == ["pr", "view"]:
                "state": "OPEN", "body": s["body"], "headRefOid": s["head"]}
 elif args[:2] == ["pr", "list"]:
     payload = [{"number": 12, "isCrossRepository": False}] if s.get("existing_pr") else []
+elif args[:2] == ["pr", "comment"]:
+    s.setdefault("comments", []).append(pathlib.Path(args[args.index("--body-file") + 1]).read_text())
+    path.write_text(json.dumps(s))
+    print("https://github.com/example/project/pull/12#issuecomment-1"); raise SystemExit
 elif args[:2] == ["pr", "edit"]:
+    if s.get("fail_pr_label") and "--add-label" in args:
+        raise SystemExit(1)
     if "--body-file" in args:
         s["body"] = pathlib.Path(args[args.index("--body-file") + 1]).read_text()
+    if "--remove-label" in args:
+        for label in args[args.index("--remove-label") + 1].split(","):
+            if label in s["pr_labels"]: s["pr_labels"].remove(label)
     if "--add-label" in args:
         s["pr_labels"].extend(args[args.index("--add-label") + 1].split(","))
     path.write_text(json.dumps(s))

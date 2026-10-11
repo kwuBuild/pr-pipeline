@@ -187,7 +187,10 @@ all of it — which is what lets the fixer hand a **replacement PR body** back. 
 is instructed to leave `gh` writes to the controller: after its final push it writes `.pr-body-revision.md` in its
 worktree root under a two-line envelope (`pr-body-revision: <dispatch_id>`, then
 `pr-body-revision-head: <pushed OID>`), and the harvest checks the envelope, the
-closure contract, the sections, and the live body against the pinned digest, then
+shared [PR report contract](../../skills/tick/lib/prompts/pr-body-contract.md)
+and the live body against the pinned digest. A missing or fenced primary
+reference receives a marked controller header using the pinned issue, while
+conflicts and changes to the complete closure set are withheld. Harvest then
 re-reads labels/head/body one last time and applies it with
 `gh pr edit --body-file` before the `ai:revised` relabel. Only a `recheck`
 outcome publishes one; every other verdict — `pipeline._BODY_REVISION_NOTES`
