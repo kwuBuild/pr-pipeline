@@ -89,6 +89,58 @@ def test_loop_cadence_quiescent_uses_heartbeat_and_stops_after_limit() -> None:
     assert stop is True
 
 
+@pytest.mark.parametrize("state, expected", [
+    # In flight: the nearest deadline, capped by the max poll.
+    ({"in_flight_count": 1, "nearest_engine_deadline": 1500.0}, (200, False)),
+    ({"in_flight_count": 1, "nearest_engine_deadline": 1150.0}, (150, False)),
+    # Queued work and a full cap both wake at the short poll.
+    ({"actionable_queue": True}, (120, False)),
+    ({"at_cap": True}, (120, False)),
+    # Quiescent: the heartbeat, until the configured stop count.
+    ({"quiescent": True, "consecutive_quiescent": 4}, (3600, False)),
+    ({"quiescent": True, "consecutive_quiescent": 5}, (3600, True)),
+])
+def test_loop_cadence_paces_from_the_configured_values(
+    state: dict[str, object], expected: tuple[int, bool],
+) -> None:
+    """The decision helper uses the cadence it is given, not the constants."""
+    inputs: dict[str, object] = {
+        "in_flight_count": 0, "nearest_engine_deadline": None,
+        "actionable_queue": False, "at_cap": False, "quiescent": False,
+        "consecutive_quiescent": 0, **state,
+    }
+
+    decision = pipeline.decide_loop_cadence(
+        **inputs,  # type: ignore[arg-type]
+        now=1000.0,
+        short_poll_seconds=120, max_poll_seconds=200,
+        heartbeat_seconds=3600, quiescent_stop_after=5,
+    )
+
+    assert decision == expected
+
+
+def test_compute_next_wake_retries_unknown_state_at_the_short_poll() -> None:
+    """An unreadable state is retried on the configured short poll."""
+    decision = pipeline.compute_next_wake(
+        in_flight_count=None, short_poll_seconds=90,
+        max_poll_seconds=200, heartbeat_seconds=3600,
+    )
+
+    assert decision.next_wake_seconds == 90
+    assert decision.stop is False
+
+
+def test_compute_next_wake_steps_off_the_cache_cliff_while_in_flight() -> None:
+    """A deadline exactly at the TTL cliff never becomes the wake."""
+    decision = pipeline.compute_next_wake(
+        in_flight_count=1, nearest_deadline_s=300, has_actionable_queue=False,
+        at_capacity=False, max_poll_seconds=600,
+    )
+
+    assert decision.next_wake_seconds < 300
+
+
 # --- validate_review ---
 
 
@@ -2251,6 +2303,34 @@ def test_valid_marker_accepts_implement_lease_with_claude_ds_engine() -> None:
     """``claude-ds`` is a valid engine value for implement-stage leases."""
     assert pipeline.valid_marker(impl_lease(engine="claude-ds"),
                                  expected_stage="implement") is True
+
+
+def test_valid_marker_accepts_stall_limits_on_engine_markers() -> None:
+    """Implementer and fixer markers record the stall limits they run under."""
+    limits = {"stall_seconds": 900, "stall_startup_grace_seconds": 0}
+
+    assert pipeline.valid_marker(impl_marker(**limits)) is True
+    assert pipeline.valid_marker(impl_lease(**limits)) is True
+
+
+@pytest.mark.parametrize("limits", [
+    {"stall_seconds": True},
+    {"stall_seconds": 900.0},
+    {"stall_seconds": "900"},
+    {"stall_seconds": 0},
+    {"stall_startup_grace_seconds": -1},
+    {"stall_startup_grace_seconds": None},
+])
+def test_valid_marker_rejects_unusable_stall_limits(
+    limits: dict[str, object],
+) -> None:
+    """A stall limit that is not a usable integer is not this writer's marker."""
+    assert pipeline.valid_marker(impl_marker(**limits)) is False
+
+
+def test_valid_marker_rejects_stall_limits_on_a_review_marker() -> None:
+    """The reviewer has no progress contract, so only corruption writes these."""
+    assert pipeline.valid_marker(marker(stall_seconds=900)) is False
 
 
 # --- reconcile_dispatch: implement stage ---
@@ -6394,6 +6474,362 @@ def test_resolve_config_reads_no_config_from_the_install_or_a_worktree(
         "resolve_config read a configuration file it must not read"
     )
     assert not any(p.is_relative_to(worktree) for p in read)
+
+
+# --- Operator config: tuning, routing and cadence ---
+
+
+@pytest.mark.parametrize("use_packaged_floor", [False, True])
+def test_resolve_config_tuning_defaults_are_todays_values(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, use_packaged_floor: bool,
+) -> None:
+    """With no override, a tick runs on the values the constants held.
+
+    Checked against the shipped floor and against no floor at all: the floor
+    states the defaults for the operator, and the resolver answers the same
+    way for an install whose floor omits a key.
+    """
+    operator_config(monkeypatch, tmp_path, "")
+    if use_packaged_floor:
+        monkeypatch.setattr(
+            pipeline, "_PACKAGED_CONFIG_PATH",
+            Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+        )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.errors == ()
+    assert config.warnings == ()
+    assert config.implementer_timeout_seconds == 60 * 60
+    assert config.fixer_timeout_seconds == 60 * 60
+    assert config.review_timeout_seconds == 20 * 60
+    assert config.engine_stall_seconds == 30 * 60
+    assert config.engine_stall_startup_grace_seconds == 5 * 60
+    assert config.max_iterations == pipeline.MAX_ITERATIONS == 5
+    assert config.impl_engine == "claude"
+    assert config.model == ""
+    assert config.fix_engine == "claude"
+    assert config.fix_model == ""
+    assert config.review_model == ""
+    assert config.review_effort == ""
+    assert config.loop_short_poll_seconds == 270
+    assert config.loop_max_poll_seconds == 270
+    assert config.loop_heartbeat_seconds == 30 * 60
+    assert config.loop_quiescent_stop_after == 3
+    assert config.transient_cooldown_seconds == 60 * 60
+    assert config.transient_cooldown_reset_buffer_seconds == 5 * 60
+    assert config.probed_route is None
+    if use_packaged_floor:
+        floor = pipeline._read_toml(pipeline._PACKAGED_CONFIG_PATH)[0]
+        shipped = floor["defaults"]
+        assert isinstance(shipped, dict)
+        assert set(pipeline._INT_SETTINGS) | {
+            "impl_engine", "model", "fix_engine", "fix_model",
+            "review_model", "review_effort",
+        } <= set(shipped), "the shipped floor must state every default"
+
+
+def test_resolve_config_tuning_layers_like_every_other_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``[defaults]`` sets every target, and a repository section beats it."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\n'
+        'implementer_timeout_seconds = 7200\n'
+        'max_iterations = 8\n'
+        'loop_heartbeat_seconds = 3600\n'
+        '\n[repos."owner/slow"]\n'
+        'implementer_timeout_seconds = 10800\n'
+        'fixer_timeout_seconds = 5400\n'
+        'review_timeout_seconds = 2400\n'
+        'engine_stall_seconds = 2700\n'
+        'engine_stall_startup_grace_seconds = 0\n'
+        'max_iterations = 2\n'
+        'loop_short_poll_seconds = 120\n'
+        'loop_max_poll_seconds = 240\n'
+        'loop_quiescent_stop_after = 6\n'
+        'transient_cooldown_seconds = 900\n'
+        'transient_cooldown_reset_buffer_seconds = 0\n',
+    )
+
+    slow = pipeline.resolve_config("owner/slow")
+    other = pipeline.resolve_config("owner/other")
+
+    assert slow.errors == other.errors == ()
+    assert slow.warnings == other.warnings == ()
+    assert (
+        slow.implementer_timeout_seconds, slow.fixer_timeout_seconds,
+        slow.review_timeout_seconds, slow.engine_stall_seconds,
+        slow.engine_stall_startup_grace_seconds, slow.max_iterations,
+        slow.loop_short_poll_seconds, slow.loop_max_poll_seconds,
+        slow.loop_heartbeat_seconds, slow.loop_quiescent_stop_after,
+        slow.transient_cooldown_seconds,
+        slow.transient_cooldown_reset_buffer_seconds,
+    ) == (10800, 5400, 2400, 2700, 0, 2, 120, 240, 3600, 6, 900, 0)
+    assert other.implementer_timeout_seconds == 7200
+    assert other.fixer_timeout_seconds == 3600
+    assert other.max_iterations == 8
+    assert other.loop_heartbeat_seconds == 3600
+
+
+@pytest.mark.parametrize("key, value, expected", [
+    ("implementer_timeout_seconds", "true", "expected an integer"),
+    ("implementer_timeout_seconds", "3600.0", "expected an integer"),
+    ("implementer_timeout_seconds", '"3600"', "expected an integer"),
+    ("fixer_timeout_seconds", "59", "at least 60"),
+    ("review_timeout_seconds", "0", "at least 60"),
+    ("review_timeout_seconds", "-1200", "at least 60"),
+    ("engine_stall_seconds", "false", "expected an integer"),
+    ("engine_stall_startup_grace_seconds", "-1", "at least 0"),
+    ("max_iterations", "0", "at least 1"),
+    ("max_iterations", "2.5", "expected an integer"),
+    ("loop_short_poll_seconds", "59", "at least 60"),
+    ("loop_max_poll_seconds", "[270]", "expected an integer"),
+    ("loop_heartbeat_seconds", '"1800"', "expected an integer"),
+    ("loop_quiescent_stop_after", "0", "at least 1"),
+    ("transient_cooldown_seconds", "30", "at least 60"),
+    ("transient_cooldown_reset_buffer_seconds", "-5", "at least 0"),
+])
+def test_resolve_config_reports_a_malformed_tuning_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    key: str, value: str, expected: str,
+) -> None:
+    """Each malformed integer is an error naming the key, never a fallback.
+
+    TOML ``true`` is a Python ``int``, so a boolean has to be refused by name;
+    a float or a string must not be rounded or parsed into a deadline.
+    """
+    operator_config(monkeypatch, tmp_path, f'[repos."owner/name"]\n{key} = {value}\n')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any(key in e and expected in e for e in config.errors), config.errors
+
+
+@pytest.mark.parametrize("key", [
+    "loop_short_poll_seconds", "loop_max_poll_seconds", "loop_heartbeat_seconds",
+])
+def test_resolve_config_refuses_a_wake_on_the_prompt_cache_cliff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str,
+) -> None:
+    """300 seconds pays a prompt-cache miss without amortizing it.
+
+    The cadence contract never picks that interval, so a configured one is
+    refused rather than quietly moved to a different wake.
+    """
+    operator_config(monkeypatch, tmp_path, f"[defaults]\n{key} = 300\n")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any(key in e and "300" in e for e in config.errors), config.errors
+
+
+@pytest.mark.parametrize("text, names", [
+    # Not greater than the longest silence a healthy engine produces.
+    ("engine_stall_seconds = 600\n", "engine_stall_seconds"),
+    # Not less than the implementer deadline.
+    ("implementer_timeout_seconds = 1800\n", "implementer_timeout_seconds"),
+    # Not less than the fixer deadline.
+    ("engine_stall_seconds = 2400\nfixer_timeout_seconds = 2400\n",
+     "fixer_timeout_seconds"),
+])
+def test_resolve_config_keeps_the_stall_threshold_between_its_bounds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, names: str,
+) -> None:
+    """A stall threshold must sit above legitimate silence and below deadlines.
+
+    At or below the longest legitimate silence it reports healthy engines. At
+    or above a deadline it can never fire before the deadline does.
+    """
+    operator_config(monkeypatch, tmp_path, f"[defaults]\n{text}")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any(
+        "engine_stall_seconds" in e and names in e for e in config.errors
+    ), config.errors
+
+
+def test_resolve_config_resolves_the_engine_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Every route key layers, and the fixer's route is independent."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\n'
+        'impl_engine = "claude-ds"\n'
+        'review_effort = "xhigh"\n'
+        '\n[repos."owner/name"]\n'
+        'impl_engine = "claude"\n'
+        'model = "claude-opus-5-5[1m]"\n'
+        'fix_engine = "claude-ds"\n'
+        'fix_model = "deepseek-v4-flash"\n'
+        'review_model = "gpt-6"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+    other = pipeline.resolve_config("owner/other")
+
+    assert config.errors == other.errors == ()
+    assert (config.impl_engine, config.model) == ("claude", "claude-opus-5-5[1m]")
+    assert (config.fix_engine, config.fix_model) == ("claude-ds", "deepseek-v4-flash")
+    assert (config.review_model, config.review_effort) == ("gpt-6", "xhigh")
+    assert other.impl_engine == other.fix_engine == "claude-ds"
+
+
+@pytest.mark.parametrize("text, fix_route", [
+    # A blank fixer route is the implementer's route, model included.
+    ('model = "opus"\n', ("claude", "opus")),
+    # The same engine named explicitly still inherits the model.
+    ('model = "opus"\nfix_engine = "claude"\n', ("claude", "opus")),
+    # Another engine does not inherit a model meant for a different provider.
+    ('model = "opus"\nfix_engine = "claude-ds"\n', ("claude-ds", "")),
+    ('fix_model = "sonnet"\n', ("claude", "sonnet")),
+])
+def test_resolve_config_fixer_route_inherits_only_a_usable_model(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    text: str, fix_route: tuple[str, str],
+) -> None:
+    """A blank fixer key inherits the implementer's, never across engines."""
+    operator_config(monkeypatch, tmp_path, f'[defaults]\n{text}')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.errors == ()
+    assert (config.fix_engine, config.fix_model) == fix_route
+
+
+@pytest.mark.parametrize("key, value", [
+    ("impl_engine", '""'),
+    ("impl_engine", '"codex"'),
+    ("impl_engine", "true"),
+    ("fix_engine", '"claude-dss"'),
+    ("model", '"-p"'),
+    ("model", '"opus 4"'),
+    ("fix_model", "7"),
+    ("review_model", '"--yolo"'),
+    ("review_effort", '"high; rm"'),
+])
+def test_resolve_config_reports_an_unusable_route(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, value: str,
+) -> None:
+    """A route value that cannot reach its argv sink stops the tick."""
+    operator_config(monkeypatch, tmp_path, f"[defaults]\n{key} = {value}\n")
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert any(key in e for e in config.errors), config.errors
+
+
+def test_resolve_config_route_flags_outrank_the_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A typed route flag wins, and is validated like a config value."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[repos."owner/name"]\nimpl_engine = "claude"\nmodel = "opus"\n'
+        'review_model = "gpt-6"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name", cli_overrides={
+        "impl_engine": "claude-ds", "model": "deepseek-v4-pro[1m]",
+        "fix_engine": "claude", "review_effort": "low",
+    })
+    refused = pipeline.resolve_config(
+        "owner/name", cli_overrides={"impl_engine": "nope"},
+    )
+
+    assert config.errors == ()
+    assert (config.impl_engine, config.model) == ("claude-ds", "deepseek-v4-pro[1m]")
+    assert (config.fix_engine, config.fix_model) == ("claude", "")
+    assert (config.review_model, config.review_effort) == ("gpt-6", "low")
+    assert any(
+        "impl_engine" in e and "the command line" in e for e in refused.errors
+    )
+
+
+def test_resolve_config_reports_the_route_recorded_for_the_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Only the repository's own section records a probed route.
+
+    Setup writes ``probed_impl_engine`` and ``probed_model`` there; a
+    ``[defaults]`` route or a flag says nothing about what was measured.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\nimpl_engine = "claude-ds"\nmodel = "x"\n'
+        'probed_impl_engine = "claude-ds"\nprobed_model = "x"\n'
+        '\n[repos."owner/probed"]\nimpl_engine = "claude"\nmodel = "haiku"\n'
+        'probed_impl_engine = "claude"\nprobed_model = ""\n'
+        '\n[repos."owner/half"]\nimpl_engine = "claude"\n',
+    )
+
+    probed = pipeline.resolve_config(
+        "owner/probed", cli_overrides={"model": "opus"},
+    )
+
+    assert probed.probed_route == ("claude", "")
+    assert probed.model == "opus"
+    assert pipeline.resolve_config("owner/other").probed_route is None
+    assert pipeline.resolve_config("owner/half").probed_route is None
+
+
+@pytest.mark.parametrize("metadata, key", [
+    ('probed_impl_engine = "claude"\n', "probed_model"),
+    ('probed_model = "sonnet"\n', "probed_impl_engine"),
+    ('probed_impl_engine = "codex"\nprobed_model = "sonnet"\n', "probed_impl_engine"),
+    ('probed_impl_engine = "claude"\nprobed_model = true\n', "probed_model"),
+    ('probed_impl_engine = "claude"\nprobed_model = "-p"\n', "probed_model"),
+])
+def test_resolve_config_refuses_incomplete_or_invalid_probe_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, metadata: str, key: str,
+) -> None:
+    operator_config(monkeypatch, tmp_path, '[repos."owner/probed"]\n' + metadata)
+
+    config = pipeline.resolve_config("owner/probed")
+
+    assert config.probed_route is None
+    assert any(key in error for error in config.errors)
+    assert any(key in error for error in config.tuning_errors)
+
+
+def test_resolve_config_separates_the_errors_a_tick_reads_once(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Tuning and route errors are marked, so dispatch's re-read can skip them.
+
+    Every error still stops the tick at startup. Only the subset in keys read
+    once at that gate is excluded from dispatch's later read of the keys it
+    still re-reads; an invalid ``permission_mode`` must keep stopping dispatch.
+    """
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\npermission_mode = "yolo"\nmax_iterations = 0\n'
+        'fix_engine = "x"\nengine_stall_seconds = 4000\nmax_in_flight = 0\n',
+    )
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert len(config.errors) == 6
+    assert set(config.tuning_errors) < set(config.errors)
+    assert [e for e in config.errors if e not in config.tuning_errors] == [
+        e for e in config.errors if "permission_mode" in e
+    ]
+
+
+@pytest.mark.parametrize("engine, model, expected", [
+    ("claude", "", ""),
+    ("claude", "opus", "opus"),
+    ("claude-ds", "", pipeline.CLAUDE_DS_DEFAULT_MODEL),
+    ("claude-ds", "deepseek-v4-flash", "deepseek-v4-flash"),
+])
+def test_effective_engine_model_names_the_model_dispatch_runs(
+    engine: str, model: str, expected: str,
+) -> None:
+    """claude-ds has no operator default to inherit, so blank is its pin."""
+    assert pipeline.effective_engine_model(engine, model) == expected
 
 
 def test_operator_config_path_is_never_inside_the_install(

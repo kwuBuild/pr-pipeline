@@ -198,14 +198,19 @@ base_ref        = ""          # "" = discover the target's GitHub default branch
 permission_mode = "auto"      # Claude implementer/fixer --permission-mode
 engine_settings = ""          # Claude implementer/fixer --settings; "" = omit
 max_in_flight   = 3           # admission cap: engines running at once per target
+implementer_timeout_seconds = 3600  # see "Deadlines, stall limits, routing and cadence"
 
 [scan]
 repos = []                    # empty or absent = unrestricted
 
 [repos."owner/notes-app"]     # overrides any [defaults] key, for one target
-base_ref      = "master"
-verify_tools  = ["<that repo's test command> *"]
 max_in_flight = 5
+base_ref     = "master"
+verify_tools = ["<that repo's test command> *"]
+impl_engine  = "claude"       # editable routing defaults, initially set by setup
+model        = ""
+probed_impl_engine = "claude" # setup evidence: refresh through setup
+probed_model       = ""
 ```
 
 The verification commands are whatever the target repository's own
@@ -297,6 +302,76 @@ does not issue GitHub requests after a rejected target or configuration. A tick
 that crashes (`tick_crash`, exit 4) also ends `--loop` before the next wait, so
 a persistent exception reaches the operator instead of retrying in the
 background.
+
+### Deadlines, stall limits, routing and cadence
+
+These keys tune paid engine lifetimes, review effort, engine routes, and loop
+activity. Each one can be set in `[defaults]` and overridden in
+`[repos."owner/name"]`, like every other per-target key. The packaged
+[`config.toml`](config.toml) ships today's values and documents each key.
+
+| Key | Unit | Default | Accepted values | Read by |
+|---|---|---|---|---|
+| `implementer_timeout_seconds` | seconds | 3600 | integer ≥ 60, greater than `engine_stall_seconds` | implementer dispatch, recorded as the marker `deadline` |
+| `fixer_timeout_seconds` | seconds | 3600 | integer ≥ 60, greater than `engine_stall_seconds` | fixer dispatch, recorded as the marker `deadline` |
+| `review_timeout_seconds` | seconds | 1200 | integer ≥ 60 | reviewer dispatch, recorded as the marker `deadline` |
+| `engine_stall_seconds` | seconds | 1800 | integer > 600 and less than both engine deadlines | implementer/fixer dispatch, recorded in the marker for stall detection |
+| `engine_stall_startup_grace_seconds` | seconds | 300 | integer ≥ 0 | implementer/fixer dispatch, recorded in the marker |
+| `max_iterations` | review/fix rounds | 5 | integer ≥ 1 | reviewer harvest: the round that reaches it gets `ai:max-iterations` |
+| `impl_engine` | — | `"claude"` | `"claude"` or `"claude-ds"` | implementer launch |
+| `model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
+| `fix_engine` | — | `""` | blank (the implementer's engine), `"claude"`, or `"claude-ds"` | fixer launch |
+| `fix_model` | — | `""` | blank, or a model id | fixer `--model`; blank inherits `model` only while the fixer runs on the implementer's engine |
+| `review_model` | — | `""` | blank (codex config, then `gpt-5.5`), or a model id | reviewer `--model` |
+| `review_effort` | — | `""` | blank (codex config, then `high`), or a bare token | reviewer `model_reasoning_effort` |
+| `loop_short_poll_seconds` | seconds | 270 | integer ≥ 60, not 300 | wake while work is queued, at capacity, or state is unknown |
+| `loop_max_poll_seconds` | seconds | 270 | integer ≥ 60, not 300 | longest wait while an engine is in flight |
+| `loop_heartbeat_seconds` | seconds | 1800 | integer ≥ 60, not 300 | wake while quiescent |
+| `loop_quiescent_stop_after` | heartbeats | 3 | integer ≥ 1 | quiescent stop in both loop paths |
+| `transient_cooldown_seconds` | seconds | 3600 | integer ≥ 60 | provider cooldown after a transient result that names no reset time |
+| `transient_cooldown_reset_buffer_seconds` | seconds | 300 | integer ≥ 0 | margin added to a reset time the provider names |
+
+Precedence is the same as for every key: explicit CLI flags, then
+`[repos."owner/name"]`, then `[defaults]`, then the packaged floor. Only the
+route keys have flags: `--impl-engine`, `--model`, `--fix-engine`,
+`--fix-model`, `--review-model`, and `--review-effort`. A typed flag is
+validated like a config value.
+
+Integer keys accept integers only. A boolean, float, or string, a value below
+the minimum, a wake of exactly 300 seconds (the prompt-cache TTL cliff, which
+the cadence never waits for), or a stall threshold outside its bounds stops the
+tick at startup with exit 3, naming the key. So does a route value that is not
+a supported engine or a usable model id. Nothing falls back silently.
+
+The optional harness `/loop` prompt schedules each one-shot tick through
+`ScheduleWakeup`, which clamps a wake to 60–3600 seconds. Under that prompt a
+`loop_heartbeat_seconds` above 3600 wakes after 3600 seconds, so the quiescent
+stop comes sooner than the configured interval implies. `--loop` has no clamp.
+
+The tick resolves the configuration once, at the startup gate, before HARVEST.
+Every stage and both loop paths read that one validated configuration, so a
+config edit made during a tick takes effect at the next tick. An edit that
+makes one of these keys invalid mid-tick changes nothing in that tick; the next
+tick refuses it at startup. Each engine's
+deadline and stall limits are recorded in its `dispatch.json` at dispatch:
+reconciliation, the stall watcher, and the status dashboard read them from
+there, so a later edit does not move them for an engine already running.
+
+`/pr-pipeline:setup` sets `impl_engine` and `model` in the repository's section,
+so the tick runs the measured route without flags. In the same atomic config
+write, it records separate `probed_impl_engine` and `probed_model` evidence.
+These two metadata keys apply only to that repository; they do not inherit
+from `[defaults]` or CLI flags. Edit routing defaults as needed, and refresh
+probe metadata only by rerunning setup. Both metadata keys must be present
+and valid together; a partial or malformed record stops startup with exit 3.
+
+When a config edit or flag selects a different implementer route, the tick
+prints `tick: implementer route … differs from the route /pr-pipeline:setup
+probed …` at startup, logs `startup_route_unprobed`, and runs. Setup measured
+`auto` permission mode on one route only; rerun setup to measure another. A
+repository set up before separate probe metadata was recorded has no recorded
+route, so the tick has nothing to compare against; rerun setup to record it.
+Mutable routing defaults alone never count as probe evidence.
 
 ### Unconfigured targets
 
@@ -393,14 +468,20 @@ Every tick invocation, looped or one-shot, takes a non-blocking mutex at
 exits immediately with code `5`, writes `lock_held` to the tick log when
 possible, and does no harvest or dispatch work.
 
-| State at end of tick | Next wake |
+| State at end of tick | Next wake (shipped default) |
 |---|---|
-| ≥1 engine in-flight, deadline > 0 | `min(nearest deadline, 270s)` cache-warm poll |
+| ≥1 engine in-flight, deadline > 0 | `min(nearest deadline, loop_max_poll_seconds)` (270s) cache-warm poll |
 | ≥1 engine in-flight, deadline lapsed mid-scan | 1s — immediate retry to harvest/escalate |
-| No engine in-flight, queue non-empty | ~270s cache-warm poll |
-| At `max_in_flight`, saturated | ~270s cache-warm poll |
-| Quiescent (all in-scope items terminal) | ~1800s heartbeat |
-| Quiescent for N consecutive heartbeats | stop + notify |
+| No engine in-flight, queue non-empty | `loop_short_poll_seconds` (270s) cache-warm poll |
+| At `max_in_flight`, saturated | `loop_short_poll_seconds` (270s) |
+| Quiescent (all in-scope items terminal) | `loop_heartbeat_seconds` (1800s) heartbeat |
+| Quiescent for `loop_quiescent_stop_after` (3) consecutive heartbeats | stop + notify |
+
+The intervals are [operator configuration](#deadlines-stall-limits-routing-and-cadence).
+Both loop paths — the one-shot `tick-cadence:` line and `--loop` — pace from the
+configuration the tick validated at startup. An invocation turned away by the
+mutex paces its retry from the configured short poll when the configuration
+resolves cleanly.
 
 Only a deadline that still requires cadence action paces the loop. Both cadence
 surfaces share one scan, and it counts a marker only when the identity-verified
@@ -485,7 +566,8 @@ a sleep into an early tick:
 3. **Engine stall.** The same watcher poll checks whether a live implementer or
    fixer has stopped *producing*. Its stream wrapper bumps the mtime of a
    `heartbeat` file beside `result.json` as engine output events arrive; when
-   that mtime has not moved for 30 minutes the loop wakes and the operator gets
+   that mtime has not moved for the engine's stall threshold (`engine_stall_seconds`,
+   30 minutes shipped, recorded in its marker) the loop wakes and the operator gets
    an `engine_stalled` tick-log entry and a notification. See
    [Engine progress heartbeats](DEBUG.md#engine-progress-heartbeats-engine_stalled).
 
@@ -500,7 +582,7 @@ a sleep into an early tick:
    than risking a silent stall.
 
    This is **detection only** — no kill, no relabel, no requeue, no deadline
-   change. A stalled engine keeps its full 60-minute timeout; the signal exists
+   change. A stalled engine keeps its full deadline (60 minutes shipped); the signal exists
    so the operator learns about a wedge tens of minutes before that timeout
    fires, instead of watching a healthy-looking row burn its whole deadline.
 
@@ -513,7 +595,7 @@ Two properties keep this from becoming a control-plane risk:
 - **Nudges cannot accelerate the quiescent stop.** Only a tick that followed a
   wait running its full scheduled interval counts toward the
   consecutive-quiescent heartbeat limit, so "stop after N quiescent heartbeats"
-  keeps meaning roughly N × 1800s of quiet that cannot be accelerated by nudge traffic. This
+  keeps meaning roughly N heartbeat intervals of quiet (3 × 1800s shipped) that cannot be accelerated by nudge traffic. This
   gate covers *both* counters: the loop's in-memory streak and the
   `.tick-state/quiescent-counter.txt` the one-shot `tick-cadence:` line reads.
   A nudge-initiated tick is also held to a 10s floor measured from the end of
@@ -727,14 +809,25 @@ additionally *names* each held slot
 the one-shot `/loop` path has only that line to notify from, so neither a stop
 nor a wedged cap caused by a human holding an engine can go unexplained.
 
-### Engine selection (`--impl-engine`)
+### Engine selection (`--impl-engine`, `--fix-engine`)
 
 ```bash
 ~/.claude/pr-pipeline/bin/pr-pipeline tick --impl-engine claude-ds
+~/.claude/pr-pipeline/bin/pr-pipeline tick --fix-engine claude-ds --fix-model deepseek-v4-flash
 ```
 
-Controls whether the implementer and fixer engines use `claude` (default) or
-`claude-ds` (DeepSeek via Claude wrapper). The reviewer always uses `codex`.
+Controls whether the implementer uses `claude` (default) or `claude-ds`
+(DeepSeek via Claude wrapper). The fixer runs on the implementer's route unless
+`fix_engine`/`--fix-engine` names its own engine; `fix_model`/`--fix-model`
+names its model. A blank fixer model inherits the implementer's model only while
+the fixer runs on the implementer's engine, because a model id names one
+provider's model. The reviewer always uses `codex`.
+
+Each flag has a config key of the same name (`impl_engine`, `fix_engine`,
+`fix_model`), so a repository's route needs no flags on every tick; setup
+writes the probed implementer route there. A flag overrides the configuration
+for one run, and the tick reports at startup when that run's implementer route
+differs from the probed one (see [Configuration](#deadlines-stall-limits-routing-and-cadence)).
 
 ### Model override (`--model`)
 
@@ -742,7 +835,8 @@ Controls whether the implementer and fixer engines use `claude` (default) or
 ~/.claude/pr-pipeline/bin/pr-pipeline tick --model claude-sonnet-4-6
 ```
 
-Overrides the model used by implementer and fixer engines. When not given, the
+Sets the implementer model (config key `model`), which the fixer inherits as
+described above. When the resolved value is blank, the
 `claude` engine gets **no `--model` flag at all**, so the CLI resolves the model
 through its own settings precedence — upgrade your default and the pipeline
 follows. Precedence is worth knowing, because it is not simply "your user
@@ -766,10 +860,12 @@ The reviewer is a separate provider from the implementer/fixer engines, so it
 has its own knobs. Resolution order for each value independently:
 
 1. the explicit flag, when given
-2. `model` / `model_reasoning_effort` from the operator's codex config —
+2. `review_model` / `review_effort` in the pipeline's operator config
+   (`[repos."owner/name"]`, then `[defaults]`)
+3. `model` / `model_reasoning_effort` from the operator's codex config —
    `$CODEX_HOME/config.toml` when that variable is set, else `~/.codex/config.toml`,
    the same root `codex` itself resolves
-3. the pinned fallbacks (`gpt-5.5`, `high`)
+4. the pinned fallbacks (`gpt-5.5`, `high`)
 
 Profiles are not consulted: since codex 0.146 the legacy `profile = "…"` key is
 rejected by codex outright, and profiles v2 apply only when `--profile` is passed
@@ -780,8 +876,10 @@ Every value — flag or config — is shape-checked for the sink it reaches. The
 effort is interpolated into a `-c model_reasoning_effort="…"` TOML expression, so
 it must be a bare token; the model is its own argv element, so provider-qualified
 ids like `openai/gpt-5.1-codex` are fine but a leading dash (which codex would
-read as an option) is not. A rejected value is reported on stderr and falls
-through to the next source rather than being swapped in silence.
+read as an option) is not. A rejected flag or pipeline config value stops the
+tick at startup, naming the key. A rejected codex config value is reported on
+stderr and falls through to the pinned fallback rather than being swapped in
+silence.
 
 The reviewer cannot inherit this config the way the claude engines inherit
 theirs. It runs under `env -i` isolation with `HOME`/`CODEX_HOME` pointed at a
@@ -962,7 +1060,9 @@ the value to the repository section even when blank, so a nonblank
 Accepting `--permission-mode auto` proves nothing, and neither does a run that
 merely starts: `auto` depends on the provider, model, and account, and a
 classifier denial is not an approval. Setup therefore measures the route the
-tick will use (`--impl-engine`, `--model`) for each repository:
+tick will use (`impl_engine`, `model`) for each repository, and `write-config`
+records routing defaults and separate probe evidence in the repository's
+section (see [the route metadata contract](#deadlines-stall-limits-routing-and-cadence)):
 
 1. Compose the allowlist an implementer launches with: the engine base grants,
    the repository's confirmed `verify_tools`, and the exact push grant. Refuse
@@ -1189,8 +1289,9 @@ mentions a limit.
 Transient results share an account-domain cooldown across implementer and fixer
 dispatch. `claude` and `claude-ds` use separate domains so a Claude subscription
 limit does not block DeepSeek-routed work. When the provider message includes a
-reset wall-clock time, the cooldown ends five minutes after the next occurrence;
-otherwise it lasts one hour. Durable state lives in
+reset wall-clock time, the cooldown ends `transient_cooldown_reset_buffer_seconds`
+(shipped: five minutes) after the next occurrence; otherwise it lasts
+`transient_cooldown_seconds` (shipped: one hour). Durable state lives in
 `.claude/worktrees/.engine-cooldowns/`.
 
 The retry boundary is `MAX_DISPATCH_ATTEMPTS = 3`:
@@ -1259,7 +1360,7 @@ requeue a fresh review at `ai:implemented` to recover. The reviewer explicitly
 checks every original finding, including any omitted from the fixer summary.
 A token tied to that fixer run
 is pinned in the reviewer marker and included in its review identity. New
-no-change rounds count toward `MAX_ITERATIONS` even on the same commit;
+no-change rounds count toward the round limit (`max_iterations`) even on the same commit;
 replaying one fixer result or review harvest does not create an extra round.
 The parser checks every reported block; it does not prove that the report
 covers every original finding or that a reason is correct. The prompt requires

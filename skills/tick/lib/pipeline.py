@@ -199,12 +199,78 @@ ENTITY_PICKUP_LABELS: dict[str, frozenset[str]] = {
     for entity in sorted(set(STAGE_ENTITIES.values()))
 }
 
-# In-process loop cadence. Kept as public constants for compatibility with
-# older callers; decide_loop_cadence delegates to compute_next_wake below.
+# Shipped defaults for the operator-tunable values. A tick reads the operator's
+# values from ResolvedConfig (keys of the same name in lower case, see
+# _INT_SETTINGS) and passes them to every consumer; these constants answer only
+# for a packaged floor that omits a key and for direct callers of the helpers.
+#
+# Loop cadence, in seconds except the stop count. The short poll is the wake
+# while work is queued, at capacity, or unknown; the max poll caps the wait
+# while an engine is in flight; the heartbeat is the quiescent wake.
 LOOP_SHORT_POLL_SECONDS = 270
 LOOP_MAX_POLL_SECONDS = 270
 LOOP_HEARTBEAT_SECONDS = 30 * 60
 LOOP_QUIESCENT_STOP_AFTER = 3
+# Stage deadlines recorded in each dispatch marker.
+IMPLEMENTER_TIMEOUT_SECONDS = 60 * 60
+FIXER_TIMEOUT_SECONDS = 60 * 60
+REVIEW_TIMEOUT_SECONDS = 20 * 60
+# Implementer/fixer stall detection; see tick.ENGINE_STALL_SECONDS for the
+# reasoning behind the shipped threshold.
+ENGINE_STALL_SECONDS = 30 * 60
+ENGINE_STALL_STARTUP_GRACE_SECONDS = 5 * 60
+# The longest silence a healthy engine can produce: Claude Code's 600s cap on
+# one Bash call. Derived from the harness, not tunable; a configured stall
+# threshold must exceed it (see tick.MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS).
+MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = 10 * 60
+# Provider cooldown after a transient (quota or rate-limit) engine result: the
+# fallback length, and the margin added to a reset time the provider names.
+TRANSIENT_COOLDOWN_SECONDS = 60 * 60
+TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
+
+# Implementer/fixer engines a route may name. ``claude-ds`` is ``claude``
+# routed to DeepSeek; it has no operator default model to inherit, so a blank
+# model means this pin (see :func:`effective_engine_model`).
+ENGINE_ROUTES = ("claude", "claude-ds")
+CLAUDE_DS_DEFAULT_MODEL = "deepseek-v4-pro[1m]"
+
+# A model id is its own argv element, so quoting cannot leak into an expression
+# and provider-qualified ids (openai/gpt-5.1-codex, qwen3:30b) are fine. What
+# argv *is* vulnerable to is a value read as an option, so the first character
+# must not be a dash. Shared by the engine ``--model`` and the reviewer model.
+ENGINE_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/\[\]-]*")
+# A reviewer reasoning effort, interpolated into a ``-c
+# model_reasoning_effort="<v>"`` TOML expression, so it must be a bare token: a
+# quote or newline could close the string and append an unreviewed config key.
+REVIEW_EFFORT_RE = re.compile(r"[A-Za-z0-9._\-\[\]]+")
+
+
+class CadenceSettings(TypedDict, total=False):
+    """Cadence keyword arguments shared by :func:`compute_next_wake` and
+    :func:`decide_loop_cadence`. An absent key is the shipped default."""
+
+    short_poll_seconds: int
+    max_poll_seconds: int
+    heartbeat_seconds: int
+    quiescent_stop_after: int
+
+
+def effective_engine_model(engine: str, model: str) -> str:
+    """Return the model an implementer/fixer dispatch runs on this route.
+
+    Args:
+        engine: ``"claude"`` or ``"claude-ds"``.
+        model: The configured model; blank means the engine's default.
+
+    Returns:
+        ``model`` when set. Blank stays blank for ``claude``, whose CLI then
+        resolves the operator's own default, and is
+        :data:`CLAUDE_DS_DEFAULT_MODEL` for ``claude-ds``.
+    """
+    if not model and engine == "claude-ds":
+        return CLAUDE_DS_DEFAULT_MODEL
+    return model
+
 
 # Files that govern the reviewer's own behaviour. A PR that edits any of these is
 # changing the very policy that decides whether it is promoted, so it must not be
@@ -416,6 +482,9 @@ def decide_loop_cadence(
     now: float | None = None,
     quiescent_stop_after: int = LOOP_QUIESCENT_STOP_AFTER,
     held_items: Sequence[str] = (),
+    short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS,
+    max_poll_seconds: int = LOOP_MAX_POLL_SECONDS,
+    heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
 ) -> tuple[int, bool]:
     """Choose the next sleep for unattended in-process loop mode.
 
@@ -439,6 +508,9 @@ def decide_loop_cadence(
             which the loop should stop.
         held_items: Operator-facing identifiers for the slots excluded from
             ``in_flight_count`` while a human hold is active.
+        short_poll_seconds: Forwarded to :func:`compute_next_wake`.
+        max_poll_seconds: Forwarded to :func:`compute_next_wake`.
+        heartbeat_seconds: Forwarded to :func:`compute_next_wake`.
 
     Returns:
         ``(sleep_seconds, stop)``.
@@ -459,6 +531,9 @@ def decide_loop_cadence(
         ),
         quiescent_stop_after=quiescent_stop_after,
         held_items=held_items,
+        short_poll_seconds=short_poll_seconds,
+        max_poll_seconds=max_poll_seconds,
+        heartbeat_seconds=heartbeat_seconds,
     )
     return decision.next_wake_seconds, decision.stop
 
@@ -751,21 +826,16 @@ def derive_tick_state(
 # --- Cadence ---
 #
 # The loop must poll because engines are detached background processes the
-# harness never signals on completion. Two cache-aware bands only, never 300s
-# (the prompt-cache TTL breakpoint that pays a cache miss without amortizing it).
+# harness never signals on completion. The intervals are the operator's
+# (ResolvedConfig loop_* keys; shipped defaults LOOP_* above): a cache-warm
+# band under the prompt-cache TTL cliff while there is work, and a cache-cold
+# heartbeat long enough to amortize a miss while there is none.
 
-# Cache-warm band: stay under the 300s TTL cliff so the prompt cache survives.
-_CADENCE_CACHE_WARM = 270
-
-# Cache-cold band: long enough to amortize the cache-miss cost; short enough
-# that a new item doesn't wait half an hour for the next poll.
-_CADENCE_HEARTBEAT = 1800
-
-# The prompt-cache TTL cliff — must never be the chosen interval.
+# The prompt-cache TTL cliff — must never be the chosen interval. Configured
+# wakes may not equal it (see resolve_config); a deadline that lands on it
+# while an engine is in flight steps back into the warm band instead.
 _CADENCE_TTL_CLIFF = 300
-
-# Number of consecutive quiescent heartbeats before the loop stops.
-_DEFAULT_QUIESCENT_STOP_AFTER = 3
+_CADENCE_CLIFF_STEP_BACK = 270
 
 
 @dataclass(frozen=True)
@@ -800,24 +870,28 @@ def compute_next_wake(
     at_capacity: bool | None = False,
     is_quiescent: bool = False,
     consecutive_quiescent_ticks: int = 0,
-    quiescent_stop_after: int = _DEFAULT_QUIESCENT_STOP_AFTER,
+    quiescent_stop_after: int = LOOP_QUIESCENT_STOP_AFTER,
     held_items: Sequence[str] = (),
+    short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS,
+    max_poll_seconds: int = LOOP_MAX_POLL_SECONDS,
+    heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
 ) -> CadenceDecision:
     """Compute the next wake interval from end-of-tick state.
 
     The cadence is load-bearing because engines are detached background
     processes — the loop must poll, and the interval determines both
-    convergence latency and spend. Two cache-aware bands only, never 300s.
+    convergence latency and spend. Never 300s.
 
-    Decision table (first match wins):
+    Decision table (first match wins; shipped defaults in parentheses):
 
     ======================================  ===================================
     State at end of tick                    Next wake
     ======================================  ===================================
-    ≥1 engine in-flight                    ``min(nearest deadline, 270s)``
-    Actionable queue non-empty             ~270s
-    At ``max_in_flight`` with work           ~270s (harvest to free a slot)
-    Quiescent                              ~1800s heartbeat
+    ≥1 engine in-flight                    ``min(nearest deadline, max poll)``
+                                            (max poll 270s)
+    Actionable queue non-empty             short poll (270s)
+    At ``max_in_flight`` with work           short poll (harvest to free a slot)
+    Quiescent                              heartbeat (1800s)
     Quiescent for N consecutive heartbeats  stop (caller notifies developer)
     ======================================  ===================================
 
@@ -838,7 +912,7 @@ def compute_next_wake(
         consecutive_quiescent_ticks: How many consecutive ticks have been
             quiescent before this one (caller tracks this across ticks).
         quiescent_stop_after: Stop the loop after this many consecutive
-            quiescent heartbeats (default 3).
+            quiescent heartbeats.
         held_items: Operator-facing identifiers for slots excluded from
             ``in_flight_count`` because a human currently holds them. Named in
             *every* reason, because the reason line is the only thing the
@@ -847,6 +921,10 @@ def compute_next_wake(
             that engine unattended; a non-quiescent tick that is nonetheless
             wedged at the admission cap needs the same explanation, since
             ``in_flight_count`` has already discounted the cause.
+        short_poll_seconds: Wake while work is queued, at capacity, or when
+            state is unknown.
+        max_poll_seconds: Longest wait while an engine is in flight.
+        heartbeat_seconds: Wake while quiescent.
 
     Returns:
         A :class:`CadenceDecision` with the next wake interval in seconds,
@@ -855,7 +933,7 @@ def compute_next_wake(
     # Guard: never return exactly the TTL cliff.
     def _guard(seconds: int) -> int:
         if seconds == _CADENCE_TTL_CLIFF:
-            return _CADENCE_CACHE_WARM
+            return _CADENCE_CLIFF_STEP_BACK
         return seconds
 
     # Held items are discounted from in_flight_count, so without this suffix
@@ -872,20 +950,20 @@ def compute_next_wake(
     # loop can recover promptly once GitHub or marker reads become trustworthy.
     if in_flight_count is None or has_actionable_queue is None or at_capacity is None:
         return CadenceDecision(
-            next_wake_seconds=_CADENCE_CACHE_WARM,
+            next_wake_seconds=short_poll_seconds,
             stop=False,
-            reason=_with_custody(f"state unknown -> wake {_CADENCE_CACHE_WARM}s"),
+            reason=_with_custody(f"state unknown -> wake {short_poll_seconds}s"),
         )
 
     # 1. In-flight engines: pace to the nearest deadline, clamped to
     #    cache-warm so we never burn a cache miss on a distant deadline.
     if in_flight_count >= 1:
         if nearest_deadline_s is not None and nearest_deadline_s > 0:
-            wake = min(int(nearest_deadline_s), _CADENCE_CACHE_WARM)
+            wake = min(int(nearest_deadline_s), max_poll_seconds)
         elif nearest_deadline_s is not None and nearest_deadline_s <= 0:
             wake = 1
         else:
-            wake = _CADENCE_CACHE_WARM
+            wake = max_poll_seconds
         # Guard against the TTL cliff before constructing the decision.
         wake = _guard(wake)
         return CadenceDecision(
@@ -905,21 +983,21 @@ def compute_next_wake(
     # 2. Actionable queue: poll promptly to dispatch.
     if has_actionable_queue:
         return CadenceDecision(
-            next_wake_seconds=_CADENCE_CACHE_WARM,
+            next_wake_seconds=short_poll_seconds,
             stop=False,
             reason=_with_custody(
-                f"actionable queue non-empty → wake {_CADENCE_CACHE_WARM}s",
+                f"actionable queue non-empty → wake {short_poll_seconds}s",
             ),
         )
 
     # 3. At capacity: poll to harvest and free a slot.
     if at_capacity:
         return CadenceDecision(
-            next_wake_seconds=_CADENCE_CACHE_WARM,
+            next_wake_seconds=short_poll_seconds,
             stop=False,
             reason=_with_custody(
                 f"at capacity ({in_flight_count} in-flight) → "
-                f"wake {_CADENCE_CACHE_WARM}s",
+                f"wake {short_poll_seconds}s",
             ),
         )
 
@@ -929,17 +1007,17 @@ def compute_next_wake(
         # this tick is also quiescent, so this is heartbeat #(prior + 1).
         stop = consecutive_quiescent_ticks + 1 >= quiescent_stop_after
         return CadenceDecision(
-            next_wake_seconds=_CADENCE_HEARTBEAT,
+            next_wake_seconds=heartbeat_seconds,
             stop=stop,
             reason=_with_custody(
                 f"quiescent (heartbeat {consecutive_quiescent_ticks + 1}/{quiescent_stop_after})"
-                + (" → stop" if stop else f" → wake {_CADENCE_HEARTBEAT}s")
+                + (" → stop" if stop else f" → wake {heartbeat_seconds}s")
             ),
         )
 
     # Fallback (should not be reachable with correct inputs).
     return CadenceDecision(
-        next_wake_seconds=_CADENCE_HEARTBEAT,
+        next_wake_seconds=heartbeat_seconds,
         stop=False,
         reason=_with_custody("fallback → heartbeat"),
     )
@@ -1720,6 +1798,46 @@ _CONFIG_KEYS = (
     "permission_mode",
     "engine_settings",
     "max_in_flight",
+    "impl_engine",
+    "model",
+    "fix_engine",
+    "fix_model",
+    "review_model",
+    "review_effort",
+)
+
+# The integer settings: ``key -> (shipped default, minimum)``. None of them has
+# a conservative reading — a shorter deadline kills work, a longer one spends
+# what the operator did not budget — so a value that is not an integer at or
+# above its minimum is a startup error naming the key, never a fallback.
+_INT_SETTINGS: dict[str, tuple[int, int]] = {
+    "implementer_timeout_seconds": (IMPLEMENTER_TIMEOUT_SECONDS, 60),
+    "fixer_timeout_seconds": (FIXER_TIMEOUT_SECONDS, 60),
+    "review_timeout_seconds": (REVIEW_TIMEOUT_SECONDS, 60),
+    "engine_stall_seconds": (
+        ENGINE_STALL_SECONDS, MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS + 1,
+    ),
+    "engine_stall_startup_grace_seconds": (ENGINE_STALL_STARTUP_GRACE_SECONDS, 0),
+    "max_iterations": (MAX_ITERATIONS, 1),
+    "loop_short_poll_seconds": (LOOP_SHORT_POLL_SECONDS, 60),
+    "loop_max_poll_seconds": (LOOP_MAX_POLL_SECONDS, 60),
+    "loop_heartbeat_seconds": (LOOP_HEARTBEAT_SECONDS, 60),
+    "loop_quiescent_stop_after": (LOOP_QUIESCENT_STOP_AFTER, 1),
+    "transient_cooldown_seconds": (TRANSIENT_COOLDOWN_SECONDS, 60),
+    "transient_cooldown_reset_buffer_seconds": (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS, 0,
+    ),
+}
+_CONFIG_KEYS += tuple(_INT_SETTINGS)
+
+# Setup evidence belongs only to the repository it measured. It neither
+# inherits from defaults nor changes when an operator edits a routing key.
+_CONFIG_PROBE_KEYS = ("probed_impl_engine", "probed_model")
+
+# Wakes the cadence contract never picks (see compute_next_wake), refused
+# rather than moved: a configured interval must be the interval that runs.
+_CACHE_CLIFF_KEYS = (
+    "loop_short_poll_seconds", "loop_max_poll_seconds", "loop_heartbeat_seconds",
 )
 
 # The admission cap when no layer names ``max_in_flight``. The packaged floor
@@ -1809,6 +1927,43 @@ class ResolvedConfig:
             answering every key is not the same statement: only setup writes a
             repository's section, after proposing its verification grants and
             probing its engine route. Always ``False`` for a blank ``repo``.
+        implementer_timeout_seconds: Implementer deadline from dispatch.
+        fixer_timeout_seconds: Fixer deadline from dispatch.
+        review_timeout_seconds: Reviewer deadline from dispatch.
+        engine_stall_seconds: Implementer/fixer output silence that reports
+            a stall. Above :data:`MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS` and
+            below both deadlines, or an entry in :attr:`errors`.
+        engine_stall_startup_grace_seconds: Extra silence allowed before an
+            engine's first output event.
+        max_iterations: Review/fix rounds before ``ai:max-iterations``.
+        impl_engine: The implementer engine, one of :data:`ENGINE_ROUTES`.
+        model: The implementer ``--model``; ``""`` is the engine default.
+        fix_engine: The fixer engine; a blank key inherits ``impl_engine``.
+        fix_model: The fixer ``--model``. A blank key inherits ``model`` when
+            the fixer runs on the implementer's engine, and is the engine
+            default otherwise: a model id belongs to one provider.
+        review_model: The reviewer model; ``""`` resolves the operator's
+            codex config, then the pinned fallback.
+        review_effort: The reviewer reasoning effort, resolved like
+            ``review_model``.
+        probed_route: The repository's ``(probed_impl_engine, probed_model)``
+            setup evidence, independent of routing defaults and CLI flags.
+            ``None`` for older setups without evidence or invalid metadata
+            (which also adds a startup error).
+        loop_short_poll_seconds: Wake while work is queued, at capacity, or
+            unknown.
+        loop_max_poll_seconds: Longest wait while an engine is in flight.
+        loop_heartbeat_seconds: Wake while quiescent.
+        loop_quiescent_stop_after: Quiescent heartbeats before the loop stops.
+        transient_cooldown_seconds: Provider cooldown after a transient engine
+            result that names no reset time.
+        transient_cooldown_reset_buffer_seconds: Margin added to a reset time
+            the provider names.
+        tuning_errors: The entries of :attr:`errors` that concern
+            ``max_in_flight``, tuning, routes, and probe metadata. A tick reads those
+            keys once, at its startup gate, so a later read within the same
+            tick — dispatch's own read of ``verify_tools`` and
+            ``engine_settings`` — must not act on an error in them.
     """
 
     login: str
@@ -1823,6 +1978,41 @@ class ResolvedConfig:
     repo_configured: bool = False
     engine_settings: str = ""
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
+    implementer_timeout_seconds: int = IMPLEMENTER_TIMEOUT_SECONDS
+    fixer_timeout_seconds: int = FIXER_TIMEOUT_SECONDS
+    review_timeout_seconds: int = REVIEW_TIMEOUT_SECONDS
+    engine_stall_seconds: int = ENGINE_STALL_SECONDS
+    engine_stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS
+    max_iterations: int = MAX_ITERATIONS
+    impl_engine: str = ENGINE_ROUTES[0]
+    model: str = ""
+    fix_engine: str = ENGINE_ROUTES[0]
+    fix_model: str = ""
+    review_model: str = ""
+    review_effort: str = ""
+    probed_route: tuple[str, str] | None = None
+    loop_short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS
+    loop_max_poll_seconds: int = LOOP_MAX_POLL_SECONDS
+    loop_heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS
+    loop_quiescent_stop_after: int = LOOP_QUIESCENT_STOP_AFTER
+    transient_cooldown_seconds: int = TRANSIENT_COOLDOWN_SECONDS
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    )
+    tuning_errors: tuple[str, ...] = ()
+
+    def cadence(self) -> CadenceSettings:
+        """Return the cadence keyword arguments for :func:`compute_next_wake`.
+
+        :func:`decide_loop_cadence` takes the same keywords, so both loop
+        paths pace from one validated configuration.
+        """
+        return {
+            "short_poll_seconds": self.loop_short_poll_seconds,
+            "max_poll_seconds": self.loop_max_poll_seconds,
+            "heartbeat_seconds": self.loop_heartbeat_seconds,
+            "quiescent_stop_after": self.loop_quiescent_stop_after,
+        }
 
 
 def _operator_config_location() -> tuple[Path, str]:
@@ -2350,6 +2540,7 @@ def resolve_config(
         ("[defaults]", declared["defaults"]),
     ]
     repo_configured = False
+    repo_section: Mapping[str, object] = {}
     if repo:
         section = next(
             (value for name, value in repos_table.items() if same_repository(name, repo)),
@@ -2358,11 +2549,14 @@ def resolve_config(
         if isinstance(section, dict):
             layers.append((f"[repos.\"{repo}\"]", section))
             repo_configured = True
+            repo_section = section
     if cli_overrides:
         layers.append(("the command line", dict(cli_overrides)))
     for label, table in layers:
         for key in table:
-            if key not in _CONFIG_KEYS:
+            if key not in _CONFIG_KEYS and not (
+                table is repo_section and key in _CONFIG_PROBE_KEYS
+            ):
                 warnings.append(f"{label} {key}: unknown setting, ignored")
 
     allow_picked = _pick(layers, "allow_touching")
@@ -2430,9 +2624,21 @@ def resolve_config(
     if problem:
         errors.append(problem)
 
+    tuning_errors: list[str] = []
     max_in_flight, problem = _resolve_max_in_flight(_pick(layers, "max_in_flight"))
     if problem:
-        errors.append(problem)
+        tuning_errors.append(problem)
+    ints: dict[str, int] = {}
+    for key, (default, minimum) in _INT_SETTINGS.items():
+        ints[key], problem = _resolve_int(_pick(layers, key), key, default, minimum)
+        if problem:
+            tuning_errors.append(problem)
+    tuning_errors.extend(_stall_bound_problems(ints))
+    routes, route_problems = _resolve_routes(layers)
+    tuning_errors.extend(route_problems)
+    probed_route, probe_problems = _resolve_probed_route(repo_section, repo)
+    tuning_errors.extend(probe_problems)
+    errors.extend(tuning_errors)
 
     login, problem, warning = _resolve_login(packaged, declared["operator"])
     if problem:
@@ -2441,6 +2647,29 @@ def resolve_config(
         warnings.append(warning)
 
     return ResolvedConfig(
+        implementer_timeout_seconds=ints["implementer_timeout_seconds"],
+        fixer_timeout_seconds=ints["fixer_timeout_seconds"],
+        review_timeout_seconds=ints["review_timeout_seconds"],
+        engine_stall_seconds=ints["engine_stall_seconds"],
+        engine_stall_startup_grace_seconds=ints[
+            "engine_stall_startup_grace_seconds"
+        ],
+        max_iterations=ints["max_iterations"],
+        loop_short_poll_seconds=ints["loop_short_poll_seconds"],
+        loop_max_poll_seconds=ints["loop_max_poll_seconds"],
+        loop_heartbeat_seconds=ints["loop_heartbeat_seconds"],
+        loop_quiescent_stop_after=ints["loop_quiescent_stop_after"],
+        transient_cooldown_seconds=ints["transient_cooldown_seconds"],
+        transient_cooldown_reset_buffer_seconds=ints[
+            "transient_cooldown_reset_buffer_seconds"
+        ],
+        impl_engine=routes["impl_engine"],
+        model=routes["model"],
+        fix_engine=routes["fix_engine"],
+        fix_model=routes["fix_model"],
+        review_model=routes["review_model"],
+        review_effort=routes["review_effort"],
+        probed_route=probed_route,
         login=login,
         allow_touching=allow_touching,
         checklist_paths=checklist_paths,
@@ -2453,7 +2682,32 @@ def resolve_config(
         errors=tuple(errors),
         warnings=tuple(warnings),
         repo_configured=repo_configured,
+        tuning_errors=tuple(tuning_errors),
     )
+
+
+def _resolve_probed_route(
+    section: Mapping[str, object], repo: str,
+) -> tuple[tuple[str, str] | None, list[str]]:
+    """Read setup's evidence without inferring it from routing defaults."""
+    if not any(key in section for key in _CONFIG_PROBE_KEYS):
+        return None, []
+    label = f'[repos."{repo}"]'
+    missing = [f"{label} {key}: missing setup probe metadata; rerun setup"
+               for key in _CONFIG_PROBE_KEYS if key not in section]
+    if missing:
+        return None, missing
+    engine, engine_problem = _resolve_string(
+        (label, section["probed_impl_engine"]), "probed_impl_engine", "",
+        lambda value: value in ENGINE_ROUTES,
+    )
+    model, model_problem = _resolve_string(
+        (label, section["probed_model"]), "probed_model", "",
+        lambda value: ENGINE_MODEL_RE.fullmatch(value) is not None,
+        blank_means="the engine's default model",
+    )
+    problems = [problem for problem in (engine_problem, model_problem) if problem]
+    return (None if problems else (engine, model)), problems
 
 
 def _resolve_max_in_flight(
@@ -2487,6 +2741,131 @@ def _resolve_max_in_flight(
             f"{value}"
         )
     return value, ""
+
+
+def _resolve_int(
+    picked: tuple[str, object] | None, key: str, default: int, minimum: int,
+) -> tuple[int, str]:
+    """Resolve one integer setting, reporting any value it cannot use.
+
+    TOML ``true`` is a Python ``int``, so a boolean is refused by name. A float
+    or a string is refused rather than rounded or parsed: the operator wrote a
+    deadline or a count, and the one that runs must be the one they wrote.
+
+    Args:
+        picked: The ``(label, value)`` pair from :func:`_pick`, or ``None``.
+        key: The setting name, for the message.
+        default: The value when no layer declares the key.
+        minimum: The smallest accepted value.
+
+    Returns:
+        ``(value, problem)``. On a problem the value is ``default``, for a
+        caller that refuses to start.
+    """
+    if picked is None:
+        return default, ""
+    label, value = picked
+    if isinstance(value, bool) or not isinstance(value, int):
+        return default, (
+            f"{label} {key}: expected an integer of at least {minimum}, got "
+            f"{type(value).__name__}"
+        )
+    if value < minimum:
+        return default, (
+            f"{label} {key}: expected an integer of at least {minimum}, got {value}"
+        )
+    if key in _CACHE_CLIFF_KEYS and value == _CADENCE_TTL_CLIFF:
+        return default, (
+            f"{label} {key}: {value} is the prompt-cache TTL cliff, which the "
+            "cadence never waits for; choose a shorter or a longer interval"
+        )
+    return value, ""
+
+
+def _stall_bound_problems(ints: Mapping[str, int]) -> list[str]:
+    """Report a stall threshold that cannot sit below both engine deadlines.
+
+    The lower bound, above :data:`MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`, is
+    the key's own minimum. The upper bound spans two keys, so it is checked on
+    the resolved values: a threshold at or past a deadline can never report a
+    stall before the deadline kills the engine.
+
+    Args:
+        ints: The resolved integer settings.
+
+    Returns:
+        One problem per deadline the threshold does not stay below.
+    """
+    stall = ints["engine_stall_seconds"]
+    return [
+        f"engine_stall_seconds ({stall}) must be less than {key} "
+        f"({ints[key]}), or a stall is never reported before the deadline"
+        for key in ("implementer_timeout_seconds", "fixer_timeout_seconds")
+        if stall >= ints[key]
+    ]
+
+
+def _resolve_routes(
+    layers: Sequence[tuple[str, Mapping[str, object]]],
+) -> tuple[dict[str, str], list[str]]:
+    """Resolve the implementer, fixer and reviewer engine routes.
+
+    Every value reaches an argv element or an environment variable of an
+    engine launch, so none has a conservative reading: a malformed one is an
+    error naming the key, never a different engine or model.
+
+    A blank fixer key inherits the implementer's. The fixer model inherits only
+    while the fixer runs on the implementer's engine: a model id names one
+    provider's model, and handing it to another provider fails at launch.
+
+    Args:
+        layers: ``(label, table)`` pairs, lowest precedence first.
+
+    Returns:
+        ``(routes, problems)``, where ``routes`` holds every
+        :class:`ResolvedConfig` route field.
+    """
+    problems: list[str] = []
+
+    def resolve(key: str, default: str, valid: Callable[[str], bool],
+                blank_means: str = "") -> str:
+        value, problem = _resolve_string(
+            _pick(layers, key), key, default, valid, blank_means=blank_means,
+        )
+        if problem:
+            problems.append(problem)
+        return value
+
+    def is_engine(value: str) -> bool:
+        return value in ENGINE_ROUTES
+
+    def is_model(value: str) -> bool:
+        return ENGINE_MODEL_RE.fullmatch(value) is not None
+
+    impl_engine = resolve("impl_engine", ENGINE_ROUTES[0], is_engine)
+    model = resolve("model", "", is_model, "the engine's default model")
+    fix_engine = resolve(
+        "fix_engine", "", is_engine, "the implementer's engine",
+    ) or impl_engine
+    fix_model = resolve("fix_model", "", is_model, "the implementer's model")
+    if not fix_model and fix_engine == impl_engine:
+        fix_model = model
+    review_model = resolve(
+        "review_model", "", is_model, "the operator's codex model",
+    )
+    review_effort = resolve(
+        "review_effort", "",
+        lambda v: REVIEW_EFFORT_RE.fullmatch(v) is not None,
+        "the operator's codex effort",
+    )
+    return {
+        "impl_engine": impl_engine,
+        "model": model,
+        "fix_engine": fix_engine,
+        "fix_model": fix_model,
+        "review_model": review_model,
+        "review_effort": review_effort,
+    }, problems
 
 
 def _resolve_login(
@@ -3741,8 +4120,14 @@ _REQUIRED_MARKER_FIELDS = frozenset(
 _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
     {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
      "fix_round", "review_sha256", "verification_unconfigured",
-     "permission_mode", "verify_tools"}
+     "permission_mode", "verify_tools", "stall_seconds",
+     "stall_startup_grace_seconds"}
 )
+
+# The stall limits an implementer/fixer was dispatched under, with the minimum
+# each must meet. Optional: markers written before the limits were configurable
+# omit them and are judged against the shipped defaults.
+_MARKER_STALL_LIMITS = {"stall_seconds": 1, "stall_startup_grace_seconds": 0}
 
 # Pipeline stages a dispatch marker may legitimately record. A marker for an
 # unknown stage is never one this pipeline wrote, so it is not trusted.
@@ -3878,6 +4263,9 @@ def valid_marker(
       marker only, preserving the no-change reasoning's round identity;
     - ``review_sha256``, when present, is a lowercase SHA-256 fingerprint on a
       *fix* marker only, binding the originating review for coverage checks;
+    - ``stall_seconds`` (at least 1) and ``stall_startup_grace_seconds`` (at
+      least 0), when present, are integers on an *implement* or *fix* marker
+      only — the stall limits that engine was dispatched under;
     - ``pre_label`` is one of the real pre-dispatch labels (``ai:implemented`` /
       ``ai:revised``) — never an arbitrary or terminal label, which reconciliation
       would otherwise revert to;
@@ -4002,6 +4390,19 @@ def valid_marker(
             or not isinstance(obj["verification_unconfigured"], bool)
         ):
             return False
+    # Stall classification reads these instead of the tick's constants, so a
+    # mistyped value would silently move or disable stall detection. Only the
+    # stages with a progress contract record them.
+    for key, minimum in _MARKER_STALL_LIMITS.items():
+        if key in obj:
+            value = obj[key]
+            if (
+                stage not in {"implement", "fix"}
+                or isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < minimum
+            ):
+                return False
     if "pr_body" in obj:
         if stage != "fix" or not valid_pr_body_provenance(obj.get("pr_body")):
             return False

@@ -204,9 +204,8 @@ def run_probe(
             f"{granting} grants `{PROBE_COMMAND}`, so the probe would measure "
             "nothing; remove that grant or change PROBE_COMMAND"
         )}
-    if not model and impl_engine == "claude-ds":
-        model = "deepseek-v4-pro[1m]"
-        report["model"] = model
+    model = pipeline.effective_engine_model(impl_engine, model)
+    report["model"] = model
     try:
         engine_bin, extra_env = tick._resolve_engine(impl_engine, model=model)
     except RuntimeError as exc:
@@ -481,7 +480,7 @@ def plan_config(
     permission_mode: str,
     base_ref: str | None,
     engine_settings: str = "",
-) -> tuple[str, dict[str, object], dict[str, object]]:
+) -> tuple[str, dict[str, object], dict[str, object], tuple[str, str]]:
     """Merge one repository's settings into the operator config, or refuse.
 
     Enforces the probe's contract for the combination being written:
@@ -492,8 +491,14 @@ def plan_config(
     - ``dontAsk`` needs verification grants, because without them an engine
       is stranded mid-run.
 
+    The probed route (``impl_engine`` and ``model``, as the probe launched
+    it) supplies the repository's routing defaults and separate
+    ``probed_impl_engine`` / ``probed_model`` evidence. The tick reports a
+    different route even after those routing defaults are edited.
+
     Returns:
-        ``(path, existing, merged)`` documents; equal when nothing changes.
+        ``(path, existing, merged, route)``: the documents, equal when nothing
+        changes, and the ``(impl_engine, model)`` route written.
 
     Raises:
         SetupRefused: With the reason to relay to the operator.
@@ -521,6 +526,11 @@ def plan_config(
             f"the recorded probe for {repo} used engine_settings "
             f"{probed_settings!r}, not {engine_settings!r}; rerun the probe with "
             "the engine settings you mean to write"
+        )
+    probed_engine, probed_model = record.get("impl_engine"), record.get("model")
+    if not isinstance(probed_engine, str) or not isinstance(probed_model, str):
+        raise SetupRefused(
+            f"the recorded probe for {repo} names no engine route; rerun the probe"
         )
     outcome = record.get("outcome")
     if not verify_tools and outcome != PASS:
@@ -562,9 +572,14 @@ def plan_config(
     # Written even when blank: a missing key would inherit a nonblank
     # [defaults] value, not the "no --settings flag" the probe measured.
     section["engine_settings"] = engine_settings
+    # The route the probe measured. Both keys always, for the same reason: a
+    # missing model would inherit [defaults] and run a route nobody probed.
+    section["impl_engine"], section["model"] = probed_engine, probed_model
+    section["probed_impl_engine"] = probed_engine
+    section["probed_model"] = probed_model
     if base_ref is not None:
         section["base_ref"] = base_ref
-    return str(path), existing, merged
+    return str(path), existing, merged, (probed_engine, probed_model)
 
 
 def _read_probe_record(repo: str) -> dict[str, object] | None:
@@ -594,7 +609,7 @@ def write_config(
     Raises:
         SetupRefused: When the plan or the resolver refuses.
     """
-    path_text, existing, merged = plan_config(
+    path_text, existing, merged, route = plan_config(
         repo, login=login, verify_tools=verify_tools,
         permission_mode=permission_mode, base_ref=base_ref,
         engine_settings=engine_settings,
@@ -603,7 +618,7 @@ def write_config(
     if merged == existing:
         errors = _resolved_errors(
             pipeline.resolve_config(repo), repo, verify_tools, permission_mode,
-            engine_settings,
+            engine_settings, route,
         )
         if errors:
             raise SetupRefused(
@@ -630,7 +645,7 @@ def write_config(
             fh.write(text)
         errors = _resolved_errors(
             _resolve_staged(staged, repo), repo, verify_tools, permission_mode,
-            engine_settings,
+            engine_settings, route,
         )
         if errors:
             raise SetupRefused("the merged configuration is invalid: " + "; ".join(errors))
@@ -652,9 +667,12 @@ def _resolved_errors(
     verify_tools: Sequence[str],
     permission_mode: str,
     engine_settings: str,
+    route: tuple[str, str],
 ) -> list[str]:
     """Return why a tick would refuse, or misread, this repository's settings."""
     errors = list(config.errors)
+    if config.probed_route != route or (config.impl_engine, config.model) != route:
+        errors.append("the probed engine route does not resolve as written")
     if not config.repo_configured:
         errors.append(f"the file does not configure {repo}")
     if config.verify_tools != tuple(verify_tools):

@@ -448,6 +448,116 @@ def test_write_config_refuses_engine_settings_other_than_the_ones_probed(
     assert not pipeline.operator_config_path().exists()
 
 
+@pytest.mark.parametrize(("probe_flags", "route"), [
+    ((), ("claude", "")),
+    (("--model", "opus"), ("claude", "opus")),
+    # claude-ds launches its pinned model when none is named, so that is the
+    # model the probe measured and the one recorded.
+    (("--impl-engine", "claude-ds"), ("claude-ds", "deepseek-v4-pro[1m]")),
+])
+def test_write_config_records_the_route_the_probe_measured(
+    doubles, monkeypatch, probe_flags: tuple[str, ...], route: tuple[str, str],
+) -> None:
+    """The repository's section names the route its probe result is for.
+
+    The tick runs that route by default and reports any other route it is
+    told to run, so a measurement is never silently applied to a route it
+    was not taken on.
+    """
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-" + "a" * 20)
+    assert run_setup("probe", REPO, *probe_flags).returncode == 0
+
+    result = run_setup("write-config", REPO, "--login", "operator-a",
+                       "--permission-mode", "auto")
+
+    assert result.returncode == 0, result.stderr
+    config = pipeline.resolve_config(REPO)
+    assert config.errors == ()
+    assert config.probed_route == route
+    assert (config.impl_engine, config.model) == route
+
+
+@pytest.mark.parametrize(("engine", "model"), [
+    ("claude", "opus"),
+    ("claude", ""),
+    ("claude-ds", "deepseek-v4-flash"),
+])
+def test_config_route_edit_preserves_probe_evidence_and_warns_at_startup(
+    doubles, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    engine: str, model: str,
+) -> None:
+    """Exercise setup and tick wrappers across an edit and a fresh probe."""
+    checkout = target_checkout(tmp_path)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-" + "a" * 20)
+    setup_sh = SETUP_PY.parents[1] / "setup.sh"
+    tick_sh = TICK_PY.parents[1] / "tick.sh"
+
+    def setup(*args: str) -> None:
+        result = subprocess.run(
+            ["bash", str(setup_sh), *args], cwd=checkout,
+            capture_output=True, text=True, timeout=120,
+        )
+        assert result.returncode == 0, result.stderr
+
+    def tick_once() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["bash", str(tick_sh)], cwd=checkout,
+            capture_output=True, text=True, timeout=120,
+        )
+
+    setup("labels", REPO)
+    setup("probe", REPO, "--model", "sonnet")
+    setup("write-config", REPO, "--login", "operator-a",
+          "--permission-mode", "auto")
+    before = tick_once()
+    assert before.returncode == 0, before.stderr
+    assert "differs from the route" not in before.stderr
+    record = setup_flow.probe_record_path(REPO).read_bytes()
+    path = pipeline.operator_config_path()
+    document = tomllib.loads(path.read_text())
+    section = document["repos"][REPO]
+    section["impl_engine"], section["model"] = engine, model
+    path.write_text(setup_flow.dump_toml(document))
+
+    for _ in range(2):
+        changed = tick_once()
+        assert changed.returncode == 0, changed.stderr
+        assert "differs from the route /pr-pipeline:setup probed" in changed.stderr
+        assert "claude with model sonnet" in changed.stderr
+        assert setup_flow.probe_record_path(REPO).read_bytes() == record
+    config = pipeline.resolve_config(REPO)
+    assert config.probed_route == ("claude", "sonnet")
+    assert (config.impl_engine, config.model) == (engine, model)
+    logs = checkout / ".claude" / "worktrees" / ".tick-log"
+    events = [json.loads(line) for path in logs.glob("*.jsonl")
+              for line in path.read_text().splitlines()]
+    assert sum(e.get("action") == "startup_route_unprobed" for e in events) == 2
+
+    setup("probe", REPO, "--impl-engine", engine, "--model", model)
+    setup("write-config", REPO, "--login", "operator-a",
+          "--permission-mode", "auto")
+    refreshed = tick_once()
+    assert refreshed.returncode == 0, refreshed.stderr
+    assert "differs from the route" not in refreshed.stderr
+    assert pipeline.resolve_config(REPO).probed_route == (engine, model)
+
+
+def test_write_config_refuses_a_probe_record_with_an_unusable_route(doubles) -> None:
+    """A probe record naming no supported route cannot become configuration."""
+    assert run_setup("probe", REPO).returncode == 0
+    record = setup_flow.probe_record_path(REPO)
+    evidence = json.loads(record.read_text())
+    evidence["impl_engine"] = "codex"
+    record.write_text(json.dumps(evidence))
+
+    result = run_setup("write-config", REPO, "--login", "operator-a",
+                       "--permission-mode", "auto")
+
+    assert result.returncode == 1
+    assert "impl_engine" in result.stderr
+    assert not pipeline.operator_config_path().exists()
+
+
 def test_write_config_refuses_without_any_probe(doubles) -> None:
     result = run_setup("write-config", REPO, "--login", "operator-a",
                        "--verify-tool", "make test", "--permission-mode", "dontAsk")
@@ -493,6 +603,10 @@ def test_write_config_keeps_everything_else_the_operator_wrote(doubles) -> None:
         "verify_tools": ["pnpm run test *"],
         "permission_mode": "auto",
         "engine_settings": "",
+        "impl_engine": "claude",
+        "model": "",
+        "probed_impl_engine": "claude",
+        "probed_model": "",
     }
     assert path.with_name("config.toml.bak").exists()
 

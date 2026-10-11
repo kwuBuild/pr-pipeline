@@ -616,8 +616,11 @@ runtime rules. The design in brief:
 5. Check the host prerequisites (`gh`, `git`, `codex`, `jq`, `claude`) and run
    the `auto` route probe. Report what is missing rather than failing on first
    dispatch.
-6. Write `~/.claude/pr-pipeline/config.toml`. Never write into a target
-   repository.
+6. Write `~/.claude/pr-pipeline/config.toml`, including routing defaults and
+   separate probe metadata in the repository's section. The tick runs those
+   defaults without flags and reports a route that differs from the probe.
+   See the [route metadata contract](../../skills/tick/README.md#deadlines-stall-limits-routing-and-cadence).
+   Never write into a target repository.
 7. Install the standalone launcher.
 
 Step 3 reads the target repository to *propose*, but a human confirms before

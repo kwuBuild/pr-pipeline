@@ -73,9 +73,14 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
                                                 None, ("issue", 462), "claude",
                                             ) == 0
 
-    hr.assert_called_once_with(None, ("pr", 551))
-    hi.assert_called_once_with(None, ("issue", 462))
-    hf.assert_called_once_with(None, ("pr", 551))
+    # A direct caller passes no validated configuration: the shipped tuning.
+    cooldown = {
+        "transient_cooldown_seconds": 3600,
+        "transient_cooldown_reset_buffer_seconds": 300,
+    }
+    hr.assert_called_once_with(None, ("pr", 551), max_iterations=5)
+    hi.assert_called_once_with(None, ("issue", 462), **cooldown)
+    hf.assert_called_once_with(None, ("pr", 551), **cooldown)
     assert dr.call_args.kwargs == {
         "tick_log": None,
         "target": ("pr", 551),
@@ -84,6 +89,7 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
         "review_effort": "",
         "trusted_author": "",
         "max_in_flight": 3,
+        "timeout_seconds": 1200,
     }
     assert di.call_args.kwargs["target"] == ("issue", 462)
     assert di.call_args.kwargs["authoritative_in_flight"] is authoritative
@@ -3689,6 +3695,64 @@ def test_implementer_dispatch_refuses_a_broken_engine_settings_file(
     assert "engine_settings" in escalate_mock.call_args[1]["reason"]
 
 
+@pytest.mark.parametrize("stage", ["implement", "fix"])
+@pytest.mark.parametrize("invalid", [
+    'loop_heartbeat_seconds = 300\nimpl_engine = "codex"\n',
+    "max_in_flight = 0\n",
+    'probed_impl_engine = "claude"\n',
+])
+def test_dispatch_ignores_a_tuning_key_edited_invalid_mid_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, invalid: str,
+) -> None:
+    """A mid-tick typo in a key the tick read at startup escalates nothing.
+
+    Dispatch reads verify_tools and engine_settings again before launch, and
+    refuses on an error there. The deadline, stall, route and cadence keys are
+    not read there: the tick runs on the values its startup gate validated, and
+    the next tick refuses the edit and names the key. Escalating this item to a
+    human over a key its dispatch never reads would be the tick changing its
+    behaviour partway through on configuration it does not use.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    config_path = tmp_path / "operator.toml"
+    config_path.write_text(
+        f'[operator]\nlogin = "{TRUSTED_AUTHOR}"\n'
+        f'\n[repos."{TRUSTED_AUTHOR}/test-repo"]\n'
+        'base_ref = "main"\n' + invalid,
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(config_path))
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    git = (
+        mock.patch("tick.git", return_value=str(repo_root)) if stage == "implement"
+        else mock.patch("tick.git", side_effect=fixer_git(repo_root))
+    )
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), git, \
+            mock.patch("tick.pipeline.atomic_write", side_effect=write_through), \
+            mock.patch("tick.gh_text", side_effect=["main", "abc123", "fix-branch"]), \
+            mock.patch("tick.gh_json", side_effect=fixer_gh_json(
+                pr_body=FIXER_PROMPT_PR_BODY, issues=FIXER_PROMPT_ISSUES,
+            )), \
+            mock.patch("tick._publish_marker_or_revert", return_value=True), \
+            mock.patch("tick.relabel", return_value=True), \
+            mock.patch("tick._escalate_dispatch_setup_failure") as escalate_mock, \
+            mock.patch("subprocess.Popen", return_value=mock.MagicMock(pid=12345)) as popen:
+        if stage == "implement":
+            tick._dispatch_one_implementer(
+                issue_number=463, issue_title="Tuning", tick_log=None,
+            )
+        else:
+            tick._dispatch_one_fixer(pr_number=43, tick_log=None)
+
+    escalate_mock.assert_not_called()
+    popen.assert_called_once()
+
+
 def test_fixer_dispatch_refuses_a_missing_engine_settings_file(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3722,10 +3786,23 @@ def test_fixer_dispatch_refuses_a_missing_engine_settings_file(
     assert "engine_settings" in escalate_mock.call_args[1]["reason"]
 
 
-def test_implementer_dispatch_sets_sixty_minute_deadline(
-    tmp_path: Path,
+@pytest.mark.parametrize("tuning, deadline, stall", [
+    # A direct caller records the shipped defaults.
+    ({}, 3600, (1800, 300)),
+    # The tick passes the validated configuration through.
+    ({"timeout_seconds": 7200, "stall_seconds": 900,
+      "stall_startup_grace_seconds": 60}, 7200, (900, 60)),
+])
+def test_implementer_dispatch_records_its_deadline_and_stall_limits(
+    tmp_path: Path, tuning: dict[str, int], deadline: int,
+    stall: tuple[int, int],
 ) -> None:
-    """Implementer lease markers should allow long verification runs."""
+    """Implementer lease markers should allow long verification runs.
+
+    The marker is what reconciliation enforces the deadline from and what
+    stall detection reads its limits from, so the configured values are only
+    in force once they are written there.
+    """
     from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -3754,9 +3831,13 @@ def test_implementer_dispatch_sets_sixty_minute_deadline(
                                 issue_number=461,
                                 issue_title="PWA icons",
                                 tick_log=None,
+                                **tuning,
                             )
 
-    assert markers[0]["deadline"] == 1001.0 + 3600
+    assert markers[0]["deadline"] == 1001.0 + deadline
+    assert (
+        markers[0]["stall_seconds"], markers[0]["stall_startup_grace_seconds"],
+    ) == stall
 
 
 def test_fixer_dispatch_honors_permission_mode_auto(
@@ -3947,10 +4028,16 @@ def test_fixer_dispatch_rejects_unsafe_head_ref(
         assert "head ref" in escalate_mock.call_args[1]["reason"]
 
 
-def test_fixer_dispatch_sets_sixty_minute_deadline(
-    tmp_path: Path,
+@pytest.mark.parametrize("tuning, deadline, stall", [
+    ({}, 3600, (1800, 300)),
+    ({"timeout_seconds": 5400, "stall_seconds": 1200,
+      "stall_startup_grace_seconds": 0}, 5400, (1200, 0)),
+])
+def test_fixer_dispatch_records_its_deadline_and_stall_limits(
+    tmp_path: Path, tuning: dict[str, int], deadline: int,
+    stall: tuple[int, int],
 ) -> None:
-    """Fixer lease markers should allow long verification runs."""
+    """Fixer lease markers carry the deadline and stall limits they run under."""
     from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -3992,9 +4079,58 @@ def test_fixer_dispatch_sets_sixty_minute_deadline(
                                         _dispatch_one_fixer(
                                             pr_number=42,
                                             tick_log=None,
+                                            **tuning,
                                         )
 
-    assert markers[0]["deadline"] == 2001.0 + 3600
+    assert markers[0]["deadline"] == 2001.0 + deadline
+    assert (
+        markers[0]["stall_seconds"], markers[0]["stall_startup_grace_seconds"],
+    ) == stall
+
+
+@pytest.mark.parametrize("tuning, deadline", [
+    ({}, 1200),
+    ({"timeout_seconds": 2400}, 2400),
+])
+def test_reviewer_dispatch_records_its_deadline(
+    tmp_path: Path, tuning: dict[str, int], deadline: int,
+) -> None:
+    """The reviewer marker carries the configured review deadline."""
+    import pipeline
+    import tick
+
+    wt_root = tmp_path / "worktrees"
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+
+    def metadata(*args: str) -> object:
+        if "comments" in args:
+            return []
+        return {"title": "Guard fix", "body": "Closes #7"}
+
+    def git_read(*args: str) -> str:
+        if "merge-base" in args or ("rev-parse" in args and "--show-toplevel" not in args):
+            return "b" * 40
+        return reviewer_git(repo_root)(*args)
+
+    with (
+        mock.patch("tick.WT_ROOT", str(wt_root)),
+        mock.patch("tick.time.time", return_value=5000.0),
+        mock.patch("tick.git", side_effect=git_read),
+        mock.patch("tick.gh_text", side_effect=["main", "abc123"]),
+        mock.patch("tick.gh_json", side_effect=metadata),
+        mock.patch("tick.pipeline.touches_review_policy", return_value=False),
+        mock.patch("tick._publish_marker_or_revert", return_value=True),
+        mock.patch("tick.relabel"),
+        mock.patch("subprocess.Popen", return_value=mock.MagicMock(pid=12345)),
+    ):
+        tick._dispatch_one_reviewer(
+            pr_number=42, pre_label=pipeline.LABEL_IMPLEMENTED, **tuning,
+        )
+
+    marker = json.loads((wt_root / "pr-42" / "dispatch.json").read_text())
+    assert marker["deadline"] == 5000.0 + deadline
+    assert "stall_seconds" not in marker
 
 
 def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
@@ -5121,7 +5257,8 @@ def test_parse_cli_args_reads_review_model_and_effort_flags() -> None:
     from tick import parse_cli_args  # type: ignore[import-untyped]
 
     assert parse_cli_args([]) == {
-        "target": None, "impl_engine": "claude", "model": "",
+        "target": None, "impl_engine": "", "model": "",
+        "fix_engine": "", "fix_model": "",
         "review_model": "", "review_effort": "",
         "permission_mode": "", "loop": False,
     }
