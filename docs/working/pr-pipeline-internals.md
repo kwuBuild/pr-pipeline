@@ -162,27 +162,13 @@ compatibility with those routes and older clients; a qualifying ancestor
 [Claude's instruction-loading documentation](https://code.claude.com/docs/en/memory#agentsmd).
 These are host discovery rules, not extra reads performed by the pipeline.
 
-The fixer and the implementer each additionally get a **prompt-bound skill
-doc**: the prompt names an install's `skills/<name>/SKILL.md` as an absolute path
-(from `tick.FIXER_SKILLS` or `tick.IMPLEMENTER_SKILLS` via
-`pipeline.skill_doc_path`, substituted at render) and requires it to be read
-before editing. The fixer binds `review-response-hygiene`. The implementer binds
-`definition-of-done`: Phase A before its first edit, Phase B before its commit,
-and the Phase B evidence block (or the skill's `n/a` line) under
-`## Test coverage` in `.pr-body.md` before `IMPLEMENTATION_COMPLETE`. The harvest
-checks that body's section structure only, not the block's content, so the
-evidence gate is a prompt obligation whose result is published in the PR body,
-not a harvest validation. The implementer must escalate if required guidance
-or proof is unavailable; see [Prompt-bound skills](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
-for the permission, exemption, and evidence-refresh contract. This is a doc
-path rather than a `Skill` invocation because the allowlist in §5 carries `Read` and no `Skill` tool. The
-doc ships with the pipeline, so the operator's installed copy governs every
-target repository — a target that has never heard of the skill still gets an
-engine whose prompt names it, and a branch cannot hand its fixer a rewritten copy
-of the rules. Dispatch resolves the path against the install before launching;
-a doc missing from the install is a packaging defect, and it logs
-`skill_unresolved` and escalates instead of running an engine that would
-silently read nothing.
+The implementer and fixer invoke the installed `pr-pipeline:definition-of-done`
+and `pr-pipeline:review-response-hygiene` skills. The launcher loads the existing
+plugin with `--plugin-dir` and preapproves the selected native call. The isolated
+Codex reviewer receives optional installed skills through `HOME/.agents/skills`
+symlinks. See [stage bindings](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
+for discovery, permissions, required guidance, and the Phase A/B obligations.
+Harvest validates result structure, not compliance with skill instructions.
 
 The fixer also gets two documents it has no pre-approved way to fetch — `gh`
 and web access are not granted — read by dispatch and substituted in: the **PR body** and the
@@ -511,18 +497,11 @@ that destroys the marker, and restores the released in-flight label when it has
 gone — the read-back inside the release proves the hold survived the removal,
 not the archive move that follows it.
 
-Skill-usage telemetry: Claude runs with `--output-format stream-json --verbose`
-behind the controller installation's `lib/claude_stream_wrapper.py`. The
-wrapper owns Claude's stdout pipe, extracts `Skill` tool-use blocks from
-assistant protocol events, and publishes only the terminal result object plus
-`skill_usage_status` and `skills_used` to `result.json`. Branch-controlled tool
-output cannot become a protocol tool-use event, and no host-privileged hook,
-engine-visible telemetry path, marker file, or branch-writable dispatch lookup
-participates in the signal. Harvest reports the wrapper fields in the existing
-`engine_result_summary` entry for implementers and fixers; `skills_used: []` is
-meaningful when status is `active`. Missing/malformed stream completion leaves
-the normal invalid-result path authoritative. Telemetry remains fail-open with
-respect to custody and relabel decisions.
+Skill observations use the existing engine result and audit records. Claude's
+stream wrapper correlates native calls with successful tool results; Codex retains
+sanitized command references. Dispatch records requested names separately. The
+[operator contract](../../skills/tick/README.md#skill-observations) defines their
+limits and historical meaning. No observation changes completion or custody.
 
 Progress heartbeats reuse that same owned stdout pipe. As each stream event is
 consumed the wrapper bumps the mtime of `heartbeat` beside `result.json` — the

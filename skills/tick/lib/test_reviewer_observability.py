@@ -269,3 +269,22 @@ def test_load_observation_replaces_invalid_content_with_unavailable(
     assert observation["status"] == "unavailable"
     assert observation["observed_skills"] == []
     assert "candidate secret" not in json.dumps(observation)
+
+
+def test_isolated_skill_links_are_plugin_references(tmp_path):
+    from reviewer_observability import observe_event_lines
+
+    source = tmp_path / "installed/skills/example/SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("guidance")
+    exposed = tmp_path / "home/.agents/skills/example"
+    exposed.parent.mkdir(parents=True)
+    exposed.symlink_to(source.parent, target_is_directory=True)
+    for path in (exposed / "SKILL.md", source):
+        event = json.dumps({"type": "item.completed", "item": {
+            "type": "command_execution", "command": f"echo '{path}'", "exit_code": 0,
+        }}).encode()
+        observation = observe_event_lines([event], skill_home=tmp_path / "home")
+        assert observation["observed_skills"] == [{"name": "example", "source": "plugin"}]
+        assert observation["evidence_contract"] == "successful_command_referencing_skill_file"
+        assert str(tmp_path) not in json.dumps(observation)

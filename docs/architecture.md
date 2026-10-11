@@ -961,6 +961,9 @@ locked down with an **allowlist, not a blocklist**:
   steerable config (`config.toml`, plugins, rules, hooks, skills — MCP/plugins run as
   out-of-sandbox processes). An *empty* `CODEX_HOME` would leave codex unauthenticated,
   so auth must be carried in explicitly. Verified end-to-end against the pinned CLI.
+- The isolated `HOME/.agents/skills` contains only deliberately exposed installed
+  review guidance from `native_skills.REVIEW_SKILLS`. Selection remains optional
+  and scope-dependent; this imports no operator plugins, config, tools, or hooks.
 - `HOME` is a scrub dir (not the real home) so the reviewer cannot read `~/.ssh`,
   `~/.config`, or other credential files; auth still resolves via the explicit
   `CODEX_HOME` symlink, which is not under `HOME`.
@@ -1215,6 +1218,8 @@ remains authoritative and the pipeline retains scratch for operator recovery.
 through a bounded sanitizer; raw events, prompts, messages, commands, output, and
 absolute paths are discarded. `review-observation.json` retains only normalized
 `SKILL.md` identities referenced by successful command events and fixed counters.
+Dispatch records requested skill names separately in the audit log; see
+[skill observations](../skills/tick/README.md#skill-observations).
 The current CLI exposes no explicit invocation event, so this is command-reference
 evidence, not proof that the file was opened or the skill was semantically invoked.
 Missing or malformed observation is non-authoritative
@@ -1407,7 +1412,8 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   optional replacement PR body (see the PR-body revision contract below)
 - The current diff (the worktree is the PR head; `git diff`/`git log` are allowed)
 - Instructions to address each finding, commit, and push
-- The doc path of each bound discipline skill (`tick.FIXER_SKILLS`), resolved
+- Native namespaced invocation and the installed source of each bound discipline
+  skill (`tick.FIXER_SKILLS`), resolved
   against the *install* at dispatch — the guidance ships with the pipeline, so
   no target repository needs a copy and no PR branch supplies the rules its own
   fixer runs under; a doc missing from the install is a packaging defect and

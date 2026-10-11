@@ -596,6 +596,11 @@ not an explicit semantic invocation signal. Reviewer child stderr still goes to
 Use `completion.json` for structured failure evidence. Implementer/fixer engine stderr
 is still captured in `stderr.log`.
 
+For missing skill observations, compare the audit log's `skill_context` requests
+with `engine_result_summary` (Claude) or `reviewer_skill_observation` (Codex).
+No observation means use is unknown; it is not proof of missing guidance. Inspect
+the normal result/envelope for failures. See [skill observations](README.md#skill-observations).
+
 ## Constants and boundaries
 
 - Worktree root: `.claude/worktrees`
@@ -621,8 +626,9 @@ is still captured in `stderr.log`.
 - Engine skill bindings: `tick.FIXER_SKILLS` and `tick.IMPLEMENTER_SKILLS`,
   resolved as `<install>/skills/<name>/SKILL.md` before launch — the install's
   own copy, not the engine worktree's, so a target repository needs no copy of
-  its own;
-  unreadable means the install is missing a file its prompt names, which logs
+  its own. Native discovery loads the existing installed `pr-pipeline` plugin;
+  the Codex optional catalog is `native_skills.REVIEW_SKILLS`.
+  Unreadable means the install is missing a file its prompt names, which logs
   `skill_unresolved` and escalates (see README "Prompt-bound skills")
 - Fixer injected context: PR body + every `closingIssuesReferences` issue body,
   with the cut stated inline; the body gets `tick.FIXER_CONTEXT_BUDGET=20000`

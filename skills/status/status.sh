@@ -204,3 +204,23 @@ else
   echo "  (no tick log entries found)"
 fi
 echo
+echo "SKILLS (recent records; observations do not prove compliance)"
+printf '%s' "${entries:-[]}" | jq -r '
+  .[] | select(.action == "skill_context" or .action == "engine_result_summary" or .action == "reviewer_skill_observation")
+  | .details as $d
+  | "  PR#\(.pr) \(.stage) [\(.dispatch_id // "unknown")] " +
+    (if .action == "skill_context" then
+       "requested: " + (if ($d.requested_skills | type) != "array" then "unknown"
+                        elif ($d.requested_skills | length) == 0 then "none"
+                        else ($d.requested_skills | join(", ")) end)
+     elif .action == "engine_result_summary" then
+       if $d.skill_usage_status != "active" then "observation unavailable"
+       elif ($d.skills_used | length) == 0 then "no observation; use unknown"
+       else "Skill calls: " + ($d.skills_used | join(", ")) end
+     else
+       if $d.status == "unavailable" then "observation unavailable"
+       elif ($d.observed_skills | length) == 0 then "no observation; use unknown"
+       else "command references (\($d.status)): " + ($d.observed_skills | map(.name + " [" + .source + "]") | join(", ")) end
+     end)
+' 2>/dev/null || echo "  (skill observations unavailable)"
+echo

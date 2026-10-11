@@ -56,6 +56,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, TypedDict, cast
 
+import native_skills
+
 
 @dataclass(frozen=True)
 class ResolvedTarget:
@@ -298,7 +300,7 @@ _INSTALL_ROOT = _LIB_DIR.parents[2]
 INSTALL_SKILLS_ROOT = _INSTALL_ROOT / "skills"
 PROMPTS_DIR = _LIB_DIR / "prompts"
 
-# Discipline skills a dispatched engine's prompt binds by doc path. Skills are
+# Discipline skills a dispatched engine's prompt binds through native loading. Skills are
 # discretionary reading unless the executed prompt names when they must run, so
 # each binding is a named constant substituted into the template (never
 # hardcoded in the .txt) — a later change can move the binding into config
@@ -364,10 +366,11 @@ _POLICY_PATH_SUFFIXES: tuple[tuple[str, ...], ...] = tuple(
         "skills/tick/resolve-target.sh",
         "skills/tick/lib/pipeline.py",
         "skills/tick/lib/tick.py",
+        "skills/tick/lib/native_skills.py",
     )
 ) + tuple(
     Path(skill_doc_path(name)).relative_to(_INSTALL_ROOT).parts
-    for name in BOUND_SKILLS
+    for name in dict.fromkeys((*BOUND_SKILLS, *native_skills.REVIEW_SKILLS))
 )
 
 # Directories whose every file is policy, matched the same way but against the

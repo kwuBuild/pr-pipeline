@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -208,7 +209,9 @@ def _observe_engine_stdout(
     if proc.stdout is None:
         return reviewer_observability.unavailable_observation()
     try:
-        return reviewer_observability.observe_event_stream(proc.stdout)
+        return reviewer_observability.observe_event_stream(
+            proc.stdout, skill_home=Path(os.environ["HOME"]) if os.environ.get("HOME") else None,
+        )
     except Exception:
         # Observability is deliberately non-authoritative. If parsing fails in
         # an unexpected way, continue draining so the child cannot deadlock on

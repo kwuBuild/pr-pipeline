@@ -6,6 +6,7 @@ import json
 import re
 from collections.abc import Iterable
 from os import PathLike
+from pathlib import Path
 from typing import BinaryIO
 
 from engine_usage import codex_usage, valid_codex_usage
@@ -40,7 +41,7 @@ _OBSERVATION_KEYS = {
 
 
 class _ObservationBuilder:
-    def __init__(self) -> None:
+    def __init__(self, skill_home: Path | None = None) -> None:
         self.event_count = 0
         self.parse_errors = 0
         self.oversized_events_skipped = 0
@@ -48,6 +49,13 @@ class _ObservationBuilder:
         self.observed: dict[tuple[str, str], dict[str, str]] = {}
         self.usage = codex_usage(None)
         self.terminal_count = 0
+        self.installed = []
+        if skill_home is not None:
+            for link in sorted((skill_home / ".agents/skills").glob("*"))[:64]:
+                if link.is_symlink() and _SKILL_NAME_RE.fullmatch(link.name):
+                    doc = link / "SKILL.md"
+                    paths = "|".join(re.escape(str(path)) for path in (doc, doc.resolve()))
+                    self.installed.append((link.name, re.compile(rf"{_TOKEN_START}(?:{paths}){_TOKEN_END}")))
 
     def observe(self, raw_line: bytes) -> None:
         self.event_count += 1
@@ -78,6 +86,10 @@ class _ObservationBuilder:
         command = item.get("command")
         if not isinstance(command, str):
             return
+        for name, pattern in self.installed:
+            if pattern.search(command):
+                self._record("plugin", name)
+                command = pattern.sub(" ", command)
         for match in _REPOSITORY_SKILL_RE.finditer(command):
             self._record("repository", match.group("name"))
         for match in _PLUGIN_SKILL_RE.finditer(command):
@@ -124,7 +136,7 @@ class _ObservationBuilder:
         self.observed[key] = {"name": name, "source": source}
 
 
-def observe_event_lines(lines: Iterable[bytes]) -> dict[str, object]:
+def observe_event_lines(lines: Iterable[bytes], *, skill_home: Path | None = None) -> dict[str, object]:
     """Return sanitized skill references and terminal usage from Codex JSONL.
 
     Args:
@@ -134,7 +146,7 @@ def observe_event_lines(lines: Iterable[bytes]) -> dict[str, object]:
         A strict, serialization-safe observation payload that excludes raw event
         content, commands, command output, prompts, and absolute paths.
     """
-    builder = _ObservationBuilder()
+    builder = _ObservationBuilder(skill_home)
     for raw_line in lines:
         builder.observe(raw_line)
     return builder.payload()
@@ -144,6 +156,7 @@ def observe_event_stream(
     stream: BinaryIO,
     *,
     max_event_bytes: int = 256 * 1024,
+    skill_home: Path | None = None,
 ) -> dict[str, object]:
     """Drain a Codex JSONL stream while bounding memory per logical event.
 
@@ -155,7 +168,7 @@ def observe_event_stream(
         A sanitized observation payload. Oversized events are drained, counted,
         and omitted without preventing later events from being inspected.
     """
-    builder = _ObservationBuilder()
+    builder = _ObservationBuilder(skill_home)
     while True:
         chunk = stream.readline(max_event_bytes + 1)
         if not chunk:

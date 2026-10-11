@@ -1691,6 +1691,10 @@ def test_dispatch_one_reviewer_passes_scrubbed_env_to_popen(
     popen.assert_called_once()
     popen_kwargs = popen.call_args[1]
     env = popen_kwargs.get("env")
+    assert (Path(env["HOME"]) / ".agents/skills/definition-of-done/SKILL.md").is_file()
+    prompt = popen.call_args.args[0][-1]
+    assert "Installed review skills (optional" in prompt
+    assert "select only those applicable" in prompt
     assert env is not None, (
         "reviewer dispatch must pass an explicit env dict (env -i isolation)"
     )
@@ -4187,7 +4191,7 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
     # run is the operator's `[engine] verify_tools` grant. A stack name that
     # creeps back in here is wrong for every install but one.
     for tool in ("pytest", "ruff", "pyright", "npm", "cargo", "gradle"):
-        assert tool not in prompt, (
+        assert tool not in prompt.replace(str(tmp_path), "<fixture>"), (
             f"prompt hard-codes the tool {tool!r}, got: {prompt}"
         )
     assert (
@@ -4227,7 +4231,7 @@ def test_dispatch_one_fixer_prompt_binds_revision_hygiene_before_editing(
 
     doc = tick.skill_doc_path(tick.REVISION_HYGIENE_SKILL)
     assert (
-        f"Before you edit anything, read `{doc}` and follow its revision rules "
+        f"Before you edit anything, invoke `pr-pipeline:review-response-hygiene` through the native Skill tool (installed source `{doc}`) and follow its revision rules "
         "for the whole run."
     ) in prompt, f"fixer prompt does not bind {doc} before editing, got: {prompt}"
 
@@ -4796,6 +4800,9 @@ def test_dispatch_one_fixer_resolves_its_bound_skill_from_the_install(
     doc = pipeline.skill_doc_path(pipeline.REVISION_HYGIENE_SKILL)
     assert doc in prompt, f"the prompt does not name the installed doc {doc}"
     assert Path(doc).is_file()
+    argv = popen.call_args.args[0]
+    assert "--plugin-dir" in argv
+    assert "Skill(pr-pipeline:review-response-hygiene)" in argv[argv.index("--allowedTools") + 1]
 
 
 def test_dispatch_one_fixer_escalates_when_the_install_lacks_a_bound_skill(
@@ -4899,10 +4906,13 @@ def test_dispatch_one_implementer_resolves_definition_of_done_from_the_install(
     prompt = (wt_root / "issue-461" / "prompt.txt").read_text()
     doc = pipeline.skill_doc_path("definition-of-done")
     assert Path(doc).is_file()
-    assert f"read `{doc}`" in prompt, (
+    assert f"installed source `{doc}`" in prompt, (
         f"the implementer prompt does not name the installed doc {doc}"
     )
     assert not (wt_root / "issue-461" / "skills").exists()
+    argv = popen.call_args.args[0]
+    assert "--plugin-dir" in argv
+    assert "Skill(pr-pipeline:definition-of-done)" in argv[argv.index("--allowedTools") + 1]
 
 
 def test_dispatch_one_implementer_prompt_gates_completion_on_definition_of_done(
@@ -4937,7 +4947,7 @@ def test_dispatch_one_implementer_prompt_gates_completion_on_definition_of_done(
 
     prompt = (wt_root / "issue-461" / "prompt.txt").read_text()
     doc = pipeline.skill_doc_path("definition-of-done")
-    phase_a = prompt.index(f"Before your first edit, read `{doc}` and run its Phase A")
+    phase_a = prompt.index(f"Before your first edit, invoke `pr-pipeline:definition-of-done` through the native Skill tool (installed source `{doc}`) and run its Phase A")
     phase_b = prompt.index("before you commit, run the skill's Phase B")
     commit = prompt.index("Commit, then push")
     assert phase_a < phase_b < commit, (
@@ -5872,7 +5882,7 @@ def test_dispatch_one_implementer_prompt_requires_green_verification_before_sent
     # run is the operator's `[engine] verify_tools` grant. A stack name that
     # creeps back in here is wrong for every install but one.
     for tool in ("pytest", "ruff", "pyright", "npm", "cargo", "gradle"):
-        assert tool not in prompt, (
+        assert tool not in prompt.replace(str(tmp_path), "<fixture>"), (
             f"prompt hard-codes the tool {tool!r}, got: {prompt}"
         )
     assert (

@@ -845,24 +845,11 @@ not apply.
 
 `definition-of-done` ships on the same grounds and by the same route.
 
-**One premise in that decision does not hold for dispatched engines, and the
-binding is what makes it not matter.** `_ENGINE_ALLOWED_TOOLS_BASE` grants
-`Read Edit Write` plus an exact `Bash` set — there is no `Skill` tool on it — so
-a dispatched implementer or fixer cannot invoke a published skill by name no
-matter where the file sits. Publishing reaches *interactive* sessions; the
-engines reach it the way they already do, as a doc path the controller binds
-into the prompt. Making an engine invoke one of these by name would mean
-widening the engine allowlist, which is a separate decision from this one and is
-not taken here.
-
-L1 (section 10) asserts the resulting skill set as an equality, so an unintended
-command is observable rather than assumed.
-
-Open question for implementation, to be answered by a real engine run rather than
-by a stub: the engine allowlist carries `Read` and no `Skill` tool, which is why
-the binding is a doc path. Whether `Read` resolves an absolute path outside the
-engine's worktree must be verified in L3, not L2 — a PATH-stubbed engine proves
-nothing about the real engine's permissions.
+**Current dispatched-engine binding.** Dispatched Claude engines load the existing
+installed plugin and receive the exact stage `Skill(...)` permission. The isolated
+Codex reviewer receives selected installed skills through native discovery. See
+[stage bindings](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
+for the runtime contract; run-specific validation is recorded in the PR.
 
 **The obvious mitigation is not obviously safe, which is why it is not taken
 here.** `claude`'s `--add-dir` would put the install inside the engine's
@@ -1049,10 +1036,9 @@ published.
    grounds that the guidance is worth invoking directly. The cost accepted is one
    description per skill in every session's context.
 
-   What the decision does *not* buy: a dispatched engine still cannot invoke
-   them. The engine allowlist carries no `Skill` tool, so the controller binds
-   these documents by path either way, and publishing them reaches interactive
-   sessions only.
+   Dispatched-engine discovery and permissions are a separate runtime contract.
+   They now use the [native stage bindings](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
+   rather than relying on the interactive catalog being inherited.
 5. Whether `[scan] repos` belongs in this change or is deferred until an operator
    wants the restriction. The unrestricted default ships either way.
 
