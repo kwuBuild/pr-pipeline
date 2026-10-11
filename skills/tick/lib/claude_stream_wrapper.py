@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -70,17 +71,19 @@ def collect_stream(
     stream: Iterable[str],
     heartbeat: ProgressHeartbeat | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
-    """Extract the terminal result and Skill tool calls from Claude JSONL.
+    """Extract the terminal result and successful Skill tool calls from Claude JSONL.
 
     Args:
         stream: The engine's JSONL stdout, one event per line.
         heartbeat: Progress heartbeat to bump as lines arrive, or ``None``.
 
     Returns:
-        The terminal ``result`` event (or ``None``) and the skills invoked.
+        The terminal ``result`` event (or ``None``) and calls with matching
+        successful results. This does not prove instruction compliance.
     """
     result: dict[str, Any] | None = None
     skills: list[str] = []
+    pending: dict[str, str] = {}
     for line in stream:
         # Bump before parsing: an unparseable line is still proof the engine
         # is emitting, which is exactly what the stall detector asks about.
@@ -88,22 +91,29 @@ def collect_stream(
             heartbeat.beat()
         try:
             event = json.loads(line)
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
             continue
         if not isinstance(event, dict):
             continue
-        if event.get("type") == "assistant":
-            message = event.get("message")
-            content = message.get("content") if isinstance(message, dict) else None
-            if isinstance(content, list):
-                for block in content:
-                    if not isinstance(block, dict) or block.get("type") != "tool_use":
-                        continue
-                    tool_input = block.get("input")
-                    if block.get("name") == "Skill" and isinstance(tool_input, dict):
-                        skill = tool_input.get("skill")
-                        if isinstance(skill, str) and skill:
-                            skills.append(skill)
+        message = event.get("message")
+        blocks = message.get("content") if isinstance(message, dict) else None
+        for block in blocks if isinstance(blocks, list) else []:
+            if not isinstance(block, dict):
+                continue
+            if (event.get("type") == "assistant"
+                    and block.get("type") == "tool_use" and block.get("name") == "Skill"):
+                args = block.get("input")
+                name = args.get("skill") if isinstance(args, dict) else None
+                identity = block.get("id")
+                if (isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", name)
+                        and isinstance(identity, str) and len(identity) <= 256 and len(pending) < 64):
+                    pending[identity] = name
+            elif event.get("type") == "user" and block.get("type") == "tool_result":
+                identity = block.get("tool_use_id")
+                name = pending.pop(identity, None) if isinstance(identity, str) else None
+                if (name and block.get("is_error", False) is False
+                        and name not in skills and len(skills) < 64):
+                    skills.append(name)
         if event.get("type") == "result":
             result = event
     return result, skills

@@ -179,6 +179,7 @@ def test_cli_implementer_uses_installed_completion_guidance(offline_tick, tmp_pa
     install = tmp_path / "plugin-cache" / "pr-pipeline" / "skills"
     source = Path(__file__).resolve().parents[2]
     shutil.copytree(source, install, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(source.parent / ".claude-plugin", install.parent / ".claude-plugin")
     doc = install / "definition-of-done" / "SKILL.md"
     launch_receipt = tmp_path / "engine-launched"
     write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", f'''
@@ -206,7 +207,10 @@ print(json.dumps({{"type": "result", "is_error": False,
             if launch_receipt.exists():
                 break
             time.sleep(0.02)
-        assert f"read `{doc}`" in launch_receipt.read_text()
+        assert f"installed source `{doc}`" in launch_receipt.read_text()
+        assert "invoke `pr-pipeline:definition-of-done`" in launch_receipt.read_text()
+        assert not (wt / "skill-context.json").exists()
+        assert not wt.with_name("issue-7-scrub").exists()
         assert data["labels"] == ["ai:implementing"]
         assert (wt / "dispatch.json").is_file()
         assert not (wt / "skills").exists()

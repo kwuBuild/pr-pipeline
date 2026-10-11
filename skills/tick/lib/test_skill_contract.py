@@ -129,6 +129,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "branch_name": "worktree-i1",
         "pr_body_source_file": "pr-body.md",
         "definition_of_done_skill_doc": "some/skill/SKILL.md",
+        "definition_of_done_skill_invocation": "pr-pipeline:definition-of-done",
     },
     "fixer": {
         "target_remote": "upstream",
@@ -139,6 +140,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "issue_contract": "### Issue #1 — contract render",
         "head_ref": "worktree-i1",
         "revision_hygiene_skill_doc": "some/skill/SKILL.md",
+        "revision_hygiene_skill_invocation": "pr-pipeline:review-response-hygiene",
         "summary_budget": 1,
         "pr_body_revision_file": "pr-body-revision.md",
         "pr_body_revision_stamp": "pr-body-revision: fix-2-1",

@@ -15,9 +15,9 @@ def test_collect_stream_extracts_skill_calls_and_terminal_result() -> None:
     """Only Claude protocol tool-use events contribute skill telemetry."""
     events = [
         {"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "name": "Skill", "input": {"skill": "docs-contract-review"}},
+            {"type": "tool_use", "id": "call-1", "name": "Skill", "input": {"skill": "docs-contract-review"}},
         ]}},
-        {"type": "user", "message": {"content": "untrusted tool output"}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "is_error": False, "content": "loaded"}]}},
         {"type": "result", "subtype": "success", "result": "done"},
     ]
 
@@ -41,6 +41,23 @@ def test_collect_stream_ignores_malformed_and_non_skill_events() -> None:
 
     assert result == {"type": "result", "result": "done"}
     assert skills == []
+
+
+def test_collect_stream_counts_only_correlated_successful_native_calls():
+    events = [{"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": identity, "name": "Skill", "input": {"skill": name}}
+        for identity, name in [("ok", "pr-pipeline:definition-of-done"),
+                               ("denied", "denied"), ("unfinished", "unfinished"),
+                               ("invalid", "invalid")]
+    ]}}, {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "unmatched", "content": "loaded"},
+        {"type": "tool_result", "tool_use_id": "denied", "is_error": True},
+        {"type": "tool_result", "tool_use_id": "invalid", "is_error": "false"},
+        {"type": "tool_result", "tool_use_id": "ok", "is_error": False},
+    ]}}, {"type": "result", "result": "done"}]
+    result, skills = collect_stream(json.dumps(event) for event in events)
+    assert result == events[-1]
+    assert skills == ["pr-pipeline:definition-of-done"]
 
 
 def test_collect_stream_advances_the_heartbeat_as_events_arrive(
@@ -136,8 +153,9 @@ def test_main_publishes_one_harvest_compatible_result(capfd, monkeypatch) -> Non
     """The wrapper owns the child stream and emits one augmented JSON object."""
     events = [
         {"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "name": "Skill", "input": {"skill": "qa"}},
+            {"type": "tool_use", "id": "call-1", "name": "Skill", "input": {"skill": "qa"}},
         ]}},
+        {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "call-1", "is_error": False, "content": "loaded"}]}},
         {"type": "result", "subtype": "success", "result": "done"},
     ]
     script = "print(" + repr("\n".join(json.dumps(e) for e in events)) + ")"

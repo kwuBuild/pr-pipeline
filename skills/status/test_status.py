@@ -555,6 +555,23 @@ def test_shipped_jq_programs_bind_no_jq_keyword_as_a_variable() -> None:
     assert violations == []
 
 
+def test_status_displays_requests_and_evidence_without_claiming_compliance(tmp_path, tick_module):
+    repo = install_status_script(tmp_path)
+    log = tick_module.TickLog.open(str(repo / ".claude/worktrees/.tick-log"))
+    log.log(
+        pr=7, phase="harvest", stage="implement", action="engine_result_summary",
+        reason="fixture", engine="claude", dispatch_id="fixture-7",
+        details={"skills_used": [], "skill_usage_status": "active"},
+    )
+    tick_module._log_skill_context(
+        tick_log=log, number=7, stage="implement", engine="claude", dispatch_id="fixture-7",
+    )
+    result = run_status(repo)
+    assert result.returncode == 0, result.stderr
+    assert "requested: definition-of-done" in result.stdout
+    assert "no observation; use unknown" in result.stdout
+
+
 # --- Helpers ---
 
 

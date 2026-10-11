@@ -49,9 +49,10 @@ pr-pipeline itself should use
 [automation-control-plane-review](../automation-control-plane-review/SKILL.md),
 [durability-boundary-review](../durability-boundary-review/SKILL.md), and
 [loop-cadence-contract-review](../loop-cadence-contract-review/SKILL.md) when their
-boundaries apply. Publishing these review skills makes them available to
-interactive maintainers; it does not add them to dispatched-engine prompts or
-change engine permissions.
+boundaries apply. The isolated reviewer also receives these installed skills as
+optional native guidance. Its prompt requires selection by scope; the catalog
+does not make these reviews mandatory for other repositories or change engine
+permissions. See [native stage bindings](#prompt-bound-skills-skill_unresolved).
 
 **Where the pipeline lives.** Pipeline *code* is resolved from the install, not
 from the repository being operated on. Pipeline *state* (`.claude/worktrees/`)
@@ -1118,8 +1119,8 @@ provider-capability claim is implied by the CLI inspection.
 
 ### Prompt-bound skills (`skill_unresolved`)
 
-The fixer prompt binds `review-response-hygiene` by naming its doc path and
-requiring the engine to read it before editing, then to declare **per finding**
+The fixer prompt binds `review-response-hygiene` through the native Claude
+`Skill` tool before editing, then to declare **per finding**
 whether the fix **repairs** the accepted design or **replaces** it. One run may
 mix the two, and each replacement states its own reasoning rather than sharing
 one run-wide set. A replacement is never blocked and never escalates — it
@@ -1146,23 +1147,34 @@ cannot be replaced by an n/a claim. The harvest checks only the body's section
 structure. It neither validates the evidence nor adds a warning when the block
 is missing, including when it publishes a generated fallback body.
 
-The binding is a doc path rather than a skill invocation on purpose: the explicit
-grants include `Read` and no `Skill` tool. Both `auto` (the default) and
-`dontAsk` receive read-only Git grants for `status`, `rev-parse`, and `merge-base`
-to support the scope re-check. These grants do not guarantee that the engine can
-read an absolute install path or run an arbitrary production entry point. Host
-policy can deny reads; additional commands depend on operator `verify_tools` or
-approval in `auto`. A required step that remains unavailable blocks completion.
+Claude already discovers namespaced skills from plugins. Dispatch loads the
+pipeline's installed plugin directly with `claude -p --plugin-dir <install>` and
+preapproves the selected `Skill(pr-pipeline:<name>)` call in both `auto` and
+`dontAsk`. The implementer invokes `pr-pipeline:definition-of-done`; the fixer
+invokes `pr-pipeline:review-response-hygiene`. The prompt names the installed
+source so a same-named task-branch skill does not satisfy the binding. No copied
+plugin or second namespace is created. Supporting files remain in the install.
 
-The path is the **install's** — an absolute path into the pipeline's own
-`skills/` directory, not a path inside the engine's worktree. The guidance ships
-with the pipeline, so the operator's installed copy is the right one for every
-target by construction: a repository that has never heard of the skill still
-gets that installed path in its prompt, and a PR branch cannot hand its fixer a
-rewritten copy of the rules it will be revised under. The same doc is published
-as `/pr-pipeline:review-response-hygiene` for interactive sessions.
+Required invocation or supporting-file access can still be denied by host policy;
+the engine must report `NEEDS_HUMAN_DECISION`. There is no silent document-read
+fallback. Verification commands retain their existing permission rules, and
+skills do not grant publication or label authority.
 
-Because it is a path, dispatch resolves it before spending anything. An
+The Codex reviewer has an isolated home. Dispatch links `native_skills.REVIEW_SKILLS`
+into its `HOME/.agents/skills` and lists their names and paths in the prompt.
+These installed skills are optional: the reviewer follows target `AGENTS.md`
+routing and selects only applicable guidance. Control-plane, durability, and
+cadence reviews apply to pr-pipeline changes. Plain catalog names avoid activating
+every skill through a dollar-prefixed mention. No operator configuration, hooks,
+plugins, or additional credentials are imported; the read-only sandbox remains.
+The links share the existing reviewer scratch lifecycle.
+
+Repeat commands for the opt-in real-engine checks are at the top of
+`lib/test_native_engine_integration.py`. Run results belong in the PR. Full
+classification of transitive guidance references remains
+[issue #77](https://github.com/kwuBuild/pr-pipeline/issues/77).
+
+Dispatch resolves mandatory installed documents before spending anything. An
 unreadable doc means the *install* is missing a file its own prompt names — a
 packaging defect, not anything about the item. It logs `skill_unresolved` (with
 the skill names and the probed paths), escalates the item to
@@ -1640,6 +1652,26 @@ jq -s '.[] | select(.action=="retained_scratch" or .action=="archive_failed" or 
 # Ticks that ran today
 ls "$LOG_DIR"/tick-$(date +%Y%m%d)*.jsonl 2>/dev/null | wc -l
 ```
+
+#### Skill observations
+
+Status reads the existing audit log. Dispatch `skill_context` rows record
+`requested_skills` and `available_skills`; availability is not proof of use.
+Claude `engine_result_summary` rows retain `skills_used` and `skill_usage_status`.
+The collector records at most 64 names from native calls with matching successful
+tool results. Older wrappers recorded attempted calls, so historical rows must
+not be reclassified as successful loading. Neither form proves compliance.
+
+Codex keeps its existing schema version 2 `review-observation.json`; version 1
+remains readable. Its normalized names describe successful commands referencing
+skill files, including the installed discovery links classified as `plugin`.
+Even an `echo` of a path qualifies; these are not native invocation events.
+Raw commands, output, and paths are discarded.
+
+Empty observations mean use is unknown. Missing observations are unavailable.
+Claude prompt expansion may emit no `Skill` call. Observations never determine
+completion, verdicts, labels, or cleanup. Detailed cross-engine read/attempt
+classification is outside this feature.
 
 #### Per-attempt token usage
 

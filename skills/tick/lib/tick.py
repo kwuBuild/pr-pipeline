@@ -54,12 +54,14 @@ import tomllib
 import traceback
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import claude_stream_wrapper
 import engine_usage
 import labels
+import native_skills
 import pipeline
 import process_control
 import reviewer_observability
@@ -957,6 +959,7 @@ def claude_engine_argv(
     allowed_tools: str,
     model: str = "",
     settings: str = "",
+    skill_plugin: str = "",
 ) -> list[str]:
     """Return the headless Claude argv every implementer and fixer runs.
 
@@ -993,6 +996,8 @@ def claude_engine_argv(
         argv += ["--model", model]
     if settings:
         argv += ["--settings", settings]
+    if skill_plugin:
+        argv += ["--plugin-dir", skill_plugin]
     return argv
 
 
@@ -1008,6 +1013,7 @@ def _launch_claude_engine(
     permission_mode: str = "auto",
     verify_tools: tuple[str, ...] | None = None,
     engine_settings: str = "",
+    skills: Sequence[str] = (),
 ) -> subprocess.Popen[bytes] | None:
     """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
@@ -1066,14 +1072,26 @@ def _launch_claude_engine(
         print(f"tick: refusing engine launch: target validation failed: {exc}", file=sys.stderr)
         return None
 
+    skill_plugin = ""
+    skill_grants = ""
+    if skills:
+        try:
+            skill_plugin = native_skills.claude_plugin(pipeline.INSTALL_SKILLS_ROOT, skills)
+            skill_grants = " " + " ".join(
+                f"Skill({native_skills.CLAUDE_NAMESPACE}:{name})" for name in skills
+            )
+        except (OSError, ValueError):
+            print("tick: refusing engine launch: native skill setup failed", file=sys.stderr)
+            return None
     prompt_path = os.path.join(wt_dir, "prompt.txt")
     stderr_path = os.path.join(wt_dir, "stderr.log")
     engine_cmd = claude_engine_argv(
         engine_bin,
         permission_mode=permission_mode,
-        allowed_tools=_engine_allowed_tools(push_permission, verify_tools),
+        allowed_tools=_engine_allowed_tools(push_permission, verify_tools) + skill_grants,
         model=model,
         settings=engine_settings,
+        skill_plugin=skill_plugin,
     )
     prompt_fh = result_fh = stderr_fh = None
     try:
@@ -2266,6 +2284,22 @@ def _skill_usage_summary(result_raw: str) -> tuple[list[str], str]:
     if not isinstance(skills, list) or not all(isinstance(s, str) for s in skills):
         return [], "unavailable"
     return skills, "active" if status == "active" else "unavailable"
+
+
+def _log_skill_context(
+    *, tick_log: "TickLog | None", number: int, stage: str,
+    dispatch_id: str, engine: str,
+) -> None:
+    """Record the requested names separately from the existing observation rows."""
+    if tick_log:
+        requested = IMPLEMENTER_SKILLS if stage == "implement" else FIXER_SKILLS if stage == "fix" else ()
+        tick_log.log(
+            pr=number, phase="dispatch", stage=stage, action="skill_context",
+            reason="installed skills available; use not yet observed",
+            engine=engine, dispatch_id=dispatch_id,
+            details={"requested_skills": list(requested),
+                     "available_skills": list(native_skills.REVIEW_SKILLS if stage == "review" else requested)},
+        )
 
 
 def _log_reviewer_skill_observation(
@@ -9706,6 +9740,19 @@ def _dispatch_one_reviewer(
     }
     os.makedirs(reviewer_env["TMPDIR"], exist_ok=True)
 
+    try:
+        review_skills = native_skills.prepare_reviewer(
+            skills=native_skills.REVIEW_SKILLS,
+            install_root=pipeline.INSTALL_SKILLS_ROOT, scrub_dir=Path(scrub_dir),
+        )
+    except (OSError, ValueError):
+        _escalate_dispatch_setup_failure(
+            entity="pr", number=pr_number, pre_label=pre_label, stage="review",
+            reason="installed native reviewer skill catalog unavailable",
+            engine="codex", tick_log=tick_log, cleanup_dir=wt_dir,
+        )
+        return
+
     # Build the reviewer engine command via engine_wrapper.
     result_path = os.path.join(wt_dir, "review.json")
     envelope_path = os.path.join(wt_dir, "completion.json")
@@ -9727,6 +9774,8 @@ def _dispatch_one_reviewer(
         "fixer_summary": fixer_summary or "No published fixer summary.",
         "original_review": original_review or "No originating review available for this round.",
     })
+
+    review_prompt = native_skills.reviewer_prompt(review_skills) + "\n\n" + review_prompt
 
     # Resolve model/effort on the trusted side and record what this review
     # actually ran with: the operator config can change between ticks, so
@@ -9818,6 +9867,11 @@ def _dispatch_one_reviewer(
                 stderr_fh.close()
             except OSError:
                 pass
+
+    _log_skill_context(
+        tick_log=tick_log, number=pr_number, stage="review",
+        dispatch_id=dispatch_id, engine="codex",
+    )
 
     # Publish the full marker with process identity (with fallback).
     # With start_new_session=True, the child's pid equals its pgid,
@@ -10376,6 +10430,7 @@ def _dispatch_one_implementer(
         "branch_name": branch_name,
         "pr_body_source_file": _PR_BODY_SOURCE_FILE,
         "definition_of_done_skill_doc": skill_doc_path(DEFINITION_OF_DONE_SKILL),
+        "definition_of_done_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{DEFINITION_OF_DONE_SKILL}",
     })
 
     result_path = os.path.join(wt_dir, "result.json")
@@ -10417,6 +10472,7 @@ def _dispatch_one_implementer(
         permission_mode=permission_mode,
         verify_tools=verify_tools,
         engine_settings=config.engine_settings,
+        skills=IMPLEMENTER_SKILLS,
     )
     if proc is None:
         # Launch failed — clean up and leave label unchanged.
@@ -10429,6 +10485,11 @@ def _dispatch_one_implementer(
                 engine=impl_engine,
             )
         return
+
+    _log_skill_context(
+        tick_log=tick_log, number=issue_number, stage="implement",
+        dispatch_id=dispatch_id, engine=impl_engine,
+    )
 
     # Publish the full marker with process identity (with fallback).
     # With start_new_session=True, the child's pid equals its pgid.
@@ -11144,6 +11205,7 @@ def _dispatch_one_fixer(
         "issue_contract": pr_context.contract_block,
         "head_ref": head_ref,
         "revision_hygiene_skill_doc": skill_doc_path(REVISION_HYGIENE_SKILL),
+        "revision_hygiene_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{REVISION_HYGIENE_SKILL}",
         "summary_budget": pipeline.FIX_SUMMARY_BUDGET,
         "pr_body_revision_file": _PR_BODY_REVISION_FILE,
         # The whole stamp line, not its prefix: the engine copies a literal it
@@ -11189,6 +11251,7 @@ def _dispatch_one_fixer(
         permission_mode=permission_mode,
         verify_tools=verify_tools,
         engine_settings=config.engine_settings,
+        skills=FIXER_SKILLS,
     )
     if proc is None:
         cleanup_scratch(wt_dir)
@@ -11200,6 +11263,11 @@ def _dispatch_one_fixer(
                 engine=impl_engine,
             )
         return
+
+    _log_skill_context(
+        tick_log=tick_log, number=pr_number, stage="fix",
+        dispatch_id=dispatch_id, engine=impl_engine,
+    )
 
     # Publish the full marker with process identity (with fallback).
     # With start_new_session=True, the child's pid equals its pgid.
