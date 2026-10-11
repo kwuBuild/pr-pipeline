@@ -138,3 +138,81 @@ engine_settings = ""
 # integer of at least 1. Zero, a negative number, a float, a string or a boolean
 # is a startup error naming this key; the tick never substitutes another cap.
 max_in_flight = 3
+
+# --- Stage deadlines, stall limits and the review round limit ---
+#
+# Integers only: a boolean, float or string, or a value below the stated
+# minimum, is a startup error naming the key. Nothing falls back silently.
+
+# How long each engine may run, in seconds from dispatch. The deadline is
+# recorded in the engine's dispatch marker; a later config change does not move
+# the deadline of an engine already running. Minimum 60.
+implementer_timeout_seconds = 3600
+fixer_timeout_seconds = 3600
+review_timeout_seconds = 1200
+
+# Implementer/fixer stall detection, in seconds. An engine with no output for
+# engine_stall_seconds is reported as stalled (reported only: nothing is killed
+# or relabelled). It must be greater than 600 — the longest silence a healthy
+# engine produces, one Claude Code Bash call at its cap — and less than both the
+# implementer and the fixer deadline. engine_stall_startup_grace_seconds is
+# added before the engine's first output event (minimum 0). Both are recorded
+# in the dispatch marker with the deadline.
+engine_stall_seconds = 1800
+engine_stall_startup_grace_seconds = 300
+
+# Review/fix rounds on one PR before it receives ai:max-iterations. Minimum 1.
+max_iterations = 5
+
+# --- Engine routing ---
+#
+# Explicit CLI flags (--impl-engine, --model, --fix-engine, --fix-model,
+# --review-model, --review-effort) override these for one run. A malformed
+# value is a startup error naming the key.
+
+# Implementer engine: "claude" or "claude-ds". /pr-pipeline:setup writes the
+# route defaults (impl_engine and model) and separate probe metadata
+# (probed_impl_engine and probed_model) into the repository's own section.
+# Editing a default or passing a flag does not rewrite that evidence: the tick
+# reports at startup when the route it runs differs. See README "Deadlines,
+# stall limits, routing and cadence" for the metadata contract.
+impl_engine = "claude"
+
+# Implementer --model. Blank: claude resolves the operator's own default, and
+# claude-ds uses deepseek-v4-pro[1m].
+model = ""
+
+# Fixer route. Blank fix_engine runs the fixer on the implementer's engine.
+# Blank fix_model inherits model while the fixer runs on the implementer's
+# engine, and otherwise uses the fixer engine's default: a model id names one
+# provider's model.
+fix_engine = ""
+fix_model = ""
+
+# Codex reviewer model and reasoning effort. Blank reads the operator's codex
+# config ($CODEX_HOME/config.toml), then the pinned fallback.
+review_model = ""
+review_effort = ""
+
+# --- Loop cadence ---
+#
+# Seconds, except the stop count. Each wake is at least 60 and never exactly
+# 300: 300 is the prompt-cache TTL cliff, which pays a cache miss without
+# amortizing it. Both loop paths — the one-shot tick's `tick-cadence:` line and
+# `--loop` — pace from these values.
+
+# Wake while work is queued, the admission cap is full, or state is unknown.
+loop_short_poll_seconds = 270
+# Longest wait while an engine is in flight (the nearest deadline can be sooner).
+loop_max_poll_seconds = 270
+# Wake while the pipeline is quiescent.
+loop_heartbeat_seconds = 1800
+# Consecutive quiescent heartbeats before the loop stops. Minimum 1.
+loop_quiescent_stop_after = 3
+
+# Provider cooldown after a transient (quota or rate-limit) engine result, in
+# seconds. transient_cooldown_seconds applies when the result names no reset
+# time (minimum 60); transient_cooldown_reset_buffer_seconds is added to a
+# reset time it does name (minimum 0).
+transient_cooldown_seconds = 3600
+transient_cooldown_reset_buffer_seconds = 300

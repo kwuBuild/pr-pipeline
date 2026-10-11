@@ -95,7 +95,8 @@ Debugging notes:
   remains the upper bound. The nudged tick advances neither quiescent counter
   — not the loop's in-memory streak, and not
   `.tick-state/quiescent-counter.txt`. If a loop stops on quiescence, or a
-  later one-shot tick reports `stop=true`, the documented N × 1800s of quiet
+  later one-shot tick reports `stop=true`, the documented N heartbeats of quiet
+  (`loop_quiescent_stop_after` × `loop_heartbeat_seconds`; 3 × 1800s shipped)
   really did elapse.
 - Suspect the watcher is over-nudging? `jq -s '[.[] | select(.action=="tick_complete")]' .claude/worktrees/.tick-log/tick-*.jsonl`
   and check tick spacing; nudged ticks appear as normal ticks closer together
@@ -106,7 +107,8 @@ Debugging notes:
 `kill -0` proves an engine process exists; it does not prove the engine is doing
 anything. An engine wedged on a network call that never returns, a permission
 wait, or a silent retry loop passes every liveness probe and burns its whole
-60-minute deadline before the pipeline reacts.
+deadline (`implementer_timeout_seconds`/`fixer_timeout_seconds`, 60 minutes
+shipped) before the pipeline reacts.
 
 The implementer/fixer stream wrapper already owns the engine's stdout, so it
 bumps the mtime of a `heartbeat` file next to that engine's `result.json` as
@@ -115,7 +117,10 @@ whole payload). A heartbeat write failure is swallowed — it must never affect
 whether the engine's result reaches harvest.
 
 A marker whose engine is still `live` but whose heartbeat has not moved for
-**30 minutes** (`ENGINE_STALL_SECONDS`) is reported as a stall.
+the stall threshold is reported as a stall. The threshold is the marker's
+`stall_seconds`: the operator's `engine_stall_seconds` (**30 minutes** shipped)
+recorded at dispatch. A marker written before the limits were recorded uses the
+shipped values (`ENGINE_STALL_SECONDS`, `ENGINE_STALL_STARTUP_GRACE_SECONDS`).
 
 **Both loop paths produce this signal.** Every tick runs the scan at the start
 of its body, so one-shot ticks scheduled from the `tick-cadence:` line — the
@@ -151,8 +156,8 @@ Debugging notes:
 - **Steady-state de-duplication per stall episode.** The progress timestamp
   already evaluated is remembered per dispatch identity in
   `.claude/worktrees/.tick-state/stall-episodes.json`, so a wedged engine does
-  not re-notify every 5s poll — or, under one-shot ticks, once every ~270s
-  cadence interval for the ~30 minutes left on its deadline. Refused verdicts
+  not re-notify every 5s poll — or, under one-shot ticks, once every cadence
+  interval (~270s shipped) for the time left on its deadline. Refused verdicts
   are remembered too, so a quiet marker whose engine is *not* live costs one
   `ps` probe rather than one per scan for as long as the directory survives. If
   the heartbeat starts advancing again, detection re-arms — a later silence at
@@ -187,11 +192,13 @@ Debugging notes:
   on its bare cadence timer.
 - **No heartbeat file is not a stall.** It means the engine has not reached its
   first output event, or the marker predates heartbeats. Those fall back to the
-  marker's `start_time` plus a 5-minute startup grace
-  (`ENGINE_STALL_STARTUP_GRACE_SECONDS`) on top of the threshold.
+  marker's `start_time` plus the startup grace on top of the threshold (the
+  marker's `stall_startup_grace_seconds`, from `engine_stall_startup_grace_seconds`;
+  5 minutes shipped).
 - **Only implement/fix stages.** The reviewer wrapper deliberately discards
   engine output, so there is no progress signal to read; its stall cost is
-  already bounded by the 20-minute review timeout, and inventing a weaker proxy
+  already bounded by the review deadline (`review_timeout_seconds`, 20 minutes
+  shipped), and inventing a weaker proxy
   for it is deferred rather than guessed at.
 - The stall check runs only after the cheap mtime test says something is wrong,
   and then uses the same identity-verified classification harvest trusts. A
@@ -222,14 +229,16 @@ Debugging notes:
   different interpreter than the dashboard used.
 
 - Seeing `engine_stalled` for engines that finish fine? The threshold is below
-  the longest legitimate silence for your workload. Raise
-  `ENGINE_STALL_SECONDS`; nothing else depends on it — the dashboard reads the
-  same constant through the command above. Raise
-  `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS` with it if the new floor comes from a
-  slower tool call rather than from a longer chain of them, and keep the sum of
-  threshold plus startup grace under the 60-minute engine timeout or the stall
-  can never be reported before `hung` escalates. Both bounds are asserted in
-  `test_tick.py`.
+  the longest legitimate silence for your workload. Raise `engine_stall_seconds`
+  in the operator config (`[defaults]` or the repository's section); nothing
+  else depends on it. It applies to engines dispatched after the change — the
+  dashboard and the watcher read each engine's recorded limit through the
+  command above. Startup refuses a threshold at or below
+  `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS` (600s, Claude Code's Bash cap; not
+  configurable) or at or above either engine deadline, because such a stall
+  either reports healthy engines or can never be reported before `hung`
+  escalates. Keep threshold plus startup grace under the deadline too, or the
+  pre-first-output fallback can never fire.
 
 ## Retained scratch recovery
 
@@ -599,12 +608,16 @@ is still captured in `stderr.log`.
   cadence deadline (`--loop` only)
 - Engine progress heartbeat: `<worktree>/heartbeat` (mtime only), written at
   most once per 5s by the implement/fix stream wrapper
-- Stall threshold: 1800s of no engine output (3x the 600s longest legitimate
-  silence, `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`); 300s extra startup grace
-  when no heartbeat file exists yet
+- Stall threshold: `engine_stall_seconds`, 1800s shipped (3x the 600s longest
+  legitimate silence, `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`); plus
+  `engine_stall_startup_grace_seconds`, 300s shipped, when no heartbeat file
+  exists yet. Both are recorded per engine in `dispatch.json`.
 - Admission cap: `max_in_flight` from the operator config (shipped default 3),
   read once at tick startup
-- Timeouts: reviewer 1200s, implementer 3600s, fixer 3600s
+- Timeouts: `review_timeout_seconds` 1200s, `implementer_timeout_seconds`
+  3600s, `fixer_timeout_seconds` 3600s shipped; each engine's is its marker
+  `deadline`
+- Round limit: `max_iterations`, 5 shipped
 - Engine skill bindings: `tick.FIXER_SKILLS` and `tick.IMPLEMENTER_SKILLS`,
   resolved as `<install>/skills/<name>/SKILL.md` before launch — the install's
   own copy, not the engine worktree's, so a target repository needs no copy of
@@ -644,12 +657,22 @@ is still captured in `stderr.log`.
   `includeIf`, worktree settings and engine `GIT_CONFIG_*` environment. Correct
   the configuration and rerun the tick; do not discard retained review evidence.
 - Configuration errors: a malformed `base_ref`, `permission_mode`,
-  `[operator] login`, `verify_tools`, `checklist_paths` or `[scan] repos` exits
-  3 with `startup_config_invalid` naming the key — none of them has a reading
-  that is both conservative and the one the operator wrote. A malformed
+  `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`, engine
+  route (`impl_engine`, `model`, `fix_engine`, `fix_model`, `review_model`,
+  `review_effort`, or the matching flag), or any deadline, stall, round,
+  cooldown or cadence key exits 3 with `startup_config_invalid` naming the key —
+  none of them has a reading that is both conservative and the one the operator
+  wrote. An integer key holding a boolean, float or string, a value below its
+  minimum, a wake of exactly 300s, or a stall threshold that is not between
+  600s and both engine deadlines is refused this way. A malformed
   `allow_touching` does: it logs `startup_config_warning`, resolves to the
   closed gate, and the tick runs. A container declared as a non-table
   (`[[defaults]]`, `[[scan]]`) and a relative `$PR_PIPELINE_CONFIG` /
   `$CLAUDE_CONFIG_DIR` are errors too. Grep the tick log for `startup_config_`
   when a setting looks ignored
+- Unprobed engine route: `startup_route_unprobed` means the implementer route
+  this tick ran (after config edits and any `--impl-engine`/`--model` flag)
+  differs from setup's separate `probed_impl_engine`/`probed_model` evidence.
+  The tick still runs. Whether `auto` permission mode works was measured on the
+  recorded route only; rerun setup to probe the new one
 - Reviewer Codex floor: `codex-cli 0.142.5`

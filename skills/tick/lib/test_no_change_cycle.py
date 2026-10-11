@@ -14,9 +14,13 @@ import pipeline
 import tick
 
 
-@pytest.mark.parametrize("lose_receipt", [False, True])
+@pytest.mark.parametrize("lose_receipt, max_iterations", [
+    (False, None), (True, None),
+    # A configured round limit moves the cap the real harvest applies.
+    (False, 2),
+])
 def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
-    tmp_path: Path, lose_receipt: bool,
+    tmp_path: Path, lose_receipt: bool, max_iterations: int | None,
 ) -> None:
     wt_root = tmp_path / "worktrees"
     wt_dir = wt_root / "pr-42"
@@ -41,6 +45,8 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
 
     decision = {"pr_number": 42, "action": "harvest", "kill": False}
     fix_round = ""
+    cap = pipeline.MAX_ITERATIONS if max_iterations is None else max_iterations
+    tuning = {} if max_iterations is None else {"max_iterations": max_iterations}
     with (
         mock.patch("tick.gh_json", side_effect=read),
         mock.patch("tick.gh", side_effect=post),
@@ -48,7 +54,7 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
         mock.patch("tick._converge_pipeline_labels", side_effect=converge),
         mock.patch("tick.cleanup_scratch"),
     ):
-        for round_index in range(pipeline.MAX_ITERATIONS):
+        for round_index in range(cap):
             write_marker(wt_dir, stage="review", dispatch=f"review-{round_index}", fix_round=fix_round)
             (wt_dir / "review.json").write_text(json.dumps({
                 "verdict": "changes_requested", "findings": [
@@ -56,12 +62,12 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
                 ],
             }))
             allow_relabel = False
-            tick._harvest_one_reviewer(decision, str(wt_root), None, None)
+            tick._harvest_one_reviewer(decision, str(wt_root), None, None, **tuning)
             assert pipeline.count_review_rounds(comments) == round_index + 1
             allow_relabel = True
-            tick._harvest_one_reviewer(decision, str(wt_root), None, None)
+            tick._harvest_one_reviewer(decision, str(wt_root), None, None, **tuning)
             assert pipeline.count_review_rounds(comments) == round_index + 1
-            if round_index == pipeline.MAX_ITERATIONS - 1:
+            if round_index == cap - 1:
                 assert transitions[-1] == pipeline.LABEL_MAX_ITERATIONS
                 break
             assert transitions[-1] == pipeline.LABEL_CHANGES_REQUESTED

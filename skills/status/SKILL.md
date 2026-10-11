@@ -82,7 +82,7 @@ Implement/fix rows carry a progress column next to the result column:
 | Value | Meaning |
 | --- | --- |
 | `quiet-Nm` | N minutes since the engine's last output. Before the first output event N counts from dispatch instead. Not by itself a health verdict: this is also what a stall *exclusion* renders (a reused PID, an already-overdue engine), so a long `quiet-Nm` means "no stall claim", not "working normally". |
-| `STALLED-Nm` | Live engine, no output for N minutes, past the 30-minute threshold. |
+| `STALLED-Nm` | Live engine, no output for N minutes, past the stall threshold recorded in its marker at dispatch (the operator's `engine_stall_seconds`, 30 minutes shipped). |
 | `-` | No progress contract: the reviewer stage (its wrapper discards engine output), or a marker with no usable clock. |
 | `?` | No verdict for this row. Either the report could not be produced at all (the `pr-pipeline:tick` lib is unreachable), or it was produced without a line for this marker — a marker created between the report call and the render, or one Python skipped as malformed while bash's own parse succeeded. Not a claim either way. |
 

@@ -52,8 +52,8 @@ out of its rules.
   record on disk, not a conversation. A crash or `/clear` in your session
   loses no workflow state; the next run picks up where the last one stopped.
 - **The rules are code, not a prompt.** A pull request gets at most five
-  reviews. An agent that runs past its deadline (60 minutes to write or fix,
-  20 to review) is stopped, and the item comes to you. An agent that fails
+  reviews by default. An agent that runs past its deadline (by default 60
+  minutes to write or fix, 20 to review) is stopped, and the item comes to you. An agent that fails
   three times without a result hands the item to you instead of retrying
   forever. When Claude Code hits a usage limit, no new Claude Code work starts
   until the limit resets.
@@ -218,8 +218,8 @@ Always name a target, such as `#42` or `pr:57`. Without one, the pipeline picks
 up every issue and pull request that waits for work, which can start more than
 you expect. See [Choose what runs](#choose-what-runs).
 
-The loop stops after the queue has been quiet for three 30-minute checks, or
-when it hits an error. Claude Code then reads the log and tells you what
+The loop stops after the queue has been quiet for three 30-minute checks (the
+default cadence), or when it hits an error. Claude Code then reads the log and tells you what
 finished, what waits for you, and the cause of any failure, with help from the
 [diagnostics guide](skills/tick/DEBUG.md). To resume, start the loop again.
 Agents keep running when the loop stops, and the next run collects their
@@ -255,10 +255,13 @@ Targets and flags apply only to the run that receives them. Each new run starts
 with the whole queue and your configured defaults, so pass the same target and
 flags again when you start the loop.
 
-Flags select the agents: `--impl-engine` chooses the implementation engine
-(`claude`, or `claude-ds` for DeepSeek through Claude Code), `--model` the
-Claude model, and `--review-model` and `--review-effort` the Codex reviewer.
-See the [operator guide](skills/tick/README.md#invocation).
+Flags select the agents for one run: `--impl-engine` chooses the implementation
+engine (`claude`, or `claude-ds` for DeepSeek through Claude Code), `--model`
+the Claude model, `--fix-engine` and `--fix-model` the fixer's own route, and
+`--review-model` and `--review-effort` the Codex reviewer. Setup records the
+implementation route it tested for each repository, so you need no flags for
+it. Deadlines, the review limit, agent routes, and loop timing are settings in
+your operator config. See the [operator guide](skills/tick/README.md#deadlines-stall-limits-routing-and-cadence).
 
 ## How it works
 
@@ -275,7 +278,7 @@ Three labels stop automation and wait for you:
 | Label | Meaning |
 |---|---|
 | `ai:needs-human-decision` | An agent or the pipeline found a scope or design question, or a conflict over who owns the item, that it must not decide alone. An agent that ran past its deadline or kept failing also lands here. |
-| `ai:max-iterations` | The pull request reached five completed reviews without approval. |
+| `ai:max-iterations` | The pull request reached the review limit (five completed reviews by default) without approval. |
 | `ai:blocked` | You set this to hold an item for a dependency or a decision. |
 
 ### Each run harvests, then dispatches
@@ -291,8 +294,8 @@ phases:
 The agents run between ticks, not during them. A tick never asks a model what
 to do. Fixed rules in code choose the next step from the labels, the local
 records, and the agents' results.
-The loop runs ticks often while agents work, checks every 30 minutes when the
-queue is idle, and stops after three quiet checks in a row.
+By default the loop runs ticks often while agents work, checks every 30 minutes
+when the queue is idle, and stops after three quiet checks in a row.
 
 Besides the labels, the pipeline keeps a small record on disk for each running
 agent. If that local record is damaged or lost, an item can need manual

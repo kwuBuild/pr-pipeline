@@ -43,7 +43,11 @@ not work around it.
 3. **Repositories and route.** Ask which repositories to drive, as
    `owner/name`. Ask which engine route the tick will run: `--impl-engine`
    (`claude` or `claude-ds`) and `--model` (blank for the operator's default).
-   The probe measures that route. Changing it later means rerunning setup.
+   The probe measures that route, and `write-config` records it as the
+   repository's `impl_engine` and `model`, so the tick runs it without flags.
+   It also writes separate `probed_impl_engine` and `probed_model` evidence.
+   A config edit or flag selecting another route reports `startup_route_unprobed`;
+   rerun setup to measure that route. See the [route metadata contract](../tick/README.md#deadlines-stall-limits-routing-and-cadence).
 4. **Each repository**, in order:
    1. `setup.sh inspect <owner/name>`. Use the returned `repo` spelling from
       here on. Report `default_branch`: a blank `base_ref` resolves it at each
@@ -111,7 +115,10 @@ not work around it.
       and drops comments. The previous file is kept as `config.toml.bak`. On
       the operator's approval, rerun without `--dry-run`. `changed: false`
       means the file already says this. `write-config` refuses a combination
-      the probe did not support.
+      the probe did not support. It writes routing defaults and separate probe
+      metadata beside the grants; deadlines, stall limits, the round limit and
+      cadence keep their shipped defaults unless the operator edits them (tick
+      README "Deadlines, stall limits, routing and cadence").
 5. **Deny rules.** Run `setup.sh deny-rules` and show the rules. Under `auto`
    the engine allowlist is not a ceiling, so force-push, remote-branch
    deletion, forced refspecs, and mirror/prune pushes can reach the

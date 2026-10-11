@@ -106,6 +106,12 @@ amortizing it):
 | Quiescent: no live dispatch, all items terminal | ~1800s heartbeat |
 | Quiescent for N consecutive heartbeats | stop + notify developer |
 
+The values above are the shipped defaults. Operators tune them per repository
+(`loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`,
+`loop_quiescent_stop_after`); the resolver refuses a configured wake of exactly
+300s, so the bands keep their purpose. See the
+[tick README](../skills/tick/README.md#deadlines-stall-limits-routing-and-cadence).
+
 In in-process `--loop` mode these intervals are an upper bound rather than a
 fixed schedule. Because every tick re-reads full state, an early wake cannot
 change what a tick concludes — only when it runs — so the loop waits on a wake

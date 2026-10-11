@@ -161,7 +161,11 @@ LOCK_HELD_EXIT_CODE = 5
 # it. Distinct from 3 because the remedy is an interactive step, not a fix to a
 # value the operator already wrote.
 UNCONFIGURED_TARGET_EXIT_CODE = 6
-REVIEW_TIMEOUT = 20 * 60  # seconds
+# Stage deadlines, in seconds. These and the stall, cooldown and cadence values
+# below are the shipped defaults from `pipeline`. The tick runs on the values
+# its startup gate validated (ResolvedConfig) and passes them to every
+# consumer; these names serve direct callers and tests.
+REVIEW_TIMEOUT = pipeline.REVIEW_TIMEOUT_SECONDS
 # Quiescence counter tracks consecutive quiescent heartbeats across ticks.
 # Written to a file under WT_ROOT so it survives worktree cleanup.
 _QUIESCENT_COUNTER_FILE = os.path.join(WT_ROOT, ".tick-state", "quiescent-counter.txt")
@@ -191,8 +195,9 @@ WAKE_REQUEST_PATH = os.path.join(WT_ROOT, ".tick-state", "wake-request")
 # verification commands are allowlisted (`_engine_verify_tools`) against suites
 # that routinely outrun the harness's 120s default — so an engine that retries
 # with a longer timeout, the obvious move, legitimately goes quiet for the full
-# cap.
-MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = 10 * 60
+# cap. Fixed, not configurable; the resolver refuses a configured stall
+# threshold at or below it.
+MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = pipeline.MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS
 # Progress-stall threshold. An implementer/fixer that has emitted no engine
 # output for this long is wedged rather than working — a network call that
 # never returns, a permission wait, a silent retry loop. Set at 3x the bound
@@ -200,12 +205,14 @@ MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = 10 * 60
 # reports a healthy engine, and a stall signal the operator learns to distrust
 # is worse than no stall signal. Still well below the 60-min deadline, so a
 # real stall surfaces with roughly half the engine's budget left to act on.
-ENGINE_STALL_SECONDS = 30 * 60
+# Operator-configurable as `engine_stall_seconds`; dispatch records the value
+# in the marker, and stall detection reads it from there.
+ENGINE_STALL_SECONDS = pipeline.ENGINE_STALL_SECONDS
 # Extra allowance when no heartbeat file exists yet. Two causes: an engine that
 # has not reached its first output event, and a marker dispatched by a wrapper
 # from before heartbeats existed. Neither is a stall, so the fallback clock
 # (marker start_time) gets this on top of the threshold before classifying.
-ENGINE_STALL_STARTUP_GRACE_SECONDS = 5 * 60
+ENGINE_STALL_STARTUP_GRACE_SECONDS = pipeline.ENGINE_STALL_STARTUP_GRACE_SECONDS
 # Stall episodes already reported, keyed by dispatch identity. Persisted for
 # the same reason `_QUIESCENT_COUNTER_FILE` is: the two executable loop paths
 # are separate processes. One-shot ticks scheduled from the `tick-cadence:`
@@ -223,10 +230,12 @@ _STALL_EPISODES_LOCK = os.path.join(WT_ROOT, ".tick-state", "stall-episodes.lock
 # in milliseconds; this exists only so a wedged notifier cannot park its
 # caller — which, since stall reporting, includes the wake-watcher thread.
 OPERATOR_NOTIFICATION_TIMEOUT_SECONDS = 10
-IMPLEMENTER_TIMEOUT = 60 * 60  # seconds
-FIXER_TIMEOUT = 60 * 60  # seconds
-DEFAULT_TRANSIENT_COOLDOWN_SECONDS = 60 * 60
-TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
+IMPLEMENTER_TIMEOUT = pipeline.IMPLEMENTER_TIMEOUT_SECONDS
+FIXER_TIMEOUT = pipeline.FIXER_TIMEOUT_SECONDS
+DEFAULT_TRANSIENT_COOLDOWN_SECONDS = pipeline.TRANSIENT_COOLDOWN_SECONDS
+TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = (
+    pipeline.TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+)
 MIN_CODEX_VERSION = "codex-cli 0.142.5"
 
 # Target and operator identity are bound at startup, before any GitHub access.
@@ -234,6 +243,13 @@ MIN_CODEX_VERSION = "codex-cli 0.142.5"
 # a config edit is adopted at the next successful startup, never mid-tick.
 # Imports and read-only CLI helpers do not require a configured Git remote.
 _IMPORT_CONFIG = pipeline.resolve_config()
+# The shipped tuning, for direct callers of the tick body that pass no
+# validated configuration. A tick never runs on it: _run_single_tick_locked
+# always passes the configuration its startup gate validated.
+_SHIPPED_CONFIG = pipeline.ResolvedConfig(
+    login="", allow_touching=False, checklist_paths=(), verify_tools=(),
+    base_ref="", permission_mode="auto", scan_repos=None, errors=(), warnings=(),
+)
 TRUSTED_HEAD_REPO = ""
 TARGET_REMOTE = ""
 TRUSTED_REVIEW_AUTHOR = _IMPORT_CONFIG.login
@@ -540,7 +556,7 @@ def _resolve_engine(impl_engine: str, model: str = "") -> tuple[str, dict[str, s
         raise RuntimeError(
             "claude-ds requires DEEPSEEK_API_KEY or DEEPSEEK_API_KEYPATH"
         )
-    resolved_model = model if model else "deepseek-v4-pro[1m]"
+    resolved_model = pipeline.effective_engine_model("claude-ds", model)
     extra: dict[str, str] = {
         "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
         "ANTHROPIC_AUTH_TOKEN": token,
@@ -580,13 +596,12 @@ _REVIEWER_CONFIG_FILENAME = "config.toml"
 #
 # Effort is interpolated into a -c model_reasoning_effort="<v>" TOML
 # expression, so it must be a bare token: a quote or newline could close the
-# string and append a second, unreviewed config key.
-_REVIEWER_EFFORT_RE = re.compile(r"[A-Za-z0-9._\-\[\]]+")
-# Model is its own argv element — quoting cannot leak into a config
-# expression, so provider-qualified ids (openai/gpt-5.1-codex, qwen3:30b) are
-# fine. What argv *is* vulnerable to is a value read as an option, so the
-# first character must not be a dash.
-_REVIEWER_MODEL_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:+/\[\]-]*")
+# string and append a second, unreviewed config key. The operator config's
+# review_effort is validated against the same grammar at startup.
+_REVIEWER_EFFORT_RE = pipeline.REVIEW_EFFORT_RE
+# Model is its own argv element; see pipeline.ENGINE_MODEL_RE, which the
+# resolver also applies to review_model, model and fix_model.
+_REVIEWER_MODEL_RE = pipeline.ENGINE_MODEL_RE
 
 _REVIEWER_VALUE_RE = {
     "model": _REVIEWER_MODEL_RE,
@@ -2479,17 +2494,25 @@ def verify_codex_bin(
 # --- Engine cooldowns ---
 
 
-def transient_cooldown_until(result_obj: object, *, now: float) -> float:
+def transient_cooldown_until(
+    result_obj: object,
+    *,
+    now: float,
+    cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    reset_buffer_seconds: int = TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS,
+) -> float:
     """Return the provider cooldown deadline for a transient engine result.
 
     Args:
         result_obj: Parsed engine result; reset hints may refine the deadline.
         now: Current epoch time.
+        cooldown_seconds: Cooldown when the result names no reset time.
+        reset_buffer_seconds: Margin added to a reset time the result names.
 
     Returns:
         Epoch time after which the provider may be dispatched again.
     """
-    fallback = now + DEFAULT_TRANSIENT_COOLDOWN_SECONDS
+    fallback = now + cooldown_seconds
     if not isinstance(result_obj, dict):
         return fallback
     result_text = result_obj.get("result")
@@ -2522,9 +2545,7 @@ def transient_cooldown_until(result_obj: object, *, now: float) -> float:
 
     current = dt.datetime.fromtimestamp(now, timezone)
     reset = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    deadline = reset + dt.timedelta(
-        seconds=TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS,
-    )
+    deadline = reset + dt.timedelta(seconds=reset_buffer_seconds)
     if deadline.timestamp() <= now:
         deadline += dt.timedelta(days=1)
     return deadline.timestamp()
@@ -4728,6 +4749,7 @@ def harvest_reviewers(
     target: tuple[str, int] | None = None,
     *,
     wt_root: str | None = None,
+    max_iterations: int = pipeline.MAX_ITERATIONS,
 ) -> bool:
     """Harvest finished reviewer engines.
 
@@ -4740,6 +4762,8 @@ def harvest_reviewers(
         target: Optional ``(type, number)`` to restrict to a single item.
         wt_root: Worktree root directory, or ``None`` to resolve
             :data:`WT_ROOT` at call time.
+        max_iterations: Review/fix rounds before ``ai:max-iterations``. The
+            tick passes its validated value; the default serves direct callers.
 
     Returns:
         ``True`` if reconciliation succeeded (reconcile_ok), ``False`` if
@@ -4766,7 +4790,10 @@ def harvest_reviewers(
     for decision in decisions:
         action = str(decision.get("action", ""))
         if action == "harvest":
-            _harvest_one_reviewer(decision, wt_root, tick_log, attempts)
+            _harvest_one_reviewer(
+                decision, wt_root, tick_log, attempts,
+                max_iterations=max_iterations,
+            )
         elif action == "fail":
             n = decision.get("pr_number")
             if isinstance(n, int):
@@ -6115,6 +6142,8 @@ def _harvest_one_reviewer(
     wt_root: str,
     tick_log: TickLog | None = None,
     attempts: Attempts | None = None,
+    *,
+    max_iterations: int = pipeline.MAX_ITERATIONS,
 ) -> None:
     """Process a completed reviewer harvest: read review, detect drift, post
     comment, flip label.
@@ -6257,6 +6286,7 @@ def _harvest_one_reviewer(
             pinned_base_ref=base_ref,
             current_base_ref=current_base_ref,
             fix_round=marker.get("fix_round", ""),
+            threshold=max_iterations,
         )
     except Exception:
         # A persistent parse error in harvest_review would loop
@@ -6857,6 +6887,10 @@ def _handle_transient_engine_result(
     wt_dir: str,
     tick_log: TickLog | None,
     attempts: Attempts | None,
+    transient_cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    ),
 ) -> bool:
     """Persist cooldown and apply the shared transient retry transition.
 
@@ -6880,7 +6914,11 @@ def _handle_transient_engine_result(
     except json.JSONDecodeError:
         result_obj = None
     now = time.time()
-    cooldown_until = transient_cooldown_until(result_obj, now=now)
+    cooldown_until = transient_cooldown_until(
+        result_obj, now=now,
+        cooldown_seconds=transient_cooldown_seconds,
+        reset_buffer_seconds=transient_cooldown_reset_buffer_seconds,
+    )
     try:
         domain = _engine_quota_domain(engine)
         EngineCooldowns(wt_root).start(
@@ -7009,6 +7047,11 @@ def _harvest_one_implementer(
     wt_root: str,
     tick_log: TickLog | None = None,
     attempts: Attempts | None = None,
+    *,
+    transient_cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    ),
 ) -> None:
     """Process a completed implementer harvest: read result, create PR or escalate.
 
@@ -7332,6 +7375,10 @@ def _harvest_one_implementer(
             wt_dir=wt_dir,
             tick_log=tick_log,
             attempts=attempts,
+            transient_cooldown_seconds=transient_cooldown_seconds,
+            transient_cooldown_reset_buffer_seconds=(
+                transient_cooldown_reset_buffer_seconds
+            ),
         ):
             return
 
@@ -7368,6 +7415,10 @@ def harvest_implementers(
     target: tuple[str, int] | None = None,
     *,
     wt_root: str | None = None,
+    transient_cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    ),
 ) -> bool:
     """Harvest finished implementer engines.
 
@@ -7376,6 +7427,11 @@ def harvest_implementers(
         target: Optional ``(type, number)`` to restrict to a single item.
         wt_root: Worktree root directory, or ``None`` to resolve
             :data:`WT_ROOT` at call time.
+        transient_cooldown_seconds: Provider cooldown after a transient
+            result that names no reset time. The tick passes its validated
+            value; the default serves direct callers.
+        transient_cooldown_reset_buffer_seconds: Margin added to a reset time
+            the transient result names.
 
     Returns:
         ``True`` if reconciliation succeeded, ``False`` if enumeration
@@ -7400,7 +7456,13 @@ def harvest_implementers(
     for decision in decisions:
         action = str(decision.get("action", ""))
         if action == "harvest":
-            _harvest_one_implementer(decision, wt_root, tick_log, attempts)
+            _harvest_one_implementer(
+                decision, wt_root, tick_log, attempts,
+                transient_cooldown_seconds=transient_cooldown_seconds,
+                transient_cooldown_reset_buffer_seconds=(
+                    transient_cooldown_reset_buffer_seconds
+                ),
+            )
 
     return enum_ok and transition_ok
 
@@ -8006,6 +8068,11 @@ def _harvest_one_fixer(
     wt_root: str,
     tick_log: TickLog | None = None,
     attempts: Attempts | None = None,
+    *,
+    transient_cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    ),
 ) -> None:
     """Process a completed fixer harvest: read result, recheck or escalate.
 
@@ -8344,6 +8411,10 @@ def _harvest_one_fixer(
             wt_dir=wt_dir,
             tick_log=tick_log,
             attempts=attempts,
+            transient_cooldown_seconds=transient_cooldown_seconds,
+            transient_cooldown_reset_buffer_seconds=(
+                transient_cooldown_reset_buffer_seconds
+            ),
         ):
             return
 
@@ -8385,6 +8456,10 @@ def harvest_fixers(
     target: tuple[str, int] | None = None,
     *,
     wt_root: str | None = None,
+    transient_cooldown_seconds: int = DEFAULT_TRANSIENT_COOLDOWN_SECONDS,
+    transient_cooldown_reset_buffer_seconds: int = (
+        TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS
+    ),
 ) -> bool:
     """Harvest finished fixer engines.
 
@@ -8393,6 +8468,11 @@ def harvest_fixers(
         target: Optional ``(type, number)`` to restrict to a single item.
         wt_root: Worktree root directory, or ``None`` to resolve
             :data:`WT_ROOT` at call time.
+        transient_cooldown_seconds: Provider cooldown after a transient
+            result that names no reset time. The tick passes its validated
+            value; the default serves direct callers.
+        transient_cooldown_reset_buffer_seconds: Margin added to a reset time
+            the transient result names.
 
     Returns:
         ``True`` if reconciliation succeeded, ``False`` if enumeration
@@ -8417,7 +8497,13 @@ def harvest_fixers(
     for decision in decisions:
         action = str(decision.get("action", ""))
         if action == "harvest":
-            _harvest_one_fixer(decision, wt_root, tick_log, attempts)
+            _harvest_one_fixer(
+                decision, wt_root, tick_log, attempts,
+                transient_cooldown_seconds=transient_cooldown_seconds,
+                transient_cooldown_reset_buffer_seconds=(
+                    transient_cooldown_reset_buffer_seconds
+                ),
+            )
 
     return enum_ok and transition_ok
 
@@ -8746,6 +8832,26 @@ def _existing_marker_blocks_dispatch(
         cleanup_scratch(wt_dir)
         return False
     return True
+
+
+def _dispatch_config_errors(config: pipeline.ResolvedConfig) -> list[str]:
+    """Return the configuration errors that should stop one engine dispatch.
+
+    Dispatch reads ``verify_tools`` and ``engine_settings`` again before each
+    launch, and refuses on any error that read reports — except one in the
+    admission cap, deadline, stall, round, cooldown, cadence, route or probe
+    metadata keys. The tick reads
+    those once, at its startup gate, and runs on the values validated there; an
+    edit made since then is the next tick's to refuse. Escalating this item
+    over a key its dispatch does not read would change the tick partway through.
+
+    Args:
+        config: The configuration dispatch just resolved.
+
+    Returns:
+        The errors that apply to this dispatch.
+    """
+    return [e for e in config.errors if e not in config.tuning_errors]
 
 
 def _escalate_dispatch_setup_failure(
@@ -9089,6 +9195,7 @@ def dispatch_reviewers(
     review_effort: str = "",
     trusted_author: str = "",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
+    timeout_seconds: int = REVIEW_TIMEOUT,
 ) -> None:
     """Dispatch reviewer engines for PRs at ai:implemented / ai:revised.
 
@@ -9117,6 +9224,9 @@ def dispatch_reviewers(
             at successful startup, for direct callers.
         max_in_flight: The admission cap. The tick always passes the value
             its startup gate validated; the default serves direct callers.
+        timeout_seconds: Reviewer deadline from dispatch. The tick passes the
+            ``review_timeout_seconds`` its startup gate validated; the default
+            serves direct callers.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     # Target type gate: only dispatch for pr targets.
@@ -9257,6 +9367,7 @@ def dispatch_reviewers(
             review_model=review_model,
             review_effort=review_effort,
             trusted_author=trusted_author,
+            timeout_seconds=timeout_seconds,
         )
 
         # Track this new engine in the in-flight set.
@@ -9275,6 +9386,7 @@ def _dispatch_one_reviewer(
     review_model: str = "",
     review_effort: str = "",
     trusted_author: str = "",
+    timeout_seconds: int = REVIEW_TIMEOUT,
 ) -> None:
     """Launch a single codex reviewer engine for one PR.
 
@@ -9297,6 +9409,8 @@ def _dispatch_one_reviewer(
         trusted_author: The operator login this tick resolved. Empty falls
             back to the active tick's :data:`TRUSTED_REVIEW_AUTHOR`, for the
             direct callers that are not running a tick.
+        timeout_seconds: Seconds from dispatch to the deadline recorded in
+            the marker, which reconciliation enforces.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     wt_dir = os.path.abspath(os.path.join(WT_ROOT, f"pr-{pr_number}"))
@@ -9532,7 +9646,7 @@ def _dispatch_one_reviewer(
         )
         return
 
-    deadline = time.time() + REVIEW_TIMEOUT
+    deadline = time.time() + timeout_seconds
 
     lease_marker: dict[str, object] = {
         "engine": "codex",
@@ -9840,6 +9954,9 @@ def dispatch_implementers(
     model: str = "",
     permission_mode: str = "auto",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
+    timeout_seconds: int = IMPLEMENTER_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
 ) -> None:
     """Dispatch implementer engines for issues at ai:available.
 
@@ -9870,6 +9987,13 @@ def dispatch_implementers(
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
         max_in_flight: The admission cap. The tick always passes the value
             its startup gate validated; the default serves direct callers.
+        timeout_seconds: Engine deadline from dispatch, recorded in the
+            marker. The tick passes its validated value; the default serves
+            direct callers.
+        stall_seconds: Output silence that reports a stall, recorded in the
+            dispatch marker for stall detection to read.
+        stall_startup_grace_seconds: Extra silence allowed before the first
+            output event, recorded beside ``stall_seconds``.
     """
     # Target type gate: only dispatch for issue targets.
     if target is not None and target[0] != "issue":
@@ -10006,6 +10130,9 @@ def dispatch_implementers(
             impl_engine=impl_engine,
             model=model,
             permission_mode=permission_mode,
+            timeout_seconds=timeout_seconds,
+            stall_seconds=stall_seconds,
+            stall_startup_grace_seconds=stall_startup_grace_seconds,
         )
         dispatched += 1
 
@@ -10035,6 +10162,9 @@ def _dispatch_one_implementer(
     impl_engine: str = "claude",
     model: str = "",
     permission_mode: str = "auto",
+    timeout_seconds: int = IMPLEMENTER_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
 ) -> None:
     """Launch a single implementer engine for one issue.
 
@@ -10056,6 +10186,13 @@ def _dispatch_one_implementer(
             overrides both the ``--model`` CLI flag and ``ANTHROPIC_MODEL``.
         permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
+        timeout_seconds: Engine deadline from dispatch, recorded in the
+            marker. The tick passes its validated value; the default serves
+            direct callers.
+        stall_seconds: Output silence that reports a stall, recorded in the
+            dispatch marker for stall detection to read.
+        stall_startup_grace_seconds: Extra silence allowed before the first
+            output event, recorded beside ``stall_seconds``.
     """
     wt_dir = os.path.join(WT_ROOT, f"issue-{issue_number}")
     dispatch_id = f"impl-{issue_number}-{int(time.time())}"
@@ -10172,18 +10309,19 @@ def _dispatch_one_implementer(
         return
 
     config = pipeline.resolve_config(TRUSTED_HEAD_REPO)
-    if config.errors:
+    dispatch_errors = _dispatch_config_errors(config)
+    if dispatch_errors:
         _escalate_dispatch_setup_failure(
             entity="issue", number=issue_number,
             pre_label=pipeline.LABEL_AVAILABLE, stage="implement",
-            reason="invalid dispatch configuration: " + "; ".join(config.errors),
+            reason="invalid dispatch configuration: " + "; ".join(dispatch_errors),
             engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
         )
         return
     verify_tools = tuple(f"Bash({entry})" for entry in config.verify_tools)
     verification_unconfigured = not verify_tools
 
-    deadline = time.time() + IMPLEMENTER_TIMEOUT
+    deadline = time.time() + timeout_seconds
 
     # For implementers, head_sha is set to base_sha: the engine branches
     # from the selected base branch, so the initial "head" is the base tip. After the
@@ -10203,6 +10341,8 @@ def _dispatch_one_implementer(
         "verification_unconfigured": verification_unconfigured,
         "permission_mode": permission_mode,
         "verify_tools": list(config.verify_tools),
+        "stall_seconds": stall_seconds,
+        "stall_startup_grace_seconds": stall_startup_grace_seconds,
     }
     try:
         pipeline.atomic_write(
@@ -10248,8 +10388,7 @@ def _dispatch_one_implementer(
     # notion of Anthropic model aliases — there is no operator default to
     # inherit. Plain claude stays "" so the flag is omitted and the CLI
     # resolves the operator's configured model.
-    if not model and impl_engine == "claude-ds":
-        model = "deepseek-v4-pro[1m]"
+    model = pipeline.effective_engine_model(impl_engine, model)
 
     # Resolve engine name to binary + extra env (claude-ds is a shell function).
     try:
@@ -10374,6 +10513,9 @@ def dispatch_fixers(
     model: str = "",
     permission_mode: str = "auto",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
+    timeout_seconds: int = FIXER_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
 ) -> None:
     """Dispatch fixer engines for PRs at ai:changes-requested.
 
@@ -10401,6 +10543,13 @@ def dispatch_fixers(
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
         max_in_flight: The admission cap. The tick always passes the value
             its startup gate validated; the default serves direct callers.
+        timeout_seconds: Engine deadline from dispatch, recorded in the
+            marker. The tick passes its validated value; the default serves
+            direct callers.
+        stall_seconds: Output silence that reports a stall, recorded in the
+            dispatch marker for stall detection to read.
+        stall_startup_grace_seconds: Extra silence allowed before the first
+            output event, recorded beside ``stall_seconds``.
     """
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
@@ -10507,6 +10656,9 @@ def dispatch_fixers(
             impl_engine=impl_engine,
             model=model,
             permission_mode=permission_mode,
+            timeout_seconds=timeout_seconds,
+            stall_seconds=stall_seconds,
+            stall_startup_grace_seconds=stall_startup_grace_seconds,
         )
 
         # Track this new engine in the in-flight set.
@@ -10694,6 +10846,9 @@ def _dispatch_one_fixer(
     impl_engine: str = "claude",
     model: str = "",
     permission_mode: str = "auto",
+    timeout_seconds: int = FIXER_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
 ) -> None:
     """Launch a single fixer engine for one PR.
 
@@ -10711,6 +10866,13 @@ def _dispatch_one_fixer(
             overrides both the ``--model`` CLI flag and ``ANTHROPIC_MODEL``.
         permission_mode: Claude ``--permission-mode``: ``"auto"`` (default,
             classifier-gated) or ``"dontAsk"`` (deny calls that would prompt).
+        timeout_seconds: Engine deadline from dispatch, recorded in the
+            marker. The tick passes its validated value; the default serves
+            direct callers.
+        stall_seconds: Output silence that reports a stall, recorded in the
+            dispatch marker for stall detection to read.
+        stall_startup_grace_seconds: Extra silence allowed before the first
+            output event, recorded beside ``stall_seconds``.
     """
     wt_dir = os.path.join(WT_ROOT, f"pr-{pr_number}")
     dispatch_id = f"fix-{pr_number}-{int(time.time())}-{uuid.uuid4().hex}"
@@ -10870,18 +11032,19 @@ def _dispatch_one_fixer(
         return
 
     config = pipeline.resolve_config(TRUSTED_HEAD_REPO)
-    if config.errors:
+    dispatch_errors = _dispatch_config_errors(config)
+    if dispatch_errors:
         _escalate_dispatch_setup_failure(
             entity="pr", number=pr_number,
             pre_label=pipeline.LABEL_CHANGES_REQUESTED, stage="fix",
-            reason="invalid dispatch configuration: " + "; ".join(config.errors),
+            reason="invalid dispatch configuration: " + "; ".join(dispatch_errors),
             engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
         )
         return
     verify_tools = tuple(f"Bash({entry})" for entry in config.verify_tools)
     verification_unconfigured = not verify_tools
 
-    deadline = time.time() + FIXER_TIMEOUT
+    deadline = time.time() + timeout_seconds
 
     lease_marker: dict[str, object] = {
         "engine": impl_engine,
@@ -10895,6 +11058,8 @@ def _dispatch_one_fixer(
         "dispatch_id": dispatch_id,
         "state": "launching",
         "verification_unconfigured": verification_unconfigured,
+        "stall_seconds": stall_seconds,
+        "stall_startup_grace_seconds": stall_startup_grace_seconds,
     }
     # PR-body revision provenance, pinned here because none of it can be
     # recovered at harvest: by then the body may already have been replaced (by
@@ -10994,8 +11159,7 @@ def _dispatch_one_fixer(
     # Resolve the effective model: "" means "use the operator's own default".
     # Symmetric with the implementer — see _dispatch_one_implementer for why
     # claude-ds keeps a concrete default and plain claude does not.
-    if not model and impl_engine == "claude-ds":
-        model = "deepseek-v4-pro[1m]"
+    model = pipeline.effective_engine_model(impl_engine, model)
 
     # Resolve engine name to binary + extra env (claude-ds is a shell function).
     try:
@@ -11328,8 +11492,10 @@ def _resolve_stage_targets(
 def main(
     target: str | None = None,
     *,
-    impl_engine: str = "claude",
+    impl_engine: str = "",
     model: str = "",
+    fix_engine: str = "",
+    fix_model: str = "",
     review_model: str = "",
     review_effort: str = "",
     permission_mode: str = "",
@@ -11337,21 +11503,30 @@ def main(
 ) -> int:
     """Run one PR-pipeline tick: HARVEST → DISPATCH → Summary.
 
+    Every engine-route argument is the explicit per-invocation flag. Empty
+    (the default) means no flag was typed, so the operator's configured value
+    applies (``impl_engine``, ``model``, ``fix_engine``, ``fix_model``,
+    ``review_model``, ``review_effort`` in ``[defaults]`` or
+    ``[repos."owner/name"]``). A typed value outranks every config layer and
+    is validated like one at startup.
+
     Args:
         target: Optional targeting argument (``"pr:N"``, ``"#N"``).
         impl_engine: Engine for implementation dispatch (``"claude"`` or
             ``"claude-ds"``).
-        model: Model override for implementer and fixer engines. Empty
-            string (default) omits ``--model`` so the ``claude`` CLI resolves
-            it (project settings outrank user settings there), and means
-            ``deepseek-v4-pro[1m]`` for claude-ds (which has no operator
-            default to inherit). Non-empty overrides both.
-        review_model: Model override for the reviewer engine. Empty string
-            (default) reads the operator's codex config (see
-            :func:`_reviewer_config_path`), falling back to the pinned
-            default.
-        review_effort: Reasoning-effort override for the reviewer engine.
-            Empty string (default) resolves the same way as ``review_model``.
+        model: Implementer model. A resolved blank omits ``--model`` so the
+            ``claude`` CLI resolves it (project settings outrank user settings
+            there), and means ``deepseek-v4-pro[1m]`` for claude-ds (which has
+            no operator default to inherit).
+        fix_engine: Engine for fixer dispatch. A resolved blank is the
+            implementer's engine.
+        fix_model: Fixer model. A resolved blank inherits the implementer's
+            model while the fixer runs on the implementer's engine.
+        review_model: Model for the reviewer engine. A resolved blank reads
+            the operator's codex config (see :func:`_reviewer_config_path`),
+            falling back to the pinned default.
+        review_effort: Reasoning effort for the reviewer engine, resolved the
+            same way as ``review_model``.
         permission_mode: Engine ``--permission-mode`` for implementer and
             fixer engines: ``"auto"`` (classifier-gated) or ``"dontAsk"``.
             Empty (default) resolves the operator's configured value, which
@@ -11401,6 +11576,7 @@ def main(
             in_flight_count=None,
             has_actionable_queue=None,
             at_capacity=None,
+            **_lock_held_cadence(),
         )
         print(cadence.format_line(), file=sys.stderr)
         sys.stderr.flush()
@@ -11411,13 +11587,32 @@ def main(
             return _run_loop_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
+                fix_engine=fix_engine, fix_model=fix_model,
             )
         return _run_single_tick_locked(
             parsed_target, impl_engine, model, review_model, review_effort,
-            permission_mode,
+            permission_mode, fix_engine=fix_engine, fix_model=fix_model,
         )
     finally:
         tick_lock.release()
+
+
+def _lock_held_cadence() -> pipeline.CadenceSettings:
+    """Return the cadence for an invocation the tick mutex turned away.
+
+    No tick runs here, so no startup gate validated a configuration. The
+    retry is still paced from the operator's cadence when the configuration
+    resolves cleanly; otherwise the shipped cadence applies, and the next
+    tick that takes the lock refuses the configuration and names the key.
+
+    Returns:
+        Cadence keyword arguments for :func:`pipeline.compute_next_wake`.
+    """
+    try:
+        config = pipeline.resolve_config(resolve_target().repo)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return {}
+    return {} if config.errors else config.cadence()
 
 
 def _log_lock_held() -> None:
@@ -11443,30 +11638,37 @@ def _run_single_tick_locked(
     review_effort: str = "",
     permission_mode: str = "",
     *,
+    fix_engine: str = "",
+    fix_model: str = "",
     count_quiescent_heartbeat: bool = True,
     unattended: bool = False,
-    admission_cap: list[int] | None = None,
+    resolved_config: list[pipeline.ResolvedConfig] | None = None,
 ) -> int:
     """Run one tick while the caller owns the tick mutex.
 
+    Every engine-route and permission argument is the typed CLI flag, and
+    empty means none was typed. Resolution happens here rather than in
+    ``main`` so a ``--loop`` run picks up a config change on its next tick —
+    and only here: the configuration this startup gate validates is the one
+    the whole tick runs on.
+
     Args:
         parsed_target: Parsed target tuple, or ``None`` for a full scan.
-        impl_engine: Engine for implementation dispatch.
-        model: Model override for implementer and fixer engines.
-        review_model: Model override for reviewer engines.
-        review_effort: Reasoning-effort override for reviewer engines.
-        permission_mode: Engine ``--permission-mode`` for implementer and
-            fixer engines (``"auto"`` or ``"dontAsk"``). Empty
-            means no flag was typed, so the operator's configured value
-            applies. Resolution happens here rather than in ``main`` so a
-            ``--loop`` run picks up a config change on its next tick.
+        impl_engine: ``--impl-engine`` flag.
+        model: ``--model`` flag.
+        review_model: ``--review-model`` flag.
+        review_effort: ``--review-effort`` flag.
+        permission_mode: ``--permission-mode`` flag for implementer and
+            fixer engines (``"auto"`` or ``"dontAsk"``).
+        fix_engine: ``--fix-engine`` flag.
+        fix_model: ``--fix-model`` flag.
         count_quiescent_heartbeat: Forwarded to :func:`_run_tick_body`; only
             the in-process loop passes ``False``, for a nudge-initiated tick.
         unattended: True under the in-process loop, where nobody can answer a
             setup prompt; an unconfigured target is logged as skipped.
-        admission_cap: When given, receives the ``max_in_flight`` value this
-            tick admits against, once every startup gate has passed. The loop
-            reads it so cadence judges capacity against the same cap.
+        resolved_config: When given, receives the configuration this tick
+            runs on once every startup gate has passed. The in-process loop
+            paces from it, so its cadence and the tick agree.
 
     Returns:
         Process exit code (0 through 4, or 6 — same semantics as ``main()``).
@@ -11498,14 +11700,15 @@ def _run_single_tick_locked(
             pass
 
     # Fail fast on a configuration value that has no conservative reading —
-    # base_ref, permission_mode, [operator] login, verify_tools, max_in_flight,
-    # [scan] repos.
-    # Each of those names a branch, grants a permission, decides whose work is
-    # trusted, or bounds paid concurrency, so a malformed one cannot be coerced
-    # into something the operator did not write: the resolver reports it and
-    # the tick refuses here, naming the key. A malformed verify_tools in
-    # particular must never be read as an empty one, which would dispatch with
-    # no verification and still award ai:ready-for-human.
+    # base_ref, permission_mode, [operator] login, verify_tools, max_in_flight, [scan] repos,
+    # the engine routes, and every deadline, stall limit, round limit, cooldown
+    # and cadence value. Each of those names a branch, grants a permission,
+    # decides whose work is trusted, picks an engine, or bounds paid engine time,
+    # so a malformed one cannot be coerced into something the operator did not
+    # write: the resolver reports it and the tick refuses here, naming the key,
+    # before HARVEST. A malformed verify_tools in particular must never be read
+    # as an empty one, which would dispatch with no verification and still award
+    # ai:ready-for-human.
     TRUSTED_HEAD_REPO = TARGET_REMOTE = ""
     try:
         resolved_target = resolve_target()
@@ -11521,11 +11724,18 @@ def _run_single_tick_locked(
         return 3
     TRUSTED_HEAD_REPO = resolved_target.repo
     TARGET_REMOTE = resolved_target.remote
+    typed_flags = {
+        "permission_mode": permission_mode,
+        "impl_engine": impl_engine,
+        "model": model,
+        "fix_engine": fix_engine,
+        "fix_model": fix_model,
+        "review_model": review_model,
+        "review_effort": review_effort,
+    }
     config = pipeline.resolve_config(
         TRUSTED_HEAD_REPO,
-        cli_overrides=(
-            {"permission_mode": permission_mode} if permission_mode else None
-        ),
+        cli_overrides={key: value for key, value in typed_flags.items() if value},
     )
     for warning in config.warnings:
         print(f"tick: config: {warning}", file=sys.stderr)
@@ -11554,8 +11764,10 @@ def _run_single_tick_locked(
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
         return 3
-    # From here on the resolved value is the one the engines run under: the
-    # flag if one was typed, else the operator's configured mode.
+    # From here on the resolved values are the ones the engines run under: the
+    # flag if one was typed, else the operator's configured value. Every
+    # tuning value is read from this one validated configuration, never
+    # resolved again later in the tick.
     permission_mode = config.permission_mode
 
     # The identity this tick reviews under is the one just resolved and
@@ -11651,20 +11863,18 @@ def _run_single_tick_locked(
         sys.stderr.flush()
         return 3
 
+    _report_unprobed_route(config, tick_log)
+
     TRUSTED_REVIEW_AUTHOR = trusted_author
-    # The one cap this tick admits and paces against. It is read here, from
-    # the configuration the gate above validated, and never resolved again
-    # later in the tick: a config edit made mid-tick waits for the next one.
-    max_in_flight = config.max_in_flight
-    if admission_cap is not None:
-        admission_cap.append(max_in_flight)
+    if resolved_config is not None:
+        resolved_config.append(config)
     try:
         return _run_tick_body(
-            tick_log, parsed_target, impl_engine, model,
-            review_model, review_effort, permission_mode,
+            tick_log, parsed_target, config.impl_engine, config.model,
+            config.review_model, config.review_effort, permission_mode,
             trusted_author=trusted_author,
             count_quiescent_heartbeat=count_quiescent_heartbeat,
-            max_in_flight=max_in_flight,
+            config=config,
         )
     except Exception:
         exc_value = sys.exc_info()[1]
@@ -11697,6 +11907,53 @@ def _run_single_tick_locked(
         print(tick_state.format_line(), file=sys.stderr)
         sys.stderr.flush()
         return TICK_CRASH_EXIT_CODE
+
+
+def _report_unprobed_route(
+    config: pipeline.ResolvedConfig, tick_log: TickLog | None,
+) -> None:
+    """Report an implementer route that differs from the one setup probed.
+
+    Setup probes one route — whether ``auto`` permission mode approves an
+    ungranted command on it — and records it in the repository's section. A
+    config edit or flag that changes the route runs without that measurement.
+    That is the operator's call to make, so the tick reports it and runs.
+
+    Args:
+        config: The configuration this tick runs on.
+        tick_log: Tick log handle, or ``None``.
+    """
+    if config.probed_route is None:
+        return
+    probed_engine, probed_model = config.probed_route
+    effective = (
+        config.impl_engine,
+        pipeline.effective_engine_model(config.impl_engine, config.model),
+    )
+    probed = (
+        probed_engine,
+        pipeline.effective_engine_model(probed_engine, probed_model),
+    )
+    if effective == probed:
+        return
+    msg = (
+        f"tick: implementer route {_route_text(*effective)} differs from the "
+        f"route /pr-pipeline:setup probed for {TRUSTED_HEAD_REPO} "
+        f"({_route_text(*probed)}); permission mode "
+        f"{config.permission_mode!r} was not measured on this route — rerun "
+        "setup to probe it"
+    )
+    print(msg, file=sys.stderr)
+    if tick_log is not None:
+        tick_log.log(
+            pr=None, phase="startup", stage="",
+            action="startup_route_unprobed", reason=msg,
+        )
+
+
+def _route_text(engine: str, model: str) -> str:
+    """Render an engine route for an operator message."""
+    return f"{engine} with model {model or '(engine default)'}"
 
 
 def _nearest_actionable_engine_deadline() -> float | None:
@@ -11888,13 +12145,19 @@ def _run_loop_locked(
     review_effort: str = "",
     permission_mode: str = "",
     *,
-    quiescent_stop_after: int = pipeline.LOOP_QUIESCENT_STOP_AFTER,
+    fix_engine: str = "",
+    fix_model: str = "",
+    quiescent_stop_after: int | None = None,
 ) -> int:
     """Run ticks in-process until interrupted or quiescent stop fires.
 
-    ``permission_mode`` is forwarded unresolved (empty means no flag was
-    typed): each tick resolves the operator's config for itself, so a config
-    edit mid-loop takes effect on the next tick rather than at loop start.
+    The flags are forwarded unresolved (empty means none was typed): each
+    tick resolves the operator's config for itself, so a config edit mid-loop
+    takes effect on the next tick rather than at loop start. The cadence after
+    a tick is paced from the configuration that tick validated.
+
+    ``quiescent_stop_after`` pins the stop count for tests; ``None`` uses the
+    tick's validated ``loop_quiescent_stop_after``.
     """
     stop_event = threading.Event()
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -11924,13 +12187,14 @@ def _run_loop_locked(
             # Clear before the tick so a nudge arriving during it is preserved
             # for the next wait instead of being consumed by this iteration.
             wake_event.clear()
-            admission_cap: list[int] = []
+            tick_config: list[pipeline.ResolvedConfig] = []
             last_rc = _run_single_tick_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
+                fix_engine=fix_engine, fix_model=fix_model,
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
-                admission_cap=admission_cap,
+                resolved_config=tick_config,
             )
             if last_rc in (
                 3, TICK_CRASH_EXIT_CODE, UNCONFIGURED_TARGET_EXIT_CODE,
@@ -11948,12 +12212,20 @@ def _run_loop_locked(
             state = _observe_loop_state(
                 parsed_target,
                 max_in_flight=(
-                    admission_cap[-1] if admission_cap
+                    tick_config[-1].max_in_flight if tick_config
                     else pipeline.DEFAULT_MAX_IN_FLIGHT
                 ),
             )
             if not state["quiescent"]:
                 consecutive_quiescent = 0
+            # Every return that reaches here passed the startup gate, which
+            # recorded the configuration the tick ran on. Only a stand-in for
+            # the tick records nothing, and gets the shipped cadence.
+            cadence: pipeline.CadenceSettings = (
+                tick_config[-1].cadence() if tick_config else {}
+            )
+            if quiescent_stop_after is not None:
+                cadence["quiescent_stop_after"] = quiescent_stop_after
             sleep_seconds, stop = pipeline.decide_loop_cadence(
                 in_flight_count=state["in_flight_count"],
                 nearest_engine_deadline=state["nearest_engine_deadline"],
@@ -11963,8 +12235,8 @@ def _run_loop_locked(
                 consecutive_quiescent=(
                     consecutive_quiescent + 1 if state["quiescent"] else 0
                 ),
-                quiescent_stop_after=quiescent_stop_after,
                 held_items=state.get("held_items", ()),
+                **cadence,
             )
             if stop:
                 _notify_loop_quiescent_stop(state.get("held_items", ()))
@@ -12426,7 +12698,7 @@ def _engine_progress(
     engine's stdout and bumps a heartbeat file as output events arrive, which
     is what makes progress observable at all. The reviewer wrapper discards
     engine output, so it has no equivalent signal — and its stall cost is
-    already bounded by the 20-minute review timeout, so inventing a weaker
+    already bounded by the review deadline, so inventing a weaker
     proxy for it is deliberately deferred rather than guessed at.
 
     Args:
@@ -12440,23 +12712,42 @@ def _engine_progress(
     """
     if marker.get("stage") not in ("implement", "fix"):
         return None
+    # The limits this engine was dispatched under. A marker written before
+    # they were recorded was dispatched under the shipped defaults.
+    stall = _marker_seconds(marker, "stall_seconds", ENGINE_STALL_SECONDS)
+    grace = _marker_seconds(
+        marker, "stall_startup_grace_seconds", ENGINE_STALL_STARTUP_GRACE_SECONDS,
+    )
     try:
         beat_at = os.path.getmtime(_heartbeat_path(wt_dir))
     except OSError:
         beat_at = None
     if beat_at is not None:
-        return _EngineProgress(beat_at, "heartbeat", ENGINE_STALL_SECONDS)
+        return _EngineProgress(beat_at, "heartbeat", stall)
     # No heartbeat yet: the engine may simply not have produced its first
     # output event, or the marker predates heartbeats entirely. Fall back to
     # the dispatch clock with a startup grace so neither reads as a stall.
     start_time = marker.get("start_time")
     if isinstance(start_time, bool) or not isinstance(start_time, (int, float)):
         return None
-    return _EngineProgress(
-        float(start_time),
-        "start_time",
-        ENGINE_STALL_SECONDS + ENGINE_STALL_STARTUP_GRACE_SECONDS,
-    )
+    return _EngineProgress(float(start_time), "start_time", stall + grace)
+
+
+def _marker_seconds(marker: Mapping[str, object], key: str, default: int) -> int:
+    """Return a non-negative integer marker field, or ``default`` without one.
+
+    Args:
+        marker: Parsed ``dispatch.json`` contents.
+        key: The field to read.
+        default: The value for a marker that does not carry a usable field.
+
+    Returns:
+        The recorded value, or ``default``.
+    """
+    value = marker.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return default
+    return value
 
 
 def _stalled_engine_identity(
@@ -13081,7 +13372,7 @@ def _run_tick_body(
     trusted_author: str = "",
     *,
     count_quiescent_heartbeat: bool = True,
-    max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
+    config: pipeline.ResolvedConfig | None = None,
 ) -> int:
     """Run the HARVEST → DISPATCH → Summary body of a tick.
 
@@ -13105,13 +13396,21 @@ def _run_tick_body(
             in-process loop passes ``False``, for a nudge-initiated tick that
             followed no scheduled interval. See
             :func:`_advance_quiescent_counter`.
-        max_in_flight: The admission cap startup validated. Every dispatch
-            stage admits against it and cadence judges capacity against it;
-            the default serves direct callers.
+        config: The configuration the startup gate validated. Every stage
+            reads its deadlines, stall limits, round limit, cooldowns, fixer
+            route and cadence from it. ``None`` — direct callers only — runs
+            the shipped defaults with the fixer on the implementer's route.
 
     Returns:
         Process exit code (0, 1, or 2 — same semantics as ``main()``).
     """
+    tuning = config if config is not None else _SHIPPED_CONFIG
+    fix_engine, fix_model = (
+        (config.fix_engine, config.fix_model) if config is not None
+        else (impl_engine, model)
+    )
+    cadence = tuning.cadence()
+    max_in_flight = tuning.max_in_flight
     try:
         stage_targets = _resolve_stage_targets(parsed_target)
     except (subprocess.CalledProcessError, ValueError) as exc:
@@ -13143,9 +13442,24 @@ def _run_tick_body(
     _scan_stalled_engines_safely(set())
 
     # Phase 1: HARVEST — reap finished engines.
-    reviewers_ok = harvest_reviewers(tick_log, stage_targets["reviewer"])
-    implementers_ok = harvest_implementers(tick_log, stage_targets["implementer"])
-    fixers_ok = harvest_fixers(tick_log, stage_targets["fixer"])
+    reviewers_ok = harvest_reviewers(
+        tick_log, stage_targets["reviewer"],
+        max_iterations=tuning.max_iterations,
+    )
+    implementers_ok = harvest_implementers(
+        tick_log, stage_targets["implementer"],
+        transient_cooldown_seconds=tuning.transient_cooldown_seconds,
+        transient_cooldown_reset_buffer_seconds=(
+            tuning.transient_cooldown_reset_buffer_seconds
+        ),
+    )
+    fixers_ok = harvest_fixers(
+        tick_log, stage_targets["fixer"],
+        transient_cooldown_seconds=tuning.transient_cooldown_seconds,
+        transient_cooldown_reset_buffer_seconds=(
+            tuning.transient_cooldown_reset_buffer_seconds
+        ),
+    )
     reconcile_ok = reviewers_ok and implementers_ok and fixers_ok
 
     # Phase 1b: Reconcile stale in-flight labels (no local marker).
@@ -13233,17 +13547,18 @@ def _run_tick_body(
                 },
             )
         tick_state = pipeline.derive_tick_state(status="FAILED")
-        cadence = pipeline.compute_next_wake(
+        decision = pipeline.compute_next_wake(
             in_flight_count=None,
             has_actionable_queue=None,
             at_capacity=None,
+            **cadence,
         )
         _write_quiescent_counter(0)
         _log_tick_summary(
-            tick_log, reconcile_ok, tick_state=tick_state, cadence=cadence,
+            tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
         _print_summary(
-            tick_log, reconcile_ok, tick_state=tick_state, cadence=cadence,
+            tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
         return 1
 
@@ -13265,6 +13580,7 @@ def _run_tick_body(
             review_effort=review_effort,
             trusted_author=trusted_author,
             max_in_flight=max_in_flight,
+            timeout_seconds=tuning.review_timeout_seconds,
         )
         dispatch_implementers(
             tick_log=tick_log, target=stage_targets["implementer"],
@@ -13273,14 +13589,20 @@ def _run_tick_body(
             model=model,
             permission_mode=permission_mode,
             max_in_flight=max_in_flight,
+            timeout_seconds=tuning.implementer_timeout_seconds,
+            stall_seconds=tuning.engine_stall_seconds,
+            stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
         )
         dispatch_fixers(
             tick_log=tick_log, target=stage_targets["fixer"],
             authoritative_in_flight=authoritative_in_flight,
-            impl_engine=impl_engine,
-            model=model,
+            impl_engine=fix_engine,
+            model=fix_model,
             permission_mode=permission_mode,
             max_in_flight=max_in_flight,
+            timeout_seconds=tuning.fixer_timeout_seconds,
+            stall_seconds=tuning.engine_stall_seconds,
+            stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
         )
     else:
         if tick_log:
@@ -13290,18 +13612,19 @@ def _run_tick_body(
                 reason="authoritative in-flight labels unavailable or invalid",
             )
         tick_state = pipeline.derive_tick_state(status="PARTIAL")
-        cadence = pipeline.compute_next_wake(
+        decision = pipeline.compute_next_wake(
             in_flight_count=None,
             has_actionable_queue=None,
             at_capacity=None,
+            **cadence,
         )
         _write_quiescent_counter(0)
         _log_tick_summary(
-            tick_log, reconcile_ok, tick_state=tick_state, cadence=cadence,
+            tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
         _print_summary(
             tick_log, reconcile_ok, dispatch_skipped=True,
-            tick_state=tick_state, cadence=cadence,
+            tick_state=tick_state, cadence=decision,
         )
         return 2
 
@@ -13323,7 +13646,7 @@ def _run_tick_body(
         is_quiescent=is_quiescent,
         count_heartbeat=count_quiescent_heartbeat,
     )
-    cadence = pipeline.compute_next_wake(
+    decision = pipeline.compute_next_wake(
         in_flight_count=in_flight_count,
         nearest_deadline_s=nearest_deadline_s,
         has_actionable_queue=has_queue,
@@ -13333,13 +13656,14 @@ def _run_tick_body(
         is_quiescent=is_quiescent,
         consecutive_quiescent_ticks=prior_quiescent,
         held_items=held_items,
+        **cadence,
     )
 
     _log_tick_summary(
-        tick_log, reconcile_ok, tick_state=tick_state, cadence=cadence,
+        tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
     )
     _print_summary(
-        tick_log, reconcile_ok, tick_state=tick_state, cadence=cadence,
+        tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
     )
 
     return 0
@@ -13431,6 +13755,8 @@ class CliArgs(TypedDict):
     target: str | None
     impl_engine: str
     model: str
+    fix_engine: str
+    fix_model: str
     review_model: str
     review_effort: str
     permission_mode: str
@@ -13441,6 +13767,8 @@ class CliArgs(TypedDict):
 _VALUE_FLAGS = {
     "--impl-engine": "impl_engine",
     "--model": "model",
+    "--fix-engine": "fix_engine",
+    "--fix-model": "fix_model",
     "--review-model": "review_model",
     "--review-effort": "review_effort",
     "--permission-mode": "permission_mode",
@@ -13522,10 +13850,15 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
         )
         raise SystemExit(1)
 
+    # Every route flag stays "" unless typed, for the same reason: the tick
+    # resolves the operator's configured route (and validates a typed one) at
+    # startup, and a default here would shadow that configuration.
     return {
         "target": target,
-        "impl_engine": values["impl_engine"] or "claude",
+        "impl_engine": values["impl_engine"],
         "model": values["model"],
+        "fix_engine": values["fix_engine"],
+        "fix_model": values["fix_model"],
         "review_model": values["review_model"],
         "review_effort": values["review_effort"],
         "permission_mode": permission_mode,
@@ -13545,6 +13878,8 @@ if __name__ == "__main__":  # pragma: no cover
             target=cli_args["target"],
             impl_engine=cli_args["impl_engine"],
             model=cli_args["model"],
+            fix_engine=cli_args["fix_engine"],
+            fix_model=cli_args["fix_model"],
             review_model=cli_args["review_model"],
             review_effort=cli_args["review_effort"],
             permission_mode=cli_args["permission_mode"],

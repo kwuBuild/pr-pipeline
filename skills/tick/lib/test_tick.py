@@ -17,7 +17,7 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 from unittest import mock
@@ -396,7 +396,7 @@ def test_run_loop_locked_marks_only_post_heartbeat_ticks_as_heartbeats(
 
     def fake_tick(
         *_args: object, count_quiescent_heartbeat: bool = True,
-        unattended: bool = False, admission_cap: list[int] | None = None,
+        unattended: bool = False, **_flags: object,
     ) -> int:
         assert unattended
         heartbeat_flags.append(count_quiescent_heartbeat)
@@ -712,6 +712,37 @@ def test_engine_stall_clock_leaves_lead_time_before_every_deadline() -> None:
     )
     assert slowest_verdict < tick.IMPLEMENTER_TIMEOUT
     assert slowest_verdict < tick.FIXER_TIMEOUT
+
+
+@pytest.mark.parametrize("heartbeat, recorded, threshold", [
+    (True, {"stall_seconds": 900, "stall_startup_grace_seconds": 60}, 900),
+    (False, {"stall_seconds": 900, "stall_startup_grace_seconds": 60}, 960),
+    # A marker written before the limits were recorded keeps the shipped ones.
+    (True, {}, 30 * 60),
+    (False, {}, 35 * 60),
+])
+def test_engine_progress_uses_the_stall_limits_the_marker_records(
+    tmp_path: Path, heartbeat: bool, recorded: dict[str, int], threshold: int,
+) -> None:
+    """Stall detection judges an engine by the limits it was dispatched under.
+
+    The marker is the one record every detector reads — the tick, the
+    ``--loop`` watcher thread, and the status dashboard's separate process —
+    so a configured threshold reaches all three without any of them resolving
+    configuration again.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    wt_dir = tmp_path / "issue-5"
+    wt_dir.mkdir()
+    if heartbeat:
+        Path(tick._heartbeat_path(str(wt_dir))).write_text("")
+    marker = {"stage": "implement", "start_time": 100.0, **recorded}
+
+    progress = tick._engine_progress(str(wt_dir), marker)
+
+    assert progress is not None
+    assert progress.threshold == threshold
 
 
 @pytest.mark.parametrize(
@@ -2599,9 +2630,11 @@ def test_main_loop_mode_uses_locked_loop_runner(
         with mock.patch("tick._run_single_tick_locked") as run_single:
             assert main(loop=True) == 0
 
-    # permission_mode is forwarded unresolved: each tick resolves the config
-    # for itself, so an edit mid-loop applies on the next tick.
-    run_loop.assert_called_once_with(None, "claude", "", "", "", "")
+    # Every flag is forwarded unresolved: each tick resolves the config for
+    # itself, so an edit mid-loop applies on the next tick.
+    run_loop.assert_called_once_with(
+        None, "", "", "", "", "", fix_engine="", fix_model="",
+    )
     run_single.assert_not_called()
 
 
@@ -3789,6 +3822,24 @@ def test_transient_cooldown_until_uses_one_hour_fallback() -> None:
         {"result": "quota exceeded"},
         now=now,
     ) == now + tick.DEFAULT_TRANSIENT_COOLDOWN_SECONDS
+
+
+def test_transient_cooldown_until_uses_the_configured_cooldown() -> None:
+    """The fallback length and the reset margin are the operator's values."""
+    import tick  # type: ignore[import-untyped]
+
+    timezone = ZoneInfo("Europe/London")
+    now = dt.datetime(2027, 7, 15, 1, 0, tzinfo=timezone).timestamp()
+    reset = dt.datetime(2027, 7, 15, 2, 40, tzinfo=timezone).timestamp()
+
+    assert tick.transient_cooldown_until(
+        {"result": "quota exceeded"}, now=now,
+        cooldown_seconds=900, reset_buffer_seconds=0,
+    ) == now + 900
+    assert tick.transient_cooldown_until(
+        {"result": "You've hit your session limit · resets 2:40am Europe/London"},
+        now=now, cooldown_seconds=900, reset_buffer_seconds=0,
+    ) == reset
 
 
 def test_transient_cooldown_until_uses_provider_reset_time() -> None:
@@ -12033,8 +12084,13 @@ def test_harvest_one_implementer_escalates_on_escalate_action(
     cleanup_mock.assert_called_once_with(str(wt_dir))
 
 
+@pytest.mark.parametrize("tuning, cooldown", [
+    ({}, 3600),
+    ({"transient_cooldown_seconds": 900,
+      "transient_cooldown_reset_buffer_seconds": 0}, 900),
+])
 def test_harvest_one_implementer_requeues_transient_result(
-    tmp_path: Path,
+    tmp_path: Path, tuning: dict[str, int], cooldown: int,
 ) -> None:
     """Transient implementer results requeue behind a durable cooldown."""
     from tick import (  # type: ignore[import-untyped]
@@ -12070,6 +12126,7 @@ def test_harvest_one_implementer_requeues_transient_result(
             with mock.patch("tick.cleanup_scratch") as cleanup_mock:
                 _harvest_one_implementer(
                     decision, str(wt_root), tick_log=tick_log, attempts=attempts,
+                    **tuning,
                 )
 
     converge_mock.assert_called_once_with(
@@ -12079,7 +12136,7 @@ def test_harvest_one_implementer_requeues_transient_result(
     assert attempts.read(7) == 1
     assert EngineCooldowns(str(wt_root)).read_active(
         "claude", now=1_800_000_000.0,
-    ) == 1_800_003_600.0
+    ) == 1_800_000_000.0 + cooldown
     entries = [json.loads(line) for line in Path(tick_log.path).read_text().splitlines()]
     retry = next(entry for entry in entries if entry["action"] == "transient_revert")
     assert retry["details"]["attempt"] == 1
@@ -14755,6 +14812,74 @@ def test_harvest_one_fixer_reposts_when_the_retry_changes_the_decision(
     )
     assert len(bodies) == 2
     assert "ai:revised" in bodies[1]
+
+
+def test_harvest_one_fixer_starts_the_configured_transient_cooldown(
+    tmp_path: Path,
+) -> None:
+    """The fixer's transient path uses the cooldown the tick validated."""
+    from tick import (  # type: ignore[import-untyped]
+        Attempts,
+        EngineCooldowns,
+        _harvest_one_fixer,
+    )
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    wt_dir = wt_root / "pr-8"
+    wt_dir.mkdir()
+    (wt_dir / "result.json").write_text(
+        json.dumps({"result": "You've hit your session limit"}),
+    )
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "pre_label": "ai:changes-requested",
+        "dispatch_id": "fix-8-quota",
+        "engine": "claude-ds",
+    }))
+    decision: dict[str, object] = {
+        "action": "harvest", "label": "", "kill": False,
+        "identity": "matched", "pr_number": 8,
+    }
+
+    with mock.patch("tick.time.time", return_value=1_800_000_000.0), \
+            mock.patch("tick.gh"), \
+            mock.patch("tick._converge_pipeline_labels", return_value=True), \
+            mock.patch("tick.cleanup_scratch"):
+        _harvest_one_fixer(
+            decision, str(wt_root), tick_log=None,
+            attempts=Attempts(str(wt_root)),
+            transient_cooldown_seconds=1200,
+            transient_cooldown_reset_buffer_seconds=0,
+        )
+
+    assert EngineCooldowns(str(wt_root)).read_active(
+        "claude-ds", now=1_800_000_000.0,
+    ) == 1_800_001_200.0
+
+
+@pytest.mark.parametrize("stage", ["reviewer", "implementer", "fixer"])
+def test_harvest_stages_forward_the_tick_tuning(stage: str, tmp_path: Path) -> None:
+    """Each HARVEST stage hands its configured values to the per-item harvest."""
+    import tick  # type: ignore[import-untyped]
+
+    tuning: dict[str, int] = {
+        "reviewer": {"max_iterations": 2},
+        "implementer": {"transient_cooldown_seconds": 900,
+                        "transient_cooldown_reset_buffer_seconds": 30},
+        "fixer": {"transient_cooldown_seconds": 900,
+                  "transient_cooldown_reset_buffer_seconds": 30},
+    }[stage]
+    decision = {"action": "harvest", "pr_number": 7}
+
+    with mock.patch("tick.reconcile_engine", return_value=([decision], True)), \
+            mock.patch("tick._execute_reconcile_actions", return_value=True), \
+            mock.patch(f"tick._harvest_one_{stage}") as harvest_one:
+        harvest = getattr(tick, f"harvest_{stage}s")
+        assert harvest(None, None, wt_root=str(tmp_path), **tuning) is True
+
+    harvest_one.assert_called_once()
+    for key, value in tuning.items():
+        assert harvest_one.call_args.kwargs[key] == value
 
 
 def test_harvest_one_fixer_posts_no_comment_on_transient_retry(
@@ -20189,6 +20314,299 @@ def test_main_refuses_to_tick_on_an_invalid_configuration(
     assert "invalid configuration" in output
 
 
+_TUNED_SECTION = (
+    'implementer_timeout_seconds = 7200\n'
+    'fixer_timeout_seconds = 5400\n'
+    'review_timeout_seconds = 2400\n'
+    'engine_stall_seconds = 900\n'
+    'engine_stall_startup_grace_seconds = 60\n'
+    'max_iterations = 2\n'
+    'impl_engine = "claude"\n'
+    'model = "opus"\n'
+    'fix_engine = "claude-ds"\n'
+    'review_model = "gpt-6"\n'
+    'review_effort = "xhigh"\n'
+    'loop_short_poll_seconds = 120\n'
+    'loop_max_poll_seconds = 200\n'
+    'loop_heartbeat_seconds = 3600\n'
+    'loop_quiescent_stop_after = 5\n'
+    'transient_cooldown_seconds = 900\n'
+    'transient_cooldown_reset_buffer_seconds = 30\n'
+)
+
+
+def test_main_runs_every_stage_on_the_validated_configuration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Each configured value reaches the consumer that enforces it.
+
+    The deadline and stall limits reach the dispatchers that record them, the
+    round limit and cooldowns reach HARVEST, each stage gets its own engine
+    route, and the emitted cadence is paced from the configured intervals.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
+    stderr = io.StringIO()
+
+    with tick_stage_mocks(tmp_path) as stages, mock.patch("sys.stderr", stderr):
+        assert tick.main() == 0
+
+    assert stages["harvest_reviewers"].call_args.kwargs["max_iterations"] == 2
+    for stage in ("harvest_implementers", "harvest_fixers"):
+        kwargs = stages[stage].call_args.kwargs
+        assert kwargs["transient_cooldown_seconds"] == 900
+        assert kwargs["transient_cooldown_reset_buffer_seconds"] == 30
+    reviewer = stages["dispatch_reviewers"].call_args.kwargs
+    assert (reviewer["timeout_seconds"], reviewer["review_model"],
+            reviewer["review_effort"]) == (2400, "gpt-6", "xhigh")
+    implementer = stages["dispatch_implementers"].call_args.kwargs
+    assert (implementer["impl_engine"], implementer["model"],
+            implementer["timeout_seconds"], implementer["stall_seconds"],
+            implementer["stall_startup_grace_seconds"]) == (
+        "claude", "opus", 7200, 900, 60)
+    fixer = stages["dispatch_fixers"].call_args.kwargs
+    assert (fixer["impl_engine"], fixer["model"], fixer["timeout_seconds"],
+            fixer["stall_seconds"], fixer["stall_startup_grace_seconds"]) == (
+        "claude-ds", "", 5400, 900, 60)
+    # The post-dispatch state reports a queue: the configured short poll.
+    assert "tick-cadence: next_wake=120 stop=false" in stderr.getvalue()
+
+
+def test_main_route_flags_override_the_configured_routes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A typed flag beats every config layer for that run only."""
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
+
+    with tick_stage_mocks(tmp_path) as stages:
+        assert tick.main(
+            impl_engine="claude-ds", model="deepseek-v4-flash",
+            fix_engine="claude", fix_model="sonnet",
+            review_model="gpt-7", review_effort="low",
+        ) == 0
+
+    implementer = stages["dispatch_implementers"].call_args.kwargs
+    fixer = stages["dispatch_fixers"].call_args.kwargs
+    reviewer = stages["dispatch_reviewers"].call_args.kwargs
+    assert (implementer["impl_engine"], implementer["model"]) == (
+        "claude-ds", "deepseek-v4-flash")
+    assert (fixer["impl_engine"], fixer["model"]) == ("claude", "sonnet")
+    assert (reviewer["review_model"], reviewer["review_effort"]) == ("gpt-7", "low")
+
+
+@pytest.mark.parametrize("text, key", [
+    ('implementer_timeout_seconds = "7200"\n', "implementer_timeout_seconds"),
+    ("review_timeout_seconds = 0\n", "review_timeout_seconds"),
+    ("engine_stall_seconds = 600\n", "engine_stall_seconds"),
+    ("engine_stall_seconds = 4000\n", "engine_stall_seconds"),
+    ("max_iterations = true\n", "max_iterations"),
+    ('impl_engine = "codex"\n', "impl_engine"),
+    ('fix_model = "-p"\n', "fix_model"),
+    ("loop_heartbeat_seconds = 300\n", "loop_heartbeat_seconds"),
+    ("transient_cooldown_seconds = 1.5\n", "transient_cooldown_seconds"),
+])
+def test_main_refuses_an_invalid_tuning_value_before_any_harvest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, text: str, key: str,
+) -> None:
+    """An invalid value stops the tick at startup, naming the key.
+
+    Nothing has been harvested, relabelled or dispatched: the refusal lands
+    before the label check and before HARVEST.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, text)
+    verify = mock.Mock()
+    monkeypatch.setattr(tick.labels, "verify", verify)
+    stderr = io.StringIO()
+
+    with tick_stage_mocks(tmp_path) as stages, mock.patch("sys.stderr", stderr):
+        assert tick.main() == 3
+
+    output = stderr.getvalue()
+    assert "invalid configuration" in output
+    assert key in output
+    verify.assert_not_called()
+    for stage in stages.values():
+        stage.assert_not_called()
+
+
+def test_main_holds_the_startup_configuration_for_the_whole_tick(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A config edit during a tick does not reach the rest of that tick."""
+    import tick  # type: ignore[import-untyped]
+
+    cfg = write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
+
+    def edit_config(*_args: object, **_kwargs: object) -> bool:
+        cfg.write_text(cfg.read_text().replace(
+            "implementer_timeout_seconds = 7200", "implementer_timeout_seconds = 9000",
+        ).replace('model = "opus"', 'model = "haiku"'), encoding="utf-8")
+        return True
+
+    with tick_stage_mocks(tmp_path) as stages:
+        stages["harvest_reviewers"].side_effect = edit_config
+        assert tick.main() == 0
+
+    implementer = stages["dispatch_implementers"].call_args.kwargs
+    assert implementer["timeout_seconds"] == 7200
+    assert implementer["model"] == "opus"
+
+
+@pytest.mark.parametrize("section, flags, reported", [
+    # The route setup recorded is the route that runs: nothing to report.
+    ('impl_engine = "claude"\nmodel = ""\n', {}, False),
+    # claude-ds with a blank model runs the pinned default, as probed.
+    ('impl_engine = "claude-ds"\nmodel = "deepseek-v4-pro[1m]"\n',
+     {"impl_engine": "claude-ds"}, False),
+    ('impl_engine = "claude"\nmodel = ""\n', {"model": "opus"}, True),
+    ('impl_engine = "claude"\nmodel = ""\n', {"impl_engine": "claude-ds"}, True),
+    # No recorded route: nothing to compare against.
+    ("", {"model": "opus"}, False),
+])
+def test_main_reports_an_implementer_route_setup_did_not_probe(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    section: str, flags: dict[str, str], reported: bool,
+) -> None:
+    """The tick names a route that differs from the one setup measured.
+
+    The setup probe decides whether ``auto`` permission mode works on one
+    route. A different route runs without that evidence, so the operator
+    hears about it at startup — and the tick still runs.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    evidence = section.replace("impl_engine =", "probed_impl_engine =").replace(
+        "model =", "probed_model =",
+    )
+    write_tuned_config(monkeypatch, tmp_path, section + evidence)
+    stderr = io.StringIO()
+
+    with tick_stage_mocks(tmp_path), mock.patch("sys.stderr", stderr):
+        assert tick.main(**flags) == 0
+
+    output = stderr.getvalue()
+    actions = [e["action"] for e in read_tick_log_entries(Path(tick.TICK_LOG_DIR))]
+    assert ("differs from the route /pr-pipeline:setup probed" in output) is reported
+    assert actions.count("startup_route_unprobed") == int(reported)
+
+
+def test_loop_paces_from_the_configuration_its_tick_validated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The in-process loop paces from the same validated configuration."""
+    import pipeline  # type: ignore[import-untyped]
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
+    waits: list[int] = []
+    cadence_inputs: list[dict[str, object]] = []
+    real_decide = pipeline.decide_loop_cadence
+
+    def recording_decide(**kwargs: object) -> tuple[int, bool]:
+        cadence_inputs.append(kwargs)
+        return real_decide(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(tick.pipeline, "decide_loop_cadence", recording_decide)
+    monkeypatch.setattr(tick, "_run_tick_body", lambda *_a, **_k: 0)
+    monkeypatch.setattr(tick, "_startup_probe", lambda: {
+        "gh_found": True, "git_found": True, "codex_found": True,
+    })
+    monkeypatch.setattr(tick, "_observe_loop_state", lambda _target=None, **_kw: {
+        "in_flight_count": 0, "nearest_engine_deadline": None,
+        "actionable_queue": False, "at_cap": False, "quiescent": True,
+    })
+    monkeypatch.setattr(
+        tick, "_wait_next_tick",
+        lambda seconds, *_a, **_k: waits.append(seconds) or (False, True),
+    )
+    monkeypatch.setattr(tick, "_start_wake_watcher", lambda *_a, **_k: None)
+    monkeypatch.setattr(tick, "_notify_loop_quiescent_stop", lambda _held: None)
+
+    rc = tick._run_loop_locked(None, "", "")
+
+    assert rc == 0
+    # Five quiescent heartbeats stop the loop: four waits, each the heartbeat.
+    assert waits == [3600] * 4
+    assert all(inputs["quiescent_stop_after"] == 5 for inputs in cadence_inputs)
+
+
+def test_lock_held_cadence_uses_the_configured_short_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A tick refused by the mutex still paces its retry from configuration."""
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, _TUNED_SECTION)
+    lock_path = tmp_path / ".tick.lock"
+    monkeypatch.setattr(tick, "TICK_LOCK_PATH", str(lock_path))
+    monkeypatch.setattr(tick, "git", lambda *_args: str(tmp_path))
+    lock = tick.TickLock(str(lock_path))
+    assert lock.acquire() is True
+    stderr = io.StringIO()
+    try:
+        with mock.patch("sys.stderr", stderr):
+            assert tick.main() == tick.LOCK_HELD_EXIT_CODE
+    finally:
+        lock.release()
+
+    assert "tick-cadence: next_wake=120 stop=false" in stderr.getvalue()
+
+
+@pytest.mark.parametrize("failure", ["target", "config"])
+def test_lock_held_cadence_falls_back_to_the_shipped_short_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str,
+) -> None:
+    """With no usable configuration, a refused invocation still paces itself.
+
+    The next tick that takes the lock refuses the configuration and names the
+    key; the retry interval only has to be a safe one.
+    """
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(
+        monkeypatch, tmp_path,
+        "loop_short_poll_seconds = 120\n"
+        + ("max_iterations = 0\n" if failure == "config" else ""),
+    )
+    if failure == "target":
+        monkeypatch.setattr(
+            tick, "resolve_target",
+            mock.Mock(side_effect=ValueError("no GitHub remote")),
+        )
+    lock_path = tmp_path / ".tick.lock"
+    monkeypatch.setattr(tick, "TICK_LOCK_PATH", str(lock_path))
+    monkeypatch.setattr(tick, "git", lambda *_args: str(tmp_path))
+    lock = tick.TickLock(str(lock_path))
+    assert lock.acquire() is True
+    stderr = io.StringIO()
+    try:
+        with mock.patch("sys.stderr", stderr):
+            assert tick.main() == tick.LOCK_HELD_EXIT_CODE
+    finally:
+        lock.release()
+
+    assert "tick-cadence: next_wake=270 stop=false" in stderr.getvalue()
+
+
+@pytest.mark.parametrize("flag, key", [
+    ("--fix-engine", "fix_engine"),
+    ("--fix-model", "fix_model"),
+])
+def test_parse_cli_args_reads_the_fixer_route_flags(flag: str, key: str) -> None:
+    """The fixer route has its own flags, unset unless typed."""
+    import tick  # type: ignore[import-untyped]
+
+    assert tick.parse_cli_args([])[key] == ""
+    assert tick.parse_cli_args([])["impl_engine"] == ""
+    assert tick.parse_cli_args([flag, "claude-ds"])[key] == "claude-ds"
+    assert tick.parse_cli_args([f"{flag}=claude"])[key] == "claude"
+
+
 def test_main_prompts_setup_for_a_target_with_no_repository_section(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -22269,7 +22687,7 @@ def test_loop_observes_cadence_with_the_cap_its_tick_admitted_against(
                 with mock.patch("sys.stderr", io.StringIO()):
                     tick._run_loop_locked(None, "claude", "", quiescent_stop_after=1)
 
-    assert body.call_args.kwargs["max_in_flight"] == 5
+    assert body.call_args.kwargs["config"].max_in_flight == 5
     assert observed == [5]
 
 
@@ -22829,3 +23247,52 @@ def disk_full_open(basename: str) -> Callable[..., object]:
         return handle
 
     return fake_open
+
+
+def write_tuned_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, section: str,
+) -> Path:
+    """Write an operator config whose target section holds ``section``."""
+    import pipeline  # type: ignore[import-untyped]
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        '[operator]\nlogin = "test-owner"\n'
+        f'\n[repos."test-owner/test-repo"]\n{section}',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
+    monkeypatch.setattr(
+        pipeline, "_PACKAGED_CONFIG_PATH",
+        Path(pipeline.__file__).resolve().parent.parent / "config.toml",
+    )
+    return cfg
+
+
+@contextlib.contextmanager
+def tick_stage_mocks(tmp_path: Path) -> Iterator[dict[str, mock.MagicMock]]:
+    """Patch every HARVEST and DISPATCH stage of a real ``tick.main()``.
+
+    Yields the stage mocks by name. The post-dispatch state reports an
+    actionable queue, so the emitted cadence is the short poll.
+    """
+    with contextlib.ExitStack() as stack:
+        for target, value in (
+            ("tick.git", str(tmp_path)),
+            ("tick._startup_probe",
+             {"gh_found": True, "git_found": True, "codex_found": True}),
+            ("tick.read_authoritative_in_flight_labels", []),
+            ("tick._compute_post_dispatch_state", (0, True, ())),
+            ("tick._compute_nearest_deadline_s", None),
+        ):
+            stack.enter_context(mock.patch(target, return_value=value))
+        yield {
+            name: stack.enter_context(mock.patch(
+                f"tick.{name}",
+                **({"return_value": True} if name.startswith("harvest") else {}),
+            ))
+            for name in (
+                "harvest_reviewers", "harvest_implementers", "harvest_fixers",
+                "dispatch_reviewers", "dispatch_implementers", "dispatch_fixers",
+            )
+        }

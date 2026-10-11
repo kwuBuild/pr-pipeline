@@ -15,13 +15,13 @@ The [distribution plan](plugin-distribution-design.md) retains unfinished migrat
 | Permission mode | `--permission-mode auto` (config/CLI can select `dontAsk`) | `--permission-mode auto` (config/CLI can select `dontAsk`) | `-s read-only` (sandbox) |
 | Pre-approved tools | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | None (read-only sandbox enforces) |
 | Model (default) | whatever `claude` resolves (no `--model` flag) | whatever `claude` resolves / `deepseek-v4-pro[1m]` (claude-ds) | operator's `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`), else `gpt-5.5` |
-| Model override | `--model` flag from tick CLI | `--model` flag from tick CLI | `--review-model` flag from tick CLI |
-| Reasoning effort | Not set (claude default) | Not set (claude default) | operator's codex config, else `high`; `--review-effort` overrides |
+| Engine and model override | `impl_engine`/`model` config keys; `--impl-engine`/`--model` flags | `fix_engine`/`fix_model` config keys; `--fix-engine`/`--fix-model` flags; blank inherits the implementer route (model only on the same engine) | `review_model` config key; `--review-model` flag |
+| Reasoning effort | Not set (claude default) | Not set (claude default) | `review_effort` config key or `--review-effort`, else operator's codex config, else `high` |
 | Env isolation | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([`tick._dispatch_one_reviewer`][tick]) |
 | Prompt source | `lib/prompts/implementer.txt` | `lib/prompts/fixer.txt` | `lib/prompts/reviewer.txt` |
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
 | Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | none — JSONL is sanitized for observations, not a heartbeat; the review timeout bounds the run |
-| Timeout | 60 min (`IMPLEMENTER_TIMEOUT`, [`tick.IMPLEMENTER_TIMEOUT`][tick]) | 60 min (`FIXER_TIMEOUT`, [`tick.FIXER_TIMEOUT`][tick]) | 20 min (`REVIEW_TIMEOUT`, [`tick.REVIEW_TIMEOUT`][tick]) |
+| Timeout | `implementer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_implementer`][tick]) | `fixer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_fixer`][tick]) | `review_timeout_seconds`, 20 min shipped ([`tick._dispatch_one_reviewer`][tick]) |
 | Process group | `start_new_session=True` | `start_new_session=True` | `os.setpgrp()` in wrapper ([`engine_wrapper.run_engine`][engine_wrapper]) |
 
 ## 2. Model and reasoning effort
@@ -48,27 +48,36 @@ When `--impl-engine claude-ds` is active, the model resolves to
 model, routing Claude Code's internal model selection through the DeepSeek API
 gateway.
 
-The tick CLI accepts `--model <model>` ([`tick.main`][tick]) which overrides
-the per-engine default for both the `--model` flag and `ANTHROPIC_MODEL`.
+The operator config key `model`, or the tick CLI's `--model <model>`
+([`tick.main`][tick]), overrides the per-engine default for both the `--model`
+flag and `ANTHROPIC_MODEL`. `pipeline.effective_engine_model` owns the claude-ds
+default.
 
 Reasoning effort is not explicitly set. Claude Code uses its own default.
 For claude-ds, `CLAUDE_CODE_EFFORT_LEVEL=max` is set ([`tick._resolve_engine`][tick]).
 
 ### Fixer
 
-Same as the implementer — the operator's own model (claude) or
-`deepseek-v4-pro[1m]` (claude-ds). Model resolution at [`tick._dispatch_one_fixer`][tick].
-Uses `_launch_claude_engine` with the same `--model` handling and env construction.
+The fixer has its own route: `fix_engine` and `fix_model` (flags `--fix-engine`
+and `--fix-model`). A blank `fix_engine` runs the fixer on the implementer's
+engine. A blank `fix_model` inherits the implementer's `model` only while the
+fixer runs on the implementer's engine, because a model id names one provider's
+model; on another engine it is that engine's default. `pipeline.resolve_config`
+resolves the route, `tick._run_tick_body` passes it to `dispatch_fixers`, and
+model resolution happens at [`tick._dispatch_one_fixer`][tick]. Uses
+`_launch_claude_engine` with the same `--model` handling and env construction.
 
 ### Reviewer
 
 Model and effort resolve in this order, independently per value:
 
 1. `--review-model` / `--review-effort` from the tick CLI
-2. `model` / `model_reasoning_effort` in the operator's codex config —
+2. `review_model` / `review_effort` in the pipeline operator config
+   (`[repos."owner/name"]`, then `[defaults]`) — validated at startup
+3. `model` / `model_reasoning_effort` in the operator's codex config —
    `$CODEX_HOME/config.toml` when set, else `~/.codex/config.toml`
    (`_operator_codex_home`, which the scrub-dir `auth.json` symlink shares)
-3. the pinned fallbacks `gpt-5.5` and `high`
+4. the pinned fallbacks `gpt-5.5` and `high`
 
 Profiles are deliberately not consulted. Since codex 0.146 the legacy
 `profile = "…"` key is rejected by codex itself (`legacy profile config is no
@@ -733,6 +742,36 @@ run; the checks do not pin future Git transport.
 consume its `ResolvedConfig` rather than raw tables. This is one resolver, not
 necessarily one resolution per tick: keeping one validated snapshot through all
 consumers remains [issue #26](https://github.com/kwuBuild/pr-pipeline/issues/26).
+The tuning and routing keys already follow that rule. `_run_single_tick_locked`
+reads them from the configuration its startup gate validated and passes that
+`ResolvedConfig` to `_run_tick_body`, which hands each value to its consumer:
+
+| Keys | Consumer |
+|---|---|
+| `max_in_flight` | all three dispatchers and both cadence paths, from the same startup `ResolvedConfig` |
+| `implementer_timeout_seconds`, `fixer_timeout_seconds`, `review_timeout_seconds` | the dispatchers, which record the marker `deadline` that reconciliation enforces |
+| `engine_stall_seconds`, `engine_stall_startup_grace_seconds` | implementer/fixer dispatch, which records them in the marker as `stall_seconds` and `stall_startup_grace_seconds`; `tick._engine_progress` reads them there for the tick, the `--loop` watcher, and the status dashboard |
+| `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)` |
+| `transient_cooldown_seconds`, `transient_cooldown_reset_buffer_seconds` | implementer/fixer harvest → `transient_cooldown_until` |
+| `impl_engine`, `model`, `fix_engine`, `fix_model`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |
+| `loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`, `loop_quiescent_stop_after` | `pipeline.compute_next_wake` in the tick body and `pipeline.decide_loop_cadence` in `_run_loop_locked`, through `ResolvedConfig.cadence()` |
+
+Dispatch still re-reads `verify_tools` and `engine_settings` before each launch
+(the #26 scope). That read refuses only on errors outside
+`ResolvedConfig.tuning_errors`, so an edit made mid-tick to a key read once at
+the gate cannot escalate an item; the next tick refuses it at startup.
+
+A mutex-refused invocation runs no tick; it resolves the configuration once,
+best effort, to pace its retry and uses the shipped cadence if that fails. A
+marker written before stall limits were recorded is judged by the shipped
+limits it was dispatched under.
+
+`probed_route` comes from the repository's `probed_impl_engine` and
+`probed_model` metadata. Setup writes it atomically with routing defaults;
+subsequent edits to `impl_engine` or `model` do not change the evidence. The tick
+logs `startup_route_unprobed` when its effective implementer route differs,
+and runs. See the [route metadata contract](../../skills/tick/README.md#deadlines-stall-limits-routing-and-cadence)
+for validation and older configurations.
 
 Exactly two files are read, both through `_read_toml`:
 
@@ -794,8 +833,8 @@ Malformation splits two ways:
   reading and appends to `ResolvedConfig.warnings`. The tick logs
   `startup_config_warning` and runs.
 - **Has none** (`base_ref`, `permission_mode`, `engine_settings`,
-  `max_in_flight`, `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`) —
-  appends to
+  `max_in_flight`, `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`, the
+  engine routes, and every integer tuning key) — appends to
   `ResolvedConfig.errors`. The tick logs `startup_config_invalid` and exits 3,
   naming the key. So does a container declared as something other than a table:
   `[[defaults]]` read as absent would replace every setting under it with the
