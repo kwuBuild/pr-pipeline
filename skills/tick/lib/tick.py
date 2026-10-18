@@ -6473,6 +6473,14 @@ def _harvest_one_reviewer(
         wt_dir=wt_dir,
         dispatch_id=dispatch_id,
     )
+    if tick_log:
+        tick_log.log(
+            pr=n, phase="harvest", stage="review", action="review_handoff",
+            reason="review outcome handed off after publication and label convergence",
+            engine=str(marker.get("engine", "codex")), dispatch_id=dispatch_id,
+            details={"label": harvest_label, "outcome": harvest_result.get("action"),
+                     "head_sha": current_head},
+        )
     cleanup_scratch(wt_dir)
 
 
@@ -7696,6 +7704,14 @@ def _harvest_one_implementer(
             tick_log, _IMPLEMENTER_CONFIG.stage,
         )
         return
+    if harvest_action == "create_pr" and tick_log:
+        tick_log.log(
+            pr=n, phase="harvest", stage="implement", action="pr_handoff",
+            reason="PR handoff confirmed after issue custody convergence",
+            engine=engine, dispatch_id=dispatch_id,
+            details={"issue_number": n, "pr_number": pr_number,
+                     "created": not existing_pr.isdigit()},
+        )
     if archive_dir and not _finalize_harvest_archive(
         wt_dir,
         archive_dir,
@@ -8762,6 +8778,14 @@ def _harvest_one_fixer(
             tick_log, _FIXER_CONFIG.stage,
         )
         return
+    if harvest_action == "recheck" and tick_log:
+        tick_log.log(
+            pr=n, phase="harvest", stage="fix", action="revision_handoff",
+            reason="revision handed off after publication and label convergence",
+            engine=engine, dispatch_id=dispatch_id,
+            details={"label": harvest_label, "outcome": harvest_result.get("sentinel"),
+                     "head_sha": current_head},
+        )
     if archive_dir and not _finalize_harvest_archive(
         wt_dir,
         archive_dir,

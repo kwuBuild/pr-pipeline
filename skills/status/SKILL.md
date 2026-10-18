@@ -75,6 +75,20 @@ visible and parked-item classification says unavailable. A failed GitHub read
 also says unavailable, rather than reporting an empty pipeline. The dashboard
 never provisions, renames, or deletes labels.
 
+## Local event feed
+
+For a retained history or a continuously updating terminal feed, run the
+standalone launcher from the target repository:
+
+```bash
+~/.claude/pr-pipeline/bin/pr-pipeline events --follow
+```
+
+This reader makes no GitHub or model calls and changes no pipeline state. Do
+not keep an AI session polling or narrating it automatically. Use `--json` for
+scripts and `'#N'` or `pr:N` to filter. The [event feed contract](EVENTS.md)
+owns the schema, retention limits, and follow behavior.
+
 ## Progress column
 
 Implement/fix rows carry a progress column next to the result column:

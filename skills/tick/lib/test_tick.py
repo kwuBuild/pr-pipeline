@@ -12826,7 +12826,7 @@ def test_harvest_one_reviewer_promotes_and_posts_comment(
     assert observation_call.kwargs["details"]["observed_skills"] == [
         {"name": "contract-review", "source": "repository"},
     ]
-    assert side_effect_order == ["log", "cleanup"]
+    assert side_effect_order == ["log", "log", "cleanup"]
 
     # Cleaned up
     cleanup_mock.assert_called_once_with(str(wt_dir))
