@@ -525,9 +525,9 @@ shorten the sleep. The tick-side call is what makes the signal exist at all in
 the operating mode `SKILL.md` prescribes, where each iteration is its own
 process and no watcher runs. Because those callers do not share memory, the
 already-evaluated progress timestamp per dispatch identity is persisted to
-`.tick-state/stall-episodes.json` — the same reason `quiescent-counter.txt`
-exists. Each scan drops entries whose dispatch is gone, so the file is bounded
-by in-flight work and carries no pruning rules of its own; a lost or malformed
+`.tick-state/stall-episodes.json` — the same reason the per-scope
+`quiescent-counters/*.txt` files exist. Each scan drops entries whose dispatch
+is gone, so the file is bounded by in-flight work and carries no pruning rules of its own; a lost or malformed
 file costs one repeated advisory report. A refuted liveness verdict is
 checkpointed immediately; a live-stall timestamp is checkpointed only after
 its operator report returns and before the scan advances. Report attempts use
@@ -733,7 +733,7 @@ reads them from the configuration its startup gate validated and passes that
 | `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)` |
 | `transient_cooldown_seconds`, `transient_cooldown_reset_buffer_seconds` | implementer/fixer harvest → `transient_cooldown_until` |
 | `impl_engine`, `model`, `fix_engine`, `fix_model`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |
-| `loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`, `loop_quiescent_stop_after` | `pipeline.compute_next_wake` in the tick body and `pipeline.decide_loop_cadence` in `_run_loop_locked`, through `ResolvedConfig.cadence()` |
+| `loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`, `loop_quiescent_stop_after` | `pipeline.compute_next_wake` in the tick body, through `ResolvedConfig.cadence()`; `_run_loop_locked` consumes the returned `TickOutcome.cadence` unchanged |
 
 Dispatch still re-reads `verify_tools` and `engine_settings` before each launch
 (the #26 scope). That read refuses only on errors outside
@@ -778,7 +778,7 @@ lists replace wholesale rather than merging, because an operator who cannot
 
 The login for issue pickup, reviewer admission, and issue cadence is the one
 each tick resolves and validates. Successful startup binds
-`TRUSTED_REVIEW_AUTHOR` for dispatch and the following loop observation, and
+`TRUSTED_REVIEW_AUTHOR` for dispatch and the tick's cadence observation, and
 also passes the login explicitly to `dispatch_reviewers`. The next tick adopts
 a later config edit. No issue author gate rereads config during a tick.
 
@@ -788,9 +788,10 @@ naming the key, never a fallback to the shipped default of 3. After every startu
 gate passes, `_run_single_tick_locked` reads `ResolvedConfig.max_in_flight` once
 and passes it to `_run_tick_body`, which hands it to all three dispatchers'
 `can_dispatch_now` calls and to the cadence `at_capacity` input. Under `--loop`
-the same value reaches `_observe_loop_state`, including its fail-closed
-occupancy fallback, which assumes that cap is full. No consumer resolves the cap
-again later in the tick.
+the loop consumes the cadence decision returned by `_run_single_tick_locked`;
+it does not observe state or resolve the cap again after the tick. Startup and
+crash outcomes contain no cadence and terminate the loop. Recoverable tick
+failures return their emitted warm retry decision.
 
 `trusted_issue_candidate` requires an exact operator login and refuses missing
 or mistyped authors. Global dispatch and cadence read only that author's

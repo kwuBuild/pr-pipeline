@@ -11,6 +11,8 @@ from unittest import mock
 import pipeline
 import pytest
 
+from tick import TickOutcome
+
 pytestmark = pytest.mark.real_target
 
 
@@ -122,7 +124,7 @@ def test_main_refuses_override_without_matching_remote_before_github(repository,
     git(repository, "remote", "add", "upstream", "https://github.com/one/repo")
     monkeypatch.setenv("PIPELINE_REPO", "elsewhere/project")
     monkeypatch.setattr(tick, "repo_root", lambda: str(repository))
-    with mock.patch.object(tick, "gh") as gh, mock.patch.object(tick, "_run_tick_body", return_value=0) as body:
+    with mock.patch.object(tick, "gh") as gh, mock.patch.object(tick, "_run_tick_body", return_value=TickOutcome(0)) as body:
         assert tick.main() == 3
     gh.assert_not_called()
     body.assert_not_called()
@@ -166,7 +168,7 @@ def test_startup_selects_case_insensitive_repo_settings(repository, monkeypatch)
     cfg.write_text('[operator]\nlogin="operator"\n[scan]\nrepos=["ELSEWHERE/PROJECT"]\n'
                    '[repos."elsewhere/project"]\npermission_mode="auto"\nverify_tools=["cargo test"]\n')
     monkeypatch.setenv("PR_PIPELINE_CONFIG", str(cfg))
-    with mock.patch.object(tick, "_run_tick_body", return_value=0) as body:
+    with mock.patch.object(tick, "_run_tick_body", return_value=TickOutcome(0)) as body:
         assert tick.main() == 0
     assert body.call_args.args[6] == "auto"
     assert tick._engine_verify_tools(tick.TRUSTED_HEAD_REPO) == ("Bash(cargo test)",)
@@ -184,7 +186,7 @@ def test_main_selects_repo_layer_and_rejects_outside_scan(repository, monkeypatc
     monkeypatch.setattr(tick, "repo_root", lambda: str(repository))
     with (
         mock.patch.object(tick, "gh", return_value=subprocess.CompletedProcess([], 0, "[]")) as gh,
-        mock.patch.object(tick, "_run_tick_body", return_value=0) as body,
+        mock.patch.object(tick, "_run_tick_body", return_value=TickOutcome(0)) as body,
         mock.patch.object(tick, "_start_wake_watcher", return_value=None),
         mock.patch.object(tick, "_wait_next_tick", return_value=(True, False)),
     ):

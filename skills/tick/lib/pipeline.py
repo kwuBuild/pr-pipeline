@@ -474,6 +474,20 @@ _FIX_REPORT_HEADROOM = 200
 _FIX_REPORT_LIMIT = FIX_SUMMARY_BUDGET + _FIX_REPORT_HEADROOM
 
 
+@dataclass(frozen=True)
+class TargetCadenceState:
+    """One validated read of a target's active stage scopes.
+
+    ``actionable=None`` means the target could not be read. ``terminal`` is
+    true only when every active scope is closed or terminal.
+    ``description`` names the target, its scopes and their observed states.
+    """
+
+    actionable: bool | None
+    terminal: bool
+    description: str
+
+
 def decide_loop_cadence(
     *,
     in_flight_count: int,
@@ -488,6 +502,7 @@ def decide_loop_cadence(
     short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS,
     max_poll_seconds: int = LOOP_MAX_POLL_SECONDS,
     heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
+    target_state: TargetCadenceState | None = None,
 ) -> tuple[int, bool]:
     """Choose the next sleep for unattended in-process loop mode.
 
@@ -504,13 +519,14 @@ def decide_loop_cadence(
             that an all-held pipeline can still reach quiescence. Real
             admission saturation is reported through ``held_items``.
         quiescent: Whether there is no in-flight or actionable work.
-        consecutive_quiescent: Number of consecutive quiescent heartbeats seen,
-            including the current one.
+        consecutive_quiescent: Number of qualifying quiet observations already
+            counted, including the current one only if it qualifies.
         now: Epoch seconds for deadline math. Defaults to current time.
         quiescent_stop_after: Number of consecutive quiescent heartbeats after
             which the loop should stop.
         held_items: Operator-facing identifiers for the slots excluded from
             ``in_flight_count`` while a human hold is active.
+        target_state: Target observation, forwarded to :func:`compute_next_wake`.
         short_poll_seconds: Forwarded to :func:`compute_next_wake`.
         max_poll_seconds: Forwarded to :func:`compute_next_wake`.
         heartbeat_seconds: Forwarded to :func:`compute_next_wake`.
@@ -529,11 +545,11 @@ def decide_loop_cadence(
         has_actionable_queue=actionable_queue,
         at_capacity=at_cap,
         is_quiescent=quiescent,
-        consecutive_quiescent_ticks=(
-            max(0, consecutive_quiescent - 1) if quiescent else 0
-        ),
+        consecutive_quiescent_ticks=max(0, consecutive_quiescent) if quiescent else 0,
+        count_quiescent_heartbeat=False,
         quiescent_stop_after=quiescent_stop_after,
         held_items=held_items,
+        target_state=target_state,
         short_poll_seconds=short_poll_seconds,
         max_poll_seconds=max_poll_seconds,
         heartbeat_seconds=heartbeat_seconds,
@@ -873,11 +889,13 @@ def compute_next_wake(
     at_capacity: bool | None = False,
     is_quiescent: bool = False,
     consecutive_quiescent_ticks: int = 0,
+    count_quiescent_heartbeat: bool = True,
     quiescent_stop_after: int = LOOP_QUIESCENT_STOP_AFTER,
     held_items: Sequence[str] = (),
     short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS,
     max_poll_seconds: int = LOOP_MAX_POLL_SECONDS,
     heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
+    target_state: TargetCadenceState | None = None,
 ) -> CadenceDecision:
     """Compute the next wake interval from end-of-tick state.
 
@@ -890,12 +908,13 @@ def compute_next_wake(
     ======================================  ===================================
     State at end of tick                    Next wake
     ======================================  ===================================
+    Target scopes terminal or closed       stop immediately
     ≥1 engine in-flight                    ``min(nearest deadline, max poll)``
                                             (max poll 270s)
     Actionable queue non-empty             short poll (270s)
     At ``max_in_flight`` with work           short poll (harvest to free a slot)
     Quiescent                              heartbeat (1800s)
-    Quiescent for N consecutive heartbeats  stop (caller notifies developer)
+    Queue quiet for N heartbeats            stop (caller notifies developer)
     ======================================  ===================================
 
     Args:
@@ -910,10 +929,13 @@ def compute_next_wake(
             dispatch-eligible label, or ``None`` when queue reads failed.
         at_capacity: ``True`` when ``in_flight_count >= max_in_flight``;
             ``None`` is treated as unknown.
-        is_quiescent: ``True`` when every tracked item is in a terminal
-            label and no engines are in flight.
-        consecutive_quiescent_ticks: How many consecutive ticks have been
-            quiescent before this one (caller tracks this across ticks).
+        is_quiescent: ``True`` when no supervisable engines or actionable
+            work remain. This alone does not prove target completion.
+        consecutive_quiescent_ticks: Qualifying quiet observations counted
+            before this tick (caller tracks this across ticks).
+        count_quiescent_heartbeat: Whether this quiet tick qualifies as another
+            observation. False for native-loop nudges, or when the caller has
+            already included this tick in ``consecutive_quiescent_ticks``.
         quiescent_stop_after: Stop the loop after this many consecutive
             quiescent heartbeats.
         held_items: Operator-facing identifiers for slots excluded from
@@ -924,6 +946,10 @@ def compute_next_wake(
             that engine unattended; a non-quiescent tick that is nonetheless
             wedged at the admission cap needs the same explanation, since
             ``in_flight_count`` has already discounted the cause.
+        target_state: Validated target observation, or ``None`` for the full
+            queue. A terminal target stops immediately, regardless of unrelated
+            occupancy. An unfinished target never stops from quiet heartbeats;
+            an unknown target stays on the short poll.
         short_poll_seconds: Wake while work is queued, at capacity, or when
             state is unknown.
         max_poll_seconds: Longest wait while an engine is in flight.
@@ -945,6 +971,8 @@ def compute_next_wake(
     # ordinary warm poll while admission is in fact blocked by human custody
     # and no tick can ever dispatch until the operator acts.
     def _with_custody(reason: str) -> str:
+        if target_state is not None:
+            reason = f"{target_state.description}; not terminal; {reason}"
         if not held_items:
             return reason
         return f"{reason}; awaiting human decision: {', '.join(held_items)}"
@@ -957,6 +985,17 @@ def compute_next_wake(
             stop=False,
             reason=_with_custody(f"state unknown -> wake {short_poll_seconds}s"),
         )
+
+    # Completion is scoped to the target, while admission and supervision
+    # remain global. Unrelated engines must not postpone a proven target stop.
+    if target_state is not None:
+        if target_state.terminal:
+            return CadenceDecision(0, True, f"{target_state.description} → stop")
+        if target_state.actionable is None:
+            return CadenceDecision(
+                short_poll_seconds, False,
+                _with_custody(f"state unknown -> wake {short_poll_seconds}s"),
+            )
 
     # 1. In-flight engines: pace to the nearest deadline, clamped to
     #    cache-warm so we never burn a cache miss on a distant deadline.
@@ -1006,14 +1045,19 @@ def compute_next_wake(
 
     # 4. Quiescent: heartbeat slowly, stop after N consecutive.
     if is_quiescent:
-        # consecutive_quiescent_ticks counts PRIOR quiescent ticks;
-        # this tick is also quiescent, so this is heartbeat #(prior + 1).
-        stop = consecutive_quiescent_ticks + 1 >= quiescent_stop_after
+        if target_state is not None:
+            return CadenceDecision(
+                heartbeat_seconds, False,
+                _with_custody(f"waiting → wake {heartbeat_seconds}s"),
+            )
+        # Observing quiet after a nudge does not count as another heartbeat.
+        quiet_count = consecutive_quiescent_ticks + int(count_quiescent_heartbeat)
+        stop = quiet_count >= quiescent_stop_after
         return CadenceDecision(
             next_wake_seconds=heartbeat_seconds,
             stop=stop,
             reason=_with_custody(
-                f"quiescent (heartbeat {consecutive_quiescent_ticks + 1}/{quiescent_stop_after})"
+                f"quiescent (heartbeat {quiet_count}/{quiescent_stop_after})"
                 + (" → stop" if stop else f" → wake {heartbeat_seconds}s")
             ),
         )
@@ -2007,8 +2051,8 @@ class ResolvedConfig:
     def cadence(self) -> CadenceSettings:
         """Return the cadence keyword arguments for :func:`compute_next_wake`.
 
-        :func:`decide_loop_cadence` takes the same keywords, so both loop
-        paths pace from one validated configuration.
+        The tick emits that decision and native mode consumes it unchanged.
+        Direct callers of :func:`decide_loop_cadence` accept the same keywords.
         """
         return {
             "short_poll_seconds": self.loop_short_poll_seconds,

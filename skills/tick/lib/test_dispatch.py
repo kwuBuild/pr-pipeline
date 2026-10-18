@@ -71,7 +71,7 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
                                         ):
                                             assert _run_tick_body(
                                                 None, ("issue", 462), "claude",
-                                            ) == 0
+                                            ).exit_code == 0
 
     # A direct caller passes no validated configuration: the shipped tuning.
     cooldown = {
@@ -108,7 +108,7 @@ def test_run_tick_body_fails_closed_when_issue_target_resolution_fails() -> None
         ):
             with mock.patch("tick.harvest_reviewers") as harvest:
                 with mock.patch("tick.dispatch_reviewers") as dispatch:
-                    assert _run_tick_body(None, ("issue", 462), "claude") == 1
+                    assert _run_tick_body(None, ("issue", 462), "claude").exit_code == 1
 
     harvest.assert_not_called()
     dispatch.assert_not_called()
