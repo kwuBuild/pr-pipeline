@@ -11141,6 +11141,10 @@ def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
     keeps a failed authoritative read from silently becoming "no contract": a
     failure returns ``None`` and the caller retains custody for the next tick.
 
+    Validate every linked repository and positive issue number before fetching
+    any issue. Reads use that explicit repository, never the PR's target as a
+    fallback. Explicit null bodies are empty; missing fields remain unknown.
+
     Which issues to quote comes from GitHub's own ``closingIssuesReferences``
     rather than a ``Closes #N`` regex over the body, so the contract block
     matches what GitHub will actually close and needs no heuristic for prose
@@ -11165,24 +11169,43 @@ def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
     if not isinstance(pr_data, dict):
         return None
     body = pr_data.get("body")
+    if body is None and "body" in pr_data:
+        body = ""
     refs = pr_data.get("closingIssuesReferences")
     if not isinstance(body, str) or not isinstance(refs, list):
         return None
 
-    issue_numbers: list[int] = []
+    issue_refs: list[tuple[str, int]] = []
     for ref in cast("list[object]", refs):
         if not isinstance(ref, dict):
             return None
-        number = cast("dict[str, object]", ref).get("number")
-        if not isinstance(number, int) or isinstance(number, bool):
+        number = ref.get("number")
+        repository = ref.get("repository")
+        if (
+            not isinstance(number, int) or isinstance(number, bool) or number <= 0
+            or not isinstance(repository, dict)
+        ):
             return None
-        issue_numbers.append(number)
+        owner = repository.get("owner")
+        name = repository.get("name")
+        if not isinstance(owner, dict) or not isinstance(name, str):
+            return None
+        login = owner.get("login")
+        if (
+            not isinstance(login, str)
+            or not re.fullmatch(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}", login)
+            or not re.fullmatch(r"[A-Za-z0-9._-]+", name)
+            or name in {".", ".."}
+        ):
+            return None
+        issue_refs.append((f"{login}/{name}", number))
 
-    contracts: list[tuple[int, str, str]] = []
-    for number in issue_numbers:
+    contracts: list[tuple[str, int, str, str]] = []
+    for repository, number in issue_refs:
         try:
             issue = gh_json(
                 "issue", "view", str(number), "--json", "title,body",
+                repo=repository,
             )
         except (subprocess.CalledProcessError, ValueError):
             return None
@@ -11190,22 +11213,24 @@ def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
             return None
         title = issue.get("title")
         issue_body = issue.get("body")
+        if issue_body is None and "body" in issue:
+            issue_body = ""
         if not isinstance(title, str) or not isinstance(issue_body, str):
             return None
-        contracts.append((number, title, issue_body.strip()))
+        contracts.append((repository, number, title, issue_body.strip()))
 
     # Every linked issue keeps its heading and an allowance of its own. The
     # heading sits outside the allowance because it is what tells the engine the
     # contract exists: a fixer can act on "issue #8 is here and cut short", and
     # cannot act on an issue #8 that renders as nothing at all.
     allowances = _split_context_budget(
-        [len(requirements) for _, _, requirements in contracts],
+        [len(requirements) for _, _, _, requirements in contracts],
         FIXER_CONTEXT_BUDGET,
     )
     blocks = [
-        f"### Issue #{number} — {title}\n\n"
-        f"{_bounded_context(requirements, budget=allowance)}"
-        for (number, title, requirements), allowance in zip(
+        f"### Issue {repository}#{number} — {title}\n\n"
+        f"{_bounded_context(requirements, budget=allowance) or '(this issue has an empty body)'}"
+        for (repository, number, title, requirements), allowance in zip(
             contracts, allowances, strict=True,
         )
     ]
