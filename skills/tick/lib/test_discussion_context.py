@@ -7,6 +7,9 @@ import subprocess
 
 import pytest
 
+from conftest import TRUSTED_AUTHOR, comment_pages, fixer_git, legacy_review
+from test_dispatch import reviewer_git
+
 
 @pytest.fixture
 def github():
@@ -154,8 +157,6 @@ def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tm
     import tick
     import pipeline
     from unittest import mock
-    from conftest import TRUSTED_AUTHOR, comment_pages, fixer_git
-    from test_dispatch import reviewer_git
     read, _, connections, _ = github
     connections[('PR', 'comments')][0][0]['body'] = 'X' * 300000 + '\n' + pipeline.REVIEW_MARKER
     root = tmp_path / 'worktrees'
@@ -166,7 +167,7 @@ def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tm
     monkeypatch.setattr(tick, 'TRUSTED_HEAD_REPO', 'owner/repo')
     monkeypatch.setattr(tick, 'git', reviewer_git(repo) if stage == 'review' else fixer_git(repo))
     monkeypatch.setattr(tick, 'gh_text', mock.Mock(side_effect=['main', 'a' * 40] + (['branch'] if stage == 'fix' else [])))
-    selected = pipeline.REVIEW_MARKER + '\nselected originating review'
+    selected = legacy_review('selected originating review')
     def github_read(*args, **kwargs):
         if '--slurp' in args:
             return comment_pages([{'body': selected, 'author': {'login': TRUSTED_AUTHOR}}])
@@ -197,6 +198,7 @@ def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tm
     if stage == 'fix':
         import hashlib
         assert marker['review_sha256'] == hashlib.sha256(selected.encode()).hexdigest()
+        assert marker['review_handoff'] == pipeline.review_reports.handoff(selected)
         assert selected in prompt
     else:
         assert '-s' in popen.call_args.args[0]

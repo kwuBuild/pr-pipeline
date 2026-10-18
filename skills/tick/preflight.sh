@@ -120,7 +120,7 @@ if ! bound "$CODEX_BIN" exec -C "$work" --skip-git-repo-check -s read-only \
   exit 1
 fi
 
-if ! verdict="$("$PY" "$LIB" validate-review --review "$out")"; then
+if ! verdict="$("$PY" "$LIB" validate-review --review "$out" --report-protocol-version 2)"; then
   echo "FAIL(b): codex output did not validate against review-schema.json"
   echo "  produced:"; sed 's/^/  /' "$out" 2>/dev/null || echo "  (no output file written)"
   exit 1

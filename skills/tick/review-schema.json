@@ -1,35 +1,96 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "findings"],
+  "description": "Protocol 2. Allow at most 52000 characters AND UTF-8 bytes across authored text. The complete rendered comment has a 60000 character AND byte safety bound, including controller metadata; this is not a preferred length or quality score.",
+  "required": [
+    "findings",
+    "observations",
+    "reasoning",
+    "report_protocol_version",
+    "risks",
+    "scope",
+    "verdict",
+    "verification"
+  ],
   "properties": {
+    "report_protocol_version": {
+      "type": "integer",
+      "enum": [
+        2
+      ]
+    },
     "verdict": {
       "type": "string",
-      "enum": ["ready_for_human", "changes_requested"],
-      "description": "ready_for_human when the diff has no blocker/major issues; changes_requested otherwise."
+      "enum": [
+        "changes_requested",
+        "needs_human_decision",
+        "ready_for_human"
+      ]
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "Concise basis for the outcome; clean reviews need no invented finding."
+    },
+    "scope": {
+      "type": "string",
+      "description": "Task contract and relevant boundaries examined; separate inspected and executed work."
     },
     "findings": {
       "type": "array",
-      "description": "One entry per issue found. Empty array for a clean review.",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "file", "summary"],
+        "required": [
+          "evidence",
+          "explanation",
+          "id",
+          "location",
+          "resolution",
+          "severity"
+        ],
         "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,63}$"
+          },
           "severity": {
             "type": "string",
-            "enum": ["blocker", "major", "minor"]
+            "enum": [
+              "blocker",
+              "major",
+              "minor"
+            ]
           },
-          "file": {
+          "location": {
             "type": "string",
-            "description": "Repo-relative path the finding applies to."
+            "description": "Precise file/line or boundary; empty if not applicable."
           },
-          "summary": {
+          "explanation": {
             "type": "string",
-            "description": "One-line description of the issue and the fix."
+            "description": "Trigger and consequence; Markdown paragraphs, lists and code are welcome."
+          },
+          "evidence": {
+            "type": "string",
+            "description": "Supporting source or reproduction and result; distinguish execution from inspection."
+          },
+          "resolution": {
+            "type": "string",
+            "description": "Optional suggestion; use an empty string when no particular fix is justified."
           }
         }
       }
+    },
+    "verification": {
+      "type": "string",
+      "description": "Checks/probes actually run, commands and outcomes; attribute CI/author evidence and explain relevant checks not run."
+    },
+    "risks": {
+      "type": "string",
+      "description": "Uncertainty, nonblocking concerns and deferred work with owner/reference when known; state none when applicable."
+    },
+    "observations": {
+      "type": "string",
+      "description": "Optional Markdown discussion, titled subsections, tradeoffs or diagrams; identify observations outside agreed scope. Use an empty string when absent."
     }
   }
 }

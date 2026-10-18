@@ -1,6 +1,6 @@
 """Engine wrapper: atomic launch/completion ownership for PR-pipeline engines.
 
-Replaces bare ``codex exec`` in the dispatch flow. The wrapper provides four
+Replaces bare ``codex exec`` in the dispatch flow. The wrapper provides five
 guarantees the bare invocation cannot:
 
 1. **Ownership before spawn:** writes a marker with the wrapper's own process
@@ -12,15 +12,17 @@ guarantees the bare invocation cannot:
    continue spending after a kill.
 
 3. **Atomic result placement:** the engine writes to a temp file; the wrapper
-   validates exit status + schema, then atomically renames into the published
-   result path. A partial or in-progress file is never visible as the final result.
+   validates exit status + schema, then atomically retains the original bytes.
+   Protocol 2 keeps rejected reports at the result path for human-decision
+   harvest; legacy/failed-engine rejection uses ``review-rejected.json``.
+   An in-progress file is never visible as a captured final result.
 
 4. **Sanitized observability:** when requested, the wrapper drains Codex JSONL
    stdout and persists bounded skill-file evidence and terminal token usage. Raw events,
    prompts, commands, command output, and absolute paths are discarded.
 
 5. **Completion envelope:** after the atomic rename, the wrapper writes a
-   dispatch-id-bound ``completion.json`` that HARVEST consumes as the gate for
+   dispatch-id- and protocol-bound ``completion.json`` that HARVEST consumes as the gate for
    ``classify_dispatch(envelope_valid=True)``. Without the envelope, even a
    present result file is not harvested.
 
@@ -127,6 +129,7 @@ def run_engine(
             wrapper_pid=wrapper_pid,
             start_time=wrapper_start_time,
             error=exc,
+            report_protocol_version=marker_template.get("report_protocol_version"),
         )
         if observation_path is not None:
             _write_observation(
@@ -165,15 +168,32 @@ def run_engine(
 
     # 3. Validate and place result atomically.
     result_valid = False
+    report_version = marker_template.get("report_protocol_version")
+    validation_reason = "Engine did not produce a readable JSON report."
     if exit_status == 0 and os.path.isfile(temp_result):
         try:
             with open(temp_result) as f:
-                result_obj = json.load(f)
-            if pipeline.validate_review(result_obj) is not None:
-                os.replace(temp_result, result_path)
+                result_obj = (pipeline.review_reports.loads(f.read()) if report_version is not None
+                              else json.load(f))
+            if pipeline.validate_review(result_obj, report_protocol_version=report_version) is not None:
                 result_valid = True
-        except (OSError, json.JSONDecodeError):
+                validation_reason = ""
+            elif report_version == pipeline.review_reports.VERSION:
+                validation_reason = pipeline.review_reports.validation_problem(result_obj)
+            else:
+                validation_reason = "Legacy report failed schema validation."
+        except (OSError, UnicodeError, ValueError):
             pass
+
+    # Preserve rejected bytes before publishing any completion. For protocol 2,
+    # captured invalid output enters harvest as a protocol failure, never a new
+    # paid review/fix attempt. Legacy failures retain their existing gates.
+    captured = False
+    if os.path.isfile(temp_result):
+        destination = (result_path if exit_status == 0 and (result_valid or report_version is not None)
+                       else os.path.join(result_dir, "review-rejected.json"))
+        os.replace(temp_result, destination)
+        captured = destination == result_path
 
     # Clean up temp file if it wasn't renamed.
     if os.path.isfile(temp_result):
@@ -190,6 +210,9 @@ def run_engine(
         "start_time": wrapper_start_time,
         "result_valid": result_valid,
     }
+    if report_version is not None:
+        envelope.update(report_protocol_version=report_version, result_captured=captured,
+                        validation_reason=validation_reason)
     if exit_status != 0:
         envelope["error_class"] = "EngineExitError"
     pipeline.atomic_write(envelope_path, json.dumps(envelope))
@@ -244,6 +267,7 @@ def _write_failure_envelope(
     wrapper_pid: int,
     start_time: float,
     error: Exception,
+    report_protocol_version: int | None = None,
 ) -> None:
     """Atomically persist failure evidence for a wrapper startup exception."""
     envelope: dict[str, object] = {
@@ -254,6 +278,9 @@ def _write_failure_envelope(
         "result_valid": False,
         "error_class": type(error).__name__,
     }
+    if report_protocol_version is not None:
+        envelope.update(report_protocol_version=report_protocol_version, result_captured=False,
+                        validation_reason="Wrapper failed before report capture.")
     pipeline.atomic_write(envelope_path, json.dumps(envelope))
 
 
@@ -306,6 +333,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_run.add_argument("--head-sha", required=True, help="Pinned head SHA")
     p_run.add_argument("--fix-round", default="", help="Pinned no-change fixer round")
+    p_run.add_argument("--report-protocol-version", type=int, choices=[pipeline.review_reports.VERSION])
     p_run.add_argument("--pre-label", required=True, help="Pre-dispatch label")
     p_run.add_argument("engine_cmd", nargs=argparse.REMAINDER, help="Engine command after --")
 
@@ -333,6 +361,8 @@ def main(argv: list[str] | None = None) -> int:
         marker_template["base_tip_sha"] = args.base_tip_sha
     if args.fix_round:
         marker_template["fix_round"] = args.fix_round
+    if args.report_protocol_version is not None:
+        marker_template["report_protocol_version"] = args.report_protocol_version
 
     return run_engine(
         dispatch_id=args.dispatch_id,

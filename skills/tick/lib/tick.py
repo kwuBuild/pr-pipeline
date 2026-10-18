@@ -2200,6 +2200,9 @@ def _archive_harvest_evidence(
         "stderr.log",
         "prompt.txt",
         "review-comment-body.txt",
+        "review-rendered.md",
+        "review-manifest.json",
+        "review-rejected.json",
         _PR_BODY_SOURCE_FILE,
         _PR_BODY_REVISION_FILE,
         ".pr-metadata-decision.json",
@@ -3360,10 +3363,12 @@ def _classify_marker(
         envelope_valid = pipeline.validate_envelope(
             envelope=envelope,
             dispatch_id=dispatch_id,
+            report_protocol_version=marker.get("report_protocol_version"),
         )
         failure_envelope_valid = pipeline.validate_failure_envelope(
             envelope,
             expected_dispatch_id=dispatch_id,
+            report_protocol_version=marker.get("report_protocol_version"),
         )
 
     # Result file: use stage-specific name when given, else check both.
@@ -3375,6 +3380,8 @@ def _classify_marker(
     else:
         result_exists = _nonempty_file(os.path.join(wt_dir, "review.json")) or \
                         _nonempty_file(os.path.join(wt_dir, "result.json"))
+    if envelope_valid and marker.get("report_protocol_version") == pipeline.review_reports.VERSION:
+        result_exists = os.path.isfile(os.path.join(wt_dir, "review.json"))
 
     # Implementers and fixers run wrapperless and therefore have no verified
     # process exit status. Proven process death plus a non-empty result is enough
@@ -3705,7 +3712,16 @@ def _held_result_outcome(
             result_obj: object = json.load(fh)
     except (OSError, UnicodeError, json.JSONDecodeError):
         result_obj = None
-    return pipeline.held_completion_outcome(config.stage, result_obj)
+    version = None
+    if config.stage == "review":
+        try:
+            marker = json.loads(Path(wt_dir, "dispatch.json").read_text())
+            version = marker.get("report_protocol_version")
+            if version is not None:
+                result_obj = pipeline.review_reports.loads(Path(wt_dir, config.result_file).read_text())
+        except (OSError, UnicodeError, ValueError, AttributeError):
+            return pipeline.OUTCOME_UNRECOGNIZED
+    return pipeline.held_completion_outcome(config.stage, result_obj, report_protocol_version=version)
 
 
 def _reconcile_one(
@@ -6378,10 +6394,13 @@ def _harvest_one_reviewer(
     # Read review.json BEFORE network calls — fail fast on missing result
     review_path = os.path.join(wt_dir, "review.json")
     try:
-        with open(review_path) as fh:
-            review_raw = fh.read()
+        review_bytes = Path(review_path).read_bytes()
     except OSError:
         return
+    try:
+        review_raw = review_bytes.decode("utf-8")
+    except UnicodeError:
+        review_raw = ""  # Retain original bytes; a replacement decode cannot validate them.
 
     # Live PR identity point-read: base ref name + head OID in one snapshot
     # (authority for retarget and head drift). The marker's base_ref is
@@ -6452,6 +6471,8 @@ def _harvest_one_reviewer(
             current_base_ref=current_base_ref,
             fix_round=marker.get("fix_round", ""),
             threshold=max_iterations,
+            report_protocol_version=marker.get("report_protocol_version"),
+            review_identity=marker.get("dispatch_id", ""),
         )
     except Exception:
         # A persistent parse error in harvest_review would loop
@@ -6477,20 +6498,37 @@ def _harvest_one_reviewer(
         else "unknown"
     )
 
+    archive_dir = ""
+    if "report_protocol_version" in marker or harvest_result.get("rendered_report"):
+        rendered = str(harvest_result.get("rendered_report") or harvest_result.get("comment_body", ""))
+        try:
+            pipeline.atomic_write(os.path.join(wt_dir, "review-rendered.md"), rendered)
+            pipeline.atomic_write(os.path.join(wt_dir, "review-manifest.json"), json.dumps({
+                "report_protocol_version": marker.get("report_protocol_version", 1),
+                "dispatch_id": dispatch_id,
+                "source_sha256": hashlib.sha256(review_bytes).hexdigest(),
+                "rendered_sha256": pipeline.review_reports.digest(rendered),
+                "validation_reason": harvest_result.get("validation_reason", ""),
+                "outcome": harvest_result.get("action"),
+            }))
+        except (OSError, UnicodeError):
+            return
+        archive_dir = _archive_harvest_evidence(
+            wt_root=wt_root, wt_dir=wt_dir, kind="pr", number=n, dispatch_id=dispatch_id,
+            tick_log=tick_log, stage="review", reuse_existing=True,
+            required_files=("review.json", "review-rendered.md", "review-manifest.json"),
+        )
+        if not archive_dir:
+            return
+
     if harvest_label == pipeline.LABEL_NEEDS_HUMAN:
-        # The reviewer's own escalation is a terminal transition like the
-        # implementer's and the fixer's, and the only silent one:
-        # ``decide_review_harvest`` sets ``post_comment`` false for an
-        # unvalidatable verdict and for changes-requested with no blocking
-        # finding, so there is no comment for ``review_already_posted`` to make
-        # a retry idempotent with. Its target is also a hold, so a converge
-        # that lands without its scratch cleanup following it leaves a
-        # completed marker under a hold *this pipeline applied itself* — and
-        # the generic hold branch would then publish the held-completion
-        # notice, which states that a workflow hold was observed while the
-        # engine was running. Neither half of that is true here. The intent is
-        # the recovery owner that keeps the resume, rather than that branch,
-        # owning the window.
+        escalation_body = str(harvest_result.get("comment_body", ""))
+        if archive_dir and harvest_result.get("validation_reason"):
+            escalation_body += f"\n\nComplete source and validation record: `{archive_dir}`."
+        # Escalation uses terminal-intent/receipt recovery, not review-round
+        # identity. Persist the exact notice before remote writes so a landed
+        # relabel followed by interruption cannot be mistaken for a human hold.
+        # Only pre-upgrade invalid reports retain the legacy silent path.
         if not _record_terminal_intent(
             wt_root, "pr", n, dispatch_id, _REVIEWER_CONFIG.stage,
             kind="escalate",
@@ -6498,7 +6536,7 @@ def _harvest_one_reviewer(
             # Written explicitly: the resume validates the record against a
             # closed schema, where an absent field cannot be told apart from a
             # corrupted one.
-            comment_body="",
+            comment_body=escalation_body,
         ):
             if tick_log:
                 tick_log.log(
@@ -6530,7 +6568,7 @@ def _harvest_one_reviewer(
             dispatch_id=dispatch_id,
             stage=_REVIEWER_CONFIG.stage,
             harvest_label=harvest_label,
-            comment_body="",
+            comment_body=escalation_body,
             attempts=attempts,
             tick_log=tick_log,
         )
@@ -6585,6 +6623,11 @@ def _harvest_one_reviewer(
             details={"label": harvest_label, "outcome": harvest_result.get("action"),
                      "head_sha": current_head},
         )
+    if archive_dir and not _finalize_harvest_archive(
+        wt_dir, archive_dir, number=n, stage="review", phase="harvest",
+        dispatch_id=dispatch_id, tick_log=tick_log,
+    ):
+        return
     cleanup_scratch(wt_dir)
 
 
@@ -10031,6 +10074,7 @@ def _dispatch_one_reviewer(
     # Pin the published reasoning and its round token from one snapshot. A
     # failed read must not launch a reviewer that never saw why nothing moved.
     fix_round, fixer_summary, original_review = "", "", ""
+    original_finding_references = "No originating finding snapshot."
     fix_comments = _read_comment_history(
         pr_number, phase="dispatch", stage="review", tick_log=tick_log,
         trusted_author=trusted_author,
@@ -10044,6 +10088,14 @@ def _dispatch_one_reviewer(
         original_review = pipeline.fixer_original_review(
             fix_comments, fixer_summary, trusted_author=trusted_author,
         )
+        if original_review:
+            try:
+                original_finding_references = json.dumps(pipeline.review_reports.handoff(original_review))
+            except ValueError:
+                if tick_log:
+                    tick_log.log(pr=pr_number, phase="dispatch", stage="review", action="skip",
+                                 reason="original review finding identity is ambiguous — retained for retry")
+                return
         if fix_round and not original_review:
             if tick_log:
                 tick_log.log(
@@ -10168,6 +10220,7 @@ def _dispatch_one_reviewer(
         "base_ref": base_ref,
         "base_sha": base_sha,        # merge-base: what Codex diffs against
         "base_tip_sha": base_tip_sha,  # main tip at dispatch: used for drift detection
+        "report_protocol_version": pipeline.review_reports.VERSION,
         **({"fix_round": fix_round} if fix_round else {}),
         "head_sha": head_sha,
         "pre_label": pre_label,
@@ -10248,6 +10301,8 @@ def _dispatch_one_reviewer(
         "trusted_head_repo": TRUSTED_HEAD_REPO,
         "trusted_review_author": trusted_author,
         **context_values,
+        "original_finding_references": original_finding_references,
+        "report_allowance": pipeline.review_reports.AUTHOR_ALLOWANCE,
     })
 
     review_prompt = native_skills.reviewer_prompt(review_skills) + "\n\n" + review_prompt
@@ -10282,6 +10337,7 @@ def _dispatch_one_reviewer(
         "--base-ref", base_ref,
         "--base-sha", base_sha,
         "--base-tip-sha", base_tip_sha,
+        "--report-protocol-version", str(pipeline.review_reports.VERSION),
         *(["--fix-round", fix_round] if fix_round else []),
         "--head-sha", head_sha,
         "--pre-label", pre_label,
@@ -11555,6 +11611,17 @@ def _dispatch_one_fixer(
         )
         return
 
+    try:
+        review_handoff = pipeline.review_reports.handoff(review_body)
+    except ValueError as exc:
+        _escalate_dispatch_setup_failure(
+            entity="pr", number=pr_number,
+            pre_label=pipeline.LABEL_CHANGES_REQUESTED, stage="fix",
+            reason=f"review finding identity is ambiguous: {exc}",
+            engine=impl_engine, tick_log=tick_log,
+        )
+        return
+
     # Create an isolated git worktree at the remote tip of the PR branch in
     # detached HEAD mode. Detached HEAD avoids the "branch already checked
     # out in another worktree" error that occurs when a stale implementer
@@ -11647,6 +11714,7 @@ def _dispatch_one_fixer(
     # Bind the exact finding set before spawning. Its content fingerprint travels
     # through harvest's comment so re-review cannot substitute a later review.
     lease_marker["review_sha256"] = hashlib.sha256(review_body.encode()).hexdigest()
+    lease_marker["review_handoff"] = review_handoff
     try:
         pipeline.atomic_write(
             os.path.join(wt_dir, "dispatch.json"),
@@ -11680,6 +11748,7 @@ def _dispatch_one_fixer(
         "verification_context": _verification_prompt(verification_unconfigured),
         "pr_number": pr_number,
         **context_values,
+        "finding_references": json.dumps(review_handoff, ensure_ascii=False),
         "head_ref": head_ref,
         "revision_hygiene_skill_doc": skill_doc_path(REVISION_HYGIENE_SKILL),
         "revision_hygiene_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{REVISION_HYGIENE_SKILL}",

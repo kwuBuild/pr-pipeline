@@ -23,6 +23,8 @@ from types import ModuleType
 from unittest import mock
 from zoneinfo import ZoneInfo
 
+from conftest import legacy_review
+
 import pytest
 
 from tick import TickOutcome
@@ -3664,7 +3666,7 @@ def test_dispatch_one_fixer_resolves_model_for_claude_ds(
                         "tick.gh_json",
                         side_effect=fixer_gh_json(
                             comments=[
-                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfixes"},
+                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review("fixes")},
                             ],
                         ),
                     ):
@@ -18461,9 +18463,9 @@ def test_dispatch_one_fixer_escalates_when_label_flip_fails_and_kill_fails(
     with mock.patch("tick.git", side_effect=fixer_git(tmp_path)):
         with mock.patch("tick.gh_text", return_value="main"):
             with mock.patch("tick.gh_json", side_effect=fixer_gh_json(comments=[
-                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- ai-pipeline-review -->\nFindings: none"},
+                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review("Fix the fixture defect")},
             ])):
-                with mock.patch("tick.pipeline.REVIEW_MARKER", "<!-- ai-pipeline-review -->"):
+                with mock.patch("tick.pipeline.REVIEW_MARKER", "<!-- pr-pipeline:review -->"):
                     with mock.patch("tick.pipeline.atomic_write"):
                         with mock.patch("os.makedirs"):
                             with mock.patch(
@@ -18512,7 +18514,7 @@ def test_dispatch_one_fixer_escalates_when_engine_resolve_fails(
                         "tick.gh_json",
                         side_effect=fixer_gh_json(
                             comments=[
-                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfixes"},
+                                {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review("fixes")},
                             ],
                         ),
                     ):

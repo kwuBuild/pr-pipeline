@@ -856,7 +856,7 @@ def fixer_gh_json(
     import pipeline  # type: ignore[import-untyped]
 
     if comments is None:
-        comments = [{"author": {"login": TRUSTED_AUTHOR}, "body": f"{pipeline.REVIEW_MARKER}\nfindings"}]
+        comments = [{"author": {"login": TRUSTED_AUTHOR}, "body": legacy_review()}]
     repository = {"name": "test-repo", "owner": {"login": TRUSTED_AUTHOR}}
     refs = [
         {"number": issue.get("number", 7), "repository": repository}
@@ -894,3 +894,13 @@ def comment_pages(comments: list[dict[str, object]]) -> list[dict[str, object]]:
         "pageInfo": {"hasNextPage": i < len(chunks) - 1,
                      "endCursor": f"cursor-{i}" if chunk else None},
     }}}}} for i, chunk in enumerate(chunks)]
+
+
+def legacy_review(summary="findings"):
+    """A genuine historical controller report for dispatch tests."""
+    import pipeline
+    return pipeline.render_review_comment(
+        verdict="changes_requested",
+        findings=[{"severity": "major", "file": "app.py:1", "summary": summary}],
+        base_sha="b" * 40, head_sha="a" * 40,
+    )

@@ -242,23 +242,15 @@ Workflow:
    Clean up the temp file after posting.
 6. Report the comment URL back to the user.
 
-Suggested comment format (reviewing agent may adapt as long as the structure is recognizable):
-```
-## AI Code Review
-
-**Verdict:** <approve / request changes / comment>
-
-### Findings
-- **[severity]** <file:line> — <issue>. <suggested fix>.
-
-### Nits
-- <file:line> — <minor point>
-
-### What's good
-- <positive observations>
-```
-
-Severity tags: `blocker`, `major`, `minor`. Omit empty sections. The format is a guideline — if the reviewing agent has a better way to communicate a specific finding, use it.
+Use the [reviewer report contract](reviewer-report-contract.md) for report
+content and examples. Manual reviewers can write Markdown directly; dispatched
+reviewers return the versioned JSON schema. State the verdict and scope,
+findings with stable IDs and evidence, verification actually performed, remaining
+risks, and optional observations. Keep observations outside the agreed scope
+explicit. A clean review needs reasoning and a verification account, with no
+invented finding. Use `ai:needs-human-decision` when required evidence, authority,
+or access prevents a defensible conclusion, and explain the missing input.
+Mechanical report validation does not certify review quality.
 
 This posting + labeling action is pre-authorized — it is not a destructive remote op and does not need per-PR confirmation. It does NOT override the owner-only rule for deletes, closes, merges, or force-pushes to others' branches.
 

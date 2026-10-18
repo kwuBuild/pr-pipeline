@@ -695,3 +695,15 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
   The tick still runs. Whether `auto` permission mode works was measured on the
   recorded route only; rerun setup to probe the new one
 - Reviewer Codex floor: `codex-cli 0.142.5`
+
+## Reviewer report failures
+
+For a protocol 2 reviewer escalation, inspect `review-manifest.json` at the
+`.harvest-evidence/` location named in the notice. `validation_reason` separates
+invalid or oversized output from a valid `needs_human_decision` report.
+`review.json` retains original bytes; `review-rendered.md` retains the complete
+render, including oversized content. Do not truncate the source to force
+publication. A failed archive, post, or relabel retains the marker and source
+for retry. A missing or mismatched completion version is not accepted as legacy
+completion. See the [report contract](../../docs/working/reviewer-report-contract.md)
+for recovery ownership and compatibility.

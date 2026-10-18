@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Literal, TypedDict, cast
 
 import native_skills
+import review_reports
 
 
 @dataclass(frozen=True)
@@ -111,7 +112,7 @@ VERDICT_CHANGES = "changes_requested"
 _VALID_VERDICTS = frozenset({VERDICT_READY, VERDICT_CHANGES})
 _VALID_SEVERITIES = frozenset({"blocker", "major", "minor"})
 
-Verdict = Literal["ready_for_human", "changes_requested"]
+Verdict = Literal["ready_for_human", "changes_requested", "needs_human_decision"]
 
 # Pipeline labels.
 LABEL_AVAILABLE = "ai:available"  # pre-dispatch label for the implement stage
@@ -413,7 +414,7 @@ _FIXER_SENTINELS = (
     SENTINEL_FIXES_PUSHED, SENTINEL_NO_CHANGES, SENTINEL_NEEDS_HUMAN_DECISION,
 )
 _HELD_COMPLETION_OUTCOMES = {
-    "review": frozenset({VERDICT_READY, VERDICT_CHANGES, OUTCOME_UNRECOGNIZED}),
+    "review": frozenset({VERDICT_READY, VERDICT_CHANGES, "needs_human_decision", OUTCOME_UNRECOGNIZED}),
     "implement": frozenset({*_IMPLEMENTATION_SENTINELS, OUTCOME_UNRECOGNIZED}),
     "fix": frozenset({*_FIXER_SENTINELS, OUTCOME_UNRECOGNIZED}),
 }
@@ -1150,6 +1151,7 @@ def validate_failure_envelope(
     obj: object,
     *,
     expected_dispatch_id: str,
+    report_protocol_version: int | None = None,
 ) -> bool:
     """Validate a wrapper-confirmed, dispatch-bound engine failure envelope.
 
@@ -1161,6 +1163,8 @@ def validate_failure_envelope(
         ``True`` only for a structurally valid nonzero-exit envelope whose wrapper
         rejected the result and whose dispatch identifier matches the marker.
     """
+    if report_protocol_version is not None:
+        obj = review_reports.envelope_base(obj, report_protocol_version, captured=False)
     if not isinstance(obj, dict):
         return False
     if set(obj.keys()) != _REQUIRED_FAILURE_ENVELOPE_FIELDS:
@@ -1276,13 +1280,13 @@ MAX_ITERATIONS = 5
 MAX_DISPATCH_ATTEMPTS = 3
 
 
-def validate_review(obj: object) -> Verdict | None:
+def validate_review(obj: object, *, report_protocol_version: int | None = None) -> Verdict | None:
     """Validate a parsed ``review.json`` against the reviewer output schema.
 
     A defensive re-check of what ``codex exec --output-schema`` should already
-    guarantee: the harvest must never promote a PR to human review on the basis
-    of malformed reviewer output, so anything that does not conform is rejected
-    and the caller applies the conservative ``changes_requested`` default.
+    guarantee: the harvest must never promote a PR on malformed output. New
+    reports use the dispatch-pinned protocol, and failures route to a human
+    decision. Missing version retains the already-running legacy gates.
 
     Args:
         obj: The object parsed from ``review.json`` (any JSON value).
@@ -1292,7 +1296,11 @@ def validate_review(obj: object) -> Verdict | None:
         ``review-schema.json`` (missing/unknown ``verdict``, a missing or
         non-list ``findings`` array, or a malformed ``findings`` entry).
     """
-    if not isinstance(obj, dict):
+    if report_protocol_version is not None:
+        if type(report_protocol_version) is not int or report_protocol_version != review_reports.VERSION:
+            return None
+        return None if review_reports.validation_problem(obj) else obj["verdict"]
+    if not isinstance(obj, dict) or "report_protocol_version" in obj:
         return None
     verdict = obj.get("verdict")
     if not isinstance(verdict, str) or verdict not in _VALID_VERDICTS:
@@ -1688,6 +1696,8 @@ def decide_review_harvest(
     current_base_ref: str = "",
     fix_round: str = "",
     trusted_author: str,
+    report_protocol_version: int | None = None,
+    review_identity: str = "",
 ) -> dict[str, object]:
     """Decide the full outcome of harvesting one finished review.
 
@@ -1747,7 +1757,7 @@ def decide_review_harvest(
         posting).
     """
     rounds = count_review_rounds(comments, trusted_author=trusted_author)
-    verdict = validate_review(review_obj)
+    verdict = validate_review(review_obj, report_protocol_version=report_protocol_version)
 
     # A retargeted PR invalidates the review outright: the diff was anchored
     # to the old base, and the SHA drift checks below cannot see the change —
@@ -1799,10 +1809,29 @@ def decide_review_harvest(
     #     empty review and spend further rounds on nothing.
     #   * changes_requested with NO blocker/major finding — contradicts the repo rule
     #     that nits alone do not warrant changes, and would dispatch a fixer with no
-    #     actionable finding. (The opposite contradiction — ready_for_human WITH a
-    #     blocker — is safely downgraded to changes below, not escalated.)
+    #     actionable finding. Legacy ready-with-blockers is downgraded below;
+    #     protocol 2 rejects either contradictory outcome as a protocol failure.
     blocking = has_blocking_findings(findings)
-    if verdict is None or (verdict == VERDICT_CHANGES and not blocking):
+    rendered_report = ""
+    validation_reason = ""
+    if report_protocol_version is not None:
+        validation_reason = review_reports.validation_problem(review_obj)
+        if report_protocol_version != review_reports.VERSION:
+            validation_reason = "Unknown dispatch report protocol version."
+        if not validation_reason:
+            token = _round_token(diff_base_sha or pinned_base, pinned_base, pinned_head,
+                                 pinned_base_ref, fix_round)
+            header = (ESCALATION_MARKER if verdict == "needs_human_decision"
+                      else REVIEW_MARKER + "\n" + token)
+            rendered_report = review_reports.render(
+                review_obj, identity=review_identity or token, header=header,
+                audit=(f"**Codex review** (base `{pinned_base_ref}`, diff base "
+                       f"`{diff_base_sha or pinned_base}`, base tip `{pinned_base}`, head `{pinned_head}`)"),
+            )
+            if not review_reports.within_limit(rendered_report):
+                validation_reason = "Complete rendered report exceeds 60,000 characters or UTF-8 bytes."
+    if (verdict is None or verdict == "needs_human_decision" or validation_reason
+            or (verdict == VERDICT_CHANGES and not blocking)):
         return {
             "action": "escalate",
             "label": LABEL_NEEDS_HUMAN,
@@ -1813,7 +1842,11 @@ def decide_review_harvest(
             "head_drift": False,
             "rounds": rounds,
             "post_comment": False,
-            "comment_body": "",
+            "comment_body": (rendered_report if verdict == "needs_human_decision" and not validation_reason
+                             else ESCALATION_MARKER + "\n\nReview report requires a human decision.\n\n" + validation_reason
+                             if report_protocol_version is not None else ""),
+            "rendered_report": rendered_report,
+            "validation_reason": validation_reason,
         }
 
     # Promote only when the verdict AND the findings agree there is nothing
@@ -1826,7 +1859,7 @@ def decide_review_harvest(
     # above guarantees pinned_base == current_base here, so pinning is not a
     # semantic change for the drift guard, only for the record's honesty.
     diff_base = diff_base_sha or pinned_base
-    comment_body = render_review_comment(
+    comment_body = rendered_report or render_review_comment(
         verdict=render_verdict,
         findings=findings,
         base_sha=diff_base,
@@ -1835,6 +1868,18 @@ def decide_review_harvest(
         base_ref=pinned_base_ref,
         fix_round=fix_round,
     )
+    if report_protocol_version is None:
+        comment_body += "\n\n" + review_reports.LEGACY_NOTE
+    if not review_reports.within_limit(comment_body):
+        reason = "Complete rendered report exceeds 60,000 characters or UTF-8 bytes."
+        return {
+            "action": "escalate", "label": LABEL_NEEDS_HUMAN,
+            "sentinel": SENTINEL_BLOCKERS, "verdict": verdict,
+            "base_retarget": False, "base_drift": False, "head_drift": False,
+            "rounds": rounds, "post_comment": False,
+            "comment_body": ESCALATION_MARKER + "\n\nReview report requires a human decision.\n\n" + reason,
+            "rendered_report": comment_body, "validation_reason": reason,
+        }
 
     # Idempotency: a comment already posted for this round means it is already
     # reflected in ``rounds`` — do not re-post it or double-count it. The
@@ -3154,7 +3199,7 @@ def parse_fix_result(obj: object) -> str | None:
     return _parse_result_sentinel(obj, _FIXER_SENTINELS)
 
 
-def held_completion_outcome(stage: str, result_obj: object) -> str:
+def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_version: int | None = None) -> str:
     """Return the validated engine outcome completed under a human hold.
 
     Args:
@@ -3170,7 +3215,7 @@ def held_completion_outcome(stage: str, result_obj: object) -> str:
         ValueError: If ``stage`` is not a known pipeline stage.
     """
     if stage == "review":
-        outcome = validate_review(result_obj)
+        outcome = validate_review(result_obj, report_protocol_version=report_protocol_version)
     elif stage == "implement":
         outcome = parse_implementation_result(result_obj)
     elif stage == "fix":
@@ -4221,7 +4266,7 @@ _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
     {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
      "fix_round", "review_sha256", "verification_unconfigured",
      "permission_mode", "verify_tools", "stall_seconds",
-     "stall_startup_grace_seconds"}
+     "stall_startup_grace_seconds", "report_protocol_version", "review_handoff"}
 )
 
 # The stall limits an implementer/fixer was dispatched under, with the minimum
@@ -4449,6 +4494,17 @@ def valid_marker(
         if stage != "fix" or not isinstance(review_sha256, str):
             return False
         if not re.fullmatch(r"[a-f0-9]{64}", review_sha256):
+            return False
+
+    if "report_protocol_version" in obj:
+        if (stage != "review" or type(obj["report_protocol_version"]) is not int
+                or obj["report_protocol_version"] != review_reports.VERSION):
+            return False
+
+    if "review_handoff" in obj:
+        if stage != "fix" or not review_reports.valid_handoff(obj["review_handoff"]):
+            return False
+        if obj.get("review_sha256") != obj["review_handoff"]["comment_sha256"]:
             return False
 
     # Implementer launch policy is one optional snapshot. Old markers omit it;
@@ -4795,6 +4851,8 @@ def harvest_review(
     current_base_ref: str = "",
     fix_round: str = "",
     trusted_author: str,
+    report_protocol_version: int | None = None,
+    review_identity: str = "",
 ) -> HarvestResult:
     """Decide the outcome of harvesting one finished review.
 
@@ -4820,7 +4878,13 @@ def harvest_review(
     Returns:
         A HarvestResult mapping with action, label, and stage-specific keys.
     """
-    review_obj = _load_json_string(review, None)
+    if report_protocol_version is None:
+        review_obj = _load_json_string(review, None)
+    else:
+        try:
+            review_obj = review_reports.loads(review)
+        except ValueError:
+            review_obj = None
     comments_list = _as_comment_list(json.loads(comments))
     result = decide_review_harvest(
         trusted_author=trusted_author,
@@ -4836,6 +4900,8 @@ def harvest_review(
         pinned_base_ref=pinned_base_ref,
         current_base_ref=current_base_ref,
         fix_round=fix_round,
+        report_protocol_version=report_protocol_version,
+        review_identity=review_identity,
     )
     return result  # type: ignore[return-value]
 
@@ -4960,6 +5026,7 @@ def validate_envelope(
     *,
     envelope: object,
     dispatch_id: str | None = None,
+    report_protocol_version: int | None = None,
 ) -> bool:
     """Return whether a completion envelope is valid and dispatch-id-bound.
 
@@ -4970,6 +5037,13 @@ def validate_envelope(
     Returns:
         ``True`` only when the envelope is structurally valid.
     """
+    if report_protocol_version is not None:
+        envelope = review_reports.envelope_base(envelope, report_protocol_version, captured=True)
+        if envelope is None:
+            return False
+        # Completion proves capture and successful engine exit. The report's
+        # validity remains separate; harvest independently rejects bad content.
+        envelope["result_valid"] = True
     return validate_completion_envelope(
         envelope,
         expected_dispatch_id=dispatch_id,
@@ -5102,13 +5176,19 @@ def _cmd_harvest_review(args: argparse.Namespace) -> int:
         pinned_base_ref=args.pinned_base_ref,
         current_base_ref=args.current_base_ref,
         fix_round=args.fix_round,
+        report_protocol_version=args.report_protocol_version,
+        review_identity=args.review_identity,
     )
     print(json.dumps(decision))
     return 0
 
 
 def _cmd_validate_review(args: argparse.Namespace) -> int:
-    verdict = validate_review(_load_json(args.review, None))
+    try:
+        obj = review_reports.loads(_read_file(args.review))
+    except ValueError:
+        obj = None
+    verdict = validate_review(obj, report_protocol_version=args.report_protocol_version)
     if verdict is None:
         print("INVALID")
         return 1
@@ -5213,6 +5293,7 @@ def _cmd_validate_envelope(args: argparse.Namespace) -> int:
     valid = validate_envelope(
         envelope=envelope,
         dispatch_id=args.dispatch_id,
+        report_protocol_version=args.report_protocol_version,
     )
     print(json.dumps({"valid": valid}))
     return 0
@@ -5448,10 +5529,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_harvest.add_argument("--threshold", type=int, default=MAX_ITERATIONS)
     p_harvest.add_argument("--fix-round", default="", help="Pinned no-change fixer round")
+    p_harvest.add_argument("--report-protocol-version", type=int)
+    p_harvest.add_argument("--review-identity", default="", help="Pinned reviewer dispatch identity")
     p_harvest.set_defaults(func=_cmd_harvest_review)
 
     p_validate = sub.add_parser("validate-review", help="Validate a review.json against the schema")
     p_validate.add_argument("--review", required=True, help="Path to review.json")
+    p_validate.add_argument("--report-protocol-version", type=int)
     p_validate.set_defaults(func=_cmd_validate_review)
 
     p_classify = sub.add_parser("classify-dispatch", help="Classify a dispatch's liveness")
@@ -5586,6 +5670,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Report whether a completion envelope is valid and dispatch-id-bound",
     )
     p_envelope.add_argument("--envelope", required=True, help="Path to completion.json")
+    p_envelope.add_argument("--report-protocol-version", type=int)
     p_envelope.add_argument(
         "--dispatch-id", default=None, help="Expected dispatch_id from the marker"
     )

@@ -60,6 +60,10 @@ def loop_repo(tmp_path):
         "LOOP_TEST_ROOT": str(repo), "LOOP_TEST_GIT": git, "LOOP_TEST_SHA": sha,
         "LOOP_TEST_LABELS": json.dumps(sorted(pipeline.WORKFLOW_LABELS)),
         "LOOP_TEST_REVIEW_MARKER": pipeline.REVIEW_MARKER,
+        "LOOP_TEST_REVIEW_BODY": pipeline.render_review_comment(
+            verdict="changes_requested", base_sha=sha, head_sha=sha,
+            findings=[{"severity": "major", "file": "app.py:1", "summary": "Fix fixture"}],
+        ),
     }
     return repo, env
 
@@ -471,7 +475,7 @@ item = {"number": 7, "title": "Loop fixture", "body": "Fixture contract",
         "headRepositoryOwner": {"login": "example"},
         "headRepository": {"name": "loop", "nameWithOwner": "example/loop"},
         "closingIssuesReferences": [], "closedByPullRequestsReferences": [], "statusCheckRollup": [],
-        "comments": [{"body": os.environ["LOOP_TEST_REVIEW_MARKER"] + "\\nFix fixture"}]}
+        "comments": [{"body": os.environ["LOOP_TEST_REVIEW_BODY"]}]}
 result = None
 if a == ["--version"]:
     print("gh version 2.75.0"); sys.exit(0)

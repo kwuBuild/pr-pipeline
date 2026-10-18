@@ -16,6 +16,8 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from unittest import mock
 
+from conftest import legacy_review
+
 import pytest
 
 from conftest import comment_pages
@@ -1140,7 +1142,7 @@ def test_dispatch_one_fixer_terminates_on_relabel_failure(
                     # the review-extraction gate to engine launch + relabel.
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings here"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review('findings here')},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -1460,12 +1462,12 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    review_comment_body = (
-        "<!-- pr-pipeline:review -->\n"
-        "## Review Findings\n"
-        "- **blocker** in `app/auth.py`: SQL injection in login handler\n"
-        "- **major** in `app/api.py`: Missing rate limiting\n"
-        "base: abc123 | head: def456"
+    review_comment_body = pipeline.render_review_comment(
+        verdict="changes_requested", base_sha="b" * 40, head_sha="a" * 40,
+        findings=[
+            {"severity": "blocker", "file": "app/auth.py", "summary": "SQL injection in login handler"},
+            {"severity": "major", "file": "app/api.py", "summary": "Missing rate limiting"},
+        ],
     )
 
     proc_mock = mock.MagicMock()
@@ -1562,12 +1564,7 @@ def test_dispatch_one_fixer_model_selection_matches_implementer(
                     gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                     with mock.patch("tick.gh_json") as gh_json_mock:
                         gh_json_mock.side_effect = fixer_gh_json(comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"},
-                            "body": (
-                                "<!-- pr-pipeline:review -->\n"
-                                "## Review Findings\n"
-                                "- **major** in `app/api.py`: no rate limit\n"
-                                "base: abc123 | head: def456"
-                            ),
+                            "body": legacy_review("no rate limit"),
                         }])
                         with mock.patch("tick.pipeline.atomic_write") as aw_mock:
                             aw_mock.side_effect = lambda path, data: (
@@ -2937,7 +2934,7 @@ def test_dispatch_one_fixer_skips_cleanup_when_kill_fails(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review('findings')},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -3046,7 +3043,7 @@ def test_dispatch_one_fixer_passes_parent_env_to_popen(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_review('findings')},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -3465,7 +3462,7 @@ def test_fixer_dispatch_uses_pr_branch_for_worktree(
         git_calls.append(args)
         return materialize(*args)
 
-    review_body = "<!-- pr-pipeline:review -->\nfindings here"
+    review_body = legacy_review('findings here')
 
     proc_mock = mock.MagicMock()
     proc_mock.pid = 12345
@@ -3963,7 +3960,7 @@ def test_fixer_dispatch_uses_bounded_unattended_flags(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    review_body = "<!-- pr-pipeline:review -->\nfindings"
+    review_body = legacy_review('findings')
 
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch(
@@ -4090,7 +4087,7 @@ def test_fixer_dispatch_records_its_deadline_and_stall_limits(
     wt_root.mkdir()
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
-    review_body = "<!-- pr-pipeline:review -->\nfindings"
+    review_body = legacy_review('findings')
     markers: list[dict[str, object]] = []
 
     with mock.patch("tick.WT_ROOT", str(wt_root)):
@@ -4190,7 +4187,7 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
-    review_body = "<!-- pr-pipeline:review -->\nfindings"
+    review_body = legacy_review('findings')
 
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch(

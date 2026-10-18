@@ -136,6 +136,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "verification_context": "Operator grants are configured.",
         "pr_number": 2,
         "review_body": "findings",
+        "finding_references": "Controller finding snapshot.",
         "pr_body": "## Summary",
         "issue_contract": "### Issue example/repo#1 — contract render",
         "discussion_file": "/fixture/discussion.json",
