@@ -11325,7 +11325,7 @@ def test_harvest_one_implementer_resumes_handoff_for_existing_pr(
     base_ref: str,
 ) -> None:
     """A retried handoff whose PR already exists must not run `gh pr create`
-    again — it rediscovers the open PR and retries only the label steps."""
+    again — it checks the live report before retrying the label steps."""
     from tick import _harvest_one_implementer  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -11349,9 +11349,12 @@ def test_harvest_one_implementer_resumes_handoff_for_existing_pr(
     def gh_text_side_effect(*args: str, **_kwargs: object) -> str:
         raise AssertionError(f"unexpected gh_text call: {args}")
 
+    snapshot = {
+        "labels": [], "headRefOid": "a" * 40,
+        "body": "## Test coverage\nDefinition of done: n/a — wording only.\n",
+    }
     gh_json_reads: list[object] = [
-        [{"number": 99, "isCrossRepository": False}],
-        {"labels": []},
+        [{"number": 99, "isCrossRepository": False}], snapshot, snapshot,
     ]
 
     with mock.patch("tick.pipeline.harvest_implementation") as harvest_impl:
@@ -11406,9 +11409,12 @@ def test_harvest_one_implementer_resume_preserves_progressed_pr_state(
     def gh_text_side_effect(*args: str, **_kwargs: object) -> str:
         raise AssertionError(f"unexpected gh_text call: {args}")
 
+    snapshot = {
+        "labels": [{"name": "ai:changes-requested"}], "headRefOid": "a" * 40,
+        "body": "## Test coverage\nDefinition of done: n/a — wording only.\n",
+    }
     gh_json_reads: list[object] = [
-        [{"number": 99, "isCrossRepository": False}],
-        {"labels": [{"name": "ai:changes-requested"}]},
+        [{"number": 99, "isCrossRepository": False}], snapshot, snapshot,
     ]
 
     with mock.patch("tick.pipeline.harvest_implementation") as harvest_impl:

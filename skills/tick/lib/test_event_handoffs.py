@@ -89,6 +89,11 @@ def harvest(tmp_path: Path, monkeypatch, stage, *, failure=None, existing=False)
             return {"baseRefName": "main", "headRefOid": "b" * 40}
         if "headRefOid,body" in args:
             return {"headRefOid": "c" * 40}
+        if "labels,headRefOid,body" in args:
+            return {
+                "labels": [{"name": "ai:implemented"}], "headRefOid": "c" * 40,
+                "body": "## Test coverage\nDefinition of done: n/a — wording only.\n",
+            }
         if "labels" in args:
             return {"labels": [{"name": "ai:implemented"}]}
         if "number,isCrossRepository" in args:
