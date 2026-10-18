@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 import tick
+from conftest import comment_pages
 
 
 @pytest.mark.parametrize("stage, action", [
@@ -32,7 +33,9 @@ def test_handoff_confirmation_follows_publication(tmp_path, monkeypatch, stage, 
     ("review", "comment"), ("review", "label"), ("fix", "comment"), ("fix", "label"),
 ])
 def test_failed_handoff_never_emits_success(tmp_path, monkeypatch, stage, failure):
-    events, _ = harvest(tmp_path, monkeypatch, stage, failure=failure)
+    events, order = harvest(tmp_path, monkeypatch, stage, failure=failure)
+    if stage == "review":
+        assert failure in order
     assert not any(e["action"] in {"pr_handoff", "review_handoff", "revision_handoff"} for e in events)
     entity = "issue" if stage == "implement" else "pr"
     assert (tmp_path / "worktrees" / f"{entity}-27" / "dispatch.json").exists()
@@ -80,6 +83,8 @@ def harvest(tmp_path: Path, monkeypatch, stage, *, failure=None, existing=False)
         order.append("label")
         return failure != "label"
     def read(*args):
+        if args[:2] == ("api", "graphql"):
+            return comment_pages([])
         if "baseRefName,headRefOid" in args:
             return {"baseRefName": "main", "headRefOid": "b" * 40}
         if "headRefOid,body" in args:

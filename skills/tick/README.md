@@ -1478,6 +1478,48 @@ The parser checks every reported block; it does not prove that the report
 covers every original finding or that a reason is correct. The prompt requires
 complete coverage, and the independent reviewer owns that judgement.
 
+### Comment trust and incomplete history
+
+The tick uses the operator login validated at startup to authenticate PR
+comments. Before reviewer/fixer dispatch and reviewer harvest, it reads the
+GraphQL comment connection twice. Each traversal must have unique comment IDs,
+valid page boundaries, and a stable total equal to the number of returned records.
+The two complete traversals must match. A detected deletion, edit, or replacement
+holds the PR for a later tick. These checks detect changing history; they do not
+provide an atomic GitHub snapshot or cover a change after the final read.
+
+Only unedited comments by that operator, with an exact marker on the first line,
+can supply fixer instructions, no-change review context, review-round counts, or
+review replay proof. A newer comment from another author cannot replace a trusted
+review. The same published review token counts once; older trusted comments
+without a round token still count individually. LF and CRLF separators are
+accepted; header whitespace is not. Raw bodies stay unchanged for fingerprints.
+
+GitHub's `lastEditedAt`, `editor`, and `includesCreatedEdit` must explicitly report
+no edit on every operator-authored comment. Original authorship and matching REST
+timestamps do not authenticate the current body. An edited operator comment holds
+processing even when its marker is gone, since ignoring it could erase a review
+round. This also holds ordinary operator notes and operator-made edits. A known
+foreign author's comment still has no authority, edited or otherwise.
+
+Known foreign authors are ignored and recorded locally as
+`comment_authors_ignored`. If a fixer has no trusted review, setup escalates to
+`ai:needs-human-decision` without launching an engine. Missing/malformed authors,
+missing edit provenance, edited operator comments, malformed bodies or pages,
+changing histories, and failed page reads are different: the tick records
+`comment_history_refused`, retains the current label and existing evidence, and
+launches no reviewer or fixer. Reviewer harvest cannot promote or reset rounds
+from that incomplete history. Restore access and retry a transient read or race.
+An edited operator record needs manual review and disposition; do not delete or
+repost it as a way to reset the recorded rounds. The tick has no automatic edit
+waiver. A missing author or edit record must not be treated as zero genuine reviews.
+
+Review publication uses authenticated comment history for replay. Fixer and
+escalation publication use the existing controller-owned receipts under
+`WT_ROOT/.receipts/`; remote `FIX_MARKER` or `ESCALATION_MARKER` text cannot forge
+those receipts. Fixer comments are read only for authenticated re-review context.
+This boundary does not distinguish two actors using the same operator credential.
+
 ### Escalation publication coverage
 
 The following map records the harvest and dispatch publication paths. The silent

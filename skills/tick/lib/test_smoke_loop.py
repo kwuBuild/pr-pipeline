@@ -475,6 +475,11 @@ item = {"number": 7, "title": "Loop fixture", "body": "Fixture contract",
 result = None
 if a == ["--version"]:
     print("gh version 2.75.0"); sys.exit(0)
+elif a[:2] == ["api", "graphql"]:
+    result = [{"data": {"repository": {"pullRequest": {"comments": {
+        "totalCount": 1, "nodes": [{"id": "1", "author": {"login": "test-owner"},
+        "body": item["comments"][0]["body"], "lastEditedAt": None, "editor": None,
+        "includesCreatedEdit": False}], "pageInfo": {"hasNextPage": False, "endCursor": "one"}}}}}}]
 elif a[0] == "api" and "/labels?" in a[1]:
     result = [[{"name": name} for name in json.loads(os.environ["LOOP_TEST_LABELS"])]]
 elif a[:2] in (["issue", "list"], ["pr", "list"]):

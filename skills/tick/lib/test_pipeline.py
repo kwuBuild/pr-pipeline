@@ -269,14 +269,14 @@ def test_review_already_posted_true_when_round_token_present() -> None:
         base_sha="b1",
         head_sha="h1",
     )
-    assert pipeline.review_already_posted([{"body": body}], "b1", "h1") is True
+    assert pipeline.review_already_posted([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], "b1", "h1", trusted_author="test-owner") is True
 
 
 def test_review_already_posted_false_for_different_head() -> None:
     body = pipeline.render_review_comment(
         verdict="changes_requested", findings=[], base_sha="b1", head_sha="h1"
     )
-    assert pipeline.review_already_posted([{"body": body}], "b1", "h2") is False
+    assert pipeline.review_already_posted([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], "b1", "h2", trusted_author="test-owner") is False
 
 
 def test_review_already_posted_false_for_same_head_different_base() -> None:
@@ -284,11 +284,11 @@ def test_review_already_posted_false_for_same_head_different_base() -> None:
     body = pipeline.render_review_comment(
         verdict="changes_requested", findings=[], base_sha="b1", head_sha="h1"
     )
-    assert pipeline.review_already_posted([{"body": body}], "b2", "h1") is False
+    assert pipeline.review_already_posted([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], "b2", "h1", trusted_author="test-owner") is False
 
 
 def test_review_already_posted_false_when_no_marked_comments() -> None:
-    assert pipeline.review_already_posted([{"body": "just a human note"}], "b1", "h1") is False
+    assert pipeline.review_already_posted([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "just a human note"}], "b1", "h1", trusted_author="test-owner") is False
 
 
 # --- count_review_rounds ---
@@ -296,21 +296,22 @@ def test_review_already_posted_false_when_no_marked_comments() -> None:
 
 def test_count_review_rounds_counts_only_marked_comments() -> None:
     comments = [
-        {"body": "random human comment"},
-        {"body": f"{pipeline.REVIEW_MARKER}\n\nround 1 findings"},
-        {"body": "another human note"},
-        {"body": f"{pipeline.REVIEW_MARKER}\n\nround 2 findings"},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "random human comment"},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": f"{pipeline.REVIEW_MARKER}\n\nround 1 findings"},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "another human note"},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": f"{pipeline.REVIEW_MARKER}\n\nround 2 findings"},
     ]
-    assert pipeline.count_review_rounds(comments, pipeline.REVIEW_MARKER) == 2
+    assert pipeline.count_review_rounds(comments, pipeline.REVIEW_MARKER, trusted_author="test-owner") == 2
 
 
 def test_count_review_rounds_zero_when_no_marked_comments() -> None:
-    assert pipeline.count_review_rounds([{"body": "hi"}], pipeline.REVIEW_MARKER) == 0
+    assert pipeline.count_review_rounds([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "hi"}], pipeline.REVIEW_MARKER, trusted_author="test-owner") == 0
 
 
-def test_count_review_rounds_tolerates_missing_or_nonstring_body() -> None:
+def test_count_review_rounds_rejects_missing_or_nonstring_body() -> None:
     comments = [{}, {"body": None}, {"body": pipeline.REVIEW_MARKER}]
-    assert pipeline.count_review_rounds(comments, pipeline.REVIEW_MARKER) == 1
+    with pytest.raises(ValueError):
+        pipeline.count_review_rounds(comments, trusted_author="test-owner")
 
 
 def test_at_max_iterations_routes_to_max_iterations_label() -> None:
@@ -449,9 +450,9 @@ def test_render_review_comment_embeds_marker_and_base_sha() -> None:
     assert "leak" in body
     assert "blocker" in body.lower()
     # The marker must be present so count_review_rounds tallies this round.
-    assert pipeline.count_review_rounds([{"body": body}]) == 1
+    assert pipeline.count_review_rounds([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], trusted_author="test-owner") == 1
     # The round token must be present so re-runs are idempotent.
-    assert pipeline.review_already_posted([{"body": body}], "abc123", "head789") is True
+    assert pipeline.review_already_posted([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], "abc123", "head789", trusted_author="test-owner") is True
 
 
 def test_render_review_comment_handles_clean_review() -> None:
@@ -460,7 +461,7 @@ def test_render_review_comment_handles_clean_review() -> None:
     )
     assert body.startswith(pipeline.REVIEW_MARKER)
     assert "abc123" in body
-    assert pipeline.count_review_rounds([{"body": body}]) == 1
+    assert pipeline.count_review_rounds([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], trusted_author="test-owner") == 1
 
 
 def test_render_review_comment_embeds_diff_base_and_freshness_tip() -> None:
@@ -490,18 +491,22 @@ def test_review_already_posted_keys_on_diff_base_tip_and_head() -> None:
         base_tip_sha="tip1",
         head_sha="h1",
     )
-    comments = [{"body": body}]
+    comments = [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}]
     assert pipeline.review_already_posted(
         comments, "mb1", "h1", base_tip_sha="tip1",
+        trusted_author="test-owner",
     ) is True
     assert pipeline.review_already_posted(
         comments, "mb2", "h1", base_tip_sha="tip1",
+        trusted_author="test-owner",
     ) is False
     assert pipeline.review_already_posted(
         comments, "mb1", "h1", base_tip_sha="tip2",
+        trusted_author="test-owner",
     ) is False
     assert pipeline.review_already_posted(
         comments, "mb1", "h2", base_tip_sha="tip1",
+        trusted_author="test-owner",
     ) is False
 
 
@@ -518,12 +523,14 @@ def test_review_already_posted_keys_on_base_ref() -> None:
         head_sha="h1",
         base_ref="main",
     )
-    comments = [{"body": body}]
+    comments = [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}]
     assert pipeline.review_already_posted(
         comments, "mb1", "h1", base_tip_sha="tip1", base_ref="main",
+        trusted_author="test-owner",
     ) is True
     assert pipeline.review_already_posted(
         comments, "mb1", "h1", base_tip_sha="tip1", base_ref="develop",
+        trusted_author="test-owner",
     ) is False
 
 
@@ -548,14 +555,17 @@ def test_review_already_posted_base_ref_legacy_fallback() -> None:
         base_ref="main",
     )
     assert pipeline.review_already_posted(
-        [{"body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
+        [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
+        trusted_author="test-owner",
     ) is True
     assert pipeline.review_already_posted(
-        [{"body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
+        [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": legacy_body}], "mb1", "h1", base_tip_sha="tip1",
         base_ref="main",
+        trusted_author="test-owner",
     ) is False
     assert pipeline.review_already_posted(
-        [{"body": ref_body}], "mb1", "h1", base_tip_sha="tip1",
+        [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": ref_body}], "mb1", "h1", base_tip_sha="tip1",
+        trusted_author="test-owner",
     ) is False
 
 
@@ -578,7 +588,7 @@ def test_decide_posts_fresh_review_when_same_shas_new_base_ref() -> None:
     )
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(),
-        comments=[{"body": old_comment}],
+        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": old_comment}],
         pinned_base="tip1",
         current_base="tip1",
         pinned_head="h1",
@@ -586,6 +596,7 @@ def test_decide_posts_fresh_review_when_same_shas_new_base_ref() -> None:
         diff_base_sha="mb1",
         pinned_base_ref="main",
         current_base_ref="main",
+        trusted_author="test-owner",
     )
     assert d["action"] == "request_changes"
     assert d["label"] == "ai:changes-requested"
@@ -595,8 +606,9 @@ def test_decide_posts_fresh_review_when_same_shas_new_base_ref() -> None:
     # The fresh comment carries the new base-ref identity, so a crash-window
     # replay of THIS round is still recognised as already posted.
     assert pipeline.review_already_posted(
-        [{"body": old_comment}, {"body": body}],
+        [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": old_comment}, {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}],
         "mb1", "h1", base_tip_sha="tip1", base_ref="main",
+        trusted_author="test-owner",
     ) is True
 
 
@@ -613,7 +625,7 @@ def test_decide_replay_suppressed_for_same_base_ref() -> None:
     )
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(),
-        comments=[{"body": posted}],
+        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": posted}],
         pinned_base="tip1",
         current_base="tip1",
         pinned_head="h1",
@@ -621,6 +633,7 @@ def test_decide_replay_suppressed_for_same_base_ref() -> None:
         diff_base_sha="mb1",
         pinned_base_ref="main",
         current_base_ref="main",
+        trusted_author="test-owner",
     )
     assert d["post_comment"] is False
 
@@ -628,7 +641,7 @@ def test_decide_replay_suppressed_for_same_base_ref() -> None:
 def test_decide_promotes_clean_review() -> None:
     d = pipeline.decide_review_harvest(
         review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b1"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "promote"
     assert d["label"] == "ai:ready-for-human"
     assert d["post_comment"] is True
@@ -638,7 +651,7 @@ def test_decide_promotes_clean_review() -> None:
 def test_decide_requests_changes() -> None:
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(), comments=[], pinned_base="b1", current_base="b1"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "request_changes"
     assert d["label"] == "ai:changes-requested"
     assert d["post_comment"] is True
@@ -647,7 +660,7 @@ def test_decide_requests_changes() -> None:
 def test_decide_discards_when_base_drifted() -> None:
     d = pipeline.decide_review_harvest(
         review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b2"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "discard"
     assert d["label"] == "ai:implemented"  # reverted for re-dispatch
     assert d["post_comment"] is False
@@ -660,7 +673,7 @@ def test_decide_invalid_review_escalates_not_fix_loop() -> None:
     # an empty review.
     d = pipeline.decide_review_harvest(
         review_obj={"verdict": "??"}, comments=[], pinned_base="b1", current_base="b1"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "escalate"
     assert d["label"] == "ai:needs-human-decision"
     assert d["verdict"] is None
@@ -669,10 +682,10 @@ def test_decide_invalid_review_escalates_not_fix_loop() -> None:
 
 def test_decide_routes_to_max_iterations_at_cap() -> None:
     # Four prior rounds already recorded; this changes_requested round is the 5th.
-    prior = [{"body": pipeline.REVIEW_MARKER}] * 4
+    prior = [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": pipeline.REVIEW_MARKER}] * 4
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(), comments=prior, pinned_base="b1", current_base="b1"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "max_iterations"
     assert d["label"] == "ai:max-iterations"
     assert d["post_comment"] is True
@@ -686,6 +699,7 @@ def test_decide_discard_reverts_to_pre_label() -> None:
         pinned_base="b1",
         current_base="b2",
         pre_label="ai:revised",
+        trusted_author="test-owner",
     )
     assert d["action"] == "discard"
     assert d["label"] == "ai:revised"
@@ -694,16 +708,16 @@ def test_decide_discard_reverts_to_pre_label() -> None:
 def test_decide_discard_defaults_pre_label_to_implemented() -> None:
     d = pipeline.decide_review_harvest(
         review_obj=clean_review(), comments=[], pinned_base="b1", current_base="b2"
-    )
+    , trusted_author="test-owner")
     assert d["label"] == "ai:implemented"
 
 
 def test_decide_clean_review_at_cap_still_promotes() -> None:
     # The cap only stops further fix loops; a clean verdict still promotes.
-    prior = [{"body": pipeline.REVIEW_MARKER}] * 9
+    prior = [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": pipeline.REVIEW_MARKER}] * 9
     d = pipeline.decide_review_harvest(
         review_obj=clean_review(), comments=prior, pinned_base="b1", current_base="b1"
-    )
+    , trusted_author="test-owner")
     assert d["action"] == "promote"
 
 
@@ -720,6 +734,7 @@ def test_decide_discards_when_head_drifted() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h2",
+        trusted_author="test-owner",
     )
     assert d["action"] == "discard"
     assert d["head_drift"] is True
@@ -735,6 +750,7 @@ def test_decide_promotes_when_head_steady() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "promote"
     assert d["head_drift"] is False
@@ -756,6 +772,7 @@ def test_decide_discards_when_base_retargeted() -> None:
         current_head="h1",
         pinned_base_ref="main",
         current_base_ref="develop",
+        trusted_author="test-owner",
     )
     assert d["action"] == "discard"
     assert d["label"] == "ai:implemented"
@@ -772,6 +789,7 @@ def test_decide_retarget_reverts_to_pre_label() -> None:
         pre_label="ai:revised",
         pinned_base_ref="main",
         current_base_ref="develop",
+        trusted_author="test-owner",
     )
     assert d["action"] == "discard"
     assert d["label"] == "ai:revised"
@@ -789,6 +807,7 @@ def test_decide_retarget_discards_without_base_tip_resolution() -> None:
         current_head="h1",
         pinned_base_ref="main",
         current_base_ref="develop",
+        trusted_author="test-owner",
     )
     assert d["action"] == "discard"
     assert d["base_retarget"] is True
@@ -804,6 +823,7 @@ def test_decide_same_base_ref_promotes() -> None:
         current_head="h1",
         pinned_base_ref="main",
         current_base_ref="main",
+        trusted_author="test-owner",
     )
     assert d["action"] == "promote"
     assert d["base_retarget"] is False
@@ -817,6 +837,7 @@ def test_decide_retarget_check_inactive_when_refs_absent() -> None:
         comments=[],
         pinned_base="b1",
         current_base="b1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "promote"
     assert d["base_retarget"] is False
@@ -839,6 +860,7 @@ def test_decide_does_not_promote_ready_verdict_with_blocker_findings() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "request_changes"
     assert d["label"] == "ai:changes-requested"
@@ -859,6 +881,7 @@ def test_decide_promotes_ready_verdict_with_minor_findings() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "promote"
 
@@ -878,11 +901,12 @@ def test_decide_skips_comment_when_already_posted_for_head() -> None:
     )
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(),
-        comments=[{"body": prior_body}],
+        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": prior_body}],
         pinned_base="b1",
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "request_changes"
     assert d["post_comment"] is False
@@ -903,11 +927,12 @@ def test_decide_posts_re_review_when_base_moved_under_same_head() -> None:
     )
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(),
-        comments=[{"body": prior_body}],
+        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": prior_body}],
         pinned_base="b2",
         current_base="b2",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["post_comment"] is True
     assert d["action"] == "request_changes"
@@ -926,6 +951,7 @@ def test_decide_audits_diff_base_separately_from_freshness_tip() -> None:
         pinned_head="h1",
         current_head="h1",
         diff_base_sha="mb1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "promote"
     body = str(d["comment_body"])
@@ -935,12 +961,13 @@ def test_decide_audits_diff_base_separately_from_freshness_tip() -> None:
     # Idempotency: a replay with the same triple must not re-post.
     d2 = pipeline.decide_review_harvest(
         review_obj=clean_review(),
-        comments=[{"body": body}],
+        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}],
         pinned_base="tip1",
         current_base="tip1",
         pinned_head="h1",
         current_head="h1",
         diff_base_sha="mb1",
+        trusted_author="test-owner",
     )
     assert d2["post_comment"] is False
 
@@ -949,7 +976,7 @@ def test_decide_idempotent_replay_does_not_inflate_iteration_cap() -> None:
     # Four prior distinct rounds, and THIS round's comment was already posted by an
     # interrupted earlier attempt (5 markers total). A naive rounds+1 would jump to
     # 6 and trip the cap on a duplicate; idempotent counting keeps it at the real 5.
-    prior = [{"body": pipeline.REVIEW_MARKER}] * 4
+    prior = [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": pipeline.REVIEW_MARKER}] * 4
     this_round = pipeline.render_review_comment(
         verdict="changes_requested",
         findings=[{"severity": "blocker", "file": "a.py", "summary": "boom"}],
@@ -958,11 +985,12 @@ def test_decide_idempotent_replay_does_not_inflate_iteration_cap() -> None:
     )
     d = pipeline.decide_review_harvest(
         review_obj=changes_review(),
-        comments=prior + [{"body": this_round}],
+        comments=prior + [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": this_round}],
         pinned_base="b1",
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     # 5 completed rounds → cap reached, but on a replay we still must not re-post.
     assert d["action"] == "max_iterations"
@@ -1330,7 +1358,7 @@ def test_cli_harvest_review_emits_decision_json(
 
     rc = pipeline.main(
         [
-            "harvest-review",
+            "harvest-review", "--trusted-author", "test-owner",
             "--review",
             str(review),
             "--comments",
@@ -1356,10 +1384,10 @@ def test_cli_harvest_review_unwraps_gh_comments_object(
     review = tmp_path / "review.json"
     review.write_text(json.dumps(changes_review()))
     comments = tmp_path / "comments.json"
-    comments.write_text(json.dumps({"comments": [{"body": pipeline.REVIEW_MARKER}] * 4}))
+    comments.write_text(json.dumps({"comments": [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": pipeline.REVIEW_MARKER}] * 4}))
     rc = pipeline.main(
         [
-            "harvest-review",
+            "harvest-review", "--trusted-author", "test-owner",
             "--review",
             str(review),
             "--comments",
@@ -1386,7 +1414,7 @@ def test_cli_harvest_review_passes_pre_label(
     comments.write_text(json.dumps([]))
     rc = pipeline.main(
         [
-            "harvest-review",
+            "harvest-review", "--trusted-author", "test-owner",
             "--review",
             str(review),
             "--comments",
@@ -1414,7 +1442,7 @@ def test_cli_harvest_review_missing_file_escalates(
     comments.write_text(json.dumps([]))
     rc = pipeline.main(
         [
-            "harvest-review",
+            "harvest-review", "--trusted-author", "test-owner",
             "--review",
             str(tmp_path / "nope.json"),
             "--comments",
@@ -1441,7 +1469,7 @@ def test_cli_harvest_review_discards_on_head_drift(
     comments.write_text(json.dumps([]))
     rc = pipeline.main(
         [
-            "harvest-review",
+            "harvest-review", "--trusted-author", "test-owner",
             "--review",
             str(review),
             "--comments",
@@ -1783,6 +1811,7 @@ def test_decide_escalates_on_malformed_review() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "escalate"
     assert d["label"] == "ai:needs-human-decision"
@@ -1803,6 +1832,7 @@ def test_decide_escalates_changes_requested_with_no_blocking_findings() -> None:
         current_base="b1",
         pinned_head="h1",
         current_head="h1",
+        trusted_author="test-owner",
     )
     assert d["action"] == "escalate"
     assert d["label"] == "ai:needs-human-decision"
@@ -3331,15 +3361,17 @@ def test_no_change_rounds_reach_cap_on_unchanged_head_and_replay_once() -> None:
     for round_index in range(pipeline.MAX_ITERATIONS):
         decision = pipeline.decide_review_harvest(
             review_obj=review, comments=comments, fix_round=fix_round, **identity,
+            trusted_author="test-owner",
         )
         assert decision["post_comment"] is True
-        comments.append({"body": decision["comment_body"]})
+        comments.append({"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": decision["comment_body"]})
         replay = pipeline.decide_review_harvest(
             review_obj=review, comments=comments, fix_round=fix_round, **identity,
+            trusted_author="test-owner",
         )
         assert replay["post_comment"] is False
         assert replay["label"] == decision["label"]
-        assert pipeline.count_review_rounds(comments) == round_index + 1
+        assert pipeline.count_review_rounds(comments, trusted_author="test-owner") == round_index + 1
         if round_index == pipeline.MAX_ITERATIONS - 1:
             assert decision["label"] == pipeline.LABEL_MAX_ITERATIONS
             break
@@ -3354,8 +3386,8 @@ def test_no_change_rounds_reach_cap_on_unchanged_head_and_replay_once() -> None:
         assert fix["label"] == pipeline.LABEL_REVISED
         # Even loss of the local publication receipt can only duplicate this
         # fixer comment, never mint a new round identity.
-        comments.extend([{"body": fix["comment_body"]}] * 2)
-        fix_round, reasoning = pipeline.latest_fixer_context(comments)
+        comments.extend([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": fix["comment_body"]}] * 2)
+        fix_round, reasoning = pipeline.latest_fixer_context(comments, trusted_author="test-owner")
         assert fix_round
         assert "Reason: Present." in reasoning
 
@@ -3366,13 +3398,13 @@ def test_latest_fixer_context_ignores_quoted_or_escalated_comments() -> None:
         sentinel=pipeline.SENTINEL_FIXES_PUSHED, engine_report="Corrected docs.",
     )
     comments = [
-        {"body": body}, {"body": "Quoted: " + body},
-        {"body": pipeline.render_fix_comment(
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}, {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "Quoted: " + body},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": pipeline.render_fix_comment(
             action="escalate", label=pipeline.LABEL_NEEDS_HUMAN,
             sentinel=pipeline.SENTINEL_NEEDS_HUMAN_DECISION,
         )},
     ]
-    assert pipeline.latest_fixer_context(comments) == ("", body)
+    assert pipeline.latest_fixer_context(comments, trusted_author="test-owner") == ("", body)
 
 
 @pytest.mark.parametrize("digest", ["", "bad", "a" * 63, "a" * 65, "A" * 64])
@@ -3407,7 +3439,13 @@ def test_fixer_report_cannot_supply_original_review_fingerprint() -> None:
         sentinel=pipeline.SENTINEL_NO_CHANGES, no_change_round="a" * 64,
         engine_report=f"<!-- pr-pipeline:fix-review {digest} -->",
     )
-    assert pipeline.fixer_original_review([{"body": original}], summary) == ""
+    comments = [
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": original},
+        {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": summary},
+    ]
+    assert pipeline.fixer_original_review(
+        comments, summary, trusted_author="test-owner",
+    ) == ""
 
 
 @pytest.mark.parametrize("value", [None, 4, True, "", "x", "a" * 63, "a" * 65])
@@ -3474,7 +3512,7 @@ def test_decide_fix_harvest_recheck_comment_sanitizes_and_bounds_report() -> Non
     )
 
     body = str(d["comment_body"])
-    assert pipeline.count_review_rounds([{"body": body}]) == 0
+    assert pipeline.count_review_rounds([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], trusted_author="test-owner") == 0
     assert "… (truncated)" in body
     assert len(body) < pipeline._FIX_REPORT_LIMIT + _FIX_COMMENT_FRAMING
 
@@ -3534,7 +3572,7 @@ def test_fix_comment_neutralises_pipeline_markers_in_engine_text() -> None:
     )
 
     body = str(d["comment_body"])
-    assert pipeline.count_review_rounds([{"body": body}]) == 0
+    assert pipeline.count_review_rounds([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": body}], trusted_author="test-owner") == 0
     assert body.count("```") == 2, "only the harness fence may remain"
     assert body.count("</details>") == 1
 
@@ -4364,6 +4402,7 @@ def test_harvest_review_public_function_is_importable() -> None:
     from pipeline import harvest_review  # type: ignore[attr-defined]
 
     result = harvest_review(
+        trusted_author="test-owner",
         review='{"verdict":"ready_for_human","findings":[]}',
         comments="[]",
         pinned_base="abc123",
@@ -4507,6 +4546,7 @@ def test_harvest_review_direct_equals_cli(tmp_path: Path) -> None:
         comments="[]",
         pinned_base="abc",
         current_base="abc",
+        trusted_author="test-owner",
     )
 
     import sys as _sys
@@ -4517,7 +4557,7 @@ def test_harvest_review_direct_equals_cli(tmp_path: Path) -> None:
     try:
         ret = pipeline.main(
             [
-                "harvest-review",
+                "harvest-review", "--trusted-author", "test-owner",
                 f"--review={review_path}",
                 f"--comments={comments_path}",
                 "--pinned-base=abc",

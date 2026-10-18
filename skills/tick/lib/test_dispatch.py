@@ -18,10 +18,13 @@ from unittest import mock
 
 import pytest
 
+from conftest import comment_pages
+
 from conftest import (  # type: ignore[import-untyped]
     TRUSTED_AUTHOR,
     allow_escalation_comment,
     fixer_gh_json,
+    reviewer_gh_json,
     fixer_git,
 )
 
@@ -968,7 +971,7 @@ def test_dispatch_one_reviewer_terminates_on_relabel_failure(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -1100,7 +1103,7 @@ def test_dispatch_one_fixer_terminates_on_relabel_failure(
                     # the review-extraction gate to engine launch + relabel.
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"body": "<!-- pr-pipeline:review -->\nfindings here"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings here"},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -1442,8 +1445,8 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
                     # Return PR comments including the pipeline review
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"body": "Human note"},
-                            {"body": review_comment_body},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "Human note"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review_comment_body},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -1463,7 +1466,8 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
 
     # Must have queried for PR comments
     gh_json_mock.assert_any_call(
-        "pr", "view", "42", "--json", "comments",
+        "api", "graphql", "--hostname", "github.com", "--paginate", "--slurp",
+        "-f", mock.ANY, "-f", "owner=test-owner", "-f", "name=test-repo", "-F", "number=42",
     )
     # The fixer prompt must include review findings, not just a generic message
     popen.assert_called_once()
@@ -1520,7 +1524,7 @@ def test_dispatch_one_fixer_model_selection_matches_implementer(
                 with mock.patch("tick.gh_text") as gh_text_mock:
                     gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                     with mock.patch("tick.gh_json") as gh_json_mock:
-                        gh_json_mock.side_effect = fixer_gh_json(comments=[{
+                        gh_json_mock.side_effect = fixer_gh_json(comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"},
                             "body": (
                                 "<!-- pr-pipeline:review -->\n"
                                 "## Review Findings\n"
@@ -1618,8 +1622,8 @@ def test_dispatch_one_fixer_hands_off_fresh_post_retarget_review(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"body": stale_clean},
-                            {"body": fresh_changes},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": stale_clean},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": fresh_changes},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -1671,7 +1675,7 @@ def test_dispatch_one_reviewer_passes_scrubbed_env_to_popen(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -1746,7 +1750,7 @@ def test_reviewer_env_exact_key_set(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -1832,10 +1836,10 @@ def test_reviewer_prompt_carries_injected_pr_metadata(
             with mock.patch("tick.gh_text") as gh_text_mock:
                 gh_text_mock.side_effect = ["main", "abc123"]  # base_ref, head
                 with mock.patch("tick.gh_json") as gh_json_mock:
-                    gh_json_mock.return_value = {
+                    gh_json_mock.side_effect = reviewer_gh_json({
                         "title": "fix: harden the frobnicator",
                         "body": "## Summary\nfrobnication drift under load.",
-                    }
+                    })
                     with mock.patch(
                         "tick.pipeline.touches_review_policy",
                         return_value=False,
@@ -1915,22 +1919,22 @@ def test_reviewer_dispatch_pins_no_change_reasoning_and_round(
     unrelated_review = pipeline.render_review_comment(
         verdict="ready_for_human", findings=[], base_sha="c" * 40, head_sha="abc123",
     )
-    comments = [] if original_state == "deleted" else [{
+    comments = [] if original_state == "deleted" else [{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"},
         "body": original_review + ("\nEdited" if original_state == "edited" else ""),
     }]
     # Neither a newer review during the fixer run nor one after publication
     # may replace the original finding set. Duplicate fixer publication is safe.
-    comments.extend([{"body": unrelated_review}, {"body": summary},
-                     {"body": summary}, {"body": unrelated_review}])
-    expected_round, _ = pipeline.latest_fixer_context(comments)
+    comments.extend([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": unrelated_review}, {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": summary},
+                     {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": summary}, {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": unrelated_review}])
+    expected_round, _ = pipeline.latest_fixer_context(comments, trusted_author="test-owner")
     wt_root = tmp_path / "worktrees"
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     proc = mock.MagicMock(pid=12345)
 
     def metadata(*args: str) -> object:
-        if "comments" in args:
-            return comments
+        if args[:2] == ("api", "graphql"):
+            return comment_pages(comments)
         return {"title": "Guard fix", "body": "Closes #7"}
 
     def git_read(*args: str) -> str:
@@ -1979,7 +1983,7 @@ def test_reviewer_retains_revised_pr_without_readable_fixer_context(
     import tick
 
     def metadata(*args: str) -> object:
-        if "comments" in args:
+        if args[:2] == ("api", "graphql"):
             return comments
         return {"title": "Guard fix", "body": "Closes #7"}
 
@@ -2137,7 +2141,7 @@ def test_reviewer_dispatch_accepts_empty_string_body(tmp_path: Path) -> None:
             with mock.patch("tick.gh_text", side_effect=["main", "abc123"]), \
                     mock.patch(
                         "tick.gh_json",
-                        return_value={"title": "valid title", "body": ""},
+                        side_effect=reviewer_gh_json({"title": "valid title", "body": ""}),
                     ):
                 with mock.patch("tick.pipeline.atomic_write"):
                     with mock.patch(
@@ -2180,7 +2184,7 @@ def test_reviewer_dispatch_uses_start_new_session_and_proc_pid_as_pgid(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -2233,7 +2237,7 @@ def test_reviewer_dispatch_retains_wrapper_stderr_and_closes_parent_handle(
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch("tick.git", side_effect=fake_git):
             with mock.patch("tick.gh_text", side_effect=["main", "abc123"]), \
-                    mock.patch("tick.gh_json", return_value=REVIEWER_PR_METADATA):
+                    mock.patch("tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA)):
                 with mock.patch("tick.pipeline.atomic_write"):
                     with mock.patch("tick._publish_marker_or_revert", return_value=True):
                         with mock.patch("tick.relabel"):
@@ -2263,7 +2267,7 @@ def test_reviewer_dispatch_closes_stderr_handle_when_popen_fails(
     with mock.patch("tick.WT_ROOT", str(wt_root)):
         with mock.patch("tick.git", side_effect=reviewer_git(repo_root)):
             with mock.patch("tick.gh_text", side_effect=["main", "abc123"]), \
-                    mock.patch("tick.gh_json", return_value=REVIEWER_PR_METADATA):
+                    mock.patch("tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA)):
                 with mock.patch("tick.pipeline.atomic_write"):
                     with mock.patch(
                         "subprocess.Popen",
@@ -2322,7 +2326,7 @@ def test_dispatch_one_reviewer_escalates_when_pr_touches_review_policy(
         with mock.patch("tick.git") as git_mock:
             git_mock.return_value = str(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = [
                     "main",     # base_ref
@@ -2380,7 +2384,7 @@ def test_dispatch_one_reviewer_proceeds_when_policy_not_touched(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = [
                     "main",     # base_ref
@@ -2444,7 +2448,7 @@ def test_dispatch_one_fixer_handles_escalation_relabel_failure(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     # No pipeline review comment → escalation path
                     gh_json_mock.side_effect = fixer_gh_json(
-                        comments=[{"body": "just a human note"}],
+                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "just a human note"}],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as atomic_write:
                         atomic_write.side_effect = lambda path, data: (
@@ -2475,9 +2479,11 @@ def test_dispatch_one_fixer_handles_escalation_relabel_failure(
     relabel_mock.assert_called_once()
     # Must NOT launch an engine — escalation path, no review findings
     popen.assert_not_called()
-    # Failed escalation retains the lease so a later tick can retry custody.
+    # The trust gate precedes worktree/lease creation. Its local receipt remains
+    # the retry owner when the escalation relabel fails.
     cleanup.assert_not_called()
-    assert wt_dir.is_dir()
+    assert not wt_dir.exists()
+    assert list((wt_root / ".receipts").glob("*.json"))
 
 
 # --- Major fix: tick_log guard on empty review body ---
@@ -2724,7 +2730,7 @@ def test_dispatch_one_reviewer_skips_cleanup_when_kill_fails(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -2788,7 +2794,7 @@ def test_dispatch_one_reviewer_escalates_to_needs_human_when_kill_fails(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -2895,7 +2901,7 @@ def test_dispatch_one_fixer_skips_cleanup_when_kill_fails(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"body": "<!-- pr-pipeline:review -->\nfindings"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings"},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -3004,7 +3010,7 @@ def test_dispatch_one_fixer_passes_parent_env_to_popen(
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
                         comments=[
-                            {"body": "<!-- pr-pipeline:review -->\nfindings"},
+                            {"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "<!-- pr-pipeline:review -->\nfindings"},
                         ],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
@@ -3179,7 +3185,7 @@ def test_reviewer_dispatch_uses_bare_exec_with_schema_prompt(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.touches_review_policy") as trp:
@@ -3286,7 +3292,7 @@ def test_reviewer_dispatch_creates_git_worktree_at_pr_head(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = git_side_effect
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.touches_review_policy") as trp:
@@ -3357,7 +3363,7 @@ def test_reviewer_dispatch_fetches_pr_head_before_policy_gate(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = git_side_effect
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.atomic_write"):
@@ -3439,7 +3445,7 @@ def test_fixer_dispatch_uses_pr_branch_for_worktree(
                 ]
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
-                        comments=[{"body": review_body}],
+                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review_body}],
                     )
                     with mock.patch("tick.pipeline.atomic_write"):
                         with mock.patch(
@@ -3931,7 +3937,7 @@ def test_fixer_dispatch_uses_bounded_unattended_flags(
                 gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
-                        comments=[{"body": review_body}],
+                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review_body}],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
                         aw_mock.side_effect = lambda path, data: (
@@ -4060,7 +4066,7 @@ def test_fixer_dispatch_records_its_deadline_and_stall_limits(
                     gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                     with mock.patch("tick.gh_json") as gh_json_mock:
                         gh_json_mock.side_effect = fixer_gh_json(
-                            comments=[{"body": review_body}],
+                            comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review_body}],
                         )
                         with mock.patch("tick.pipeline.atomic_write") as aw_mock:
                             def capture_marker(path: str, data: str) -> None:
@@ -4108,8 +4114,8 @@ def test_reviewer_dispatch_records_its_deadline(
     repo_root.mkdir()
 
     def metadata(*args: str) -> object:
-        if "comments" in args:
-            return []
+        if args[:2] == ("api", "graphql"):
+            return comment_pages([])
         return {"title": "Guard fix", "body": "Closes #7"}
 
     def git_read(*args: str) -> str:
@@ -4158,7 +4164,7 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
                 gh_text_mock.side_effect = ["main", "abc123", "fix-branch"]
                 with mock.patch("tick.gh_json") as gh_json_mock:
                     gh_json_mock.side_effect = fixer_gh_json(
-                        comments=[{"body": review_body}],
+                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review_body}],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as aw_mock:
                         aw_mock.side_effect = lambda path, data: (
@@ -5102,7 +5108,7 @@ def test_reviewer_dispatch_includes_unattended_flags(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.touches_review_policy") as trp:
@@ -5367,7 +5373,7 @@ def test_reviewer_dispatch_forwards_resolved_model_settings(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.touches_review_policy") as trp:
@@ -5440,7 +5446,7 @@ def test_reviewer_auth_symlink_follows_codex_home(tmp_path: Path) -> None:
             with mock.patch("tick.git") as git_mock:
                 git_mock.side_effect = reviewer_git(repo_root)
                 with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                    "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                    "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
                 ):
                     gh_text_mock.side_effect = ["main", "abc123"]
                     with mock.patch("tick.pipeline.touches_review_policy") as trp:
@@ -6395,7 +6401,7 @@ def test_reviewer_scrub_dir_is_outside_candidate_worktree(
         with mock.patch("tick.git") as git_mock:
             git_mock.side_effect = reviewer_git(repo_root)
             with mock.patch("tick.gh_text") as gh_text_mock, mock.patch(
-                "tick.gh_json", return_value=REVIEWER_PR_METADATA,
+                "tick.gh_json", side_effect=reviewer_gh_json(REVIEWER_PR_METADATA),
             ):
                 gh_text_mock.side_effect = ["main", "abc123"]
                 with mock.patch("tick.pipeline.touches_review_policy") as trp:

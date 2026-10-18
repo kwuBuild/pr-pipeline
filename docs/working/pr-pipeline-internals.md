@@ -361,9 +361,10 @@ engine's `result` text into a PR comment (`pipeline.render_fix_comment`), so
 branch-controlled text reaches a public comment. This does not widen the trust
 boundary — a fixer already commits and pushes to the PR, an unbounded channel —
 but the excerpt is truncated and stripped of `<!--`/`-->`, fence, and
-`</details>` sequences so engine text cannot forge a pipeline marker (which would
-inflate the `count_review_rounds` iteration cap) or break out of its rendered
-block. A `recheck` publishes the same bounded excerpt: only the `escalate` branch
+`</details>` sequences to preserve the rendered report. Comment consumers also
+require authenticated first-line markers under the
+[comment trust contract](../../skills/tick/README.md#comment-trust-and-incomplete-history).
+A `recheck` publishes the same bounded excerpt: only the `escalate` branch
 archives harvest evidence, so on a successful fixer run the PR comment is the sole
 durable record of what the engine changed. The attempt-cap and transient
 escalations publish no engine text at all — they report a failed side effect and a
@@ -431,6 +432,18 @@ in the [coverage map](../../skills/tick/README.md#silent-transitions). Tick
 maintainers own those follow-on gaps. They include unreadable reviewer verdicts,
 wrapper-confirmed reviewer failures, reconciliation without a usable result,
 and post-launch label failures where the engine could not be terminated.
+
+Comment-history authority: `tick._comment_history_snapshot` reads the GraphQL
+comment connection with `gh api graphql --paginate --slurp` and validates page
+boundaries, unique IDs, and total counts. `tick._read_comment_history` requires two
+matching complete traversals. `pipeline.trusted_comment_history` validates author,
+body, and explicit unedited provenance before granting operator authority.
+`trusted_marker_comments` applies the exact first-line LF/CRLF
+header check used by round counting, review replay, fixer selection, and no-change
+provenance. These paths use the existing per-tick operator identity. Unknown
+history returns before launch, publication, label change, or scratch cleanup.
+The [operator contract](../../skills/tick/README.md#comment-trust-and-incomplete-history)
+owns recovery and historical-round behavior.
 
 Receipt custody: the "comment landed" receipts live under `WT_ROOT/.receipts/`,
 deliberately outside the item's scratch. A fixer scratch is a checked-out worktree

@@ -10,6 +10,8 @@ from unittest import mock
 
 import pytest
 
+from conftest import comment_pages
+
 import pipeline
 import tick
 
@@ -30,13 +32,13 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
     allow_relabel = False
 
     def read(*args: str) -> object:
-        if "comments" in args:
-            return list(comments)
+        if args[:2] == ("api", "graphql"):
+            return comment_pages(comments)
         return {"headRefOid": "a" * 40, "baseRefName": "main", "body": ""}
 
     def post(*args: str) -> subprocess.CompletedProcess[str]:
         assert args[:3] == ("pr", "comment", "42")
-        comments.append({"body": Path(args[args.index("--body-file") + 1]).read_text()})
+        comments.append({"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": Path(args[args.index("--body-file") + 1]).read_text()})
         return subprocess.CompletedProcess(args, 0, stdout="https://example.test/comment")
 
     def converge(_entity: str, _number: int, label: str, **_kwargs: object) -> bool:
@@ -63,10 +65,10 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
             }))
             allow_relabel = False
             tick._harvest_one_reviewer(decision, str(wt_root), None, None, **tuning)
-            assert pipeline.count_review_rounds(comments) == round_index + 1
+            assert pipeline.count_review_rounds(comments, trusted_author="test-owner") == round_index + 1
             allow_relabel = True
             tick._harvest_one_reviewer(decision, str(wt_root), None, None, **tuning)
-            assert pipeline.count_review_rounds(comments) == round_index + 1
+            assert pipeline.count_review_rounds(comments, trusted_author="test-owner") == round_index + 1
             if round_index == cap - 1:
                 assert transitions[-1] == pipeline.LABEL_MAX_ITERATIONS
                 break
@@ -94,8 +96,8 @@ def test_unchanged_head_cycle_caps_and_replayed_harvest_counts_once(
             assert transitions[-1] == pipeline.LABEL_REVISED
             assert len(comments) == count_before + int(lose_receipt)
             assert comments[-1]["body"] == published
-            next_round, reasoning = pipeline.latest_fixer_context(comments)
-            assert pipeline.fixer_original_review(comments, reasoning) == original_review
+            next_round, reasoning = pipeline.latest_fixer_context(comments, trusted_author="test-owner")
+            assert pipeline.fixer_original_review(comments, reasoning, trusted_author="test-owner") == original_review
             assert next_round and next_round != fix_round
             assert "current caller already guards" in reasoning
             fix_round = next_round
@@ -115,13 +117,13 @@ def test_harvest_cli_threads_no_change_identity(tmp_path: Path, capsys: pytest.C
     fix = json.loads(capsys.readouterr().out)
     assert fix["label"] == pipeline.LABEL_REVISED
     assert f"<!-- pr-pipeline:fix-review {'e' * 64} -->" in fix["comment_body"]
-    fix_round, _ = pipeline.latest_fixer_context([{"body": fix["comment_body"]}])
+    fix_round, _ = pipeline.latest_fixer_context([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": fix["comment_body"]}], trusted_author="test-owner")
     comments_path = tmp_path / "comments.json"
     comments_path.write_text("[]")
     review_path = tmp_path / "review.json"
     review_path.write_text(json.dumps({"verdict": "ready_for_human", "findings": []}))
     args = [
-        "harvest-review", "--review", str(review_path), "--comments", str(comments_path),
+        "harvest-review", "--trusted-author", "test-owner", "--review", str(review_path), "--comments", str(comments_path),
         "--pinned-base", "b", "--current-base", "b", "--pinned-head", "a",
         "--current-head", "a", "--fix-round", fix_round,
     ]
@@ -129,7 +131,7 @@ def test_harvest_cli_threads_no_change_identity(tmp_path: Path, capsys: pytest.C
     review = json.loads(capsys.readouterr().out)
     assert review["label"] == pipeline.LABEL_READY_FOR_HUMAN
     assert fix_round in review["comment_body"]
-    comments_path.write_text(json.dumps([{"body": review["comment_body"]}]))
+    comments_path.write_text(json.dumps([{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": review["comment_body"]}]))
     assert pipeline.main(args) == 0
     assert json.loads(capsys.readouterr().out)["post_comment"] is False
 

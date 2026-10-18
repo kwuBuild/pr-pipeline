@@ -1312,32 +1312,75 @@ def validate_review(obj: object) -> Verdict | None:
     return verdict  # type: ignore[return-value]
 
 
-def count_review_rounds(comments: list[object], marker: str = REVIEW_MARKER) -> int:
-    """Count completed review rounds from a PR's comment history.
+def trusted_comment_history(comments: object, *, trusted_author: str) -> list[dict[str, Any]]:
+    """Validate complete history and select the existing operator's comments.
 
-    The comment history is the durable authority for the fix-iteration count: it
-    survives worktree loss or recreation, so a cleaned-up worktree cannot silently
-    reset the runaway-spend valve. Each completed review round posts exactly one
-    marker-stamped comment, so the count is the number of comments containing the
-    marker.
-
-    Args:
-        comments: The ``comments`` array from ``gh pr view <N> --json comments``.
-            Each entry is expected to be a mapping with a ``body`` string; missing
-            or non-string bodies are ignored defensively.
-        marker: The fixed header string the reviewer stamps on its comments.
-
-    Returns:
-        The number of marker-stamped review comments.
+    Known foreign authors are ignored. Operator comments require explicit unedited
+    GraphQL provenance; even a removed header must not erase a round. Unknown
+    authors or malformed entries raise ValueError: discarding them could erase
+    genuine historical rounds.
+    Callers must retain evidence and stop spend/promotion on that exception.
+    The I/O owner must establish pagination completeness before calling this.
     """
-    count = 0
+    if not isinstance(trusted_author, str) or not _LOGIN_RE.fullmatch(trusted_author):
+        raise ValueError("comment history has no trusted operator identity")
+    if not isinstance(comments, list):
+        raise ValueError("comment history is not an array")
+    trusted: list[dict[str, Any]] = []
     for comment in comments:
         if not isinstance(comment, dict):
-            continue
-        body = comment.get("body")
-        if isinstance(body, str) and marker in body:
-            count += 1
-    return count
+            raise ValueError("comment history contains a malformed entry")
+        author = comment.get("author")
+        login = author.get("login") if isinstance(author, dict) else None
+        if not isinstance(login, str) or not (
+            _LOGIN_RE.fullmatch(login)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*\[bot\]", login)
+        ):
+            raise ValueError("comment history contains an unknown author")
+        if not isinstance(comment.get("body"), str):
+            raise ValueError("comment history contains a malformed body")
+        if login == trusted_author:
+            # Validate even ordinary notes: an edit may have erased a review
+            # header. Missing provenance cannot silently remove a genuine round.
+            if not {"lastEditedAt", "editor", "includesCreatedEdit"} <= comment.keys():
+                raise ValueError("operator comment has unknown edit provenance")
+            if (comment["lastEditedAt"] is not None or comment["editor"] is not None
+                    or comment["includesCreatedEdit"] is not False):
+                raise ValueError("operator comment is edited or has invalid edit provenance")
+            trusted.append(comment)
+    return trusted
+
+
+def trusted_marker_comments(
+    comments: object, marker: str, *, trusted_author: str,
+) -> list[dict[str, Any]]:
+    """Select operator comments whose first line is the exact marker header."""
+    return [comment for comment in trusted_comment_history(
+        comments, trusted_author=trusted_author,
+    ) if comment["body"] == marker
+        or comment["body"].startswith((marker + "\n", marker + "\r\n"))]
+
+
+def count_review_rounds(
+    comments: list[object], marker: str = REVIEW_MARKER, *, trusted_author: str,
+) -> int:
+    """Count authenticated rounds, deduplicating published round tokens.
+
+    Tokenless historical headers still count individually. Missing identity or
+    malformed history raises rather than resetting the runaway-spend valve.
+    """
+    tokens: set[str] = set()
+    legacy = 0
+    for comment in trusted_marker_comments(
+        comments, marker, trusted_author=trusted_author,
+    ):
+        lines = comment["body"].splitlines()
+        token = lines[1] if len(lines) > 1 else ""
+        if token.startswith(_ROUND_MARKER_PREFIX) and token.endswith(" -->"):
+            tokens.add(token)
+        else:
+            legacy += 1
+    return legacy + len(tokens)
 
 
 def at_max_iterations(rounds: int, threshold: int = MAX_ITERATIONS) -> bool:
@@ -1430,6 +1473,7 @@ def review_already_posted(
     base_tip_sha: str = "",
     base_ref: str = "",
     fix_round: str = "",
+    trusted_author: str,
 ) -> bool:
     """Return whether this exact round's review comment was already posted.
 
@@ -1445,7 +1489,7 @@ def review_already_posted(
     whose tip is the same commit is recognised as a new round as well.
 
     Args:
-        comments: The PR's ``comments`` array (``gh pr view --json comments``).
+        comments: Complete normalized history with author, body, and edit provenance.
         base_sha: The diff anchor (merge-base) the round was reviewed against.
         head_sha: The reviewed head SHA whose comment to look for.
         marker: The fixed review-comment header; defaults to :data:`REVIEW_MARKER`.
@@ -1455,20 +1499,20 @@ def review_already_posted(
         base_ref: The base branch name pinned at dispatch. Empty matches only
             the legacy three-part token format (markers without ``base_ref``).
         fix_round: No-change fixer identity pinned at reviewer dispatch.
+        trusted_author: Operator posting identity validated by the caller.
 
     Returns:
         ``True`` if a marker-stamped comment carrying this round's token exists.
     """
+    marked = trusted_marker_comments(comments, marker, trusted_author=trusted_author)
     if not head_sha:
         return False
     token = _round_token(
         base_sha, base_tip_sha or base_sha, head_sha, base_ref, fix_round,
     )
-    for comment in comments:
-        if not isinstance(comment, dict):
-            continue
-        body = comment.get("body")
-        if isinstance(body, str) and marker in body and token in body:
+    for comment in marked:
+        lines = comment["body"].splitlines()
+        if len(lines) > 1 and lines[1] == token:
             return True
     return False
 
@@ -1643,6 +1687,7 @@ def decide_review_harvest(
     pinned_base_ref: str = "",
     current_base_ref: str = "",
     fix_round: str = "",
+    trusted_author: str,
 ) -> dict[str, object]:
     """Decide the full outcome of harvesting one finished review.
 
@@ -1701,7 +1746,7 @@ def decide_review_harvest(
         ``post_comment`` (bool), and ``comment_body`` (str, empty when not
         posting).
     """
-    rounds = count_review_rounds(comments)
+    rounds = count_review_rounds(comments, trusted_author=trusted_author)
     verdict = validate_review(review_obj)
 
     # A retargeted PR invalidates the review outright: the diff was anchored
@@ -1801,6 +1846,7 @@ def decide_review_harvest(
         comments, diff_base, pinned_head,
         base_tip_sha=pinned_base, base_ref=pinned_base_ref,
         fix_round=fix_round,
+        trusted_author=trusted_author,
     )
     rounds_after = rounds if already_posted else rounds + 1
 
@@ -3289,12 +3335,10 @@ def _sanitize_engine_report(value: object) -> str:
     The excerpt is model output embedded in a shared record, so three
     substrings are neutralised beyond the length bound. HTML comment delimiters
     go first: the pipeline's round-counting and idempotency markers *are* HTML
-    comments, and a fixer that quotes a reviewer comment back at us would
-    otherwise smuggle a :data:`REVIEW_MARKER` into the body and inflate the
-    iteration count (``count_review_rounds`` matches the raw substring, so
-    fencing the payload does not help). The fence delimiter and the closing
-    ``</details>`` tag go next, because an unbalanced one in the payload would
-    let the remainder of the report escape the block it is rendered in.
+    comments. Neutralizing quoted markers keeps controller metadata distinct
+    from engine prose; readers also require an authenticated first-line header.
+    The fence delimiter and the closing ``</details>`` tag go next, because an
+    unbalanced one in the payload would let the remainder of the report escape the block it is rendered in.
 
     Args:
         value: The engine's ``result`` field (any JSON value; non-strings yield
@@ -3397,11 +3441,10 @@ def _neutralize_comment_markup(text: str) -> str:
 
     Applies to any span of a published body that the controller did not author
     in full. HTML comment delimiters go first: the pipeline's round-counting and
-    idempotency markers *are* HTML comments, and ``count_review_rounds`` matches
-    the raw substring, so a smuggled :data:`REVIEW_MARKER` inflates the
-    iteration count no matter how the payload is fenced. The fence delimiter and
-    the closing ``</details>`` tag go next, because an unbalanced one lets the
-    remainder of the span escape the block it is rendered in.
+    idempotency markers *are* HTML comments. Neutralizing them keeps controller
+    metadata distinct from engine prose; readers also authenticate first-line
+    headers. The fence delimiter and the closing ``</details>`` tag go next,
+    because an unbalanced one lets the remainder of the span escape the block it is rendered in.
 
     Args:
         text: The untrusted span.
@@ -3573,7 +3616,9 @@ def render_fix_comment(
     return "\n".join(lines)
 
 
-def latest_fixer_context(comments: list[object]) -> tuple[str, str]:
+def latest_fixer_context(
+    comments: list[object], *, trusted_author: str,
+) -> tuple[str, str]:
     """Return the latest published recheck's no-change identity and reasoning.
 
     The identity is authored by harvest from the fixer dispatch, not a comment
@@ -3581,10 +3626,10 @@ def latest_fixer_context(comments: list[object]) -> tuple[str, str]:
     Dispatch pins it alongside the prompt snapshot; harvest never re-derives it
     from newer comments. Empty identity preserves legacy and pushed-fix tokens.
     """
-    for comment in reversed(comments):
-        body = comment.get("body") if isinstance(comment, dict) else None
-        if not isinstance(body, str) or not body.startswith(FIX_MARKER + "\n"):
-            continue
+    for comment in reversed(trusted_marker_comments(
+        comments, FIX_MARKER, trusted_author=trusted_author,
+    )):
+        body = comment["body"]
         if f"- Outcome: `recheck` → `{LABEL_REVISED}`" not in body.splitlines():
             continue
         token = re.fullmatch(r"<!-- pr-pipeline:no-change ([a-f0-9]{64}) -->", body.splitlines()[1])
@@ -3592,22 +3637,31 @@ def latest_fixer_context(comments: list[object]) -> tuple[str, str]:
     return "", ""
 
 
-def fixer_original_review(comments: list[object], fixer_summary: str) -> str:
+def fixer_original_review(
+    comments: list[object], fixer_summary: str, *, trusted_author: str,
+) -> str:
     """Resolve the exact review fingerprint pinned before the fixer launched.
 
     Never substitute a newer review or an edited copy. Missing provenance or
     a deleted/edited original returns empty so no-change review fails closed.
-    This binds content, not comment authorship (a separate trust boundary).
+    Both the fixer summary and the original review require operator authorship.
     """
+    trusted_fixes = trusted_marker_comments(
+        comments, FIX_MARKER, trusted_author=trusted_author,
+    )
+    if not any(comment["body"] == fixer_summary for comment in trusted_fixes):
+        return ""
     # Controller metadata precedes the blank line; engine report text cannot
     # supply or override the review fingerprint.
-    header = fixer_summary.split("\n\n", 1)[0]
+    header = fixer_summary.replace("\r\n", "\n").split("\n\n", 1)[0]
     match = re.search(r"^<!-- pr-pipeline:fix-review ([a-f0-9]{64}) -->$", header, re.M)
     if match is None:
         return ""
-    for comment in comments:
-        body = comment.get("body") if isinstance(comment, dict) else None
-        if isinstance(body, str) and hashlib.sha256(body.encode()).hexdigest() == match[1]:
+    for comment in trusted_marker_comments(
+        comments, REVIEW_MARKER, trusted_author=trusted_author,
+    ):
+        body = comment["body"]
+        if hashlib.sha256(body.encode()).hexdigest() == match[1]:
             return body
     return ""
 
@@ -4740,6 +4794,7 @@ def harvest_review(
     pinned_base_ref: str = "",
     current_base_ref: str = "",
     fix_round: str = "",
+    trusted_author: str,
 ) -> HarvestResult:
     """Decide the outcome of harvesting one finished review.
 
@@ -4766,8 +4821,9 @@ def harvest_review(
         A HarvestResult mapping with action, label, and stage-specific keys.
     """
     review_obj = _load_json_string(review, None)
-    comments_list = _as_comment_list(_load_json_string(comments, []))
+    comments_list = _as_comment_list(json.loads(comments))
     result = decide_review_harvest(
+        trusted_author=trusted_author,
         review_obj=review_obj,
         comments=comments_list,
         pinned_base=pinned_base,
@@ -5014,10 +5070,10 @@ def _load_json_string(raw: str, default: object) -> object:
 
 
 def _as_comment_list(loaded: object) -> list[object]:
-    """Coerce loaded comments JSON to a list.
+    """Unwrap complete comments JSON without coercing missing data to zero.
 
-    ``gh pr view <N> --json comments`` writes an *object* ``{"comments": [...]}``,
-    while ``-q .comments`` writes a bare array. Accept either shape so the
+    Accept a bare array or a ``{"comments": [...]}`` object. Entries must
+    carry the author/body/edit provenance checked by trusted_comment_history. The
     iteration count is never silently zeroed by an unwrapped object.
     """
     if isinstance(loaded, list):
@@ -5026,13 +5082,14 @@ def _as_comment_list(loaded: object) -> list[object]:
         inner = loaded.get("comments")
         if isinstance(inner, list):
             return inner
-    return []
+    raise ValueError("comment history is not an array or comments object")
 
 
 def _cmd_harvest_review(args: argparse.Namespace) -> int:
     review_raw = _read_file(args.review)
     comments_raw = _read_file(args.comments)
     decision = harvest_review(
+        trusted_author=args.trusted_author,
         review=review_raw,
         comments=comments_raw,
         pinned_base=args.pinned_base,
@@ -5360,8 +5417,9 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_harvest = sub.add_parser("harvest-review", help="Decide a finished review's outcome")
+    p_harvest.add_argument("--trusted-author", required=True, help="Validated operator posting login")
     p_harvest.add_argument("--review", required=True, help="Path to review.json")
-    p_harvest.add_argument("--comments", required=True, help="Path to gh comments JSON")
+    p_harvest.add_argument("--comments", required=True, help="Path to complete normalized comments JSON")
     p_harvest.add_argument(
         "--pinned-base", required=True,
         help="base tip snapshot from dispatch.json (base_tip_sha; freshness anchor)",
