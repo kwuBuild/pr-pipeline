@@ -25,30 +25,19 @@ The PR should reflect the repo's one-commit-per-task rule unless the user explic
 
 ## PR body template
 
-PR descriptions must include these sections:
+Use the authoritative [shared PR report contract and template](../../skills/tick/lib/prompts/pr-body-contract.md).
+The controller injects that same file into implementer and fixer prompts.
+Include Summary, Why this approach, What changed, Test coverage, and Test plan.
+Additional context is optional. Explain structure and impact in natural prose;
+paragraphs, nested lists, and useful subsections are allowed.
 
-```md
-## Summary
-- What this PR does (1-3 bullets)
-- Reference the issue: `Closes #N`
-
-## Why this approach
-- Why the implementation is structured this way
-- Key design decisions and tradeoffs
-- Why this approach is the best fit for this codebase right now
-
-## What changed
-- What each file/module does
-- Any reviewer context needed to navigate the diff
-
-## Test coverage
-- What's tested and how
-- Notable test design choices (e.g. why a mock vs real subprocess, why fixture vs direct invocation)
-
-## Test plan
-- [x] Tests that passed locally
-- [ ] Remaining manual verification items, if any
-```
+Harvest checks closure authority and publication size mechanically. A missing
+or hidden primary reference receives a marked controller reference to the known
+target while the full authored report survives. Formatting alone does not fail
+the handoff; explicit conflicting authority remains invalid. Missing
+non-control sections produce a metadata/layout notice while the complete report
+survives. A missing Impact bullet is accepted prose variation. The contract
+above owns closure syntax, accepted heading variants, and normalization rules.
 
 ## Section intent
 

@@ -11295,10 +11295,12 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
     assert "agent/issue-42" in pr_create_args
     assert pr_create_args[pr_create_args.index("--base") + 1] == base_ref
     assert pr_create_args[pr_create_args.index("--title") + 1] == (
-        "feat: implement issue #42"
+        "Issue #42: implementation review"
     )
-    fallback_body = pr_create_args[pr_create_args.index("--body") + 1]
-    assert "Closes #42" in fallback_body
+    assert "--body-file" in pr_create_args
+    record = json.loads((wt_root / ".pr-publications" / "issue-42-d-42" / "decision.json").read_text())
+    assert "Closes #42" in record["body"]
+    assert "No verification results are claimed" in record["body"]
     # Relabeled to ai:implemented
     relabel_mock.assert_called_once_with("pr", 99, "", "ai:implemented")
     # The issue converges to NO pipeline label — removing only
@@ -11786,63 +11788,7 @@ def test_harvest_one_implementer_uses_valid_pr_body_file(
     assert "Closes #42" in body
 
 
-def test_harvest_one_implementer_falls_back_when_pr_body_file_is_malformed(
-    tmp_path: Path,
-) -> None:
-    """Malformed engine-authored PR metadata must not block PR creation."""
-    from tick import _harvest_one_implementer  # type: ignore[import-untyped]
-
-    wt_root = tmp_path / "worktrees"
-    wt_root.mkdir()
-    wt_dir = wt_root / "issue-11"
-    wt_dir.mkdir()
-    (wt_dir / "result.json").write_text(
-        '{"result": "IMPLEMENTATION_COMPLETE"}',
-    )
-    (wt_dir / "dispatch.json").write_text(json.dumps({"base_ref": "main"}))
-    (wt_dir / ".pr-body.md").write_text(
-        "Incomplete generated title\n\n## Summary\n- Missing required sections.\n",
-    )
-
-    decision: dict[str, object] = {
-        "action": "harvest",
-        "label": "",
-        "kill": False,
-        "identity": "matched",
-        "pr_number": 11,
-    }
-
-    with mock.patch("tick.pipeline.harvest_implementation") as harvest_impl:
-        harvest_impl.return_value = {
-            "action": "create_pr",
-            "label": "",
-            "sentinel": "IMPLEMENTATION_COMPLETE",
-        }
-        with mock.patch("tick.gh_json", side_effect=gh_json_no_holds):
-            with mock.patch("tick.gh_text") as gh_text_mock:
-                gh_text_mock.return_value = (
-                    "https://github.com/test-owner/test-repo/pull/101\n"
-                )
-                with mock.patch("tick.relabel"):
-                    with mock.patch("tick.cleanup_scratch"):
-                        with mock.patch(
-                            "tick._converge_pipeline_labels", return_value=True,
-                        ):
-                            _harvest_one_implementer(
-                                decision, str(wt_root),
-                                tick_log=None, attempts=None,
-                            )
-
-    pr_create_args = gh_text_mock.call_args[0]
-    assert "--body-file" not in pr_create_args
-    assert pr_create_args[pr_create_args.index("--title") + 1] == (
-        "feat: implement issue #11"
-    )
-    fallback_body = pr_create_args[pr_create_args.index("--body") + 1]
-    assert "Closes #11" in fallback_body
-
-
-def test_read_engine_pr_metadata_requires_guideline_body_structure(
+def test_read_engine_pr_metadata_accepts_flexible_guideline_body_structure(
     tmp_path: Path,
 ) -> None:
     """Engine metadata must satisfy the canonical PR-body content contract."""
@@ -11859,7 +11805,7 @@ def test_read_engine_pr_metadata_requires_guideline_body_structure(
         "- How this solves the issue: require the canonical structure.\n\n"
         "## What changed\n"
         "- Structure: the prompt feeds metadata into harvest validation.\n"
-        "- Impact: malformed bodies fall back to a valid generated body.\n\n"
+        "- Impact: authored context survives presentation differences.\n\n"
         "## Test coverage\n"
         "- Covers generated metadata.\n\n"
         "## Test plan\n"
@@ -11867,7 +11813,9 @@ def test_read_engine_pr_metadata_requires_guideline_body_structure(
     )
     (wt_dir / ".pr-body.md").write_text(body)
 
-    assert _read_engine_pr_metadata(str(wt_dir), 42) is None
+    metadata = _read_engine_pr_metadata(str(wt_dir), 42)
+    assert metadata.outcome == "authored"
+    assert metadata.body == body.split("\n\n", 1)[1]
 
 
 def test_fallback_implementation_pr_metadata_satisfies_guideline_structure() -> None:
@@ -11882,8 +11830,8 @@ def test_fallback_implementation_pr_metadata_satisfies_guideline_structure() -> 
     assert _pr_body_matches_guidelines(body, 42)
 
 
-def test_pr_body_guideline_markers_have_strict_positions() -> None:
-    """Problem and Impact markers must orient and close their sections."""
+def test_pr_body_guideline_markers_accept_authored_positions() -> None:
+    """Useful prose following Impact must never discard the author's report."""
     from tick import _pr_body_matches_guidelines  # type: ignore[import-untyped]
 
     valid_body = (
@@ -11905,8 +11853,8 @@ def test_pr_body_guideline_markers_have_strict_positions() -> None:
         "- Impact: behavior is available.\n- Updates the service.",
     )
 
-    assert not _pr_body_matches_guidelines(problem_not_second, 42)
-    assert not _pr_body_matches_guidelines(impact_not_last, 42)
+    assert _pr_body_matches_guidelines(problem_not_second, 42)
+    assert _pr_body_matches_guidelines(impact_not_last, 42)
 
 
 def test_harvest_one_implementer_clears_custody_before_reviewer_dispatch(
@@ -17438,10 +17386,9 @@ def test_harvest_leaves_the_pr_body_alone_when_the_fixer_wrote_no_revision(
     ),
     (
         "invalid",
-        fixer_revision_file("## Summary\n\nCloses #7\nnot the required shape\n"),
+        fixer_revision_file(""),
         STALE_PR_BODY,
-        "left unchanged — the fixer's revision did not satisfy the required "
-        "PR body sections",
+        "left unchanged — the fixer's revision body was empty",
     ),
     (
         "conflict",

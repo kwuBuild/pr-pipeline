@@ -5937,11 +5937,9 @@ def test_dispatch_one_implementer_prompt_requests_guideline_pr_body_file(
             f"implementer prompt must require {section!r}, got: {prompt}"
         )
     assert "Closes #461" in prompt
-    assert "first content line under `## Summary`" in prompt
-    assert "- Problem:" in prompt
-    assert "- How this solves the issue:" in prompt
-    assert "- Structure:" in prompt
-    assert "- Impact:" in prompt
+    assert "Shared PR report contract" in prompt
+    assert "not required bullet tokens" in prompt
+    assert "## Additional context" in prompt
     assert "Do not commit .pr-body.md" in prompt
 
 

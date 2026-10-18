@@ -37,3 +37,6 @@ tmp/
 .pr-body.md
 .pr-create-body.md
 .pr-body-revision.md
+
+# Controller publication decision retained with engine scratch
+.pr-metadata-decision.json

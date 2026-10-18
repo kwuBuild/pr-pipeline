@@ -313,6 +313,12 @@ _PR_BODY_REQUIRED_SECTIONS = (
     "## Test coverage",
     "## Test plan",
 )
+_PR_LAYOUT_NOTICE_PREFIX = (
+    "> **Metadata/layout notice:** Authored report is missing template sections: "
+)
+_PR_LAYOUT_NOTICE_SUFFIX = (
+    ". The authored content is preserved; this notice does not assess verification evidence."
+)
 _TERMINAL_LABELS = frozenset({
     pipeline.LABEL_READY_FOR_HUMAN,
     pipeline.LABEL_NEEDS_HUMAN,
@@ -454,6 +460,9 @@ def load_prompt_template(
     path = os.path.join(directory, f"{name}.txt")
     with open(path) as fh:
         template = fh.read()
+    if "{pr_body_contract}" in template:
+        with open(os.path.join(directory, "pr-body-contract.md"), encoding="utf-8") as fh:
+            variables = {**variables, "pr_body_contract": fh.read()}
     return template.format_map({k: str(v) for k, v in variables.items()})
 
 
@@ -2084,6 +2093,9 @@ def _archive_harvest_evidence(
         "stderr.log",
         "prompt.txt",
         "review-comment-body.txt",
+        _PR_BODY_SOURCE_FILE,
+        _PR_BODY_REVISION_FILE,
+        ".pr-metadata-decision.json",
     ):
         if not _copy_evidence_file(wt_dir, archive_dir, filename):
             archive_ok = False
@@ -6464,69 +6476,234 @@ def _harvest_one_reviewer(
     cleanup_scratch(wt_dir)
 
 
-def _fallback_implementation_pr_metadata(
-    issue_number: int, *, verification_unconfigured: bool = False,
-) -> tuple[str, str]:
-    """Return the generated PR title/body used when engine metadata is absent."""
-    verification = (
-        "- Verification grants were unconfigured; the engine acknowledged the waiver.\n\n"
-        "## Test plan\n"
-        "- [ ] Inspect the engine's reported checks; the pipeline has no command-execution evidence."
-        if verification_unconfigured else
-        "- The implementer completed the repository verification commands.\n\n"
-        "## Test plan\n"
-        "- [x] The repository's verification commands (tests, lint, type check) "
-        "passed before the implementer pushed; the pipeline does not record "
-        "which commands those were."
-    )
+def _fallback_implementation_pr_metadata(issue_number: int) -> tuple[str, str]:
+    """Identify the review without inventing implementation or test results."""
     return (
-        f"feat: implement issue #{issue_number}",
-        (
-            "## Summary\n"
-            f"Closes #{issue_number}\n\n"
-            f"- Problem: Issue #{issue_number} requires an implementation.\n"
-            "- Implements the issue through the automated PR pipeline.\n\n"
-            "## Why this approach\n"
-            "- How this solves the issue: the implementer completed the requested "
-            "change and verification workflow.\n\n"
-            "## What changed\n"
-            "- Structure: see the commit diff for the implementation flow.\n"
-            "- Impact: the linked issue's requested behavior is now implemented.\n\n"
-            "## Test coverage\n"
-            f"{verification}"
-        ),
+        f"Issue #{issue_number}: implementation review",
+        "## Summary\n"
+        f"Closes #{issue_number}\n\n"
+        "The authored implementation report is unavailable. Review the branch "
+        "and recover the author's explanation and evidence before approval.\n\n"
+        "No verification results are claimed by this placeholder.\n",
     )
+
+
+def _pr_document_lines(body: str) -> list[tuple[str, str]]:
+    """Read document sections outside code, including list-contained blocks.
+
+    List content margins are cumulative; the fence's three-space allowance is
+    relative to its container. Dedenting out of a list ends its unclosed fence.
+    Tabs affect indentation columns only. Returned lines and publication bytes
+    remain authored, separate from the concurrent-edit fingerprint.
+    """
+    lines: list[tuple[str, str]] = []
+    margins: list[int] = []
+    markers: list[tuple[int, int]] = []
+    fence = ""
+    width = 0
+    section = ""
+    paragraph = False
+    empty_item = False
+
+    def opening_fence(content: str) -> re.Match[str] | None:
+        opening = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", content)
+        if opening and not (opening[1][0] == "`" and "`" in opening[2]):
+            return opening
+        return None
+
+    def paragraph_break(content: str) -> bool:
+        # Inline backticks, hashtags and tildes are ordinary paragraph text.
+        # Thematic breaks and setext underlines, however, end a paragraph even
+        # though they have no ATX heading marker. Share this classification with
+        # lazy list continuation so both decisions use actual block syntax.
+        return bool(
+            re.match(r" {0,3}(?:#{1,6}(?: |$)|>)", content)
+            or re.fullmatch(r" {0,3}(?:(?:- *){3,}|(?:\* *){3,}|(?:_ *){3,})", content)
+            or (paragraph and re.fullmatch(r" {0,3}(?:=+|-+) *", content))
+            or opening_fence(content)
+        )
+
+    def list_item(content: str, margin: int, interrupting: bool) -> re.Match[str] | None:
+        item = re.match(r"( {0,3})((?:[-+*]|[0-9]{1,9}[.)]))( +|$)(.*)$", content)
+        if not item or re.fullmatch(r" {0,3}(?:(?:- *){3,}|(?:\* *){3,}|(?:_ *){3,})", content):
+            return None
+        # A marker outside the paragraph's item can start a sibling or a new
+        # list, even when its bullet/type/delimiter changes. Only a marker in
+        # the same content container interrupts that paragraph: an ordered
+        # interruption must start at 1, and an empty item cannot interrupt it.
+        position = margin + len(item[1])
+        outside_paragraph = any(
+            parent <= position < content_margin
+            for parent, content_margin in markers
+        )
+        if interrupting and not outside_paragraph:
+            if not item[4].strip() or (item[2][0].isdigit() and int(item[2][:-1]) != 1):
+                return None
+        return item
+
+    for line in body.splitlines():
+        expanded = line.expandtabs(4)
+        indent = len(expanded) - len(expanded.lstrip(" "))
+        # A bare marker already supplies the item's first blank content line.
+        # Another blank ends that empty item, even if the next block has enough
+        # indentation to look like a continuation. Its parent remains open.
+        if empty_item and not expanded.strip():
+            margins.pop()
+            markers = markers[:len(margins)]
+        empty_item = False
+        # A paragraph may continue without its list indentation. Block starts
+        # (notably a fence) and lines after a blank cannot be lazy continuations.
+        enclosing_margin = next((m for m in reversed(margins) if m <= indent), 0)
+        block_start = paragraph_break(expanded[enclosing_margin:]) or list_item(
+            expanded[enclosing_margin:], enclosing_margin, paragraph,
+        )
+        lazy = paragraph and bool(expanded.strip()) and not block_start
+        if expanded.strip() and not lazy:
+            while margins and indent < margins[-1]:
+                margins.pop()
+                # Preserve popped markers until this line is classified: the
+                # line may be a sibling of the item it just dedented out of.
+                fence = ""
+        margin = margins[-1] if margins else 0
+        content = expanded[margin:] if indent >= margin else expanded.lstrip(" ")
+        if fence:
+            closing = r" {0,3}" + re.escape(fence) + "{" + str(width) + r",} *"
+            if re.fullmatch(closing, content):
+                fence = ""
+            continue
+        # A fence can start on the marker line, including in nested list items.
+        interrupting = paragraph
+        while item := list_item(content, margin, interrupting):
+            padding = len(item[3])
+            if not item[4] or padding > 4:
+                padding = 1
+            offset = len(item[1]) + len(item[2]) + padding
+            markers = markers[:len(margins)] + [(margin, margin + offset)]
+            margin += offset
+            margins.append(margin)
+            content = content[offset:]
+            empty_item = not content.strip()
+            interrupting = False
+            paragraph = False
+        markers = markers[:len(margins)]
+        opening = opening_fence(content)
+        if opening:
+            fence, width = opening[1][0], len(opening[1])
+            paragraph = False
+            continue
+        # Four content columns start indented code only outside a paragraph.
+        # Such examples have no heading or closure authority either.
+        if not paragraph and content.startswith("    "):
+            continue
+        heading = re.fullmatch(r" {0,3}##[ \t]+(.+?)[ \t]*", line)
+        if heading:
+            section = re.sub(r"[ \t]+#+[ \t]*$", "", heading[1]).strip().lower()
+        paragraph = bool(content.strip()) and not paragraph_break(content)
+        lines.append((section, line))
+    return lines
+
+
+def _primary_closures(body: str, *, summary_only: bool = True) -> set[str]:
+    """Find standalone closures outside code blocks, normally under Summary."""
+    numbers: set[str] = set()
+    for section, line in _pr_document_lines(body):
+        if summary_only and section != "summary":
+            continue
+        match = re.fullmatch(r"\s*(?:(?:[-+*]|\d+[.)])[ \t]+)?Closes #(\d+)[ \t]*", line)
+        if match:
+            numbers.add(match[1].lstrip("0") or "0")
+    return numbers
+
+
+def _pr_body_validation_reason(body: str, issue_number: int) -> str:
+    """Validate control fields only; section completeness is advisory."""
+    if len(body) > _PR_BODY_MAX_CHARS or len(body.encode()) > _PR_BODY_MAX_CHARS:
+        return "body exceeds the publication limit"
+    numbers = _primary_closures(body)
+    if not numbers:
+        return "missing primary closure under Summary"
+    if len(numbers) != 1:
+        return "ambiguous primary closure under Summary"
+    if numbers != {str(issue_number)} or issue_number <= 0:
+        return "primary closure does not match target issue"
+    return ""
 
 
 def _pr_body_matches_guidelines(body: str, issue_number: int) -> bool:
-    """Return whether an implementer PR body satisfies the canonical structure."""
-    headings = [line for line in body.splitlines() if line.startswith("## ")]
-    if tuple(headings) != _PR_BODY_REQUIRED_SECTIONS:
-        return False
+    """Accept publishable closure authority regardless of prose layout."""
+    return not _pr_body_validation_reason(body, issue_number)
 
-    sections: dict[str, list[str]] = {}
-    current = ""
-    for line in body.splitlines():
-        if line in _PR_BODY_REQUIRED_SECTIONS:
-            current = line
-            sections[current] = []
-        elif current and line.strip():
-            sections[current].append(line.strip())
 
-    summary = sections.get("## Summary", [])
-    why = sections.get("## Why this approach", [])
-    changed = sections.get("## What changed", [])
+def _pr_layout_notice(body: str) -> str:
+    """Describe missing template sections without certifying report evidence."""
+    sections = {section for section, _ in _pr_document_lines(body)}
+    missing = [heading[3:] for heading in _PR_BODY_REQUIRED_SECTIONS
+               if heading[3:].lower() not in sections]
+    if not missing:
+        return ""
     return (
-        bool(summary)
-        and summary[0] == f"Closes #{issue_number}"
-        and len(summary) > 1
-        and summary[1].startswith("- Problem:")
-        and bool(why)
-        and why[0].startswith("- How this solves the issue:")
-        and bool(changed)
-        and changed[0].startswith("- Structure:")
-        and len(changed) > 1
-        and changed[-1].startswith("- Impact:")
+        _PR_LAYOUT_NOTICE_PREFIX + ", ".join(missing) + _PR_LAYOUT_NOTICE_SUFFIX
+    )
+
+
+def _is_pr_layout_notice(paragraph: str) -> bool:
+    """Recognize only the exact controller-generated missing-section paragraph."""
+    if not (paragraph.startswith(_PR_LAYOUT_NOTICE_PREFIX)
+            and paragraph.endswith(_PR_LAYOUT_NOTICE_SUFFIX)):
+        return False
+    missing = paragraph[len(_PR_LAYOUT_NOTICE_PREFIX):-len(_PR_LAYOUT_NOTICE_SUFFIX)].split(", ")
+    return missing == [heading[3:] for heading in _PR_BODY_REQUIRED_SECTIONS
+                       if heading[3:] in missing]
+
+
+def _with_metadata_notice(body: str, notice: str) -> str:
+    """Refresh leading controller layout state; preserve authored occurrences."""
+    prefix = ""
+    # Interpret controller prefixes after the supported CRLF equivalence, not
+    # after the concurrent-edit fingerprint's broader surrounding-space strip.
+    remainder = body.replace("\r\n", "\n")
+    warning = pipeline.VERIFICATION_WARNING + "\n\n"
+    if remainder.startswith(warning):
+        prefix, remainder = warning, remainder[len(warning):]
+    # Only exact controller paragraphs in the leading prefix are ours. Never
+    # remove matching text embedded in prose/code, or custom authored notices.
+    while True:
+        paragraph, separator, tail = remainder.partition("\n\n")
+        if not _is_pr_layout_notice(paragraph):
+            break
+        remainder = tail if separator else ""
+    if notice and not (remainder == notice or remainder.startswith(notice + "\n\n")):
+        remainder = notice + "\n\n" + remainder
+    return prefix + remainder
+
+
+def _supply_primary_closure(body: str, issue_number: int) -> tuple[str, str]:
+    """Keep the report and supply known authority when layout omits it.
+
+    A visible conflicting reference is not formatting. Never infer the target
+    from examples: the caller supplies the dispatch issue or pinned provenance.
+    The raw closing-directive-set check still gates every fixer replacement.
+    """
+    if _primary_closures(body):
+        return body, ""
+    visible = _primary_closures(body, summary_only=False)
+    if visible - {str(issue_number)}:
+        return body, "conflicting primary closure outside Summary"
+    if issue_number <= 0:
+        return body, "no controller target issue"
+    # Leading controller notices are refreshed separately. Keep the existing
+    # verification warning first so the normal composer does not duplicate it.
+    remainder = _with_metadata_notice(body, "")
+    warning = pipeline.VERIFICATION_WARNING + "\n\n"
+    prefix = ""
+    if remainder.startswith(warning):
+        prefix, remainder = warning, remainder[len(warning):]
+    return (
+        prefix + f"## Summary\nCloses #{issue_number}\n\n"
+        "> **Controller issue reference:** Harvest supplied the known target "
+        "because the authored report has no visible primary closure under Summary. "
+        "The complete authored report follows.\n\n" + remainder,
+        "",
     )
 
 
@@ -6596,31 +6773,12 @@ def _declared_closures(body: str) -> tuple[str, ...]:
 
 
 def _summary_closure(body: str) -> int:
-    """Return the issue number one PR body's ``## Summary`` opens by closing.
-
-    ``pr-guidelines.md`` makes ``Closes #N`` the first content line under
-    ``## Summary``, and :func:`_pr_body_matches_guidelines` checks exactly that
-    line. Extracting it separately is what lets the harvest pin the *original*
-    number instead of accepting whichever issue a replacement happens to name.
-
-    Args:
-        body: Raw PR body text.
-
-    Returns:
-        The issue number, or ``0`` when the body declares none there.
-    """
-    in_summary = False
-    for line in body.splitlines():
-        if line.startswith("## "):
-            if in_summary:
-                return 0
-            in_summary = line == "## Summary"
-            continue
-        if not in_summary or not line.strip():
-            continue
-        match = re.fullmatch(r"Closes #(\d+)", line.strip())
-        return int(match.group(1)) if match else 0
-    return 0
+    """Return the single distinct primary closure shared by both authors."""
+    numbers = _primary_closures(body)
+    try:
+        return int(next(iter(numbers))) if len(numbers) == 1 else 0
+    except ValueError:
+        return 0  # an unrepresentable number cannot supply dispatch authority
 
 
 class PRBodyProvenance(NamedTuple):
@@ -6632,8 +6790,8 @@ class PRBodyProvenance(NamedTuple):
 
     Attributes:
         digest: :func:`_pr_body_digest` of the body as dispatch read it.
-        summary_closes: The issue its ``## Summary`` opened by closing. The
-            replacement must open with the same one.
+        summary_closes: The single primary issue under Summary. The
+            replacement must declare the same one outside code blocks.
         closes: Every closure :func:`_declared_closures` found in it. The
             replacement must declare exactly the same set.
         truncated: Whether the engine was shown only a prefix of the body. A
@@ -6757,9 +6915,8 @@ def _fixer_body_revision(
         ``"unstamped"``, ``"stale-head"``, ``"unavailable"``, ``"truncated"``,
         ``"closure-drift"``, ``"invalid"``, or ``"conflict"``. Each names its own
         cause, because the comment this feeds is the next reviewer's handoff:
-        "did not satisfy the required PR body sections" printed over a file that
-        was too large, or that could not be read at all, sends them to look at
-        the wrong thing.
+        reporting an empty body for a file that was too large or could not be
+        read would send the reviewer to the wrong cause.
     """
     try:
         with open(
@@ -6814,9 +6971,14 @@ def _fixer_body_revision(
         # section that sat past the cut.
         return "truncated", ""
 
-    body = _normalized_pr_body("\n".join(lines[2:]))
+    envelope = text.split("\n", 2)
+    body = _normalized_pr_body(envelope[2] if len(envelope) == 3 else "")
     if not body:
         return "invalid", ""
+    body, closure_reason = _supply_primary_closure(body, provenance.summary_closes)
+    if closure_reason:
+        return "closure-drift", ""
+    body = _with_metadata_notice(body, _pr_layout_notice(body))
     body = _normalized_pr_body(pipeline.with_verification_warning(
         body, required=verification_unconfigured
         or pipeline.VERIFICATION_WARNING in live_body,
@@ -6829,9 +6991,8 @@ def _fixer_body_revision(
         or len(body.encode()) > _PR_BODY_MAX_CHARS
     ):
         return "oversized", ""
-    # Closure contract before section shape: a swapped or added `Closes #N` is a
-    # perfectly well-formed body that changes what merging the PR does, and
-    # "did not satisfy the required sections" would be a false explanation of it.
+    # Preserve both primary authority and every additional closing directive.
+    # Presentation flexibility must not change which issues merging will close.
     if (
         _summary_closure(body) != provenance.summary_closes
         or _declared_closures(body) != provenance.closes
@@ -6859,67 +7020,142 @@ def _fixer_body_revision(
     return "ready", body
 
 
-def _read_engine_pr_metadata(
-    wt_dir: str,
-    issue_number: int,
-) -> tuple[str, str] | None:
-    """Read and validate engine-authored PR metadata from ``.pr-body.md``.
+class ImplementationPRMetadata(NamedTuple):
+    """Authored content and the mechanical decision retained for publication."""
 
-    The first line is the PR title. The remaining content is the PR body and
-    must satisfy the repo's required PR body sections plus ``Closes #N``.
-    Invalid or unreadable metadata returns ``None`` so PR creation can fall
-    back to the generated title/body without blocking harvest.
-    """
-    metadata_path = os.path.join(wt_dir, _PR_BODY_SOURCE_FILE)
+    title: str
+    body: str
+    outcome: str
+    reason: str
+    notice: str
+    normalizations: tuple[str, ...]
+    controller_reference: bool = False
+
+
+class PRMetadataInvalid(ValueError):
+    """Readable source cannot safely authorize initial publication."""
+
+
+def _read_engine_pr_metadata(wt_dir: str, issue_number: int) -> ImplementationPRMetadata:
+    """Recover title independently; distinguish absent content from I/O failure."""
+    path = os.path.join(wt_dir, _PR_BODY_SOURCE_FILE)
+    reason = ""
     try:
-        with open(metadata_path, encoding="utf-8") as fh:
-            text = fh.read()
-    except (OSError, UnicodeDecodeError):
-        return None
+        with open(path, "rb") as fh:
+            raw = fh.read()
+    except FileNotFoundError:
+        if os.path.lexists(path):
+            raise  # an existing dangling link is an I/O failure
+        raw = b""
+        reason = "source artifact absent"
+    title_raw, _, body_raw = raw.partition(b"\n")
+    try:
+        title = title_raw.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        title = ""
+    fallback_title, fallback_body = _fallback_implementation_pr_metadata(issue_number)
+    title = title or fallback_title
+    try:
+        body = body_raw.decode("utf-8")
+    except UnicodeDecodeError:
+        body = ""
+        reason = "body is not decodable as UTF-8"
+    normalizations = ("CRLF to LF",) if "\r\n" in body else ()
+    body = body.replace("\r\n", "\n")
+    # The envelope's blank separator is not part of the report. Do not strip
+    # line-end whitespace: two trailing spaces can be a Markdown hard break.
+    if body.startswith("\n"):
+        body = body[1:]
+    if not body.strip():
+        reason = reason or "body is empty"
+        notice = (
+            "> **Metadata/layout notice:** Authored PR metadata unavailable: "
+            + reason + ". No verification results are claimed."
+        )
+        return ImplementationPRMetadata(
+            title, fallback_body, "unavailable", reason, notice, normalizations,
+        )
+    authored_body = body
+    body, reason = _supply_primary_closure(body, issue_number)
+    reason = reason or _pr_body_validation_reason(body, issue_number)
+    return ImplementationPRMetadata(
+        title, body, "invalid" if reason else "authored", reason,
+        _pr_layout_notice(body) if not reason else "", normalizations,
+        controller_reference=body != authored_body,
+    )
 
-    lines = text.splitlines()
-    if not lines:
-        return None
 
-    title = lines[0].strip()
-    if not title or title.startswith("#"):
-        return None
+def _pr_publication_path(wt_dir: str, number: int, kind: str = "issue") -> str:
+    """Keep a small publication record outside disposable engine scratch."""
+    dispatch_id = _read_dispatch_id(wt_dir)
+    basename = os.path.basename(_harvest_evidence_path(
+        os.path.dirname(wt_dir), kind, number, dispatch_id,
+    ))
+    return os.path.join(os.path.dirname(wt_dir), ".pr-publications", basename)
 
-    body = "\n".join(lines[1:]).strip()
-    if not body:
-        return None
 
-    if not _pr_body_matches_guidelines(body, issue_number):
-        return None
+def _record_pr_metadata(
+    wt_dir: str, number: int, metadata: dict[str, object], *,
+    kind: str = "issue", source_file: str = _PR_BODY_SOURCE_FILE,
+) -> None:
+    """Retain original bytes and decision before create, escalation, or cleanup.
 
-    return title, f"{body}\n"
+    Atomic individual replacements leave the original worktree as retry owner
+    until every write succeeds. A later handoff reads only the decision notice;
+    it never replays the staged title or report over an existing PR.
+    """
+    archive = _pr_publication_path(wt_dir, number, kind)
+    os.makedirs(archive, exist_ok=True)
+    source = os.path.join(wt_dir, source_file)
+    if os.path.lexists(source) and not _replace_evidence_file(
+        archive, source_file, lambda partial: shutil.copyfile(source, partial),
+    ):
+        raise OSError("could not retain authored PR source")
+    decision = json.dumps(metadata, ensure_ascii=False, indent=2) + "\n"
+
+    def write_decision(path: str) -> None:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(decision)
+
+    if not _replace_evidence_file(wt_dir, ".pr-metadata-decision.json", write_decision):
+        raise OSError("could not record PR metadata decision")
+    if not _replace_evidence_file(archive, "decision.json", write_decision):
+        raise OSError("could not retain PR metadata decision")
+
+
+def _implementation_metadata_notice(wt_dir: str, issue_number: int) -> str:
+    """Load this dispatch's notice for recovery without reading stale content."""
+    try:
+        path = os.path.join(_pr_publication_path(wt_dir, issue_number), "decision.json")
+        with open(path, encoding="utf-8") as fh:
+            decision = json.load(fh)
+    except FileNotFoundError:
+        if os.path.lexists(os.path.join(wt_dir, ".pr-metadata-decision.json")):
+            raise  # this handoff owes a retained record; do not drop its notice
+        return ""  # legacy handoff with no metadata decision
+    if not isinstance(decision, dict) or not isinstance(decision.get("notice"), str):
+        raise ValueError("invalid PR publication decision")
+    return decision["notice"]
 
 
 def _implementation_pr_create_args(
-    wt_dir: str,
-    issue_number: int,
-    *,
-    verification_unconfigured: bool = False,
+    wt_dir: str, issue_number: int, *, verification_unconfigured: bool = False,
 ) -> list[str]:
-    """Build ``gh pr create`` title/body args for an implementer harvest."""
+    """Stage authored metadata; I/O retries and invalid control data escalates."""
     metadata = _read_engine_pr_metadata(wt_dir, issue_number)
-    if metadata is not None:
-        title, body = metadata
-        body = pipeline.with_verification_warning(body, required=verification_unconfigured)
-        body_file = os.path.join(wt_dir, _PR_CREATE_BODY_FILE)
-        try:
-            with open(body_file, "w", encoding="utf-8") as fh:
-                fh.write(body)
-        except OSError:
-            pass
-        else:
-            return ["--title", title, "--body-file", body_file]
-
-    title, body = _fallback_implementation_pr_metadata(
-        issue_number, verification_unconfigured=verification_unconfigured,
-    )
+    body = _with_metadata_notice(metadata.body, metadata.notice)
     body = pipeline.with_verification_warning(body, required=verification_unconfigured)
-    return ["--title", title, "--body", body]
+    if len(body) > _PR_BODY_MAX_CHARS or len(body.encode()) > _PR_BODY_MAX_CHARS:
+        metadata = metadata._replace(
+            outcome="invalid", reason="body with notices exceeds the publication limit",
+        )
+    _record_pr_metadata(wt_dir, issue_number, dict(metadata._asdict()))
+    if metadata.outcome == "invalid":
+        raise PRMetadataInvalid(metadata.reason)
+    body_file = os.path.join(wt_dir, _PR_CREATE_BODY_FILE)
+    with open(body_file, "w", encoding="utf-8", newline="") as fh:
+        fh.write(body)
+    return ["--title", metadata.title, "--body-file", body_file]
 
 
 def _handle_transient_engine_result(
@@ -7268,16 +7504,27 @@ def _harvest_one_implementer(
                 )
             skip_cleanup = True
         if not skip_cleanup and not existing_pr.isdigit():
-            pr_metadata_args = _implementation_pr_create_args(
-                wt_dir, n, verification_unconfigured=verification_unconfigured,
-            )
             try:
+                pr_metadata_args = _implementation_pr_create_args(
+                    wt_dir, n, verification_unconfigured=verification_unconfigured,
+                )
                 pr_url = gh_text(
                     "pr", "create",
                     "--head", head_branch,
                     "--base", base_ref,
                     *pr_metadata_args,
                 )
+            except PRMetadataInvalid as exc:
+                harvest_action = "escalate"
+                harvest_label = pipeline.LABEL_NEEDS_HUMAN
+                harvest_result["reason"] = f"PR metadata: {exc}"
+                skip_cleanup = True
+            except OSError as exc:
+                if tick_log:
+                    tick_log.log(pr=n, phase="harvest", stage="implement",
+                                 action="pr_metadata_retry", reason=str(exc),
+                                 dispatch_id=dispatch_id)
+                skip_cleanup = True
             except subprocess.CalledProcessError as exc:
                 _log_side_effect_failure(
                     tick_log=tick_log,
@@ -7305,11 +7552,21 @@ def _harvest_one_implementer(
                 # corrupt that state, so only a label-less PR gets the initial
                 # handoff label; an unreadable label set retries next tick.
                 needs_handoff_label = True
-                if existing_pr.isdigit() or verification_unconfigured:
+                try:
+                    metadata_notice = _implementation_metadata_notice(wt_dir, n)
+                except (OSError, ValueError) as exc:
+                    metadata_notice = ""
+                    skip_cleanup = True
+                    if tick_log:
+                        tick_log.log(pr=n, phase="harvest", stage="implement",
+                                     action="pr_metadata_retry", reason=str(exc),
+                                     dispatch_id=dispatch_id)
+                ensure_notices = verification_unconfigured or bool(existing_pr and metadata_notice)
+                if not skip_cleanup and (existing_pr.isdigit() or ensure_notices):
                     try:
                         handoff = gh_json(
                             "pr", "view", str(pr_number), "--json",
-                            "labels,headRefOid,body" if verification_unconfigured
+                            "labels,headRefOid,body" if ensure_notices
                             else "labels",
                         )
                     except (subprocess.CalledProcessError, ValueError):
@@ -7319,11 +7576,13 @@ def _harvest_one_implementer(
                         skip_cleanup = True
                     else:
                         needs_handoff_label = not resumed_labels
-                        if verification_unconfigured:
+                        if ensure_notices:
                             warning_state = _ensure_implementation_warning(
                                 number=pr_number, snapshot=handoff,
                                 wt_root=wt_root, dispatch_id=dispatch_id,
                                 tick_log=tick_log,
+                                verification_unconfigured=verification_unconfigured,
+                                metadata_notice=metadata_notice,
                             )
                             if warning_state == "held":
                                 # A PR hold cannot spend the issue's retry
@@ -7364,7 +7623,7 @@ def _harvest_one_implementer(
                     elif attempts is not None:
                         attempts.clear(n)
 
-    elif harvest_action == "escalate":
+    if harvest_action == "escalate":
         comment_body = pipeline.render_implementation_escalation_comment(
             result=result_raw,
             sentinel=harvest_result.get("sentinel"),
@@ -7742,6 +8001,8 @@ def _ensure_implementation_warning(
     wt_root: str,
     dispatch_id: str,
     tick_log: TickLog | None,
+    verification_unconfigured: bool = True,
+    metadata_notice: str = "",
 ) -> str:
     """Require visible evidence on created and rediscovered PRs before handoff."""
     labels = _pipeline_labels(snapshot)
@@ -7752,7 +8013,15 @@ def _ensure_implementation_warning(
     head, body = snapshot.get("headRefOid"), snapshot.get("body")
     if not isinstance(head, str) or not head or not isinstance(body, str):
         return "unreadable"
-    candidate = _normalized_pr_body(pipeline.with_verification_warning(body, required=True))
+    # The retained notice records what this handoff owes, not which sections a
+    # human's newer live report still lacks. Availability notices stay historical.
+    if _is_pr_layout_notice(metadata_notice):
+        candidate = _with_metadata_notice(body, _pr_layout_notice(body))
+    else:
+        candidate = _with_metadata_notice(body, metadata_notice) if metadata_notice else body
+    candidate = _normalized_pr_body(pipeline.with_verification_warning(
+        candidate, required=verification_unconfigured,
+    ))
     if len(candidate) > _PR_BODY_MAX_CHARS or len(candidate.encode()) > _PR_BODY_MAX_CHARS:
         return "oversized"
     authority = _pr_body_write_authority(
@@ -8279,6 +8548,26 @@ def _harvest_one_fixer(
         str(harvest_result.get("comment_body", ""))
         if harvest_result.get("post_comment") is True else ""
     )
+
+    if os.path.lexists(os.path.join(wt_dir, _PR_BODY_REVISION_FILE)):
+        try:
+            _record_pr_metadata(
+                wt_dir, n,
+                {"outcome": revision_state, "harvest_action": harvest_action,
+                 "body": revision_body, "head": current_head,
+                 "normalization": "CRLF to LF and surrounding whitespace (GitHub round trip)"},
+                kind="pr", source_file=_PR_BODY_REVISION_FILE,
+            )
+        except OSError as exc:
+            if tick_log:
+                tick_log.log(pr=n, phase="harvest", stage="fix",
+                             action="pr_metadata_retry", reason=str(exc),
+                             dispatch_id=dispatch_id)
+            _bound_failed_harvest(
+                n, "pr", _FIXER_CONFIG.in_flight_label, wt_dir, attempts,
+                tick_log, _FIXER_CONFIG.stage,
+            )
+            return
 
     if revision_state and tick_log:
         tick_log.log(

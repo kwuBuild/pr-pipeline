@@ -1262,6 +1262,43 @@ These are authoritative reads: a failed `gh` call, or a payload whose `body` /
 an absent contract. A PR that genuinely closes no issue is not an error; the
 prompt says so in words.
 
+### Authored implementation reports
+
+The [shared PR report contract](lib/prompts/pr-body-contract.md) owns the template,
+closure parser, presentation variants, and normalization rules. Both author
+prompts receive its exact text. Harvest preserves the title independently of
+body layout and publishes authored prose, evidence, and scope without semantic
+rewriting or invented verification results.
+
+| Initial report | Harvest outcome |
+|---|---|
+| Readable body with valid closure authority | Publish the complete content; missing non-control sections add one metadata/layout notice. |
+| Missing or fenced primary reference, or an unrecognized Summary heading | Preserve the full report and prepend a marked controller issue reference using the dispatched target. Formatting alone does not escalate the harvest. |
+| Absent, empty, or undecodable body | Publish a metadata-unavailable placeholder identifying the issue; preserve a separately readable title. Claim no verification results. The PR still enters `ai:implemented` for review. |
+| Conflicting, ambiguous, or wrong primary closure; oversized content | Preserve the source and escalate to `ai:needs-human-decision` with the reason. Never truncate or infer a different issue. |
+| Read, staging, or retention I/O failure | Keep source, marker, and attempt state; retry under the existing bounded harvest policy. |
+
+Before publication, harvest retains original `.pr-body.md` bytes (when present)
+and `decision.json` under
+`.claude/worktrees/.pr-publications/issue-<N>-<dispatch-id>/`. The decision records
+the title, body, outcome, validation reason, notice, normalization actions, and
+whether harvest supplied a controller issue reference. The retained source is
+the original report, including malformed formatting.
+The worktree also holds `.pr-metadata-decision.json`; terminal escalation copies
+it and the source into `.harvest-evidence/` before cleanup. These records survive
+handoff; general retention policy remains separate work in #69.
+
+If creation succeeds but a later label step fails, harvest rediscovers the PR.
+It never replays the archived title or body over that PR. It adds a required
+notice to the freshly read live body through the guarded update path, which
+rechecks head, body, and labels before writing and preserves later human edits.
+A required layout notice reflects the current live report's missing sections,
+including partial or complete repairs made after creation with LF or CRLF line
+endings. Leading controller notices follow the
+[shared report contract](lib/prompts/pr-body-contract.md); embedded examples stay authored.
+Metadata/layout notices are separate from the verification-grant warning. They
+do not detect or certify definition-of-done evidence; #76 owns that detector.
+
 ### The PR body the fixer hands back
 
 The fixer is instructed to leave GitHub metadata writes to the controller. It
@@ -1270,6 +1307,12 @@ lets the harvest publish it — the same engine-writes-file, controller-applies-
 shape as the implementer's `.pr-body.md`. Leaving the file absent is the normal
 case and the prompt says so; it is written only when the body no longer describes
 the head the fixer pushed.
+
+For a present candidate, harvest retains the original `.pr-body-revision.md`
+and its classification in `.pr-publications/pr-<N>-<dispatch-id>/` before any
+publication or scratch cleanup. A retention failure keeps custody for bounded
+retry. An absent candidate remains normal and never selects an implementation
+placeholder.
 
 The file carries a two-line envelope before the body. The first line binds it to
 the **dispatch** (`pr-body-revision: <dispatch id>`), the second to the **commit**
@@ -1291,8 +1334,8 @@ that happens to match:
 | Provenance | A marker with no `pr_body` block (written before this path existed, or a PR whose body pinned no closure), or a live body the harvest could not read. Judging such a candidate on its content would report a perfectly good body as malformed. |
 | Truncation | Any revision at all, when the body handed to the engine was cut short by the context bound. The engine would be replacing a document whose tail it never saw, and no structural check can tell a deliberate rewrite from the silent loss of a section past the cut. |
 | Head | A head stamp that is not the PR's live head at harvest. A body written for an intermediate commit describes work that is no longer the tip. |
-| Closures | A body whose `## Summary` no longer opens with the pinned `Closes #N`, or whose full set of closing directives (`closes`/`fixes`/`resolves` anywhere in the body, cross-repo and URL forms included) differs from the set pinned at dispatch. Merging acts on every one of them, so a swap, a drop, or an addition changes what the PR does. Read from the body rather than from `closingIssuesReferences`, which GitHub leaves empty for a PR based on a non-default branch. |
-| Sections | A body that fails the repo's PR-body contract. |
+| Closures | A body with conflicting primary authority, or whose full set of closing directives (`closes`/`fixes`/`resolves` anywhere in the body, cross-repo and URL forms included) differs from the set pinned at dispatch after supplying a missing primary reference. The controller can prepend the pinned issue with a marked explanation when formatting omits or hides the primary line. Merging acts on every one of them, so a swap, a drop, or an addition changes what the PR does. Read from the body rather than from `closingIssuesReferences`, which GitHub leaves empty for a PR based on a non-default branch. |
+| Presentation | Apply the shared PR report contract. Missing non-control sections add a notice; optional context and custom subsections survive. An empty candidate remains invalid. |
 | Conflict | A live body that no longer matches the digest dispatch recorded — somebody edited it while the fixer ran. A live body that already *equals* the candidate is this run's own landed write, not a conflict, so a retry re-applies it harmlessly. |
 | Outcome | Any result other than `recheck`. An escalated or requeued run may not have pushed the head the replacement describes. |
 

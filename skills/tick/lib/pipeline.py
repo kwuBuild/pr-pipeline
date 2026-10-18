@@ -3432,8 +3432,7 @@ _BODY_REVISION_NOTES = {
     ),
     "conflict": "left unchanged — it was edited while the fixer ran",
     "invalid": (
-        "left unchanged — the fixer's revision did not satisfy the required "
-        "PR body sections"
+        "left unchanged — the fixer's revision body was empty"
     ),
     "unreadable": (
         "left unchanged — the fixer's revision file could not be read"

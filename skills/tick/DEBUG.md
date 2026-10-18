@@ -639,6 +639,15 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
 - Fixer change-summary budget: `pipeline.FIX_SUMMARY_BUDGET=3000`, substituted
   into the fixer prompt; the published excerpt is capped at that plus
   `_FIX_REPORT_HEADROOM`
+- Initial PR metadata: inspect `.pr-publications/issue-<N>-<dispatch-id>/`
+  for the original `.pr-body.md` and `decision.json`. `pr_metadata_retry` means
+  a source, staging, or retention I/O operation failed; scratch remains under
+  the bounded harvest retry policy. Conflicting closure authority or oversized
+  content uses the normal human-decision escalation with the reason and source
+  archive. Missing/hidden primary references use a marked controller header and
+  preserve the report; inspect `controller_reference` in the decision. A
+  successful-create retry uses the existing PR, preserving human
+  content and applying any required notice through the guarded body update.
 - Fixer PR-body revision: engine writes `<fixer worktree>/.pr-body-revision.md`
   after its final push, first line `pr-body-revision: <dispatch_id>`, second line
   `pr-body-revision-head: <pushed OID>`; the harvest validates it against the
