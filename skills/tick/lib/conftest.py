@@ -830,7 +830,7 @@ def fixer_revision_file(
 
 def fixer_gh_json(
     *,
-    pr_body: str = "",
+    pr_body: str | None = "",
     issues: Sequence[dict[str, object]] = (),
     comments: list[dict[str, object]] | None = None,
 ) -> Callable[..., object]:
@@ -857,12 +857,17 @@ def fixer_gh_json(
 
     if comments is None:
         comments = [{"body": f"{pipeline.REVIEW_MARKER}\nfindings"}]
-    refs = [{"number": issue.get("number", 7)} for issue in issues]
+    repository = {"name": "test-repo", "owner": {"login": TRUSTED_AUTHOR}}
+    refs = [
+        {"number": issue.get("number", 7), "repository": repository}
+        for issue in issues
+    ]
     by_number = {str(issue.get("number", 7)): issue for issue in issues}
 
-    def side_effect(*args: str) -> object:
+    def side_effect(*args: str, repo: str | None = None) -> object:
         fields = args[args.index("--json") + 1] if "--json" in args else ""
         if args[0] == "issue":
+            assert repo == f"{TRUSTED_AUTHOR}/test-repo"
             return by_number.get(args[2], {})
         if "comments" in fields:
             return {"comments": comments}

@@ -4252,7 +4252,7 @@ def test_dispatch_one_fixer_prompt_carries_the_story_surface_and_contract(
         f"the fixer prompt does not carry the PR body, got: {prompt}"
     )
     assert (
-        "### Issue #7 — feat: keep the custody marker durable"
+        "### Issue test-owner/test-repo#7 — feat: keep the custody marker durable"
     ) in prompt, (
         f"the fixer prompt does not carry the linked issue contract: {prompt}"
     )
@@ -4300,9 +4300,10 @@ def test_dispatch_one_fixer_retains_custody_when_the_issue_read_fails(
 
     reads: list[tuple[str, ...]] = []
 
-    def gh_json_side_effect(*args: str) -> object:
+    def gh_json_side_effect(*args: str, repo: str | None = None) -> object:
         reads.append(args)
         if args[0] == "issue":
+            assert repo == "test-owner/test-repo"
             raise subprocess.CalledProcessError(1, "gh")
         # A well-formed reference: the read has to be reached for the raise
         # above to be the thing under test rather than dead code.
@@ -4470,14 +4471,14 @@ def test_dispatch_one_fixer_prompt_represents_every_linked_issue(
         ],
     )
 
-    assert "### Issue #8 — fix: the contract that must survive" in prompt, (
+    assert "### Issue test-owner/test-repo#8 — fix: the contract that must survive" in prompt, (
         "a later linked issue lost its heading, so the fixer cannot tell the "
         f"contract exists at all: {prompt[-2000:]}"
     )
     assert "SECOND-CONTRACT-REQUIREMENT" in prompt, (
         f"a later linked issue's requirements were dropped: {prompt[-2000:]}"
     )
-    assert "### Issue #7 — feat: the oversized first contract" in prompt, (
+    assert "### Issue test-owner/test-repo#7 — feat: the oversized first contract" in prompt, (
         "the first contract lost its heading to the fair-share split"
     )
     assert prompt.count("F") <= tick.FIXER_CONTEXT_BUDGET, (

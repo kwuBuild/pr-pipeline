@@ -181,6 +181,13 @@ one budget, the linked issues sharing a second one shortest-first via
 `tick._split_context_budget`, so a long first contract cannot consume the whole
 budget and leave a later issue with no heading at all.
 
+`tick._fixer_pr_context` validates each linked issue's repository and number
+before any issue fetch. It uses explicit repository reads and qualified headings;
+the PR remains bound to the canonical target. Explicit null bodies render as
+empty, while missing or malformed fields retain the dispatch for retry. The
+[governing-context contract](../../skills/tick/README.md#governing-context-the-fixer-is-handed)
+owns the identity, empty-body, ordering, and retry rules.
+
 The same dispatch read also pins the marker's `pr_body` provenance block — the
 body's digest, the closure contract it declares, and whether the engine was shown
 all of it — which is what lets the fixer hand a **replacement PR body** back. It

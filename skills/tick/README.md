@@ -1241,6 +1241,14 @@ and substitutes them into the prompt: the PR body, and the body of every issue
 GitHub reports under `closingIssuesReferences`. Without them the prompt would be
 demanding work the engine cannot perform.
 
+Each reference must supply a positive integer issue number and a repository
+with a valid owner login and repository name. Dispatch validates the complete
+reference list before reading any issue, then fetches each issue with its explicit
+`owner/name` repository. The canonical target still owns PR reads and writes.
+References retain their reported order, including same-numbered issues in
+different repositories. Missing or malformed repository identity never falls
+back to the canonical target.
+
 Reading them here rather than granting the engine `gh` is the point, and it does
 not depend on which permission mode the engine launched under. Under `dontAsk` a
 `gh` call needing approval is denied; under the default `auto` mode it can reach
@@ -1257,15 +1265,18 @@ not a flat `budget // n` — the issues are allowanced shortest-first with each
 one's unused remainder rolled forward, so a one-paragraph contract cannot
 reserve half the budget away from a long one, and a long one cannot spend the
 whole budget before a later issue is reached. Each issue keeps its
-`### Issue #N — title` heading outside its allowance, because an issue cut short
+`### Issue owner/name#N — title` heading outside its allowance, because an issue cut short
 is something the fixer can still act on and an issue that renders as nothing is
 not.
 
-These are authoritative reads: a failed `gh` call, or a payload whose `body` /
-`closingIssuesReferences` fields are not the expected types, retains the PR at
-`ai:changes-requested` and logs a `skip` — it never renders as an empty body or
-an absent contract. A PR that genuinely closes no issue is not an error; the
-prompt says so in words.
+An explicit JSON `null` body is empty, as is an empty or whitespace-only string.
+The prompt states that the PR or issue has an empty body. Missing body fields,
+non-text non-null bodies, malformed references, and failed `gh` reads remain
+unknown: dispatch retains the PR at `ai:changes-requested` and logs a `skip`
+for retry. A PR that genuinely closes no issue is not an error; the prompt says
+so in words. Discovery still uses GitHub's reported links. For a stacked PR with
+no reported links, the declared closure contract remains pinned from the PR body
+for replacement validation.
 
 ### Authored implementation reports
 
