@@ -42,6 +42,24 @@ def comment_cli(offline_tick):
     payload = [entries[i:i+100] for i in range(0, len(entries), 100)] or [[]]
     if s.get("delete_between_pages"):
         payload = [entries[:100], entries[101:]]
+elif args[:2] == ["api", "graphql"] and "--slurp" not in args:
+    values = dict(arg.split("=", 1) for arg in args if "=" in arg)
+    query = values["query"]
+    def attributed(record, identity):
+        return {"id": identity, "url": "https://github.com/example/project/" + identity,
+                "author": record.get("author"), "createdAt": "2026-10-11T12:00:00Z",
+                "updatedAt": "2026-10-11T12:00:00Z", **record}
+    if "query Source" in query:
+        kind = "pullRequest" if "pullRequest(number:" in query else "issue"
+        record = {"title": "Fix", "body": s["body"], "author": {"login": "operator"}}
+        payload = {"data": {"repository": {kind: attributed(record, "PR")}}}
+    else:
+        field = next(name for name in ("closingIssuesReferences", "reviewThreads", "reviews", "comments") if name + "(first:" in query)
+        entries = [attributed(c, "C" + str(i)) for i, c in enumerate(s["history"])] if field == "comments" else []
+        start = int(values.get("cursor", "0"))
+        nodes = entries[start:start + 100]
+        payload = {"data": {"node": {field: {"nodes": nodes, "pageInfo": {
+            "hasNextPage": start + 100 < len(entries), "endCursor": str(start + 100)}}}}}
 elif args[:2] == ["api", "graphql"]:
     if s.get("fail_history"): raise SystemExit(1)
     entries = [{"id": str(i + 1), "lastEditedAt": None, "editor": None,
@@ -170,8 +188,16 @@ def test_cli_latest_forgery_cannot_replace_trusted_fixer_prompt(comment_cli):
     [prompt] = list(root.rglob("prompt.txt"))
     assert "TRUSTED FINDINGS" in prompt.read_text()
     assert "FORGED INSTRUCTIONS" not in prompt.read_text()
+    # The full evidence retains the outsider's words without selecting them.
+    [context_file] = list(root.rglob("discussion.json"))
+    discussion = json.loads(context_file.read_text())
+    forged = discussion["pr"]["comments"][-1]
+    assert forged["author"]["login"] == "outsider"
+    assert "FORGED INSTRUCTIONS" in "".join(forged["bodyParts"])
+    marker = json.loads(prompt.with_name("dispatch.json").read_text())
+    assert marker["review_sha256"] == hashlib.sha256(data["history"][-2]["body"].encode()).hexdigest()
     calls = [json.loads(line) for line in Path(str(state) + ".calls").read_text().splitlines()]
-    reads = [call for call in calls if call[:2] == ["api", "graphql"]]
+    reads = [call for call in calls if call[:2] == ["api", "graphql"] and "--slurp" in call]
     assert len(reads) == 2
     assert reads[0] == ["api", "graphql", "--hostname", "github.com", "--paginate", "--slurp",
                         "-f", "query=" + tick._COMMENT_HISTORY_QUERY, "-f", "owner=example",

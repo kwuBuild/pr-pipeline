@@ -10,6 +10,7 @@ from unittest import mock
 
 import pipeline
 import pytest
+from test_dispatch import existing_dispatch_sources  # noqa: F401
 
 from conftest import comment_pages
 from tick import TickOutcome

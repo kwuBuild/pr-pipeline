@@ -48,6 +48,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import tomllib
@@ -59,6 +60,7 @@ from typing import Any, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import claude_stream_wrapper
+import discussion_context
 import engine_usage
 import labels
 import native_skills
@@ -6904,9 +6906,9 @@ class PRBodyProvenance(NamedTuple):
             replacement must declare the same one outside code blocks.
         closes: Every closure :func:`_declared_closures` found in it. The
             replacement must declare exactly the same set.
-        truncated: Whether the engine was shown only a prefix of the body. A
-            full replacement written against a prefix would delete the tail its
-            author never saw, and no structural gate can detect that.
+        truncated: Whether the inline PR-body excerpt was cut short. This
+            conservative replacement guard remains in place even when the
+            complete body is also supplied in the discussion file.
     """
 
     digest: str
@@ -9843,6 +9845,70 @@ def dispatch_reviewers(
         )
 
 
+def _read_pr_discussion(
+    pr_number: int, *, stage: str, engine: str, tick_log: TickLog | None,
+) -> dict | None:
+    """Acquire launch evidence separately from the selected control records."""
+    try:
+        return discussion_context.acquire(
+            gh_json, TRUSTED_HEAD_REPO, pr_number, _summary_closure,
+        )
+    except discussion_context.ContextError as exc:
+        if tick_log:
+            tick_log.log(
+                pr=pr_number, phase="dispatch", stage=stage, action="skip",
+                reason=f"required PR discussion unavailable: {exc} — retained for retry",
+                engine=engine,
+            )
+        return None
+
+
+def _write_pr_discussion(
+    wt_dir: str, discussion: dict, values: dict[str, str], *,
+    pr_number: int, stage: str, engine: str, tick_log: TickLog | None,
+) -> dict[str, str] | None:
+    """Supply complete evidence inside disposable scratch, outside git's index.
+
+    A fresh directory avoids paths/symlinks supplied by the PR. Its internal
+    ignore file excludes itself and every payload from ordinary git add -A.
+    Existing scratch cleanup/archive owns the directory's lifetime. Large
+    selected reports also move to files; no discussion text changes argv size.
+    """
+    try:
+        directory = Path(tempfile.mkdtemp(prefix=".pr-pipeline-context-", dir=wt_dir))
+        (directory / ".gitignore").write_text("*\n", encoding="utf-8")
+        path = directory / "discussion.json"
+        path.write_text(
+            json.dumps(discussion_context.readable(discussion), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        supplied = {"discussion_file": str(path.resolve())}
+        for name, value in values.items():
+            if len(value.encode("utf-8")) > FIXER_CONTEXT_BUDGET:
+                source = directory / f"{name}.json"
+                parts = {"textParts": [
+                    value[start:start + 256] for start in range(0, len(value), 256)
+                ]}
+                source.write_text(json.dumps(parts, ensure_ascii=False, indent=2), encoding="utf-8")
+                supplied[name] = (
+                    f"Read the full {name} from `{source.resolve()}`. "
+                    "Join its ordered textParts without a separator. "
+                    "This file is required task evidence."
+                )
+            else:
+                supplied[name] = value
+        return supplied
+    except (OSError, ValueError) as exc:
+        if tick_log:
+            tick_log.log(
+                pr=pr_number, phase="dispatch", stage=stage, action="skip",
+                reason=f"cannot supply complete PR discussion: {exc} — retained for retry",
+                engine=engine,
+            )
+        cleanup_scratch(wt_dir)
+        return None
+
+
 def _dispatch_one_reviewer(
     *,
     pr_number: int,
@@ -9955,43 +10021,12 @@ def _dispatch_one_reviewer(
     if not head_sha:
         return
 
-    # Fetch the PR title/body for the reviewer prompt. The reviewer engine
-    # runs in a scrubbed, credential-free environment (no GH auth by design),
-    # so it cannot read the PR description itself; the trusted tick fetches
-    # the metadata with its own gh access and injects it into the prompt as
-    # delimited context. A failed or malformed read retains the PR for the
-    # next tick — launching without the intent context would silently degrade
-    # the review contract.
-    try:
-        pr_metadata = gh_json(
-            "pr", "view", str(pr_number), "--json", "title,body",
-        )
-    except (subprocess.CalledProcessError, ValueError):
-        pr_metadata = None
-    pr_title = (
-        pr_metadata.get("title") if isinstance(pr_metadata, dict) else None
+    discussion = _read_pr_discussion(
+        pr_number, stage="review", engine="codex", tick_log=tick_log,
     )
-    _raw_body = (
-        pr_metadata.get("body") if isinstance(pr_metadata, dict) else None
-    )
-    # Both fields must be strings for the payload to count as well-formed.
-    # An empty body is valid (a PR may have no description); a missing or
-    # non-string body is a malformed payload and must not be coerced to ""
-    # — that would launch the context-less review this read exists to prevent.
-    if (
-        not isinstance(pr_title, str)
-        or not pr_title
-        or not isinstance(_raw_body, str)
-    ):
-        if tick_log:
-            tick_log.log(
-                pr=pr_number, phase="dispatch", stage="review",
-                action="skip",
-                reason="failed to read PR title/body — retained for retry",
-                engine="codex",
-            )
+    if discussion is None:
         return
-    pr_body: str = _raw_body
+    pr_title, pr_body = discussion["pr"]["title"], discussion["pr"]["body"]
 
     # Pin the published reasoning and its round token from one snapshot. A
     # failed read must not launch a reviewer that never saw why nothing moved.
@@ -10113,6 +10148,16 @@ def _dispatch_one_reviewer(
         )
         return
 
+    context_values = _write_pr_discussion(
+        wt_dir, discussion,
+        {"pr_title": pr_title, "pr_body": pr_body,
+         "fixer_summary": fixer_summary or "No published fixer summary.",
+         "original_review": original_review or "No originating review available for this round."},
+        pr_number=pr_number, stage="review", engine="codex", tick_log=tick_log,
+    )
+    if context_values is None:
+        return
+
     deadline = time.time() + timeout_seconds
 
     lease_marker: dict[str, object] = {
@@ -10202,10 +10247,7 @@ def _dispatch_one_reviewer(
         "head_sha": head_sha,
         "trusted_head_repo": TRUSTED_HEAD_REPO,
         "trusted_review_author": trusted_author,
-        "pr_title": pr_title,
-        "pr_body": pr_body,
-        "fixer_summary": fixer_summary or "No published fixer summary.",
-        "original_review": original_review or "No originating review available for this round.",
+        **context_values,
     })
 
     review_prompt = native_skills.reviewer_prompt(review_skills) + "\n\n" + review_prompt
@@ -11236,7 +11278,9 @@ class FixerPRContext(NamedTuple):
     body_provenance: PRBodyProvenance | None
 
 
-def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
+def _fixer_pr_context(
+    pr_number: int, *, discussion: dict | None = None,
+) -> FixerPRContext | None:
     """Read the PR body and the contract of every issue the PR closes.
 
     Both are governing inputs for a revision — `review-response-hygiene` rule 2
@@ -11250,79 +11294,66 @@ def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
     any issue. Reads use that explicit repository, never the PR's target as a
     fallback. Explicit null bodies are empty; missing fields remain unknown.
 
-    Which issues to quote comes from GitHub's own ``closingIssuesReferences``
-    rather than a ``Closes #N`` regex over the body, so the contract block
-    matches what GitHub will actually close and needs no heuristic for prose
-    that merely mentions an issue. The *closure contract* a replacement body has
-    to preserve is read from the body instead — see :func:`_declared_closures`
-    for why the two differ.
+    Dispatch supplies the complete acquired discussion, which uses GitHub
+    closing references or the primary issue when GitHub reports no links. The
+    standalone helper retains its reported-reference read for existing callers.
+    Both paths share qualified identity validation. Replacement provenance uses
+    :func:`_declared_closures` and the existing bounded-excerpt flag.
 
     Args:
         pr_number: The PR under repair.
+        discussion: Complete validated launch acquisition, when called by dispatch.
 
     Returns:
         The :class:`FixerPRContext` for this dispatch, or ``None`` when a read
         failed or returned a payload to distrust.
     """
-    try:
-        pr_data = gh_json(
-            "pr", "view", str(pr_number),
-            "--json", "body,closingIssuesReferences",
-        )
-    except (subprocess.CalledProcessError, ValueError):
-        return None
-    if not isinstance(pr_data, dict):
-        return None
-    body = pr_data.get("body")
-    if body is None and "body" in pr_data:
-        body = ""
-    refs = pr_data.get("closingIssuesReferences")
-    if not isinstance(body, str) or not isinstance(refs, list):
-        return None
-
-    issue_refs: list[tuple[str, int]] = []
-    for ref in cast("list[object]", refs):
-        if not isinstance(ref, dict):
-            return None
-        number = ref.get("number")
-        repository = ref.get("repository")
-        if (
-            not isinstance(number, int) or isinstance(number, bool) or number <= 0
-            or not isinstance(repository, dict)
-        ):
-            return None
-        owner = repository.get("owner")
-        name = repository.get("name")
-        if not isinstance(owner, dict) or not isinstance(name, str):
-            return None
-        login = owner.get("login")
-        if (
-            not isinstance(login, str)
-            or not re.fullmatch(r"[A-Za-z0-9](?:-?[A-Za-z0-9]){0,38}", login)
-            or not re.fullmatch(r"[A-Za-z0-9._-]+", name)
-            or name in {".", ".."}
-        ):
-            return None
-        issue_refs.append((f"{login}/{name}", number))
-
-    contracts: list[tuple[str, int, str, str]] = []
-    for repository, number in issue_refs:
+    if discussion is not None:
+        body = discussion["pr"]["body"]
+        contracts = [
+            (issue["repository"], issue["number"], issue["title"], issue["body"].strip())
+            for issue in discussion["issues"]
+        ]
+    else:
         try:
-            issue = gh_json(
-                "issue", "view", str(number), "--json", "title,body",
-                repo=repository,
+            pr_data = gh_json(
+                "pr", "view", str(pr_number),
+                "--json", "body,closingIssuesReferences",
             )
         except (subprocess.CalledProcessError, ValueError):
             return None
-        if not isinstance(issue, dict):
+        if not isinstance(pr_data, dict):
             return None
-        title = issue.get("title")
-        issue_body = issue.get("body")
-        if issue_body is None and "body" in issue:
-            issue_body = ""
-        if not isinstance(title, str) or not isinstance(issue_body, str):
+        body = pr_data.get("body")
+        if body is None and "body" in pr_data:
+            body = ""
+        refs = pr_data.get("closingIssuesReferences")
+        if not isinstance(body, str) or not isinstance(refs, list):
             return None
-        contracts.append((repository, number, title, issue_body.strip()))
+
+        try:
+            issue_refs = discussion_context.qualified_references(refs)
+        except discussion_context.ContextError:
+            return None
+
+        contracts: list[tuple[str, int, str, str]] = []
+        for repository, number in issue_refs:
+            try:
+                issue = gh_json(
+                    "issue", "view", str(number), "--json", "title,body",
+                    repo=repository,
+                )
+            except (subprocess.CalledProcessError, ValueError):
+                return None
+            if not isinstance(issue, dict):
+                return None
+            title = issue.get("title")
+            issue_body = issue.get("body")
+            if issue_body is None and "body" in issue:
+                issue_body = ""
+            if not isinstance(title, str) or not isinstance(issue_body, str):
+                return None
+            contracts.append((repository, number, title, issue_body.strip()))
 
     # Every linked issue keeps its heading and an allowance of its own. The
     # heading sits outside the allowance because it is what tells the engine the
@@ -11351,7 +11382,7 @@ def _fixer_pr_context(pr_number: int) -> FixerPRContext | None:
         contract_block=contract_block,
         # Pinned against the whole body and the *bounded* one together: the
         # digest and closure contract describe what GitHub holds, and the
-        # truncation flag records that the engine saw less than that.
+        # truncation flag retains the existing guard on a shortened excerpt.
         body_provenance=_pr_body_provenance(
             body, truncated=bounded_body != body_block,
         ),
@@ -11497,17 +11528,13 @@ def _dispatch_one_fixer(
     # for a revision, and the engine cannot fetch either itself. Read them here,
     # before anything is created, so a failed or untrustworthy read costs one
     # skipped dispatch instead of a fixer working from a contract it never saw.
-    pr_context = _fixer_pr_context(pr_number)
-    if pr_context is None:
-        if tick_log:
-            tick_log.log(
-                pr=pr_number, phase="dispatch", stage="fix",
-                action="skip",
-                reason="failed to read PR body or linked issue contract — "
-                       "retained for retry",
-                engine=impl_engine,
-            )
+    discussion = _read_pr_discussion(
+        pr_number, stage="fix", engine=impl_engine, tick_log=tick_log,
+    )
+    if discussion is None:
         return
+    pr_context = _fixer_pr_context(pr_number, discussion=discussion)
+    assert pr_context is not None  # The acquisition validated each source.
 
     # Authenticate history before creating scratch or acquiring a launch lease.
     comments = _read_comment_history(
@@ -11608,6 +11635,15 @@ def _dispatch_one_fixer(
     if pr_context.body_provenance is not None:
         lease_marker["pr_body"] = pr_context.body_provenance.as_marker_field()
 
+    context_values = _write_pr_discussion(
+        wt_dir, discussion,
+        {"review_body": review_body, "pr_body": pr_context.body_block,
+         "issue_contract": pr_context.contract_block},
+        pr_number=pr_number, stage="fix", engine=impl_engine, tick_log=tick_log,
+    )
+    if context_values is None:
+        return
+
     # Bind the exact finding set before spawning. Its content fingerprint travels
     # through harvest's comment so re-review cannot substitute a later review.
     lease_marker["review_sha256"] = hashlib.sha256(review_body.encode()).hexdigest()
@@ -11643,9 +11679,7 @@ def _dispatch_one_fixer(
         "target_remote": TARGET_REMOTE,
         "verification_context": _verification_prompt(verification_unconfigured),
         "pr_number": pr_number,
-        "review_body": review_body,
-        "pr_body": pr_context.body_block,
-        "issue_contract": pr_context.contract_block,
+        **context_values,
         "head_ref": head_ref,
         "revision_hygiene_skill_doc": skill_doc_path(REVISION_HYGIENE_SKILL),
         "revision_hygiene_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{REVISION_HYGIENE_SKILL}",

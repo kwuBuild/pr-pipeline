@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from tick import TickOutcome
+from test_dispatch import existing_dispatch_sources  # noqa: F401
 
 from conftest import (  # type: ignore[import-untyped]
     FIXER_HARVEST_HEAD,
