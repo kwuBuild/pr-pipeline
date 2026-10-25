@@ -476,10 +476,45 @@ result = None
 if a == ["--version"]:
     print("gh version 2.75.0"); sys.exit(0)
 elif a[:2] == ["api", "graphql"]:
-    result = [{"data": {"repository": {"pullRequest": {"comments": {
-        "totalCount": 1, "nodes": [{"id": "1", "author": {"login": "test-owner"},
-        "body": item["comments"][0]["body"], "lastEditedAt": None, "editor": None,
-        "includesCreatedEdit": False}], "pageInfo": {"hasNextPage": False, "endCursor": "one"}}}}}}]
+    assert a[2:4] == ["--hostname", "github.com"]
+    values = dict(value.split("=", 1) for value in a if "=" in value)
+    query = values["query"]
+    payload = json.loads((root / "context.json").read_text()) if (root / "context.json").exists() else {"pr": item, "issues": {}}
+    def attributed(record, identity):
+        if record == "read-failure":
+            sys.exit(1)
+        return {"id": identity, "url": "https://github.com/example/loop/" + identity,
+                "title": "Fixture title", "author": {"login": "owner"},
+                "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", **record}
+    if "--slurp" in a:
+        result = [{"data": {"repository": {"pullRequest": {"comments": {
+            "totalCount": 1, "nodes": [{"id": "1", "author": {"login": "test-owner"},
+            "body": item["comments"][0]["body"], "lastEditedAt": None, "editor": None,
+            "includesCreatedEdit": False}], "pageInfo": {"hasNextPage": False, "endCursor": "one"}}}}}}]
+    elif "query Source" in query:
+        source_kind = "pullRequest" if "pullRequest(number:" in query else "issue"
+        repository = values["owner"] + "/" + values["name"]
+        if source_kind == "pullRequest":
+            assert repository == "example/loop"
+            record = attributed(payload["pr"], "PR")
+        else:
+            key = repository + "#" + values["number"]
+            record = attributed(payload["issues"].get(key, {}), "ISSUE:" + key)
+        result = {"data": {"repository": {source_kind: record}}}
+    else:
+        field = next(name for name in ("closingIssuesReferences", "reviewThreads", "reviews", "comments") if name + "(first:" in query)
+        identity = values["id"]
+        if field == "closingIssuesReferences":
+            pages = [payload["pr"].get(field)]
+        else:
+            pages = payload.get("discussion", {}).get(identity, {}).get(field, [[]])
+        index = int(values.get("cursor", "0"))
+        nodes = pages[index]
+        if nodes == "read-failure":
+            print("requested discussion page unavailable", file=sys.stderr)
+            sys.exit(1)
+        result = {"data": {"node": {field: {"nodes": nodes, "pageInfo": {
+            "hasNextPage": index + 1 < len(pages), "endCursor": str(index + 1)}}}}}
 elif a[0] == "api" and "/labels?" in a[1]:
     result = [[{"name": name} for name in json.loads(os.environ["LOOP_TEST_LABELS"])]]
 elif a[:2] in (["issue", "list"], ["pr", "list"]):

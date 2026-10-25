@@ -940,11 +940,10 @@ comment is what the next fixer dispatch reads as its findings handoff.
 The reviewer gets:
 - Read-only sandbox (`-s read-only`) — blocks filesystem writes
 - The committed diff, self-scoped against the pinned base SHA
-- The PR title and body, fetched by the trusted tick with its own `gh` access and
-  embedded in the prompt as delimited context-only text — the reviewer environment
-  has no GitHub credentials (by design, see below), so it cannot run `gh pr view`
-  itself, and a failed metadata read retains the PR for the next tick instead of
-  launching a context-less review
+- Fresh PR and governing issue bodies plus complete attributed discussion,
+  fetched by the trusted tick. The prompt points to ignored worktree files under
+  the [governing-context contract](../skills/tick/README.md#governing-context-the-fixer-is-handed).
+  The reviewer has no GitHub credentials; failed acquisition retains the PR for retry
 - The worktree's `AGENTS.md`, auto-loaded by codex as the project doc, plus
   unrestricted read access to the rest of the tree (`CLAUDE.md`, review
   checklists, docs) to consult at its own discretion
@@ -1384,6 +1383,8 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   committed and pushed, or `NEEDS_HUMAN_DECISION` if blocked on scope/design
 
 **Review prompt:**
+- Complete launch context under the [governing-context contract](../skills/tick/README.md#governing-context-the-fixer-is-handed),
+  separate from the selected fixer report and originating review
 - Latest published fixer recheck summary on `ai:revised`, including reasons
   for `Decision: no-change`, plus the exact originating review identified by
   the fixer's pinned fingerprint. Check every original finding, even when the
@@ -1401,17 +1402,12 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   `review.json` the wrapper validates and publishes
 
 **Fix prompt:**
-- Review comments from the PR (via `gh pr view --json comments`)
-- The current PR body, and the requirements of every issue GitHub reports under
-  `closingIssuesReferences` (via `gh pr view --json body,closingIssuesReferences`
-  plus `gh issue view --json title,body`). The engine has no pre-approved `gh` access, so
-  these are read at dispatch and substituted; each is capped at
-  `tick.FIXER_CONTEXT_BUDGET` with the cut stated in the text — the linked issues
-  share one budget, allowanced shortest-first so no issue is dropped outright —
-  and a failed or mistyped read retains the PR rather than rendering an absent
-  contract. The same read pins the marker's `pr_body` provenance block — the
-  body's digest, the closure contract it declares, and whether the copy handed to
-  the engine was cut short — which gates the PR-body revision path below
+- The selected originating review from [authenticated comment history](../skills/tick/README.md#comment-trust-and-incomplete-history)
+- Fresh PR and governing issue bodies and complete discussion under the
+  [governing-context contract](../skills/tick/README.md#governing-context-the-fixer-is-handed).
+  Full text lives in ignored worktree files; inline excerpts retain the existing
+  budget. The PR-body provenance block still pins the raw body's digest, declared
+  closures and whether its inline excerpt was truncated
 - The filename, the dispatch-bound stamp line, and the head-stamp prefix for an
   optional replacement PR body (see the PR-body revision contract below)
 - The current diff (the worktree is the PR head; `git diff`/`git log` are allowed)
@@ -1467,10 +1463,9 @@ shape as the implementer's `.pr-body.md`:
   unreadable live body withholds the replacement outright, because judging the
   candidate on its sections would publish "malformed body" about a body that is
   fine.
-- A revision is withheld outright when the body handed to the engine was
-  truncated for the prompt. The engine cannot preserve what it never read, and no
-  structural check can distinguish an intentional rewrite from a section lost
-  past the cut.
+- A revision is withheld when the PR-body excerpt was truncated. This remains
+  a conservative publication guard even though the full source is now available
+  in the discussion file; this change does not relax replacement authority.
 - The closure contract comes from the body, not from `closingIssuesReferences`:
   the replacement must open `## Summary` with the same `Closes #N` and declare
   exactly the same set of closing directives anywhere in the body. Merging acts

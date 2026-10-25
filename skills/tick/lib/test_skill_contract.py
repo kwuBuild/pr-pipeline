@@ -138,6 +138,7 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "review_body": "findings",
         "pr_body": "## Summary",
         "issue_contract": "### Issue example/repo#1 — contract render",
+        "discussion_file": "/fixture/discussion.json",
         "head_ref": "worktree-i1",
         "revision_hygiene_skill_doc": "some/skill/SKILL.md",
         "revision_hygiene_skill_invocation": "pr-pipeline:review-response-hygiene",

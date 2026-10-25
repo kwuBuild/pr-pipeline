@@ -632,10 +632,12 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
   the Codex optional catalog is `native_skills.REVIEW_SKILLS`.
   Unreadable means the install is missing a file its prompt names, which logs
   `skill_unresolved` and escalates (see README "Prompt-bound skills")
-- Fixer injected context: PR body + every `closingIssuesReferences` issue body,
-  with the cut stated inline; the body gets `tick.FIXER_CONTEXT_BUDGET=20000`
-  and the linked issues share a second one, shortest-first so no issue is
-  dropped; a failed or mistyped read retains the PR and logs a `skip`
+- Reviewer/fixer context: inspect the prompt's `.pr-pipeline-context-*/discussion.json`
+  and any selected-report files in the stage worktree. `bodyParts`, `diffHunkParts`
+  and `textParts` concatenate without separators. A required read/page or file
+  failure logs its cause as a dispatch `skip` and retains the pickup label for
+  retry. See the [governing-context contract](README.md#governing-context-the-fixer-is-handed)
+  for source selection, pagination, attribution and excerpt budgets
 - Fixer change-summary budget: `pipeline.FIX_SUMMARY_BUDGET=3000`, substituted
   into the fixer prompt; the published excerpt is capped at that plus
   `_FIX_REPORT_HEADROOM`

@@ -30,6 +30,43 @@ from conftest import (  # type: ignore[import-untyped]
 
 
 @pytest.fixture(autouse=True)
+def existing_dispatch_sources(monkeypatch):
+    """Adapt the older launch fixtures at the acquisition boundary.
+
+    These tests focus on custody, grants, report selection and bounded prompt
+    excerpts. test_discussion_context and test_fixer_context exercise the real
+    acquisition with paginated GraphQL payloads and subprocess CLI shims.
+    """
+    import tick
+    import discussion_context
+
+    def read_context(number, *, stage, engine, tick_log):
+        try:
+            fields = "title,body" if stage == "review" else "body,closingIssuesReferences"
+            data = tick.gh_json("pr", "view", str(number), "--json", fields)
+            if not isinstance(data, dict) or "body" not in data or (data["body"] is not None and not isinstance(data["body"], str)):
+                raise ValueError("invalid PR body")
+            title = data.get("title") if stage == "review" else "Fixture PR"
+            if not isinstance(title, str) or not title:
+                raise ValueError("invalid PR title")
+            issues = []
+            if stage == "fix":
+                for repo, issue_number in discussion_context.qualified_references(data.get("closingIssuesReferences")):
+                    issue = tick.gh_json("issue", "view", str(issue_number), "--json", "title,body", repo=repo)
+                    if not isinstance(issue, dict) or not isinstance(issue.get("title"), str) or "body" not in issue or (issue["body"] is not None and not isinstance(issue["body"], str)):
+                        raise ValueError("invalid issue body")
+                    issues.append({**issue, "body": issue["body"] or "", "repository": repo, "number": issue_number})
+            return {"pr": {"title": title, "body": data["body"] or ""}, "issues": issues}
+        except (ValueError, subprocess.CalledProcessError):
+            if tick_log:
+                tick_log.log(pr=number, phase="dispatch", stage=stage, action="skip", engine=engine,
+                             reason="failed to read PR title/body or linked issue contract — retained for retry")
+            return None
+
+    monkeypatch.setattr(tick, "_read_pr_discussion", read_context)
+
+
+@pytest.fixture(autouse=True)
 def isolate_reviewer_config(tmp_path_factory: pytest.TempPathFactory):
     """Point the reviewer config resolver at an empty file, not the operator's.
 
@@ -2077,10 +2114,9 @@ def test_reviewer_dispatch_retains_pr_on_malformed_metadata_payload(
     "metadata",
     [
         {"title": "valid title", "body": 7},
-        {"title": "valid title", "body": None},
         {"title": "valid title"},
     ],
-    ids=["int-body", "null-body", "missing-body"],
+    ids=["int-body", "missing-body"],
 )
 def test_reviewer_dispatch_retains_pr_on_malformed_body_payload(
     tmp_path: Path, metadata: dict[str, object],
@@ -4266,7 +4302,7 @@ def test_dispatch_one_fixer_prompt_carries_the_story_surface_and_contract(
         "the linked issue's requirements did not reach the prompt"
     )
     assert (
-        "you have no GitHub access, so what is quoted above is all of it."
+        "you have no GitHub access, so read the full controller-supplied context file as well as the excerpts above."
     ) in prompt, f"the prompt does not bound what the engine can see: {prompt}"
 
 
@@ -6581,7 +6617,17 @@ def render_fixer_prompt(
                                 )
 
     popen.assert_called_once()
-    return (wt_root / f"pr-{pr_number}" / "prompt.txt").read_text()
+    worktree = wt_root / f"pr-{pr_number}"
+    prompt = (worktree / "prompt.txt").read_text()
+    # Consume the referenced excerpt/report files as the prompt requires. Full
+    # discussion-file consumption is proved separately through real engines.
+    for source in worktree.glob(".pr-pipeline-context-*/*.json"):
+        if source.name == "discussion.json":
+            continue
+        pointer = f"Read the full {source.stem} from `{source.resolve()}`. Join its ordered textParts without a separator. This file is required task evidence."
+        assert pointer in prompt
+        prompt = prompt.replace(pointer, "".join(json.loads(source.read_text())["textParts"]))
+    return prompt
 
 # Flags of bare `codex exec` that consume the next argv element as a value
 # (from `codex exec --help` on codex-cli 0.142.5). Everything else starting

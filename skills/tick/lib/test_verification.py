@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+from test_dispatch import existing_dispatch_sources  # noqa: F401
 
 import pipeline
 import tick

@@ -27,7 +27,12 @@ def context_repo(loop_repo):
         yield repo, env
     finally:
         marker_path = repo / ".claude/worktrees/pr-7/dispatch.json"
-        if marker_path.exists():
+        # Consuming-engine proofs exit on their own. Do not signal a completed
+        # fixture from an old marker: its PID/group can already be gone or reused.
+        completed = any(path.is_file() and path.stat().st_size > 0
+                        for path in (marker_path.parent / "completion.json",
+                                     marker_path.parent / "result.json"))
+        if marker_path.exists() and not completed:
             pid = json.loads(marker_path.read_text()).get("pid")
             if pid:
                 try:
@@ -47,10 +52,7 @@ def test_launcher_preserves_linked_repository_identity(context_repo):
 
     run_tick(repo, env)
 
-    assert issue_reads(repo) == [
-        ["gh", "issue", "view", "7", "--json", "title,body", "--repo", "github.com/other/contracts"],
-        ["gh", "issue", "view", "7", "--json", "title,body", "--repo", "github.com/example/loop"],
-    ]
+    assert issue_reads(repo) == ["other/contracts#7", "example/loop#7"]
     worktree = repo / ".claude/worktrees/pr-7"
     prompt = (worktree / "prompt.txt").read_text()
     foreign = "### Issue other/contracts#7 — Foreign contract\n\nForeign requirement"
@@ -117,7 +119,8 @@ def test_launcher_retains_unknown_context_then_retries(context_repo, failure):
     repo, env = context_repo
     good = {
         "pr": {"body": "## Summary\nCloses #7\n", "closingIssuesReferences": [issue_ref("other/contracts", 7)]},
-        "issues": {"other/contracts#7": {"title": "Contract", "body": "Required behavior"}},
+        "issues": {"other/contracts#7": {"title": "Contract", "body": "Required behavior"},
+                   "example/loop#7": {"title": "Local", "body": "Local contract"}},
     }
     bad = json.loads(json.dumps(good))
     if failure == "reference":
@@ -140,12 +143,12 @@ def test_launcher_retains_unknown_context_then_retries(context_repo, failure):
         entries = [json.loads(line)
                    for path in (repo / ".claude/worktrees/.tick-log").glob("tick-*.jsonl")
                    for line in path.read_text().splitlines()]
-        assert any(entry.get("action") == "skip" and "linked issue" in entry.get("reason", "")
+        assert any(entry.get("action") == "skip" and "discussion unavailable" in entry.get("reason", "")
                    for entry in entries)
     if failure in {"reference", "pr-body", "pr-read"}:
         assert issue_reads(repo) == []
     else:
-        assert all(call[-1] == "github.com/other/contracts" for call in issue_reads(repo))
+        assert all(identity == "other/contracts#7" for identity in issue_reads(repo))
 
     (repo / "context.json").write_text(json.dumps(good))
     run_tick(repo, env)
@@ -206,7 +209,14 @@ def run_tick(repo, env):
 
 
 def issue_reads(repo):
-    return [call for call in read_calls(repo) if call[:3] == ["gh", "issue", "view"]]
+    identities = []
+    for call in read_calls(repo):
+        if call[:3] != ["gh", "api", "graphql"]:
+            continue
+        values = dict(arg.split("=", 1) for arg in call if "=" in arg)
+        if "query Source" in values["query"] and "issue(number:" in values["query"]:
+            identities.append(values["owner"] + "/" + values["name"] + "#" + values["number"])
+    return identities
 
 
 def read_calls(repo):

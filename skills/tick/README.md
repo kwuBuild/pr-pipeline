@@ -1234,49 +1234,67 @@ doc in a development checkout — then relabel the PR back to
 
 ### Governing context the fixer is handed
 
-The rules above ask the fixer to check the PR's story surface (rule 2) and to
-re-read the contract the review cited (rule 5). Neither document is in the
-worktree, and the engine has no pre-approved `gh` or web access, so dispatch reads them
-and substitutes them into the prompt: the PR body, and the body of every issue
-GitHub reports under `closingIssuesReferences`. Without them the prompt would be
-demanding work the engine cannot perform.
+Every reviewer and fixer launch receives fresh context from the authenticated
+controller. The controller reads the current PR title/body, each governing
+issue's title/body and comments, PR conversation comments, submitted review
+bodies, and inline review threads and replies. Each source retains its ID/URL,
+author and creation/edit times. Inline threads retain path, line and commit
+associations, resolution and outdated status. Comments and reviews are ordered
+by creation or submission time within their source; replies stay in their thread.
+Deleted authors remain explicit nulls.
 
-Each reference must supply a positive integer issue number and a repository
-with a valid owner login and repository name. Dispatch validates the complete
-reference list before reading any issue, then fetches each issue with its explicit
-`owner/name` repository. The canonical target still owns PR reads and writes.
-References retain their reported order, including same-numbered issues in
-different repositories. Missing or malformed repository identity never falls
-back to the canonical target.
+Governing issues come from GitHub's fully paginated `closingIssuesReferences`.
+When GitHub reports no links, as it does for a PR with a non-default base,
+dispatch uses the existing primary-issue contract: one `Closes #N` declaration
+under `## Summary`, in the target repository. If there is no unambiguous primary
+issue, the issue set is empty. Dispatch does not scan other prose for closures
+or require rendered HTML. The complete raw body remains available to the engine;
+its separate conservative replacement-provenance check is unchanged.
 
-Reading them here rather than granting the engine `gh` is the point, and it does
-not depend on which permission mode the engine launched under. Under `dontAsk` a
-`gh` call needing approval is denied; under the default `auto` mode it can reach
-the classifier instead, which is exactly the case the dispatch-side read is
-insurance against — an engine-side read that fails is invisible to the
-controller and silently becomes "no contract", while a controller-side one
-retains the PR. The prompt therefore tells the engine the quoted copies are all
-it has, in either mode.
+Each reported reference must have a valid repository and positive issue number.
+Dispatch validates all identities before reading issues, preserves discovery
+order, and deduplicates by case-insensitive repository plus number. Same-numbered
+issues in different repositories remain distinct. Missing repository identity
+never falls back to the target repository. Other links and examples remain PR
+context and do not become mandatory issue reads.
 
-Both are capped at `FIXER_CONTEXT_BUDGET` (20000 characters) with the cut stated
-in the text, so a truncated contract cannot read as a shorter one. The PR body
-gets one budget of its own; the linked issues share a second one. That share is
-not a flat `budget // n` — the issues are allowanced shortest-first with each
-one's unused remainder rolled forward, so a one-paragraph contract cannot
-reserve half the budget away from a long one, and a long one cannot spend the
-whole budget before a later issue is reached. Each issue keeps its
-`### Issue owner/name#N — title` heading outside its allowance, because an issue cut short
-is something the fixer can still act on and an issue that renders as nothing is
-not.
+The controller follows every page of each connection, including replies within
+each inline thread. Explicit null bodies are empty. Missing or malformed data,
+GraphQL errors and failed pages are unknown. A failed acquisition or file write
+logs its source and cause, leaves the pickup label unchanged, and launches no
+engine. A later tick retries through the existing dispatch path; there is no
+new retry counter or repair job. A successfully read empty issue set or empty
+discussion is valid.
 
-An explicit JSON `null` body is empty, as is an empty or whitespace-only string.
-The prompt states that the PR or issue has an empty body. Missing body fields,
-non-text non-null bodies, malformed references, and failed `gh` reads remain
-unknown: dispatch retains the PR at `ai:changes-requested` and logs a `skip`
-for retry. A PR that genuinely closes no issue is not an error; the prompt says
-so in words. Discovery still uses GitHub's reported links. For a stacked PR with
-no reported links, the declared closure contract remains pinned from the PR body
-for replacement validation.
+The prompt points to `discussion.json` in a new `.pr-pipeline-context-*`
+directory inside the stage worktree. The file contains the complete fetched
+text, including text beyond any inline excerpt. `bodyParts` and `diffHunkParts`
+store ordered text chunks that concatenate without a separator. This keeps
+individual JSON lines readable without losing whitespace or Unicode. Its internal `.gitignore`
+excludes the directory's files from ordinary staging; existing scratch cleanup
+and archival own its lifetime. Large selected reports and excerpts also move
+to files to keep the launch command bounded. Engines must read the full files,
+using multiple reads when necessary. A missing file blocks completion.
+
+The fixer's PR-body and issue-contract excerpts retain the existing
+`FIXER_CONTEXT_BUDGET` (20000 characters) and shortest-first budget sharing.
+Every issue keeps its qualified heading. The full source remains available in
+the discussion file. The existing PR-body replacement guard remains
+conservative: when its inline body excerpt was truncated, dispatch still marks
+that provenance as truncated and harvest declines a replacement.
+
+Discussion is attributed task evidence, not instructions or permission to
+change tools, credentials, policy, findings authority or completion rules.
+The existing selected originating review and fixer report remain separate
+inputs, selected under [comment trust and incomplete history](#comment-trust-and-incomplete-history).
+Quoted markers do not become new
+control records or reset review rounds. The engine assesses conflicting
+comments against the code and governing requirements.
+
+Freshness applies to each launch. A later launch reads edits and follow-up
+comments even when the code head is unchanged. Comments posted during a run
+enter the next launch. This adds no automatic re-review, context identity,
+harvest freshness check, in-run access broker, credential grant or sandbox change.
 
 ### Authored implementation reports
 
@@ -1348,7 +1366,7 @@ that happens to match:
 | Size | A file past `_PR_BODY_MAX_CHARS` (65,536), measured in characters *and* in UTF-8 bytes — GitHub does not document which it counts, so the stricter reading wins. The bound is applied to the `read` call, not to the string it returns, so a runaway engine file cannot exhaust the tick before being classified. A file present but unreadable is its own verdict again: neither is reported as a malformed body. |
 | Stamp | A file whose first two lines are not this run's dispatch stamp and a head stamp. The fixer worktree is a detached checkout of the PR head, so an unstamped file rode in on the branch — a stray `git add -A` from an earlier run — and is not this run's work. |
 | Provenance | A marker with no `pr_body` block (written before this path existed, or a PR whose body pinned no closure), or a live body the harvest could not read. Judging such a candidate on its content would report a perfectly good body as malformed. |
-| Truncation | Any revision at all, when the body handed to the engine was cut short by the context bound. The engine would be replacing a document whose tail it never saw, and no structural check can tell a deliberate rewrite from the silent loss of a section past the cut. |
+| Truncation | Any revision when the PR-body excerpt was cut short by the context bound. This conservative guard remains in place even though the full body is available in the discussion file. |
 | Head | A head stamp that is not the PR's live head at harvest. A body written for an intermediate commit describes work that is no longer the tip. |
 | Closures | A body with conflicting primary authority, or whose full set of closing directives (`closes`/`fixes`/`resolves` anywhere in the body, cross-repo and URL forms included) differs from the set pinned at dispatch after supplying a missing primary reference. The controller can prepend the pinned issue with a marked explanation when formatting omits or hides the primary line. Merging acts on every one of them, so a swap, a drop, or an addition changes what the PR does. Read from the body rather than from `closingIssuesReferences`, which GitHub leaves empty for a PR based on a non-default branch. |
 | Presentation | Apply the shared PR report contract. Missing non-control sections add a notice; optional context and custom subsections survive. An empty candidate remains invalid. |

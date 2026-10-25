@@ -170,27 +170,27 @@ symlinks. See [stage bindings](../../skills/tick/README.md#prompt-bound-skills-s
 for discovery, permissions, required guidance, and the Phase A/B obligations.
 Harvest validates result structure, not compliance with skill instructions.
 
-The fixer also gets two documents it has no pre-approved way to fetch — `gh`
-and web access are not granted — read by dispatch and substituted in: the **PR body** and the
-body of **every issue GitHub reports under `closingIssuesReferences`**. These are
-what `review-response-hygiene` rules 2 and 5 operate on, so without them the
-prompt demands a check the engine cannot perform. Both are authoritative reads
-that retain custody on failure, and both are capped at
-`tick.FIXER_CONTEXT_BUDGET` with the cut announced in the text — the body against
-one budget, the linked issues sharing a second one shortest-first via
-`tick._split_context_budget`, so a long first contract cannot consume the whole
-budget and leave a later issue with no heading at all.
+Both reviewer and fixer dispatch call `discussion_context.acquire` for fresh
+PR and governing issue bodies and complete discussion. The helper paginates
+closing references, comments, submitted reviews, threads and each thread's
+replies independently. Qualified issue validation reuses #33's repository and
+nullable-body rules. GitHub's reported issue links select the governing sources;
+when the list is empty, the existing `tick._summary_closure` selects the primary
+issue for a stacked PR. No rendered HTML or general prose scan is required.
+Raw replacement provenance remains separate.
 
-`tick._fixer_pr_context` validates each linked issue's repository and number
-before any issue fetch. It uses explicit repository reads and qualified headings;
-the PR remains bound to the canonical target. Explicit null bodies render as
-empty, while missing or malformed fields retain the dispatch for retry. The
-[governing-context contract](../../skills/tick/README.md#governing-context-the-fixer-is-handed)
-owns the identity, empty-body, ordering, and retry rules.
+`tick._write_pr_discussion` writes the complete attributed data into an ignored,
+uniquely named directory inside the stage worktree before launch. Large selected
+reports also move to files. A failed required read or write retains the pickup
+label for retry without launching. Existing scratch cleanup owns these files.
+`tick._fixer_pr_context` renders the bounded fixer excerpts and pins existing
+body provenance; review/report selection remains a separate authority path.
+The [governing-context contract](../../skills/tick/README.md#governing-context-the-fixer-is-handed)
+owns the source, ordering, pagination, file, authority and retry rules.
 
 The same dispatch read also pins the marker's `pr_body` provenance block — the
-body's digest, the closure contract it declares, and whether the engine was shown
-all of it — which is what lets the fixer hand a **replacement PR body** back. It
+body's digest, the closure contract it declares, and whether its inline excerpt
+was truncated — which is what lets the fixer hand a **replacement PR body** back. It
 is instructed to leave `gh` writes to the controller: after its final push it writes `.pr-body-revision.md` in its
 worktree root under a two-line envelope (`pr-body-revision: <dispatch_id>`, then
 `pr-body-revision-head: <pushed OID>`), and the harvest checks the envelope, the
