@@ -321,6 +321,16 @@ _PR_LAYOUT_NOTICE_PREFIX = (
 _PR_LAYOUT_NOTICE_SUFFIX = (
     ". The authored content is preserved; this notice does not assess verification evidence."
 )
+_IMPLEMENTATION_EVIDENCE_WARNING = (
+    "> **Implementation evidence missing:** `Test coverage` lacks the required "
+    "definition-of-done evidence or an explicit `Definition of done: n/a` "
+    "Scope exemption with a reason. Recover the author's evidence before approval. "
+    "This notice checks presence only; it does not validate proof or approve the change."
+)
+_IMPLEMENTATION_EVIDENCE_FIELDS = frozenset({
+    "phase a", "proved at", "entry point", "boundary swept",
+    "disproof (static)", "disproof (execution)", "scope rechecked",
+})
 _TERMINAL_LABELS = frozenset({
     pipeline.LABEL_READY_FOR_HUMAN,
     pipeline.LABEL_NEEDS_HUMAN,
@@ -6643,13 +6653,18 @@ def _fallback_implementation_pr_metadata(issue_number: int) -> tuple[str, str]:
     )
 
 
-def _pr_document_lines(body: str) -> list[tuple[str, str]]:
+def _pr_document_lines(
+    body: str, *, include_code: bool = False, exclude_comments: bool = False,
+) -> list[tuple[str, str]]:
     """Read document sections outside code, including list-contained blocks.
 
     List content margins are cumulative; the fence's three-space allowance is
     relative to its container. Dedenting out of a list ends its unclosed fence.
-    Tabs affect indentation columns only. Returned lines and publication bytes
-    remain authored, separate from the concurrent-edit fingerprint.
+    Tabs affect indentation columns only. Publication bytes remain authored,
+    separate from the concurrent-edit fingerprint. Evidence
+    may include code lines, but code never establishes section boundaries.
+    Its optional comment filter changes only the evidence view, not the
+    authored body or the default closure/layout interpretation.
     """
     lines: list[tuple[str, str]] = []
     margins: list[int] = []
@@ -6659,6 +6674,32 @@ def _pr_document_lines(body: str) -> list[tuple[str, str]]:
     section = ""
     paragraph = False
     empty_item = False
+    comment = False
+
+    def without_comments(line: str) -> str:
+        nonlocal comment
+        visible: list[str] = []
+        while line:
+            if comment:
+                _, closing, line = line.partition("-->")
+                if not closing:
+                    break
+                comment = False
+                continue
+            # Inline code and escaped '<' display comment markers literally.
+            token = re.search(r"(?<!`)(`+)(?!`).*?(?<!`)\1(?!`)|<!--", line)
+            if not token:
+                visible.append(line)
+                break
+            prefix = line[:token.start()]
+            visible.append(prefix)
+            escaped = (len(prefix) - len(prefix.rstrip("\\"))) % 2
+            if token[0] == "<!--" and not escaped:
+                comment = True
+            else:
+                visible.append(token[0])
+            line = line[token.end():]
+        return "".join(visible)
 
     def opening_fence(content: str) -> re.Match[str] | None:
         opening = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", content)
@@ -6697,6 +6738,11 @@ def _pr_document_lines(body: str) -> list[tuple[str, str]]:
         return item
 
     for line in body.splitlines():
+        # Hidden lines cannot open fences, list items, or coverage sections.
+        if exclude_comments and comment:
+            line = without_comments(line)
+            if not line.strip():
+                continue
         expanded = line.expandtabs(4)
         indent = len(expanded) - len(expanded.lstrip(" "))
         # A bare marker already supplies the item's first blank content line.
@@ -6725,6 +6771,8 @@ def _pr_document_lines(body: str) -> list[tuple[str, str]]:
             closing = r" {0,3}" + re.escape(fence) + "{" + str(width) + r",} *"
             if re.fullmatch(closing, content):
                 fence = ""
+            elif include_code:
+                lines.append((section, line))
             continue
         # A fence can start on the marker line, including in nested list items.
         interrupting = paragraph
@@ -6749,7 +6797,13 @@ def _pr_document_lines(body: str) -> list[tuple[str, str]]:
         # Four content columns start indented code only outside a paragraph.
         # Such examples have no heading or closure authority either.
         if not paragraph and content.startswith("    "):
+            if include_code:
+                lines.append((section, line))
             continue
+        if exclude_comments:
+            line = without_comments(line)
+            expanded = line.expandtabs(4)
+            content = expanded[margin:] if indent >= margin else expanded.lstrip(" ")
         heading = re.fullmatch(r" {0,3}##[ \t]+(.+?)[ \t]*", line)
         if heading:
             section = re.sub(r"[ \t]+#+[ \t]*$", "", heading[1]).strip().lower()
@@ -6811,15 +6865,54 @@ def _is_pr_layout_notice(paragraph: str) -> bool:
                        if heading[3:] in missing]
 
 
+def _split_pr_warning_prefix(body: str) -> tuple[str, str]:
+    """Separate exact leading controller warnings from authored occurrences."""
+    prefix = ""
+    remainder = body.replace("\r\n", "\n")
+    while True:
+        paragraph, separator, tail = remainder.partition("\n\n")
+        if paragraph not in (pipeline.VERIFICATION_WARNING, _IMPLEMENTATION_EVIDENCE_WARNING):
+            break
+        prefix += paragraph + "\n\n"
+        remainder = tail if separator else ""
+    return prefix, remainder
+
+
+def _with_implementation_evidence_notice(body: str) -> str:
+    """Refresh structural evidence presence without judging the authored proof."""
+    prefix, remainder = _split_pr_warning_prefix(body)
+    prefix = prefix.replace(_IMPLEMENTATION_EVIDENCE_WARNING + "\n\n", "")
+    fields: set[str] = set()
+    exempt = False
+    for section, line in _pr_document_lines(
+        remainder, include_code=True, exclude_comments=True,
+    ):
+        if section != "test coverage":
+            continue
+        # The skill's output can be a literal block or readable Markdown.
+        # Values need content; their correctness remains the reviewer's job.
+        text = re.sub(r"^\s*(?:[-+*]|\d+[.)])[ \t]+", "", line)
+        text = text.replace("**", "").replace("__", "").strip()
+        label, separator, value = text.partition(":")
+        if not separator or not value.strip():
+            continue
+        label = label.strip().lower()
+        if label in _IMPLEMENTATION_EVIDENCE_FIELDS:
+            fields.add(label)
+        if label == "definition of done" and re.fullmatch(
+            r"n/a\s+[—–-]\s+\S.*", value.strip(), re.IGNORECASE,
+        ):
+            exempt = True
+    if not exempt and not _IMPLEMENTATION_EVIDENCE_FIELDS <= fields:
+        prefix += _IMPLEMENTATION_EVIDENCE_WARNING + "\n\n"
+    return prefix + remainder
+
+
 def _with_metadata_notice(body: str, notice: str) -> str:
     """Refresh leading controller layout state; preserve authored occurrences."""
-    prefix = ""
     # Interpret controller prefixes after the supported CRLF equivalence, not
     # after the concurrent-edit fingerprint's broader surrounding-space strip.
-    remainder = body.replace("\r\n", "\n")
-    warning = pipeline.VERIFICATION_WARNING + "\n\n"
-    if remainder.startswith(warning):
-        prefix, remainder = warning, remainder[len(warning):]
+    prefix, remainder = _split_pr_warning_prefix(body)
     # Only exact controller paragraphs in the leading prefix are ours. Never
     # remove matching text embedded in prose/code, or custom authored notices.
     while True:
@@ -6848,11 +6941,7 @@ def _supply_primary_closure(body: str, issue_number: int) -> tuple[str, str]:
         return body, "no controller target issue"
     # Leading controller notices are refreshed separately. Keep the existing
     # verification warning first so the normal composer does not duplicate it.
-    remainder = _with_metadata_notice(body, "")
-    warning = pipeline.VERIFICATION_WARNING + "\n\n"
-    prefix = ""
-    if remainder.startswith(warning):
-        prefix, remainder = warning, remainder[len(warning):]
+    prefix, remainder = _split_pr_warning_prefix(_with_metadata_notice(body, ""))
     return (
         prefix + f"## Summary\nCloses #{issue_number}\n\n"
         "> **Controller issue reference:** Harvest supplied the known target "
@@ -7134,6 +7223,11 @@ def _fixer_body_revision(
     if closure_reason:
         return "closure-drift", ""
     body = _with_metadata_notice(body, _pr_layout_notice(body))
+    # An accepted replacement can repair an existing implementation notice.
+    # Unrelated fixer-only reports do not acquire a new evidence obligation.
+    if any(_IMPLEMENTATION_EVIDENCE_WARNING in _split_pr_warning_prefix(report)[0]
+           for report in (body, live_body)):
+        body = _with_implementation_evidence_notice(body)
     body = _normalized_pr_body(pipeline.with_verification_warning(
         body, required=verification_unconfigured
         or pipeline.VERIFICATION_WARNING in live_body,
@@ -7299,6 +7393,7 @@ def _implementation_pr_create_args(
     """Stage authored metadata; I/O retries and invalid control data escalates."""
     metadata = _read_engine_pr_metadata(wt_dir, issue_number)
     body = _with_metadata_notice(metadata.body, metadata.notice)
+    body = _with_implementation_evidence_notice(body)
     body = pipeline.with_verification_warning(body, required=verification_unconfigured)
     if len(body) > _PR_BODY_MAX_CHARS or len(body.encode()) > _PR_BODY_MAX_CHARS:
         metadata = metadata._replace(
@@ -7716,7 +7811,9 @@ def _harvest_one_implementer(
                         tick_log.log(pr=n, phase="harvest", stage="implement",
                                      action="pr_metadata_retry", reason=str(exc),
                                      dispatch_id=dispatch_id)
-                ensure_notices = verification_unconfigured or bool(existing_pr and metadata_notice)
+                # Rediscovery always checks current evidence, including legacy
+                # handoffs without a retained layout decision or verify warning.
+                ensure_notices = verification_unconfigured or bool(existing_pr)
                 if not skip_cleanup and (existing_pr.isdigit() or ensure_notices):
                     try:
                         handoff = gh_json(
@@ -8183,6 +8280,7 @@ def _ensure_implementation_warning(
         candidate = _with_metadata_notice(body, _pr_layout_notice(body))
     else:
         candidate = _with_metadata_notice(body, metadata_notice) if metadata_notice else body
+    candidate = _with_implementation_evidence_notice(candidate)
     candidate = _normalized_pr_body(pipeline.with_verification_warning(
         candidate, required=verification_unconfigured,
     ))

@@ -76,6 +76,26 @@ examples remain unchanged. Prefix recognition normalizes CRLF to LF before
 refreshing notices; it preserves authored indentation and Markdown hard breaks.
 There is no mandatory final Impact line.
 
+Implementation publication checks for the completion evidence required by
+[definition-of-done](../../../definition-of-done/SKILL.md#required-output)
+under Test coverage. It recognizes the seven required
+labels with nonempty values, or `Definition of done: n/a — <reason>` with a
+nonempty reason. Plain text, list items, bold labels, and fenced or indented
+evidence blocks are accepted. HTML comments outside literal code cannot supply
+coverage headings, evidence fields, or exemption reasons. Comment markers in
+literal code remain visible evidence. A heading inside a code block does not
+establish Test coverage.
+This is a structural presence check; it does not validate the claims or approve
+the change. Missing evidence adds one leading **Implementation evidence missing**
+notice, separate from layout and verification-grant notices. The complete
+authored report remains intact.
+
+On implementation handoff recovery, harvest checks the current live report and
+refreshes that notice through the guarded body-update path. An accepted fixer
+replacement also refreshes an existing evidence notice. The controller removes
+its leading notice when the report supplies the evidence or exemption; embedded
+copies remain authored content.
+
 Publication converts CRLF line endings to LF and removes the single blank
 separator after the title envelope. The controller header described above is
 the only added issue authority. The authored report retains other whitespace,

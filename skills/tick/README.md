@@ -1346,8 +1346,17 @@ A required layout notice reflects the current live report's missing sections,
 including partial or complete repairs made after creation with LF or CRLF line
 endings. Leading controller notices follow the
 [shared report contract](lib/prompts/pr-body-contract.md); embedded examples stay authored.
-Metadata/layout notices are separate from the verification-grant warning. They
-do not detect or certify definition-of-done evidence; #76 owns that detector.
+Implementation publication also adds a visible **Implementation evidence
+missing** notice when Test coverage has neither the required definition-of-done
+fields nor the explicit Scope exemption. This applies to authored reports,
+generated placeholders, and rediscovered PRs, including legacy handoffs without
+a retained metadata decision. The
+[shared report contract](lib/prompts/pr-body-contract.md) defines the accepted
+evidence forms and notice refresh rules. Retry uses the current live body and
+preserves its title, authored content, and workflow labels. A failed or stale
+body update retains custody for retry. Metadata/layout notices, missing-evidence
+notices, and verification-grant warnings remain separate. None certifies the
+meaning or quality of the evidence or grants approval.
 
 ### The PR body the fixer hands back
 
