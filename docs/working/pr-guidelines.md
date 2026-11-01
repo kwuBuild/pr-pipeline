@@ -265,7 +265,7 @@ pipeline custody — that is, whether it holds a dispatch marker.
 | `pr-pipeline:tick` | Any item holding a dispatch marker | Owns every stage transition on marker-owned work: both the dispatch flip and the harvest flip |
 | A human | Any item, at any time | Normal workflow transitions on items with no dispatch marker, **plus** an emergency hold on marker-owned work — see below |
 | An interactive agent working by hand | Any item with no dispatch marker | This is how work enters the queue; the commands under [Transitions](#transitions) are written for this actor |
-| A dispatched engine (implementer, fixer, reviewer) | Nothing | Reports its outcome through the completion sentinel in its prompt |
+| A dispatched engine (implementer, fixer, reviewer) | Nothing | Reports its outcome through the completion protocol pinned by dispatch and described in its prompt |
 
 **Checking for a dispatch marker.** A marker is a `dispatch.json` in the item's
 worktree — `.claude/worktrees/issue-<N>/dispatch.json` for an issue,

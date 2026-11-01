@@ -54,6 +54,18 @@ stale and causes another avoidable review round.
 - If I review only the blocker area named last time, what second-order drift is
   still visible right now?
 
+## Dispatched revision reports
+
+When the controller pins a versioned report protocol, use its complete finding
+references and response template. Preserve the assessment, disposition, evidence,
+and change or concrete no-change reason for every original finding. Explain a
+replacement's changed contract, tradeoff and affected surfaces in useful prose;
+there is no fixed four-line layout. Record unresolved work explicitly, including
+partial pushes and unavailable verification. Additional context is welcome.
+The report requests independent review or a human decision; it never grants
+approval. See [complete fixer reports](../tick/README.md#complete-fixer-reports)
+for controller-owned validation, publication and recovery.
+
 ## Required Output
 
 Structure the pass in these buckets:

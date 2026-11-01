@@ -4222,57 +4222,30 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
 
     popen.assert_called_once()
     prompt = (wt_root / "pr-42" / "prompt.txt").read_text()
-    assert "the repository's own verification commands" in prompt
-    assert "`CLAUDE.md`/`AGENTS.md`" in prompt
-    # The pipeline drives repositories it does not own, so the prompt must not
-    # name any one stack's toolchain: what to run and in what order is the
-    # target repo's own guides to state, and what the engine is *permitted* to
-    # run is the operator's `[engine] verify_tools` grant. A stack name that
-    # creeps back in here is wrong for every install but one.
+    normalized = " ".join(prompt.split())
+    assert "the repository's own verification commands" in normalized
+    assert "order and exact invocations prescribed by `CLAUDE.md`/`AGENTS.md`" in normalized
     for tool in ("pytest", "ruff", "pyright", "npm", "cargo", "gradle"):
-        assert tool not in prompt.replace(str(tmp_path), "<fixture>"), (
-            f"prompt hard-codes the tool {tool!r}, got: {prompt}"
-        )
-    assert (
-        "Only output FIXES_PUSHED_RECHECK_NEEDED after every verification "
-        "command the repository prescribes passes"
-    ) in prompt
-    assert "If any verification command cannot be made green" in prompt
+        assert tool not in prompt.replace(str(tmp_path), "<fixture>")
+    assert "every required verification command passes, and the push succeeds" in normalized
     assert "NEEDS_HUMAN_DECISION" in prompt
-    # The harvest comment publishes the engine's own words as the record of what
-    # the fixer did, and a bare sentinel is otherwise a protocol-valid result —
-    # so the demand for a summary has to live in the dispatched prompt, not only
-    # in the renderer that formats whatever comes back.
-    assert "output a change summary" in prompt
-    assert "Before the completion sentinel" in prompt
+    assert "one JSON object" in normalized
+    assert "bare sentinel" in prompt or "no surrounding fence or sentinel" in normalized
 
 
 def test_dispatch_one_fixer_prompt_binds_revision_hygiene_before_editing(
     tmp_path: Path,
 ) -> None:
-    """The rendered fixer prompt must load the revision-hygiene skill first.
-
-    The skill's rules 2 and 3 (story surface, sibling omissions) cover two of the
-    three failure classes the recent review record shows, but a skill nobody is
-    told to open is discretionary reading. The binding therefore has to live in
-    the prompt the engine actually receives, and the assertion runs against that
-    rendered prompt — a template-prefix check would pass on a substitution the
-    production render site never supplies.
-
-    The prompt names the doc *path* rather than telling the engine to invoke a
-    skill: dispatched engines run under a bounded allowlist that carries ``Read``
-    and no ``Skill`` tool, so an "invoke" instruction would be denied and the
-    binding would be theatre.
-    """
-    import tick  # type: ignore[import-untyped]
+    """Both revision guidance and production proof must be natively bound."""
+    import tick
 
     prompt = render_fixer_prompt(tmp_path)
-
-    doc = tick.skill_doc_path(tick.REVISION_HYGIENE_SKILL)
-    assert (
-        f"Before you edit anything, invoke `pr-pipeline:review-response-hygiene` through the native Skill tool (installed source `{doc}`) and follow its revision rules "
-        "for the whole run."
-    ) in prompt, f"fixer prompt does not bind {doc} before editing, got: {prompt}"
+    normalized = " ".join(prompt.split())
+    assert "Before editing, invoke `pr-pipeline:review-response-hygiene`" in normalized
+    for skill in tick.FIXER_SKILLS:
+        assert tick.skill_doc_path(skill) in prompt
+        assert f"pr-pipeline:{skill}" in prompt
+    assert "through the native Skill tool" in normalized
 
 
 def test_dispatch_one_fixer_prompt_carries_the_story_surface_and_contract(
@@ -4299,7 +4272,7 @@ def test_dispatch_one_fixer_prompt_carries_the_story_surface_and_contract(
         "the linked issue's requirements did not reach the prompt"
     )
     assert (
-        "you have no GitHub access, so read the full controller-supplied context file as well as the excerpts above."
+        "Read the complete launch context"
     ) in prompt, f"the prompt does not bound what the engine can see: {prompt}"
 
 
@@ -4561,12 +4534,11 @@ def test_dispatch_one_fixer_prompt_lets_a_short_contract_donate_its_share(
 
 def test_fixer_prompt_allows_reasoned_no_change_without_a_push(tmp_path: Path) -> None:
     prompt = render_fixer_prompt(tmp_path)
-    assert "Decision: no-change" in prompt
-    assert "Reason:" in prompt
+    normalized = " ".join(prompt.split())
+    assert "`no-change`" in prompt and "concrete evidence and a reason" in normalized
     assert "NO_CHANGES_RECHECK_NEEDED" in prompt
-    assert "do not commit or push" in prompt
+    assert "without fabricating a commit or pushing" in normalized
     assert "every finding" in prompt
-    assert "needs no declaration" not in prompt
 
 
 def test_fixer_dispatch_identity_is_unique_within_one_second(tmp_path: Path) -> None:
@@ -4595,69 +4567,30 @@ def test_dispatch_one_fixer_prompt_rechecks_the_declaration_before_the_sentinel(
     """
     prompt = render_fixer_prompt(tmp_path)
 
+    normalized = " ".join(prompt.split())
     for clause in (
-        "they are necessary but not sufficient, because no green command can "
-        "see a stale story surface, an unswept sibling path, or a replacement "
-        "nobody audited.",
-        "Before the completion sentinel, re-check your repair-or-replacement "
-        "decision against the diff you actually pushed, because a fix that "
-        "began as a repair can cross into a replacement; a replacement then "
-        "owes an audit of the new design's call sites, operating modes, and "
-        "failure or interrupted states, plus every doc and PR-body claim that "
-        "still teaches the replaced contract.",
-        "Only output FIXES_PUSHED_RECHECK_NEEDED after every verification "
-        "command the repository prescribes passes, the push succeeds, and "
-        "every finding you addressed carries a decision that matches the diff "
-        "you pushed.",
+        "Re-check this assessment against the final diff",
+        "Green commands are necessary but not sufficient",
+        "Audit call sites, operating modes, failure and interrupted states",
+        "every required verification command passes, and the push succeeds",
     ):
-        assert clause in prompt, (
-            f"fixer prompt is missing the completion gate: {clause!r}, "
-            f"got: {prompt}"
-        )
+        assert clause in normalized
 
 
 def test_dispatch_one_fixer_prompt_shapes_the_published_declaration(
     tmp_path: Path,
 ) -> None:
-    """A replacement must publish reasoning the next reviewer can size.
-
-    Stating a rationale is not enough on its own — a round-one revision that
-    justified rejecting the reviewer's shape still cost two more rounds, because
-    what was missing was the audit of the substitute. Each decision
-    therefore carries both halves in a fixed format, and it sits *inside* the
-    block of the finding it belongs to: one run-wide declaration cannot say
-    which finding was replaced, so a mixed run publishes one argument the next
-    reviewer has to re-attach to a finding by guessing.
-    """
+    """Each finding permits expressive reasoning within the shared bound."""
     import pipeline
 
     prompt = render_fixer_prompt(tmp_path)
-
-    assert (
-        "Open each block with `Finding:` naming the finding in one line, then "
-        "its own decision line — either `Decision: repair`, or `Decision: "
-        "replacement` followed by one line each for `Rejected shape:` (the "
-        "shape the reviewer proposed), `Why rejected:`, `Replacing contract:`, "
-        "and `Audited surfaces:` — and close the block with `Change:` naming "
-        "what you changed to close it."
-    ) in prompt, f"fixer prompt does not fix the declaration format, got: {prompt}"
-    assert (
-        "Every finding carries its own decision: one run may mix repairs, "
-        "replacements, and no-change decisions, and each replacement states its own four "
-        "lines rather than sharing one set with another finding."
-    ) in prompt, (
-        "the prompt still permits one run-wide declaration, so a mixed review "
-        f"cannot say which finding was replaced, got: {prompt}"
-    )
-    assert "Declaration: repair" not in prompt, (
-        "the run-wide declaration survives alongside the per-finding one"
-    )
-    assert (
-        f"Keep the whole summary under {pipeline.FIX_SUMMARY_BUDGET} characters."
-    ) in prompt, (
-        "the budget the prompt states is not the harvest's own publish budget, "
-        f"so a compliant summary can still truncate, got: {prompt}"
-    )
+    normalized = " ".join(prompt.split())
+    assert "exactly one object per complete pinned reference" in normalized
+    for field in ("reference", "disposition", "assessment", "evidence", "change"):
+        assert f"`{field}`" in prompt
+    assert "changed contract, tradeoff, rejected alternative and audited surfaces" in normalized
+    assert "no four-line prose grammar" in normalized
+    assert str(pipeline.fixer_reports.AUTHOR_ALLOWANCE) in prompt
 
 
 def test_dispatch_one_fixer_prompt_offers_the_stamped_pr_body_revision_path(
@@ -4901,9 +4834,10 @@ def test_dispatch_one_fixer_escalates_when_the_install_lacks_a_bound_skill(
     )
     assert unresolved["pr"] == 42
     assert unresolved["stage"] == "fix"
-    assert unresolved["details"]["skills"] == ["review-response-hygiene"]
+    assert unresolved["details"]["skills"] == ["review-response-hygiene", "definition-of-done"]
     assert unresolved["details"]["probe_paths"] == [
         str(empty_install / "review-response-hygiene" / "SKILL.md"),
+        str(empty_install / "definition-of-done" / "SKILL.md"),
     ]
 
 

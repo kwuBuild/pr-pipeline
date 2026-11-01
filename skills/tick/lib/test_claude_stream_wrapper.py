@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from claude_stream_wrapper import ProgressHeartbeat, collect_stream, main
 
 
@@ -170,6 +172,18 @@ def test_main_publishes_one_harvest_compatible_result(capfd, monkeypatch) -> Non
     assert published["skills_used"] == ["qa"]
     assert published["skill_usage_status"] == "active"
     assert published["claude_exit_status"] == 0
+
+
+@pytest.mark.parametrize("engine_tail", [[], ["--", "engine-argument"]])
+def test_main_preserves_legacy_heartbeat_arguments_without_separator(tmp_path, capfd, monkeypatch, engine_tail):
+    heartbeat = tmp_path / "heartbeat"
+    with open(os.devnull) as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        status = main(["--heartbeat", str(heartbeat), sys.executable, "-c",
+                       "print('{\"type\":\"result\",\"result\":\"done\"}')", *engine_tail])
+    assert status == 0
+    assert heartbeat.exists()
+    assert json.loads(capfd.readouterr().out)["result"] == "done"
 
 
 def test_main_preserves_structured_result_on_nonzero_child_exit(

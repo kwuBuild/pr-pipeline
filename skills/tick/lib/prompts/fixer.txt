@@ -26,11 +26,10 @@ will be available on the next launch. Do not commit the context directory.
 The controller pinned this finding snapshot from the exact report above:
 {finding_references}
 
-Use each complete finding reference (originating review identity plus ID) in
-your Finding: line. Historical one-line findings have ordinal IDs in their
-original order. Preserve this identity; F1 in a different review is a different
-finding. Additional observations and remaining risks are context, not required
-findings. Do not infer cross-round carry-forward from similar prose.
+Use each complete finding reference (originating review identity plus ID) in a
+finding response. Historical findings have ordinal IDs in original order.
+Additional observations are context, not required findings. Do not infer a new
+finding set or cross-round carry-forward from prose.
 
 ## Current PR Body
 
@@ -40,17 +39,107 @@ findings. Do not infer cross-round carry-forward from similar prose.
 
 {issue_contract}
 
-Before you edit anything, invoke `{revision_hygiene_skill_invocation}` through the native Skill tool (installed source `{revision_hygiene_skill_doc}`) and follow its revision rules for the whole run. Then decide, for each finding, whether your fix **repairs** the accepted design — keeping its invariants, ownership boundaries, durable authorities, and externally observable contract — or **replaces** it. Whether you adopted the reviewer's suggested implementation is not the test; the test is whether the pushed head still asserts the same contract. Replacing a design is allowed and is never escalated, but it has to argue for itself. If a finding is already addressed or does not apply to the current code, record `Decision: no-change` with a concrete `Reason:` explaining the evidence. Every finding needs an explicit disposition; the reviewer independently evaluates your reasoning. The PR body and the linked issue above are the story surface and the contract those rules ask you to re-check; you have no GitHub access, so read the full controller-supplied context file as well as the excerpts above. You cannot edit the PR body yourself, but you can hand the pipeline a replacement. When the body quoted above no longer describes the head you push, write the full replacement body to `{pr_body_revision_file}` in the worktree root **after your final push** (see the next paragraph), because the file has to name the commit it describes and only the push settles which commit that is. Its first line must be exactly `{pr_body_revision_stamp}`, its second line must be `{pr_body_revision_head_stamp} <OID>` where `<OID>` is the full 40-character commit you just pushed (`git rev-parse HEAD` after the push), and its remaining lines are the body: follow the shared PR report contract below and preserve the current body's primary closure and complete closing-directive set exactly. If the body quoted above was cut short by a truncation notice, do not write the file at all: the controller retains its conservative truncation guard and declines such a revision even though the full source is available in the context file. Do not commit the file. Leaving it absent is the normal case and costs nothing, so write it only when the body is actually wrong. The harvest validates it, checks that nobody edited the body while you ran, and applies it before the re-review label; say in your change summary what you rewrote and why, because a body the harvest declines to publish is reported by reason alone.
+## Revision workflow
 
-For findings requiring changes, apply the fixes following the repository workflow. Before committing, run the repository's own verification commands — its tests, linter, and type checker, in the order and with the exact invocations its `CLAUDE.md`/`AGENTS.md` and the docs those route to prescribe — until every one of them passes; they are necessary but not sufficient, because no green command can see a stale story surface, an unswept sibling path, or a replacement nobody audited. Commit, then push to the PR branch with `git push {target_remote} HEAD:refs/heads/{head_ref}` (the only allowed push form; the explicit fully-qualified refspec is required because the fixer worktree uses a detached HEAD). If the PR body needs replacing, write `{pr_body_revision_file}` now, after that push and stamped with the commit it published — a file written earlier describes a commit that may no longer be the head, and the harvest refuses it. Before the completion sentinel, re-check your repair-or-replacement decision against the diff you actually pushed, because a fix that began as a repair can cross into a replacement; a replacement then owes an audit of the new design's call sites, operating modes, and failure or interrupted states, plus every doc and PR-body claim that still teaches the replaced contract. Then output a change summary as one block per finding, including findings needing no change. Open each block with `Finding:` naming the finding in one line, then its own decision line — either `Decision: repair`, or `Decision: replacement` followed by one line each for `Rejected shape:` (the shape the reviewer proposed), `Why rejected:`, `Replacing contract:`, and `Audited surfaces:` — and close the block with `Change:` naming what you changed to close it. For a finding needing no change, use exactly three non-empty lines: `Finding: <finding>`, `Decision: no-change`, and `Reason: <evidence and why no change is needed>`, with one line per field and no `Change:` line. Every finding carries its own decision: one run may mix repairs, replacements, and no-change decisions, and each replacement states its own four lines rather than sharing one set with another finding. Keep the whole summary under {summary_budget} characters. The harvest publishes this summary on the PR as the record of what the fixer did, so "fixed the review findings" is not a summary — the next reviewer reads it instead of guessing from the diff, and evaluates a replacement from your stated reasoning rather than reconstructing it. Do not add, remove, or change any `ai:` label on any issue or pull request — not on this PR, and not on any other item in the repository. The dispatching pipeline owns every pipeline label transition and reads your outcome from the completion sentinel below; the repository workflow's label instructions are for interactive agents, not for you. A label you set mid-run cannot be retracted, and the pipeline reads it as a human hold that overrides the sentinel you finish with. Only output FIXES_PUSHED_RECHECK_NEEDED after every verification command the repository prescribes passes, the push succeeds, and every finding you addressed carries a decision that matches the diff you pushed. If any verification command cannot be made green, or the repository prescribes a command you have no permission to run, or you are blocked or unable to proceed, output NEEDS_HUMAN_DECISION.
+Before editing, invoke `{revision_hygiene_skill_invocation}` through the native
+Skill tool (installed source `{revision_hygiene_skill_doc}`). Also invoke
+`{definition_of_done_skill_invocation}` (installed source
+`{definition_of_done_skill_doc}`) and follow its applicable proof requirements.
+A same-named repository document or plain file read cannot replace native
+invocation. If required guidance or supporting files are missing or denied,
+report NEEDS_HUMAN_DECISION in the outcome field below.
 
-If every finding needs no change, do not commit or push and do not fabricate a change. Re-check each finding against the current code and run the repository-prescribed verification commands. Once those pass, output only the three-line no-change block above for every finding, with optional blank lines between blocks, then the waiver line if the verification configuration below requires it, followed by NO_CHANGES_RECHECK_NEEDED on its own final line. Keep the summary within {summary_budget} characters; no preamble, omitted decisions, or empty reasons. The PR head must remain unchanged from dispatch. Leave `{pr_body_revision_file}` absent on this path. This completion requests re-review at ai:revised; it never promotes the PR or overrules a blocking finding. If any finding needs a repair or replacement, use the normal committed-and-pushed completion instead. An unchanged-head FIXES_PUSHED_RECHECK_NEEDED claim still escalates, as does any malformed no-change completion.
+Assess every finding against the current code and governing requirements.
+Distinguish a repair of the accepted contract from a replacement that changes
+invariants, ownership, durable authority or externally observable behavior.
+Replacing a design is allowed and is never escalated merely because it is a
+replacement. Explain the changed contract, tradeoff, rejected alternative and
+audited surfaces in prose. Audit call sites, operating modes, failure and
+interrupted states, and documentation that teaches the old contract. Re-check
+this assessment against the final diff; adopting a suggested implementation
+alone does not determine the disposition. A no-change response needs concrete
+evidence and a reason. An unresolved response names the remaining obstacle and
+follow-up owner/reference. Independent review judges the reasoning.
+
+For changes, follow the repository workflow. Before committing, run
+the repository's own verification commands: its tests, linter and type checker
+in the order and exact invocations prescribed by `CLAUDE.md`/`AGENTS.md` and
+the documents they reference, until every required command passes. Green commands are
+necessary but not sufficient: verify the story surface and sibling paths too.
+Commit, then push using only:
+`git push {target_remote} HEAD:refs/heads/{head_ref}`
+The worktree has a detached HEAD. Do not force-push or overwrite an advanced
+remote head to repair report formatting. If every finding needs no change,
+verify the existing behavior without fabricating a commit or pushing.
+
+The controller can publish an optional PR body replacement. When the current
+body no longer describes the pushed head, write the full replacement to
+`{pr_body_revision_file}` in the worktree root **after your final push**.
+Its first line must be exactly `{pr_body_revision_stamp}`. Its second line must
+be `{pr_body_revision_head_stamp} <OID>`, using the full 40-character pushed
+commit from `git rev-parse HEAD`. The remaining lines follow the shared PR body
+contract below. Preserve the primary closure and complete closing-directive set
+exactly. Do not commit this file. Leave it absent when no change is needed, on
+the no-change path, or when the quoted body includes a truncation notice.
+The controller checks provenance, live head and concurrent body edits before
+publication. Explain proposed updates in your report even if publication could
+be withheld.
+
+Do not add, remove, or change any `ai:` label on any issue or pull request. The pipeline
+owns label transitions. Repository label instructions are for interactive
+agents. A fixer requests independent re-review; it never grants approval.
+
+## Complete revision report
+
+Your final response must be one JSON object, with no surrounding fence or
+sentinel outside it. Copy these controller binding fields exactly:
+{report_binding}
+
+Add these required fields:
+- `published_head`: full 40-character head actually published by this run, or
+  the unchanged pinned head when nothing was pushed. Record partial pushes too.
+- `outcome`: exactly FIXES_PUSHED_RECHECK_NEEDED, NO_CHANGES_RECHECK_NEEDED, or
+  NEEDS_HUMAN_DECISION. This dedicated field alone selects the outcome; prose
+  may quote these tokens freely.
+- `revision_summary`: resulting behavior and scope. The controller displays
+  pinned and published heads above it.
+- `findings`: an array with exactly one object per complete pinned reference.
+  Each object has `reference`, `disposition`, `assessment`, `evidence`, and
+  `change`. All are non-empty strings. Disposition is `repair`, `replacement`,
+  `no-change`, or `unresolved`. `change` describes the actual change or concrete
+  reason for no change. For a replacement, explain the new contract, tradeoff,
+  rejected approach and affected surfaces. Do not omit unresolved findings.
+- `verification`: commands/probes actually run and results, regression coverage,
+  and relevant checks not run with reasons. Include applicable proof evidence.
+- `verification_status`: `passed`, `failed`, or `unavailable`. Use `passed` only
+  when every required check passed; waivers do not invent passing checks.
+- `verification_waiver`: empty string unless the configuration below requires
+  the exact value VERIFICATION_UNCONFIGURED_WAIVER.
+- `documentation`: PR/documentation updates, or an explicit statement that none
+  are needed.
+- `remaining_work`: unresolved work and follow-up owner/reference, or none.
+- `additional_context`: optional free-form explanation, empty or omitted when
+  unnecessary. Extra discussion never adds required finding identities.
+
+Prose strings permit paragraphs, lists, fenced code and useful subsections;
+encode newlines as JSON string escapes. There is no four-line prose grammar or
+minimum report length. Keep all authored text within {summary_budget}
+characters AND UTF-8 bytes. The single complete rendered comment is limited to
+60,000 characters AND bytes including controller metadata. Oversize or malformed
+reports retain complete evidence and take a human hold; they are not truncated,
+split into comments, or sent to another implementation run to repair prose.
+
+Choose FIXES_PUSHED_RECHECK_NEEDED only after all findings have repair,
+replacement or no-change dispositions, at least one repair/replacement exists,
+every required verification command passes, and the push succeeds. Choose
+NO_CHANGES_RECHECK_NEEDED only when every finding has an evidence-backed
+no-change disposition, verification passes, and the pinned head is unchanged.
+Both outcomes request re-review at ai:revised. If any finding remains unresolved,
+verification fails or cannot run, required authority is unavailable, or work is
+blocked, choose NEEDS_HUMAN_DECISION and include the complete explanation,
+including any partial pushed work. Field presence does not certify correctness.
 
 {pr_body_contract}
 
 Verification configuration for this dispatch:
 {verification_context}
-
-If native invocation, required guidance, or a required supporting file is missing or denied, output NEEDS_HUMAN_DECISION. A plain document read does not satisfy the native binding.
-
-Invoke the namespaced skill from the installed source above. A same-named repository skill cannot replace it. If native invocation or required supporting guidance is unavailable or denied, output NEEDS_HUMAN_DECISION.
