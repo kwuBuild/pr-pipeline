@@ -325,12 +325,13 @@ Old markers remain valid and report the missing policy as unknown.
 
 A malformed list (including parentheses/newlines in a permission body) is an
 error, never an empty grant. A valid empty list dispatches with a
-`verification_unconfigured` log entry and a prompt requiring the exact line
-`VERIFICATION_UNCONFIGURED_WAIVER` immediately before the success sentinel.
-Harvest validates that waiver against the marker and the same final sentinel
-occurrence that supplies the outcome, never against current config. No-change
-fixer completion requires the same waiver outside its finding-summary blocks.
-Legacy markers without the field retain their old completion contract.
+`verification_unconfigured` log entry and an explicit completion waiver.
+New fixer reports carry `VERIFICATION_UNCONFIGURED_WAIVER` in their dedicated
+`verification_waiver` field. Implementers and legacy fixers put that exact line
+immediately before the success sentinel, outside legacy finding-summary blocks.
+Harvest validates the waiver against the dispatch marker and stage's outcome,
+never against current config. Legacy markers without the configuration field
+retain their old completion contract. A waiver does not waive required checks.
 
 The controller prefixes `pipeline.VERIFICATION_WARNING` as a standalone opening
 paragraph at PR creation, outside engine-authored Markdown/HTML context, and
@@ -364,19 +365,18 @@ retains a separate scrubbed environment because it has a different trust posture
 Publication surface: implementer result escalations publish
 `pipeline.render_implementation_escalation_comment`; its fields and limits are
 owned by the [operator report contract](../../skills/tick/README.md#escalation-publication-coverage).
-A fixer **escalation** echoes a bounded excerpt of the
-engine's `result` text into a PR comment (`pipeline.render_fix_comment`), so
-branch-controlled text reaches a public comment. This does not widen the trust
-boundary — a fixer already commits and pushes to the PR, an unbounded channel —
-but the excerpt is truncated and stripped of `<!--`/`-->`, fence, and
-`</details>` sequences to preserve the rendered report. Comment consumers also
-require authenticated first-line markers under the
+A new fixer report publishes complete Markdown through `fixer_reports.render`,
+with only reserved controller-marker syntax neutralized. Both successful and
+human-decision runs archive source and rendered evidence before publication.
+Malformed or oversized reports retain the evidence and publish a concise human
+notice. The [complete fixer report contract](../../skills/tick/README.md#complete-fixer-reports)
+owns validation, size limits, recovery and legacy excerpt compatibility.
+Branch-controlled prose remains task evidence; comment consumers require
+authenticated first-line markers under the
 [comment trust contract](../../skills/tick/README.md#comment-trust-and-incomplete-history).
-A `recheck` publishes the same bounded excerpt: only the `escalate` branch
-archives harvest evidence, so on a successful fixer run the PR comment is the sole
-durable record of what the engine changed. The attempt-cap and transient
-escalations publish no engine text at all — they report a failed side effect and a
-spent retry budget respectively, both controller-owned facts.
+The attempt-cap and legacy transient escalations publish no engine text: they
+report a failed side effect and a spent retry budget respectively, both
+controller-owned facts.
 
 Publication ordering: a transition that reports an engine result, or fires before
 one was launched, should explain itself before the label moves. The

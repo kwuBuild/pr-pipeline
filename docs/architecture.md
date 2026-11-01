@@ -666,26 +666,25 @@ malformed point-read retains the marker for the next tick. Markers without a
 pinned head (pre-upgrade) skip the check — no contradiction can be proven
 without dispatch-time provenance.
 
-A fixer can instead finish with `NO_CHANGES_RECHECK_NEEDED`: every finding
-must have its own `Finding:`, `Decision: no-change`, and non-empty `Reason:`
-line, within the published summary budget. This requires a dispatch identity,
-the originating review's fingerprint, and an unchanged pinned head; missing or
-mixed decisions, missing reasons,
-and a moved head escalate. It never promotes a PR. The controller publishes
-the reasoning and a hidden `pr-pipeline:no-change` token derived from the
-fixer's dispatch ID before relabelling to `ai:revised`. Fixer dispatch pins
-the SHA-256 of the exact review body it handed the engine as `review_sha256`
-in both lease and published markers. Harvest carries that fingerprint into a
-`pr-pipeline:fix-review` header in the fixer comment.
-The parser validates every reported block. It cannot prove that a finding was
-not omitted altogether or that the stated reason is correct; the prompt
-requires full coverage and the independent reviewer checks that judgement.
+New fixer dispatches use versioned complete revision reports. Dispatch pins the
+qualified finding set and original review digest; harvest checks exact coverage,
+head/dispatch binding, verification status and the dedicated outcome. It publishes
+a complete report or preserves source and takes a human hold. The report protocol,
+size policy, archive ownership and legacy compatibility have one authoritative
+contract in [Complete fixer reports](../skills/tick/README.md#complete-fixer-reports).
+
+A no-change outcome requires all expected findings to have evidence-backed
+no-change dispositions and the pinned head to remain unchanged. The controller
+publishes a stable dispatch-derived `pr-pipeline:no-change` token before
+relabeling to `ai:revised`. Every new fixer comment also carries the original
+review fingerprint in `pr-pipeline:fix-review`. This is a request for independent
+review, never approval or a machine judgment that the reasoning is correct.
 
 Reviewer dispatch reads the latest published recheck summary on revised PRs,
 resolves the originating review by that fingerprint from the same comment
 snapshot, and puts both complete bodies in the prompt as context for independent
 evaluation. The reviewer explicitly checks every original finding, including
-those omitted by the fixer, against the current code. For no-change rounds,
+those omitted by the fixer, against the current code. For new reports and legacy no-change rounds,
 a missing fingerprint or a deleted/edited original retains the PR for retry
 without launching or relabelling; it never substitutes a newer review.
 Operators must restore the exact original comment or requeue a fresh review
@@ -1372,11 +1371,11 @@ machine's dispatch markers. See
 
 Prompts are assembled by the tick from live data:
 
-Every Claude engine prompt (implementer and fixer) must end with an explicit
-**sentinel instruction**, because the emitted sentinel is the only signal the
-harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
-— its verdict is a typed field in `review.json`, pinned by `--output-schema`
-(see *Reviewer (Codex)*).
+The implementer prompt supplies an explicit completion sentinel. New fixer
+prompts supply a dedicated outcome field in the complete revision report.
+The reviewer supplies a typed verdict in `review.json`, pinned by
+`--output-schema` (see *Reviewer (Codex)*). Each stage's harvest validates its
+control field and the evidence required by that stage before publication.
 
 **Implementation prompt:**
 - Issue body and title (via `gh issue view`)
@@ -1391,9 +1390,9 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
 - Complete launch context under the [governing-context contract](../skills/tick/README.md#governing-context-the-fixer-is-handed),
   separate from the selected fixer report and originating review
 - Latest published fixer recheck summary on `ai:revised`, including reasons
-  for `Decision: no-change`, plus the exact originating review identified by
+  for no-change dispositions, plus the exact originating review identified by
   the fixer's pinned fingerprint. Check every original finding, even when the
-  summary omits it. Failed reads or missing/edited originals on no-change rounds
+  summary omits it. Failed reads or missing/edited originals for new reports and legacy no-change rounds
   retain the PR for retry
 - Instruction to self-scope the committed diff via `git diff`/`git log` against
   the pinned base SHA carried in the prompt (from `dispatch.json`, not a live ref)
@@ -1424,21 +1423,13 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   no target repository needs a copy and no PR branch supplies the rules its own
   fixer runs under; a doc missing from the install is a packaging defect and
   escalates instead of launching
-- A repair, replacement, or no-change declaration **per finding**, made before
-  editing and
-  re-checked against the pushed diff, published in that finding's own block of
-  the change summary. One run may mix all three dispositions; each no-change
-  decision states its own evidence in `Reason:`, and each replacement
-  states its own rejected shape, reasoning, replacing contract, and audited
-  surfaces
-- **Sentinel instruction:** end with `FIXES_PUSHED_RECHECK_NEEDED` once
-  revisions are committed and pushed *and* every finding addressed carries a
-  decision matching the pushed diff — the three green commands are necessary but
-  not sufficient — or `NEEDS_HUMAN_DECISION` if a finding is out of scope
-- **No-push completion:** if every finding needs no change and verification
-  passes, emit only the three-line no-change blocks and then
-  `NO_CHANGES_RECHECK_NEEDED`. Do not commit, push, or write a PR-body revision
-  on this path; the harvest publishes the reasoning for an independent review
+- A complete versioned JSON revision report with one disposition, assessment,
+  evidence and change/reason per qualified finding. Re-check repairs and
+  replacements against the final diff; unresolved findings remain explicit.
+  Markdown prose is preserved under the [complete report contract](../skills/tick/README.md#complete-fixer-reports).
+- A dedicated outcome field requesting independent re-review or a human decision;
+  tokens quoted in prose do not control the outcome. Pushed, no-change, and
+  unresolved reports retain dispatch/head binding and required verification.
 
 The fixer never runs `gh pr edit` itself — that would place an unretractable
 remote mutation mid-run, before the push it describes is verified. It writes a

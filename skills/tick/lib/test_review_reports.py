@@ -361,10 +361,18 @@ from pathlib import Path
 prompt = sys.stdin.read()
 snapshot = next(json.loads(line) for line in prompt.splitlines() if line.startswith('{"version":'))
 Path("consumed-prompt.txt").write_text(prompt)
-summary = "\\n\\n".join("Finding: " + ref + "\\nDecision: no-change\\nReason: Verified the existing retained-source path."
-                        for ref in snapshot["finding_refs"])
+marker = json.loads(Path("dispatch.json").read_text())
+report = {"report_protocol_version": 2, "dispatch_id": marker["dispatch_id"],
+          "pinned_head": marker["head_sha"], "published_head": marker["head_sha"],
+          "review_sha256": marker["review_sha256"], "outcome": "NO_CHANGES_RECHECK_NEEDED",
+          "revision_summary": "Existing behavior meets the contract.",
+          "findings": [{"reference": ref, "disposition": "no-change", "assessment": "Checked source.",
+                        "evidence": "Retained-source probe passed.", "change": "No change needed."}
+                       for ref in snapshot["finding_refs"]],
+          "verification": "Probe passed.", "verification_status": "passed", "verification_waiver": "",
+          "documentation": "No updates needed.", "remaining_work": "Independent review."}
 print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                  "result": summary + "\\nNO_CHANGES_RECHECK_NEEDED"}))
+                  "result": json.dumps(report)}))
 ''')
     worktree = seed_wrapper(root, env, report, 2)
     run_report_tick(root, env)

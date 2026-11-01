@@ -58,6 +58,7 @@ from typing import Literal, TypedDict, cast
 
 import native_skills
 import review_reports
+import fixer_reports
 
 
 @dataclass(frozen=True)
@@ -449,17 +450,8 @@ FIX_MARKER = "<!-- pr-pipeline:fix -->"
 # fixer's, and it must never be counted as a review round.
 ESCALATION_MARKER = "<!-- pr-pipeline:escalation -->"
 
-# Size contract for the fixer's change summary, stated to the engine in its own
-# prompt (substituted, never hardcoded there) and enforced here at publish time.
-#
-# The budget covers one block per finding, each carrying its own
-# repair-or-replacement decision — a replacement states the rejected shape, why
-# it was rejected, the contract that replaced it, and the surfaces it audited,
-# and the whole point of demanding that reasoning is that the next reviewer gets
-# to read it. A run with several replacements repeats those four lines per
-# finding, which is why the budget is per-run rather than per-finding. Squeezing
-# all of it into the old limit would publish a truncated rationale, which is
-# worse than none: it reads as a complete argument that happens to stop.
+# Compatibility budget for already-running legacy fixer dispatches only.
+# New runs use fixer_reports.AUTHOR_ALLOWANCE and the shared rendered bound.
 FIX_SUMMARY_BUDGET = 3000
 
 # Slack between the budget the prompt states and the limit the excerpt is cut
@@ -3196,10 +3188,14 @@ def parse_fix_result(obj: object) -> str | None:
         The sentinel string, or ``None`` if ``obj`` is not a valid result or
         contains no recognised sentinel.
     """
+    if isinstance(obj, dict) and "report_protocol_version" in obj:
+        report, _ = fixer_reports.parse_result(obj, obj["report_protocol_version"])
+        return report["outcome"] if report else None
     return _parse_result_sentinel(obj, _FIXER_SENTINELS)
 
 
-def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_version: int | None = None) -> str:
+def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_version: int | None = None,
+                            fix_marker: dict | None = None) -> str:
     """Return the validated engine outcome completed under a human hold.
 
     Args:
@@ -3219,7 +3215,23 @@ def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_v
     elif stage == "implement":
         outcome = parse_implementation_result(result_obj)
     elif stage == "fix":
-        outcome = parse_fix_result(result_obj)
+        if report_protocol_version is not None:
+            report, problem = fixer_reports.parse_result(result_obj, report_protocol_version)
+            marker = fix_marker or {}
+            if report and not problem:
+                problem = fixer_reports.binding_problem(
+                    report, dispatch_id=marker.get("dispatch_id", ""),
+                    pinned_head=marker.get("head_sha", ""), review_sha256=marker.get("review_sha256", ""),
+                    review_handoff=marker.get("review_handoff"),
+                ) or fixer_reports.outcome_problem(
+                    report, current_head=report["published_head"],
+                    verification_unconfigured=marker.get("verification_unconfigured") is True,
+                )
+            outcome = report["outcome"] if report and not problem else None
+        elif isinstance(result_obj, dict) and "report_protocol_version" in result_obj:
+            outcome = None
+        else:
+            outcome = parse_fix_result(result_obj)
     else:
         raise ValueError(f"unknown pipeline stage: {stage}")
     return outcome or OUTCOME_UNRECOGNIZED
@@ -4047,11 +4059,15 @@ def decide_fix_harvest(
     dispatch_id: str = "",
     review_sha256: str = "",
     verification_unconfigured: bool = False,
+    report_protocol_version: int | None = None,
+    review_handoff: object = None,
 ) -> dict[str, object]:
     """Decide the outcome of a finished fixer engine.
 
-    The fixer emits a sentinel token literally in ``result.json``. The
-    harvest parses it and decides: ``recheck`` (fixes committed and pushed,
+    Versioned dispatches validate the complete report and dedicated outcome via
+    ``fixer_reports``. The remaining path preserves legacy completion gates.
+    A legacy fixer emits a sentinel token literally in ``result.json`` and
+    harvest decides: ``recheck`` (fixes committed and pushed,
     ready for re-review at ``ai:revised``) or ``escalate`` (blocked, missing
     sentinel, or unparseable output → ``ai:needs-human-decision``).
 
@@ -4112,6 +4128,13 @@ def decide_fix_harvest(
         live head, ``head_advanced`` reports an unchanged head as ``False``.
         A valid no-change completion also carries ``head_advanced=False``.
     """
+    if report_protocol_version is not None or (isinstance(result_obj, dict) and "report_protocol_version" in result_obj):
+        return _decide_fixer_report(
+            result_obj=result_obj, report_protocol_version=report_protocol_version,
+            dispatch_id=dispatch_id, pinned_head=pinned_head, current_head=current_head,
+            review_sha256=review_sha256, review_handoff=review_handoff,
+            verification_unconfigured=verification_unconfigured, body_revision=body_revision,
+        )
     sentinel = parse_fix_result(result_obj)
     report = _sanitize_engine_report(
         result_obj.get("result") if isinstance(result_obj, dict) else None
@@ -4154,7 +4177,7 @@ def decide_fix_harvest(
                 ),
                 no_change_round=no_change_round,
                 review_sha256=review_sha256,
-            ),
+            ) + "\n\n" + fixer_reports.LEGACY_NOTE,
         }
         if not head_advanced:
             decision["head_advanced"] = False
@@ -4190,6 +4213,52 @@ def decide_fix_harvest(
         if transient is not None:
             return transient
     return terminal("escalate", LABEL_NEEDS_HUMAN, head_advanced=True)
+
+
+def _decide_fixer_report(
+    *, result_obj: object, report_protocol_version: object, dispatch_id: str,
+    pinned_head: str, current_head: str, review_sha256: str, review_handoff: object,
+    verification_unconfigured: bool, body_revision: str,
+) -> dict[str, object]:
+    report, problem = fixer_reports.parse_result(result_obj, report_protocol_version)
+    if report:
+        problem = fixer_reports.binding_problem(
+            report, dispatch_id=dispatch_id, pinned_head=pinned_head,
+            review_sha256=review_sha256, review_handoff=review_handoff,
+        ) or fixer_reports.outcome_problem(
+            report, current_head=current_head, verification_unconfigured=verification_unconfigured,
+        )
+    sentinel = report["outcome"] if report else None
+    recheck = not problem and sentinel in {SENTINEL_FIXES_PUSHED, SENTINEL_NO_CHANGES}
+    action, label = ("recheck", LABEL_REVISED) if recheck else ("escalate", LABEL_NEEDS_HUMAN)
+    header = render_fix_comment(
+        action=action, label=label, sentinel=sentinel, pinned_head=pinned_head, current_head=current_head,
+        escalation_reason=problem or ("The fixer requests a human decision; see its complete explanation." if not recheck else ""),
+        body_revision=body_revision if recheck else ("not-applied" if body_revision == "ready" else body_revision),
+        no_change_round=hashlib.sha256(dispatch_id.encode()).hexdigest() if recheck and sentinel == SENTINEL_NO_CHANGES else "",
+        review_sha256=review_sha256,
+    )
+    metadata, rest = header.split("\n\n", 1)
+    header = (metadata + "\n" + fixer_reports.COMMENT_MARKER
+              + "\n<!-- pr-pipeline:fix-dispatch " + hashlib.sha256(dispatch_id.encode()).hexdigest()
+              + " -->\n\n" + rest)
+    # Keep the complete rendering for evidence even when the publication bound
+    # requires a small human-decision notice instead. Never retry code for prose.
+    rendered = fixer_reports.render(report, header) if report else ""
+    if rendered and not review_reports.within_limit(rendered):
+        problem = "Complete revision comment exceeds 60,000 characters or 60,000 UTF-8 bytes."
+    if problem:
+        action, label = "escalate", LABEL_NEEDS_HUMAN
+        body = render_fix_comment(
+            action=action, label=label, sentinel=sentinel, pinned_head=pinned_head, current_head=current_head,
+            escalation_reason=problem + " Complete source is retained in the harvest-evidence archive; operator recovery is required.",
+            review_sha256=review_sha256,
+        )
+    else:
+        body = rendered
+    return {"action": action, "label": label, "sentinel": sentinel, "post_comment": True,
+            "comment_body": body, "rendered_report": rendered, "validation_reason": problem,
+            "head_advanced": pinned_head != current_head}
 
 
 def trusted_issue_candidate(metadata: object, *, trusted_author: str) -> bool:
@@ -4497,8 +4566,11 @@ def valid_marker(
             return False
 
     if "report_protocol_version" in obj:
-        if (stage != "review" or type(obj["report_protocol_version"]) is not int
-                or obj["report_protocol_version"] != review_reports.VERSION):
+        version = fixer_reports.VERSION if stage == "fix" else review_reports.VERSION
+        if (stage not in {"review", "fix"} or type(obj["report_protocol_version"]) is not int
+                or obj["report_protocol_version"] != version):
+            return False
+        if stage == "fix" and "review_handoff" not in obj:
             return False
 
     if "review_handoff" in obj:
@@ -4987,6 +5059,8 @@ def harvest_fix(
     dispatch_id: str = "",
     review_sha256: str = "",
     verification_unconfigured: bool = False,
+    report_protocol_version: int | None = None,
+    review_handoff: object = None,
 ) -> HarvestResult:
     """Decide the outcome of a finished fixer engine.
 
@@ -5008,9 +5082,14 @@ def harvest_fix(
     Returns:
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
     """
-    result_obj = _load_json_string(result, None)
+    try:
+        result_obj = review_reports.loads(result)
+    except (ValueError, TypeError, RecursionError):
+        result_obj = None
     decision = decide_fix_harvest(
         result_obj=result_obj,
+        report_protocol_version=report_protocol_version,
+        review_handoff=review_handoff,
         verification_unconfigured=verification_unconfigured,
         pre_label=pre_label,
         pinned_head=pinned_head,
@@ -5274,6 +5353,9 @@ def _cmd_harvest_fix(args: argparse.Namespace) -> int:
         body_revision=args.body_revision,
         dispatch_id=args.dispatch_id,
         review_sha256=args.review_sha256,
+        report_protocol_version=args.report_protocol_version,
+        review_handoff=_load_json(args.review_handoff, None) if args.review_handoff else None,
+        verification_unconfigured=args.verification_unconfigured,
     )
     print(json.dumps(decision))
     return 0
@@ -5601,6 +5683,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_harvest_fix.add_argument("--result", required=True, help="Path to result.json")
     p_harvest_fix.add_argument("--dispatch-id", default="", help="Fixer dispatch identity")
+    p_harvest_fix.add_argument("--report-protocol-version", type=int)
+    p_harvest_fix.add_argument("--review-handoff", help="Path to the dispatch-pinned review_handoff JSON")
+    p_harvest_fix.add_argument("--verification-unconfigured", action="store_true")
     p_harvest_fix.add_argument(
         "--review-sha256", default="", help="Original review fingerprint from dispatch.json",
     )

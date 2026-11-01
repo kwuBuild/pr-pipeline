@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import re
@@ -10,6 +11,8 @@ import sys
 import time
 from collections.abc import Iterable
 from typing import Any
+
+import fixer_reports
 
 # Name of the progress-heartbeat file, written next to the engine's
 # ``result.json`` inside its worktree. Its *mtime* is the whole payload: the
@@ -119,34 +122,23 @@ def collect_stream(
     return result, skills
 
 
-def split_wrapper_args(argv: list[str]) -> tuple[str | None, list[str]]:
-    """Split the wrapper's own options from the engine command.
-
-    Args:
-        argv: The wrapper's argument vector, without ``argv[0]``.
-
-    Returns:
-        The ``--heartbeat`` path (``None`` when absent) and the remaining
-        engine command, with the ``--`` separator stripped.
-    """
-    heartbeat_path: str | None = None
-    rest = list(argv)
-    while rest:
-        if rest[0] == "--heartbeat" and len(rest) > 1:
-            heartbeat_path = rest[1]
-            del rest[:2]
-            continue
-        break
-    if rest and rest[0] == "--":
-        rest = rest[1:]
-    return heartbeat_path, rest
-
-
 def main(argv: list[str] | None = None) -> int:
     """Run Claude, collect its trusted stream, and emit one result object."""
-    heartbeat_path, command = split_wrapper_args(
-        list(sys.argv[1:] if argv is None else argv),
-    )
+    args = list(sys.argv[1:] if argv is None else argv)
+    # This is transport metadata, pinned by dispatch, not engine prose. Both
+    # Claude routes keep their existing result and process-liveness authority.
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--heartbeat")
+    parser.add_argument("--fix-report-protocol-version", type=int, choices=[fixer_reports.VERSION])
+    # Parse only leading wrapper options. A legacy invocation may omit the
+    # separator and still pass its own "--" through to the engine command.
+    boundary = 0
+    while boundary < len(args) and args[boundary] in {"--heartbeat", "--fix-report-protocol-version"}:
+        boundary += 2
+    options = parser.parse_args(args[:boundary])
+    heartbeat_path, command = options.heartbeat, args[boundary:]
+    if command and command[0] == "--":
+        command = command[1:]
     if not command:
         return 1
     try:
@@ -168,6 +160,8 @@ def main(argv: list[str] | None = None) -> int:
     result["skills_used"] = skills
     result["skill_usage_status"] = "active"
     result["claude_exit_status"] = exit_status
+    if options.fix_report_protocol_version is not None:
+        result["report_protocol_version"] = options.fix_report_protocol_version
     json.dump(result, sys.stdout)
     sys.stdout.write("\n")
     return exit_status

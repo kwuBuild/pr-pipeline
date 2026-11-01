@@ -125,7 +125,10 @@ def test_dispatch_pins_grants_warning_and_completion_requirement(tmp_path, monke
     assert marker["verification_unconfigured"] is not configured
     assert pipeline.valid_marker(marker)
     prompt = (wt / "prompt.txt").read_text()
-    assert ("VERIFICATION_UNCONFIGURED_WAIVER" in prompt) is not configured
+    # The report schema names the optional waiver for both configurations;
+    # only the dispatch-owned configuration section can require its use.
+    verification_context = prompt.split("Verification configuration for this dispatch:\n", 1)[1] if stage == "fix" else prompt
+    assert ("VERIFICATION_UNCONFIGURED_WAIVER" in verification_context) is not configured
     argv = launch.call_args.args[0]
     grants = argv[argv.index("--allowedTools") + 1]
     assert ("Bash(custom-check *)" in grants) is configured

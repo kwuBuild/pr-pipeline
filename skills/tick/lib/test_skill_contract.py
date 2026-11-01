@@ -143,6 +143,9 @@ _PROMPT_RENDER_VARIABLES: dict[str, dict[str, object]] = {
         "head_ref": "worktree-i1",
         "revision_hygiene_skill_doc": "some/skill/SKILL.md",
         "revision_hygiene_skill_invocation": "pr-pipeline:review-response-hygiene",
+        "definition_of_done_skill_doc": "some/proof/SKILL.md",
+        "definition_of_done_skill_invocation": "pr-pipeline:definition-of-done",
+        "report_binding": "Controller report binding.",
         "summary_budget": 1,
         "pr_body_revision_file": "pr-body-revision.md",
         "pr_body_revision_stamp": "pr-body-revision: fix-2-1",
@@ -783,7 +786,7 @@ def test_credentialed_engine_prompts_forbid_pipeline_label_mutation(
     )
     for contract_text in [
         _ENGINE_LABEL_PROHIBITION,
-        "completion sentinel",
+        "completion sentinel" if prompt_name == "implementer" else "dedicated field alone selects the outcome",
         *_ENGINE_EXTRA_CLAUSES[prompt_name],
     ]:
         assert contract_text in text, (

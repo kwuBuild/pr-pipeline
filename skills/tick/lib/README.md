@@ -84,8 +84,10 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 # without a terminal state. Empty head values disable the check (markers that
 # predate push verification).
 # NO_CHANGES_RECHECK_NEEDED instead requires equal, non-empty head SHAs,
-# --dispatch-id and --review-sha256 from the fixer marker, and a bounded report
-# with Finding:, Decision: no-change, and Reason: for every reported finding.
+# --dispatch-id and --review-sha256 from the fixer marker. New dispatches also
+# require --report-protocol-version 2 and --review-handoff <snapshot.json>, where
+# snapshot.json contains the marker's exact review_handoff object. Legacy markers
+# omit those options and retain the old bounded no-change block grammar.
 # Accepted no-change results also carry head_advanced=false, but request re-review.
 # The review fingerprint pins the original finding set for the coverage check.
 #
@@ -99,6 +101,8 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
   --result result.json [--pre-label ai:changes-requested] \
   [--pinned-head <sha> --current-head <sha>] \
   [--dispatch-id <fixer-dispatch-id> --review-sha256 <original-review-sha256>] \
+  [--report-protocol-version 2 --review-handoff <snapshot.json>] \
+  [--verification-unconfigured] \
   [--body-revision <state>]
 
 # Validate a new report against protocol 2 (prints verdict; exit 1 + "INVALID" if not).
@@ -256,11 +260,13 @@ review harvest does not derive it from newer comments.
 |---|---|
 | `action` | `recheck` \| `escalate` \| `retry` |
 | `label` | GitHub label to set for `action` |
-| `sentinel` | extracted completion sentinel, or `null` if the engine emitted none |
-| `head_advanced` | present (and `false`) for accepted `NO_CHANGES_RECHECK_NEEDED` recheck and contradictory `FIXES_PUSHED`-without-a-push escalation |
-| `failure_class` | present only on `retry` (`quota_or_limit`) |
+| `sentinel` | Validated new report outcome or extracted legacy sentinel; `null` when unavailable. |
+| `head_advanced` | New reports: whether the live head differs from the pinned head. Legacy reports: present and `false` for accepted no-change or contradictory pushed-without-a-push outcomes. |
+| `failure_class` | present only on legacy `retry` (`quota_or_limit`); malformed new reports hold instead |
 | `post_comment` | `true` on both terminal outcomes, absent on `retry` |
-| `comment_body` | rendered fixer comment (marker, head before → after, outcome, sentinel, a bounded engine excerpt; plus the escalation reason on `escalate`, and a `- PR body:` line whenever `--body-revision` is given). Accepted no-change completions include the dispatch-derived round token; `--review-sha256` records the original review fingerprint. |
+| `comment_body` | Complete new fixer report or a concise human-decision notice. Legacy results keep a bounded excerpt and visible legacy note. Includes head identities, outcome and any body-update status. |
+| `rendered_report` | Complete attempted new-report rendering, retained even when oversized. |
+| `validation_reason` | Mechanical failure reason; empty for valid reporting, including unresolved-work reports. |
 
 The tick posts `comment_body` **before** flipping the label and treats a failed
 post as a failed harvest: the label stays put and the marker + scratch survive for

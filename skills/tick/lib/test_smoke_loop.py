@@ -455,8 +455,24 @@ with (root / "calls.jsonl").open("a") as log:
 (root / "engine-started").touch()
 while not (root / "engine-exit").exists():
     time.sleep(0.02)
+result = "Offline completion fixture\\nNEEDS_HUMAN_DECISION"
+if os.environ["LOOP_TEST_STAGE"] == "fix":
+    marker = json.loads(Path("dispatch.json").read_text())
+    result = json.dumps({
+        "report_protocol_version": marker["report_protocol_version"],
+        "dispatch_id": marker["dispatch_id"], "pinned_head": marker["head_sha"],
+        "published_head": marker["head_sha"], "review_sha256": marker["review_sha256"],
+        "outcome": "NEEDS_HUMAN_DECISION", "revision_summary": "Offline completion fixture.",
+        "findings": [{"reference": ref, "disposition": "unresolved",
+                      "assessment": "This fixture requests an owner decision.",
+                      "evidence": "No implementation work was attempted.",
+                      "change": "The owner must resolve the finding."}
+                     for ref in marker["review_handoff"]["finding_refs"]],
+        "verification": "No checks run by this fixture.", "verification_status": "unavailable",
+        "verification_waiver": "", "documentation": "No documentation changed.",
+        "remaining_work": "Owner decision required."})
 print(json.dumps({"type": "result", "is_error": False,
-                  "result": "Offline completion fixture\\nNEEDS_HUMAN_DECISION"}), flush=True)
+                  "result": result}), flush=True)
 '''
 
 GH_SHIM = '''

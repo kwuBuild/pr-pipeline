@@ -638,9 +638,13 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
   failure logs its cause as a dispatch `skip` and retains the pickup label for
   retry. See the [governing-context contract](README.md#governing-context-the-fixer-is-handed)
   for source selection, pagination, attribution and excerpt budgets
-- Fixer change-summary budget: `pipeline.FIX_SUMMARY_BUDGET=3000`, substituted
-  into the fixer prompt; the published excerpt is capped at that plus
-  `_FIX_REPORT_HEADROOM`
+- New fixer reports: inspect `report_protocol_version`, `review_handoff`, and
+  `review_sha256` in the marker, then `result.json`, `fix-rendered.md` and
+  `fix-manifest.json` in scratch or `.harvest-evidence/`. The manifest records
+  complete source/rendered digests and validation reason. A malformed or
+  oversized report takes a human hold; do not rerun code merely to repair prose.
+  See [complete fixer reports](README.md#complete-fixer-reports) for limits,
+  outcomes, legacy compatibility and explicit operator recovery.
 - Initial PR metadata: inspect `.pr-publications/issue-<N>-<dispatch-id>/`
   for the original `.pr-body.md` and `decision.json`. `pr_metadata_retry` means
   a source, staging, or retention I/O operation failed; scratch remains under

@@ -348,7 +348,7 @@ DEFINITION_OF_DONE_SKILL = pipeline.DEFINITION_OF_DONE_SKILL
 
 # The skills each engine stage resolves before launch, against the same
 # resolver; `pipeline.BOUND_SKILLS` is the union every stage's tuple draws from.
-FIXER_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL,)
+FIXER_SKILLS: tuple[str, ...] = (REVISION_HYGIENE_SKILL, DEFINITION_OF_DONE_SKILL)
 IMPLEMENTER_SKILLS: tuple[str, ...] = (DEFINITION_OF_DONE_SKILL,)
 
 # Ceiling on each governing document injected into a fixer prompt (the PR body,
@@ -1050,6 +1050,7 @@ def _launch_claude_engine(
     verify_tools: tuple[str, ...] | None = None,
     engine_settings: str = "",
     skills: Sequence[str] = (),
+    fix_report_protocol_version: int | None = None,
 ) -> subprocess.Popen[bytes] | None:
     """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
@@ -1140,6 +1141,8 @@ def _launch_claude_engine(
             [
                 sys.executable, _CLAUDE_STREAM_WRAPPER,
                 "--heartbeat", _heartbeat_path(wt_dir),
+                *(["--fix-report-protocol-version", str(fix_report_protocol_version)]
+                  if fix_report_protocol_version is not None else []),
                 "--", *engine_cmd,
             ],
             stdin=prompt_fh,
@@ -2213,6 +2216,8 @@ def _archive_harvest_evidence(
         "review-rendered.md",
         "review-manifest.json",
         "review-rejected.json",
+        "fix-rendered.md",
+        "fix-manifest.json",
         _PR_BODY_SOURCE_FILE,
         _PR_BODY_REVISION_FILE,
         ".pr-metadata-decision.json",
@@ -3723,7 +3728,8 @@ def _held_result_outcome(
     except (OSError, UnicodeError, json.JSONDecodeError):
         result_obj = None
     version = None
-    if config.stage == "review":
+    marker = None
+    if config.stage in {"review", "fix"}:
         try:
             marker = json.loads(Path(wt_dir, "dispatch.json").read_text())
             version = marker.get("report_protocol_version")
@@ -3731,7 +3737,9 @@ def _held_result_outcome(
                 result_obj = pipeline.review_reports.loads(Path(wt_dir, config.result_file).read_text())
         except (OSError, UnicodeError, ValueError, AttributeError):
             return pipeline.OUTCOME_UNRECOGNIZED
-    return pipeline.held_completion_outcome(config.stage, result_obj, report_protocol_version=version)
+    return pipeline.held_completion_outcome(
+        config.stage, result_obj, report_protocol_version=version, fix_marker=marker,
+    )
 
 
 def _reconcile_one(
@@ -4303,6 +4311,15 @@ def _reconcile_one(
         in_flight_label=config.in_flight_label,
         dispatch_attempts=dispatch_attempts,
     )
+    if (config.stage == "fix" and marker_valid and isinstance(marker, dict)
+            and marker.get("report_protocol_version") == pipeline.fixer_reports.VERSION
+            and classify_state == "stale"
+            and current_label in (config.in_flight_label, dispatch_pre_label)):
+        # A dead new fixer with no report may already have pushed. Preserve
+        # the existing dead-tree authority, but publish a report failure instead
+        # of replaying code work. This is not a successful completion envelope.
+        decision = {"action": "report_missing" if identity == "dead" else "leave",
+                    "kill": False, "label": ""}
 
     # A dead wrapper can leave a paid child alive in its recorded process
     # group. That retains custody but cannot prove process identity strongly
@@ -8643,6 +8660,22 @@ def _end_dispatch_escalation(
         pass
 
 
+def _fixer_publication_authority(number: int, expected_head: str) -> str:
+    """Point-read the head and hold immediately before a new-report mutation."""
+    try:
+        snapshot = gh_json("pr", "view", str(number), "--json", "headRefOid,labels,state")
+    except (subprocess.CalledProcessError, ValueError):
+        return "unreadable"
+    labels = _pipeline_labels(snapshot)
+    if not isinstance(snapshot, dict) or labels is None:
+        return "unreadable"
+    if pipeline.HOLD_LABELS & set(labels):
+        return "held"
+    if snapshot.get("state") != "OPEN" or snapshot.get("headRefOid") != expected_head:
+        return "drifted"
+    return "clear"
+
+
 def _harvest_one_fixer(
     decision: dict[str, object],
     wt_root: str,
@@ -8675,11 +8708,20 @@ def _harvest_one_fixer(
         return
 
     result_path = os.path.join(wt_dir, "result.json")
+    result_present = True
     try:
-        with open(result_path) as fh:
-            result_raw = fh.read()
+        result_bytes = Path(result_path).read_bytes()
+    except FileNotFoundError:
+        if decision.get("action") != "report_missing":
+            return
+        result_present, result_bytes = False, b""
     except OSError:
         return  # result missing — leave marker, retry next tick
+    try:
+        result_raw = result_bytes.decode("utf-8")
+    except UnicodeError:
+        # Parsing fails closed; archive copies the original bytes unchanged.
+        result_raw = ""
 
     # Read pre_label from dispatch marker; fall back to config default
     dispatch_path = os.path.join(wt_dir, "dispatch.json")
@@ -8690,6 +8732,7 @@ def _harvest_one_fixer(
     pinned_head = ""
     review_sha256 = ""
     provenance: PRBodyProvenance | None = None
+    marker = {}
     if os.path.isfile(dispatch_path):
         try:
             with open(dispatch_path) as fh:
@@ -8774,6 +8817,8 @@ def _harvest_one_fixer(
             body_revision=revision_state,
             dispatch_id=dispatch_id,
             review_sha256=review_sha256,
+            report_protocol_version=marker.get("report_protocol_version"),
+            review_handoff=marker.get("review_handoff"),
         )
     except Exception:
         # Cap persistent parse errors to avoid infinite retries.
@@ -8811,6 +8856,38 @@ def _harvest_one_fixer(
         if harvest_result.get("post_comment") is True else ""
     )
 
+    archive_dir = ""
+    if "report_protocol_version" in marker:
+        rendered = str(harvest_result.get("rendered_report") or fixer_body)
+        try:
+            pipeline.atomic_write(os.path.join(wt_dir, "fix-rendered.md"), rendered)
+            pipeline.atomic_write(os.path.join(wt_dir, "fix-manifest.json"), json.dumps({
+                "report_protocol_version": marker["report_protocol_version"],
+                "dispatch_id": dispatch_id, "review_handoff": marker.get("review_handoff"),
+                "source_sha256": hashlib.sha256(result_bytes).hexdigest(),
+                "source_present": result_present,
+                "rendered_sha256": pipeline.review_reports.digest(rendered),
+                "validation_reason": harvest_result.get("validation_reason", ""),
+                "outcome": harvest_action, "published_head": current_head,
+            }))
+        except (OSError, UnicodeError):
+            _bound_failed_harvest(n, "pr", _FIXER_CONFIG.in_flight_label, wt_dir,
+                                  attempts, tick_log, _FIXER_CONFIG.stage)
+            return
+        archive_dir = _archive_harvest_evidence(
+            wt_root=wt_root, wt_dir=wt_dir, kind="pr", number=n, dispatch_id=dispatch_id,
+            tick_log=tick_log, stage="fix", reuse_existing=True,
+            required_files=("dispatch.json", "fix-rendered.md", "fix-manifest.json")
+                           + (("result.json",) if result_present else ()),
+        )
+        if not archive_dir or not all(
+            _copy_evidence_file(wt_dir, archive_dir, name)
+            for name in ("fix-rendered.md", "fix-manifest.json")
+        ):
+            _bound_failed_harvest(n, "pr", _FIXER_CONFIG.in_flight_label, wt_dir,
+                                  attempts, tick_log, _FIXER_CONFIG.stage)
+            return
+
     if os.path.lexists(os.path.join(wt_dir, _PR_BODY_REVISION_FILE)):
         try:
             _record_pr_metadata(
@@ -8840,6 +8917,14 @@ def _harvest_one_fixer(
             reason=revision_state,
             dispatch_id=dispatch_id,
         )
+
+    if "report_protocol_version" in marker:
+        authority = _fixer_publication_authority(n, current_head)
+        if authority != "clear":
+            if authority != "held":
+                _bound_failed_harvest(n, "pr", _FIXER_CONFIG.in_flight_label, wt_dir,
+                                      attempts, tick_log, _FIXER_CONFIG.stage)
+            return
 
     if harvest_action == "escalate":
         # Terminal transitions record their decision before *any* remote
@@ -8952,6 +9037,8 @@ def _harvest_one_fixer(
     # with no stated reason — precisely the audit gap this comment closes. A
     # failed post therefore blocks the relabel and retains custody, matching
     # reviewer harvest semantics.
+    if "report_protocol_version" in marker and _fixer_publication_authority(n, current_head) != "clear":
+        return
     if fixer_body:
         if not _post_harvest_comment(
             entity="pr",
@@ -8969,16 +9056,17 @@ def _harvest_one_fixer(
             return
 
     skip_cleanup = False
-    archive_dir = ""
 
     if harvest_action == "recheck":
+        if "report_protocol_version" in marker and _fixer_publication_authority(n, current_head) != "clear":
+            return
         if not _converge_pipeline_labels(
             "pr", n, harvest_label,
             tick_log=tick_log, phase="harvest", stage=_FIXER_CONFIG.stage,
         ):
             skip_cleanup = True
         else:
-            if attempts is not None:
+            if attempts is not None and not archive_dir:
                 attempts.clear(n)
             # Bump iteration cache (advisory accelerator — comment history
             # remains the authority for the round cap).
@@ -9055,6 +9143,8 @@ def _harvest_one_fixer(
     # their job. Retiring them here keeps WT_ROOT from accumulating one file per
     # dispatch; a leftover is harmless either way, since the next dispatch's id
     # can never match a stale receipt.
+    if archive_dir and attempts is not None:
+        attempts.clear(n)
     _discard_comment_receipts(wt_root, "pr", n)
     cleanup_scratch(wt_dir)
 
@@ -9104,7 +9194,7 @@ def harvest_fixers(
     # Process harvest decisions — read result.json, recheck / escalate
     for decision in decisions:
         action = str(decision.get("action", ""))
-        if action == "harvest":
+        if action in ("harvest", "report_missing"):
             _harvest_one_fixer(
                 decision, wt_root, tick_log, attempts,
                 transient_cooldown_seconds=transient_cooldown_seconds,
@@ -10194,11 +10284,11 @@ def _dispatch_one_reviewer(
                     tick_log.log(pr=pr_number, phase="dispatch", stage="review", action="skip",
                                  reason="original review finding identity is ambiguous — retained for retry")
                 return
-        if fix_round and not original_review:
+        if (fix_round or pipeline.fixer_reports.is_current_comment(fixer_summary)) and not original_review:
             if tick_log:
                 tick_log.log(
                     pr=pr_number, phase="dispatch", stage="review", action="skip",
-                    reason="original no-change review missing or edited — retained for retry",
+                    reason="original revision review missing or edited — retained for retry",
                     engine="codex",
                 )
             return
@@ -11813,6 +11903,7 @@ def _dispatch_one_fixer(
     # through harvest's comment so re-review cannot substitute a later review.
     lease_marker["review_sha256"] = hashlib.sha256(review_body.encode()).hexdigest()
     lease_marker["review_handoff"] = review_handoff
+    lease_marker["report_protocol_version"] = pipeline.fixer_reports.VERSION
     try:
         pipeline.atomic_write(
             os.path.join(wt_dir, "dispatch.json"),
@@ -11843,14 +11934,26 @@ def _dispatch_one_fixer(
         )
     prompt = load_prompt_template("fixer", {
         "target_remote": TARGET_REMOTE,
-        "verification_context": _verification_prompt(verification_unconfigured),
+        "verification_context": (
+            "No operator-defined verification grants. Set verification_waiver to "
+            + pipeline.VERIFICATION_WAIVER + "; this waiver is not evidence that checks passed. "
+            "Required checks remain mandatory; if unavailable use NEEDS_HUMAN_DECISION."
+            if verification_unconfigured else "Operator verification grants are configured. Required checks must pass."
+        ),
         "pr_number": pr_number,
         **context_values,
         "finding_references": json.dumps(review_handoff, ensure_ascii=False),
         "head_ref": head_ref,
         "revision_hygiene_skill_doc": skill_doc_path(REVISION_HYGIENE_SKILL),
         "revision_hygiene_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{REVISION_HYGIENE_SKILL}",
-        "summary_budget": pipeline.FIX_SUMMARY_BUDGET,
+        "summary_budget": pipeline.fixer_reports.AUTHOR_ALLOWANCE,
+        "report_binding": json.dumps({
+            "report_protocol_version": pipeline.fixer_reports.VERSION,
+            "dispatch_id": dispatch_id, "pinned_head": head_sha,
+            "review_sha256": lease_marker["review_sha256"],
+        }),
+        "definition_of_done_skill_doc": skill_doc_path(DEFINITION_OF_DONE_SKILL),
+        "definition_of_done_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{DEFINITION_OF_DONE_SKILL}",
         "pr_body_revision_file": _PR_BODY_REVISION_FILE,
         # The whole stamp line, not its prefix: the engine copies a literal it
         # was given rather than composing one from a dispatch id it would have
@@ -11896,6 +11999,7 @@ def _dispatch_one_fixer(
         verify_tools=verify_tools,
         engine_settings=config.engine_settings,
         skills=FIXER_SKILLS,
+        fix_report_protocol_version=pipeline.fixer_reports.VERSION,
     )
     if proc is None:
         cleanup_scratch(wt_dir)

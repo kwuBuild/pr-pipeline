@@ -1181,16 +1181,13 @@ provider-capability claim is implied by the CLI inspection.
 
 ### Prompt-bound skills (`skill_unresolved`)
 
-The fixer prompt binds `review-response-hygiene` through the native Claude
-`Skill` tool before editing, then to declare **per finding**
-whether the fix **repairs** the accepted design or **replaces** it. One run may
-mix the two, and each replacement states its own reasoning rather than sharing
-one run-wide set. A replacement is never blocked and never escalates — it
-publishes the shape the reviewer proposed, why that shape was rejected, the
-contract that replaced it, and the surfaces it audited, so the next reviewer
-evaluates the decision instead of reconstructing it from the diff. The decisions
-are re-checked against the pushed diff before the completion sentinel, which now
-needs them alongside the three green commands.
+The fixer binds `review-response-hygiene` and `definition-of-done` through the
+native Claude `Skill` tool before editing. Each finding receives its own
+assessment, disposition, evidence and change or no-change reason. Re-check repair
+versus replacement against the final diff. Replacements explain the new contract,
+tradeoff and audited surfaces; replacement alone is not an escalation reason.
+The [complete report contract](#complete-fixer-reports) owns the outcome fields,
+verification requirements, publication and recovery rules.
 
 The implementer prompt binds `definition-of-done` the same way. The engine runs
 Phase A (claim, production entry point and authoritative mode, invariant owner,
@@ -1213,7 +1210,7 @@ Claude already discovers namespaced skills from plugins. Dispatch loads the
 pipeline's installed plugin directly with `claude -p --plugin-dir <install>` and
 preapproves the selected `Skill(pr-pipeline:<name>)` call in both `auto` and
 `dontAsk`. The implementer invokes `pr-pipeline:definition-of-done`; the fixer
-invokes `pr-pipeline:review-response-hygiene`. The prompt names the installed
+invokes both `pr-pipeline:review-response-hygiene` and `pr-pipeline:definition-of-done`. The prompt names the installed
 source so a same-named task-branch skill does not satisfy the binding. No copied
 plugin or second namespace is created. Supporting files remain in the install.
 
@@ -1435,7 +1432,7 @@ at all.
 
 ### Transient quota and limit results
 
-Implementer and fixer results without a valid completion sentinel are classified
+Implementer and legacy fixer results without a valid completion sentinel are classified
 as transient when the provider reports status 429, a known rate-limit subtype, or
 a known session/usage/quota-limit message. A valid success or
 `NEEDS_HUMAN_DECISION` sentinel remains authoritative even if the surrounding text
@@ -1482,44 +1479,73 @@ them as unknown; harvest does not substitute current configuration. Denials and
 grants each show at most ten entries and 3200 source characters, with truncation stated.
 Only tool names and command strings are included from denial records.
 
-Both **terminal fixer outcomes** also embed a bounded excerpt of the engine's
-`result` text in the PR comment. An escalation needs it because the comment asks a human to make
-a decision and they need the engine's own words; a `recheck` needs it because the
-recheck path archives no evidence and deletes the scratch that held `result.json`,
-so the comment is the run's only durable record of what was fixed. The fixer
-prompt states a summary budget (`pipeline.FIX_SUMMARY_BUDGET`, 3000 characters)
-and the excerpt limit is that budget plus headroom for the completion sentinel,
-so a summary written to the stated size — including the repair, replacement, or
-no-change decision each finding's block carries — reaches the PR whole. Anything past the
-limit is truncated, and the excerpt is stripped of `<!--`, `-->`, fence, and
-`</details>` sequences so engine text cannot forge a pipeline marker or escape
-its rendered block. The attempt-cap and transient escalations publish no model
-output — they report a failed side effect and a spent retry budget, not an
-engine result.
+### Complete fixer reports
 
-A fixer that finds every review finding already addressed or inapplicable can
-complete without a push. Each finding must have exactly three non-empty lines:
-`Finding: <name>`, `Decision: no-change`, and `Reason: <evidence>`. The summary
-ends with `NO_CHANGES_RECHECK_NEEDED`. Missing decisions or reasons, an
-over-budget summary, missing dispatch/head/original-review provenance, or a changed head
-escalate. An unchanged-head `FIXES_PUSHED_RECHECK_NEEDED` claim still escalates.
+New fixer dispatches pin `report_protocol_version=2`, the exact originating
+review digest, and the immutable qualified finding references from the reviewer
+report. The shared authenticated-comment reader and legacy-review adapter select
+that review. Ambiguous historical finding boundaries take a human hold before
+launch. The existing discussion snapshot supplies current PR/issue requirements
+and owner clarifications; there is no second context acquisition lifecycle.
+Both Claude and Claude-DS receive installed revision-hygiene and definition-of-done
+guidance through native skill binding.
 
-The accepted no-change comment explicitly says that nothing was changed and
-requests re-review at `ai:revised`. The next reviewer receives the published
-reasoning and the exact originating review as context and decides independently.
-Fixer dispatch pins a fingerprint of that review; harvest publishes it, and
-reviewer dispatch resolves the matching body from the same comment snapshot.
-A missing or edited original, or a missing fingerprint, retains a no-change
-round without launching a reviewer. Restore the exact original comment or
-requeue a fresh review at `ai:implemented` to recover. The reviewer explicitly
-checks every original finding, including any omitted from the fixer summary.
-A token tied to that fixer run
-is pinned in the reviewer marker and included in its review identity. New
-no-change rounds count toward the round limit (`max_iterations`) even on the same commit;
-replaying one fixer result or review harvest does not create an extra round.
-The parser checks every reported block; it does not prove that the report
-covers every original finding or that a reason is correct. The prompt requires
-complete coverage, and the independent reviewer owns that judgement.
+The fixer returns one JSON object as its final response. The stream adapter
+preserves that response in `result.json` and stamps the dispatch protocol version
+beside it. The report repeats the dispatch ID, pinned head, published head and
+original review fingerprint. Its dedicated `outcome` field selects the result;
+completion tokens inside prose or code examples have no control authority.
+The response fields are defined in `lib/fixer_reports.py` and explained in the
+fixer prompt: revision summary, one assessment/disposition/evidence/change-or-reason
+per finding, verification and status, PR/documentation updates, remaining work,
+and optional Additional context. Prose can contain paragraphs, lists, code fences
+and subsections. Mechanical validation checks identity, coverage and completeness;
+it does not judge the correctness of a rationale or grant independent approval.
+
+| Complete report state | Harvest disposition |
+|---|---|
+| All expected findings resolved, at least one repair/replacement, verification passed, and claimed pushed head matches an advanced live head | Publish the complete report and request independent re-review at `ai:revised`. |
+| All expected findings have evidence-backed no-change dispositions, verification passed, and pinned head is unchanged | Publish the complete report and request independent re-review without a commit. |
+| Human-decision outcome, including unresolved findings, unavailable verification or partial pushes | Publish the complete explanation and take `ai:needs-human-decision`. |
+| Missing, duplicate or unknown references; malformed/incomplete report; contradictory outcome/head; oversized comment | Archive complete source and validation reason, publish a concise human-decision notice and hold. Never rerun implementation to repair prose. |
+| Archive, comment, body-update or label failure | Retain source, marker and attempts; retry publication under the existing bounded custody rules. |
+
+Successful outcomes retain the existing required-check and verification-waiver
+rules. The author allowance comes from the reviewer's shared publication bound:
+52,000 characters and UTF-8 bytes of authored content. The complete rendered
+comment, including controller metadata, must fit both 60,000 characters and
+60,000 UTF-8 bytes. Harvest preserves Markdown/code fences and neutralizes only
+reserved controller-marker openers. It never truncates or splits a new report.
+Oversized source and the full attempted rendering remain in the evidence archive.
+
+Every new run archives `fix-rendered.md`, `fix-manifest.json`, dispatch/prompt
+evidence and complete scratch before cleanup. It preserves `result.json` when
+present and records its absence otherwise. The manifest records
+source/rendered fingerprints, originating review references, published head and
+validation reason. A report-less dead fixer can already have pushed; it takes a
+report-failure hold instead of replaying code work. Process-tree death and the
+existing result authority still gate harvest; fixers do not use reviewer envelopes.
+
+Comment receipts retain the existing at-least-once publication contract: retries
+with a receipt suppress duplicates, while a crash after GitHub accepts a comment
+but before its receipt is saved can publish one duplicate. Head/hold checks run
+again before new-report publication and re-review transition. PR body replacement
+keeps its existing provenance, closure, concurrent-edit and pushed-head guards.
+
+An accepted no-change comment carries a stable dispatch-derived
+`pr-pipeline:no-change` token. Each new no-change round counts toward
+`max_iterations`, even on the same commit. Retries preserve that token. Both
+pushed and no-change reports carry the pinned `pr-pipeline:fix-review` fingerprint.
+Re-review receives the complete published report and exact original review. A
+missing or edited original for any new report retains the PR for retry. Restore
+the exact comment or explicitly requeue a fresh review at `ai:implemented`.
+After a report-failure hold, use the existing operator recovery workflow; no
+automatic report-repair engine is launched.
+
+Only already-running dispatches without a protocol version use legacy sentinel
+and no-change validation. Their comments include a visible legacy-evidence note;
+the old 3,000-character summary and bounded sanitized excerpt remain compatibility
+behavior. A malformed new result can never select that fallback.
 
 ### Comment trust and incomplete history
 
