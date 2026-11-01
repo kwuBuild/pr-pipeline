@@ -945,6 +945,22 @@ codex's own built-in defaults.
 Each dispatch logs the values it resolved (`action=model_resolved`) so a
 review's provenance survives a later config edit.
 
+### Expressive reviewer reports
+
+New reviewer dispatches pin report protocol 2 through the wrapper and harvest.
+The [reviewer report contract](../../docs/working/reviewer-report-contract.md)
+owns report fields, examples, compatibility, size limits and finding identity.
+Full reports include reasoning, scope, detailed findings, verification, risks,
+and optional observations. A valid human-decision report needs no invented code
+finding. Invalid or oversized output is retained intact and produces an
+escalation notice; it never starts a code fixer or counts as a completed round.
+
+The archive contains `review.json`, `review-rendered.md`, and
+`review-manifest.json`. Archive, post and relabel failures retain custody for
+retry. Fixer dispatch authenticates the originating comment and pins stable
+finding references and report/comment digests while passing its full text.
+Ambiguous historical report formats require a human decision.
+
 ### Admission gate: issue authors
 
 Only issues authored by the configured operator can enter implementation.
@@ -1552,6 +1568,7 @@ transition except where the table states a bounded or best-effort exception:
 | Terminal transition | Post gates the relabel | On post failure |
 |---|---|---|
 | implementer result `escalate` → `ai:needs-human-decision` (`_harvest_one_implementer` → `_complete_escalate_transition`) | yes, and bounded | label held, scratch retained; repeated post failure reaches the attempt cap |
+| protocol 2 reviewer human-decision, invalid, or oversized result → `ai:needs-human-decision` | yes, and bounded | source and manifest retained; notice and terminal transition retried |
 | reviewer verdict → `ai:max-iterations` (`_harvest_one_reviewer`) | yes, and bounded | verdict post retried; repeated failure reaches the attempt cap |
 | fixer `recheck` → `ai:revised` | yes | label held, scratch retained, retried next tick |
 | fixer `escalate` → `ai:needs-human-decision` | yes | same |
@@ -1640,7 +1657,7 @@ renderer does not cover them.
 
 | Runtime owner | Silent escalation | Evidence and consequence |
 |---|---|---|
-| `_harvest_one_reviewer` → `_complete_escalate_transition` | Invalid reviewer verdict, or changes requested with no blocking finding | Archived review result; the PR has no explanation for the validation failure. |
+| `_harvest_one_reviewer` → `_complete_escalate_transition` | Legacy dispatch with invalid verdict, or legacy changes requested with no blocking finding | Archived review result; the PR has no explanation for the validation failure. Protocol 2 reports use the published escalation path above. |
 | `_harvest_failed_reviewer` | Wrapper-confirmed reviewer failure | `.harvest-evidence/` bundle; the PR has no explanation for the engine failure. |
 | `_reconcile_one` → `_execute_reconcile_actions` | Launch timeout, hung engine, unknown live process identity, conflicting pipeline labels, or resultless dispatch attempt cap | Tick log and retained scratch when custody requires it; no published reason. Reconcile does not require a readable result and cannot use the implementer report. |
 | `_dispatch_one_implementer`, `_dispatch_one_fixer`, `_dispatch_one_reviewer` | In-flight label write fails and engine termination also fails | Tick log and retained marker/scratch; the terminal label prevents duplicate dispatch while an engine may still run. |

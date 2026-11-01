@@ -23,6 +23,15 @@ will be available on the next launch. Do not commit the context directory.
 
 {review_body}
 
+The controller pinned this finding snapshot from the exact report above:
+{finding_references}
+
+Use each complete finding reference (originating review identity plus ID) in
+your Finding: line. Historical one-line findings have ordinal IDs in their
+original order. Preserve this identity; F1 in a different review is a different
+finding. Additional observations and remaining risks are context, not required
+findings. Do not infer cross-round carry-forward from similar prose.
+
 ## Current PR Body
 
 {pr_body}

@@ -7,6 +7,14 @@ The [distribution plan](plugin-distribution-design.md) retains unfinished migrat
 
 ---
 
+The [reviewer report contract](reviewer-report-contract.md) owns protocol 2
+report structure and publication. `review_reports.py` validates and renders
+complete reports; dispatch pins the version, the wrapper retains rejected bytes,
+and harvest archives the source, render and manifest before remote publication.
+Protocol failures and valid human-decision reports use escalation recovery and
+do not count as code-review rounds. Fixer snapshots carry exact report digests
+and finding references through the existing authenticated comment history.
+
 ## 1. Engine launch summary
 
 | Property | Implementer | Fixer | Reviewer |
@@ -409,8 +417,8 @@ and delay its own cap-based cleanup of the scratch just retained.
 
 What publishes is bounded; what stays silent is its complement. Exactly two
 functions run `gh <entity> comment`: `_harvest_one_reviewer` (the reviewer
-verdict, posted directly and gating its relabel — the only post with no receipt,
-so a relabel failure after a landed post reposts it next tick) and
+verdict, posted directly and gating its relabel — retries use authenticated
+round identity to suppress a landed post) and
 `_post_harvest_comment` (everything else, under `fix-comment`, `cap-escalation`,
 `transient-escalation`, or `dispatch-escalation`). **Every other terminal
 transition publishes nothing.** The silent set is stated this way round because
@@ -429,7 +437,7 @@ would copy.
 
 The remaining silent escalation paths and their evidence locations are listed
 in the [coverage map](../../skills/tick/README.md#silent-transitions). Tick
-maintainers own those follow-on gaps. They include unreadable reviewer verdicts,
+maintainers own those follow-on gaps. They include unreadable legacy reviewer verdicts,
 wrapper-confirmed reviewer failures, reconciliation without a usable result,
 and post-launch label failures where the engine could not be terminated.
 

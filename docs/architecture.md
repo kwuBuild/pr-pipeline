@@ -293,6 +293,7 @@ pr:ai:implemented
 pr:ai:reviewing
     ──[harvest: NO_BLOCKERS]──▶ pr:ai:ready-for-human
     ──[harvest: BLOCKERS_FOUND]──▶ pr:ai:changes-requested
+    ──[protocol 2 human decision, invalid or oversized report]──▶ pr:ai:needs-human-decision   (archive + explanation; no completed review round)
     ──[harvest: base or head drifted]──▶ pr:ai:implemented|ai:revised   (discard + re-dispatch)
     ──[dead reviewer + dispatch-bound failure envelope]──▶ pr:ai:needs-human-decision   (archive + terminal route; no redispatch)
     ──[dead PID, no result]──▶ pr:ai:implemented|ai:revised   (revert to pre_label + re-dispatch)
@@ -422,7 +423,8 @@ pre-dispatch label posts nothing — no outcome has been decided yet.
 The scope is load-bearing, not hedging. `ai:needs-human-decision` is still
 reachable from transitions the gate does not cover. The publication coverage
 map distinguishes implemented gates from unresolved publication gaps, including
-invalid reviewer verdicts. A readable engine result alone does not prove that
+invalid legacy reviewer verdicts. Protocol 2 reviewer escalations publish through
+the terminal-intent/receipt path. A readable engine result alone does not prove that
 its transition publishes an explanation.
 
 The gate holds wherever a failed post can be *bounded*. Transient exhaustion is
@@ -1312,13 +1314,16 @@ there.
    (`os.setpgrp`), then replaces the lease with a full ownership marker carrying
    `pid` + `start_time` (OS-reported) + `pgid` (= wrapper PID, since it is the group
    leader) + `dispatch_id` before spawning codex. The child inherits the process group.
-3. Engine runs; wrapper validates exit status + schema, then atomically renames the
-   result to `review.json`. The wrapper always writes `completion.json`: either a
-   success envelope or the strict failure envelope described above.
-4. Next tick sees `completion.json` → validates envelope (dispatch-id match, exit 0,
-   `result_valid=True`) → classifies as `complete` → harvests → deletes marker +
-   envelope + result files. A bare `review.json` without a valid envelope is NOT
-   treated as complete — it is classified as stale.
+3. The wrapper validates exit status and the dispatch-pinned report protocol,
+   then atomically retains the original output. Protocol 2 captures invalid
+   reports too, so harvest can explain a protocol failure without repeating code
+   work. Legacy and nonzero-exit rejected bytes use `review-rejected.json`.
+4. The next tick validates dispatch identity and protocol binding in
+   `completion.json`. Legacy completion requires exit 0 and `result_valid=True`;
+   protocol 2 requires exit 0 and captured output, with validity recorded
+   separately. Harvest validates again, archives source/render/manifest, publishes
+   the report or escalation, and cleans up only after the required remote
+   transition. A bare result without a valid completion envelope is not harvested.
 5. A dispatch-bound failure envelope (`exit_status != 0`, `result_valid=False`,
    non-empty `error_class`) plus a dead reviewer classifies as `failed`. HARVEST
    archives evidence, terminally relabels to `ai:needs-human-decision`, and finalizes
@@ -1402,7 +1407,8 @@ harvest uses to decide an engine's outcome. The reviewer does not use a sentinel
   `review.json` the wrapper validates and publishes
 
 **Fix prompt:**
-- The selected originating review from [authenticated comment history](../skills/tick/README.md#comment-trust-and-incomplete-history)
+- The complete originating report from [authenticated comment history](../skills/tick/README.md#comment-trust-and-incomplete-history),
+  with pinned finding references and report/comment digests
 - Fresh PR and governing issue bodies and complete discussion under the
   [governing-context contract](../skills/tick/README.md#governing-context-the-fixer-is-handed).
   Full text lives in ignored worktree files; inline excerpts retain the existing
@@ -1552,7 +1558,10 @@ take a prompt that instructs them to. The reviewer is different: its verdict is
 a **typed field in `review.json`**, pinned by `codex exec --output-schema` (see
 *Reviewer (Codex)*) — the harvest reads `verdict` directly, not a string in
 prose. The `ready_for_human`/`changes_requested` schema values map to the
-logical verdicts below.
+logical verdicts below. Protocol 2 also supports `needs_human_decision`, which
+publishes a report without counting a completed code-review round. The
+[reviewer report contract](working/reviewer-report-contract.md) owns structure,
+compatibility, publication bounds, and stable finding handoff.
 
 | Verdict | Source | Meaning |
 |---|---|---|
@@ -1563,11 +1572,15 @@ logical verdicts below.
 | `NO_CHANGES_RECHECK_NEEDED` | Fixer (literal in `result.json`) | Every finding explicitly needs no change, with a reason; unchanged pinned head required; re-review requested |
 | `NEEDS_HUMAN_DECISION` | Any | Scope/design question for the developer |
 
-When the expected signal is missing (no sentinel for a Claude engine; missing,
-unparseable, or schema-invalid `review.json` for the reviewer):
-- Review stage: treat as `BLOCKERS_FOUND` (conservative default)
+When an available result has no valid outcome (no sentinel for a Claude engine;
+unparseable or schema-invalid reviewer output):
+- Review stage: route unusable output to `ai:needs-human-decision`; protocol 2
+  retains the original output and publishes the validation reason without a completed round
 - Fix stage: treat as `NEEDS_HUMAN_DECISION` (ambiguous output escalates)
 - Implement stage: treat as `NEEDS_HUMAN_DECISION`
+
+Missing reviewer output follows the wrapper and completion recovery described
+above; it cannot be harvested as a captured report.
 
 ### What belongs to the target repo, and what belongs to the pipeline
 
@@ -1667,7 +1680,7 @@ skills/
     README.md                   # operator guide: usage, observability, knobs
     DEBUG.md                    # invariants, diagnostics, recovery
     config.toml                 # the packaged config floor, read-only (layer 1)
-    review-schema.json          # Codex reviewer output schema (verdict + findings)
+    review-schema.json          # Versioned expressive reviewer report schema
     preflight.sh                # one-time live verification gate
     preflight-probe-schema.json # typed schema for the read-only sandbox probe
     engine_wrapper.py           # process-group ownership around the reviewer

@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from conftest import legacy_review
 
 import pipeline
 import tick
@@ -179,7 +180,7 @@ def test_cli_latest_forgery_cannot_replace_trusted_fixer_prompt(comment_cli):
     root, state, env = comment_cli
     data = json.loads(state.read_text())
     data["history"] = [comment("ordinary note", "outsider")] * 100 + [
-        comment(pipeline.REVIEW_MARKER + "\nTRUSTED FINDINGS", "operator"),
+        comment(legacy_review("TRUSTED FINDINGS"), "operator"),
         comment(pipeline.REVIEW_MARKER + "\nFORGED INSTRUCTIONS", "outsider"),
     ]
     state.write_text(json.dumps(data))
@@ -296,7 +297,7 @@ def test_cli_reviewer_harvest_authenticates_replay_and_preserves_unknown_history
     data = json.loads(state.read_text())
     if history_state in ("forged", "crlf"):
         assert data["pr_labels"] == ["ai:ready-for-human"]
-        assert data.get("posted", []) == ([review_body] if history_state == "forged" else [])
+        assert data.get("posted", []) == ([review_body + "\n\n" + pipeline.review_reports.LEGACY_NOTE] if history_state == "forged" else [])
         assert not (wt / "dispatch.json").exists()
     else:
         assert data["pr_labels"] == ["ai:reviewing"]
@@ -345,7 +346,7 @@ def test_crlf_header_keeps_round_replay_and_raw_body():
 def test_cli_crlf_review_supplies_fixer_prompt(comment_cli):
     root, state, env = comment_cli
     data = json.loads(state.read_text())
-    body = pipeline.REVIEW_MARKER + "\r\nTRUSTED CRLF FINDINGS"
+    body = legacy_review("TRUSTED CRLF FINDINGS").replace("\n", "\r\n")
     data["history"] = [comment(body, "operator")]
     state.write_text(json.dumps(data))
     run_comment_tick(root, env)

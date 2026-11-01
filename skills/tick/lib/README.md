@@ -101,8 +101,9 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
   [--dispatch-id <fixer-dispatch-id> --review-sha256 <original-review-sha256>] \
   [--body-revision <state>]
 
-# Validate a review.json against the schema (prints verdict; exit 1 + "INVALID" if not).
-"$PY" "$PIPELINE" validate-review --review review.json
+# Validate a new report against protocol 2 (prints verdict; exit 1 + "INVALID" if not).
+# Omit the version only for an already-running legacy dispatch.
+"$PY" "$PIPELINE" validate-review --review review.json --report-protocol-version 2
 
 # Classify a dispatch's liveness (prints {"state": ...}). State ∈
 # complete|live|stale|hung|launching. `complete` requires the PID to have exited (a

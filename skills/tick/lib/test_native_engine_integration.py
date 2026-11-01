@@ -38,8 +38,11 @@ def native_fixture(tmp_path, monkeypatch):
         directory.mkdir(parents=True)
         instruction = (
             "Read proof.txt next to this SKILL.md. Return review JSON with verdict "
-            "ready_for_human and one minor finding, file proof.txt, summary exactly "
-            "the supporting file content. Do not change files."
+            "ready_for_human, report_protocol_version 2, and one minor finding "
+            "with id F1, location proof.txt, and evidence exactly the supporting "
+            "file content. Supply reasoning, scope, verification, risks and the "
+            "finding explanation. Use empty strings for observations and the "
+            "finding resolution. Do not change files."
             if name == "pipeline-skill-probe" else
             "Use Read to read `${CLAUDE_SKILL_DIR}/proof.txt`. Return exactly its "
             "content. Do not change files or run other tools."
@@ -95,7 +98,9 @@ def test_real_claude_native_binding_reads_support(native_fixture, mode, skill):
 
 
 def test_real_isolated_codex_dispatch_reads_installed_support(native_fixture, monkeypatch):
+    from conftest import comment_pages
     import native_skills
+    import pipeline
     import tick
 
     actual_git = tick.git
@@ -106,7 +111,10 @@ def test_real_isolated_codex_dispatch_reads_installed_support(native_fixture, mo
 
     monkeypatch.setattr(tick, "git", fixture_git)
     monkeypatch.setattr(tick, "gh_text", lambda *args: "main" if "baseRefName" in args else head)
-    monkeypatch.setattr(tick, "gh_json", lambda *args: {"title": "fixture", "body": ""})
+    monkeypatch.setattr(tick, "gh_json", lambda *args, **kwargs: comment_pages([]))
+    monkeypatch.setattr(tick, "_read_pr_discussion", lambda *args, **kwargs: {
+        "pr": {"title": "fixture", "body": ""}, "issues": [],
+    })
     monkeypatch.setattr(tick, "relabel", lambda *args, **kwargs: None)
     monkeypatch.setattr(tick, "_publish_marker_or_revert", lambda **kwargs: True)
     monkeypatch.setattr(native_skills, "REVIEW_SKILLS", ("pipeline-skill-probe",))
@@ -119,7 +127,9 @@ def test_real_isolated_codex_dispatch_reads_installed_support(native_fixture, mo
     assert finish(tick._ENGINE_CHILDREN[0]) == 0
     worktree = Path(tick.WT_ROOT) / "pr-7"
     result = json.loads((worktree / "review.json").read_text())
-    assert result["findings"][0]["summary"] == "native-fixture-a7c385"
+    assert pipeline.validate_review(result, report_protocol_version=2) == "ready_for_human"
+    assert result["findings"][0]["evidence"] == "native-fixture-a7c385"
+    assert result["observations"] == result["findings"][0]["resolution"] == ""
     observation = json.loads((worktree / "review-observation.json").read_text())
     assert observation["explicit_invocation_events_supported"] is False
     assert observation["observed_skills"] == [{"name": "pipeline-skill-probe", "source": "plugin"}]
