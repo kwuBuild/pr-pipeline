@@ -32,7 +32,7 @@ this check.
 | Verification and publication | 1,988 tests passed; branch pushed; `IMPLEMENTATION_COMPLETE`; six CI checks succeeded; merged 11 October 2026 | 1,575 tests passed; PR pushed; five CI checks succeeded; merged 20 September 2026 |
 | Independent review | Pipeline Codex reviewer round on head `5132b27`: "No blockers". Its usage is unavailable: when checked, the earliest retained tick-log file began at 22:17 UTC that day, after the review, and no file held a #80 or #81 engine record | Separate review on the same head approved, with one non-blocking documentation note |
 | Author-side subagents | None | None. The host's auto-approval guardian ran as a separate session: 151,280 input (115,200 cached), 701 output. This is not code review |
-| Charges | Not available. The pipeline `result.json` for this run is not retained, so no reported cost exists | Not available in the native session |
+| Charges | Client-reported estimate only: the transcript's terminal `cost-state` record gives `totalCostUSD` 6.5250184 (about $6.53), with `hasUnknownModelCost: false`. Its token counters match the Input and Output rows. Actual charges and quota attribution are not available. The pipeline `result.json` for this run is not retained | No monetary figure in the native session. Actual charges are not available |
 
 The Codex figures come from the
 [first evidence comment](https://github.com/kwuBuild/pr-pipeline/issues/52#issuecomment-5752280172)
@@ -87,12 +87,22 @@ The repository guide is about one quarter of the size of the host skill catalog.
 
 ## Conclusion
 
-1. **Instruction size.** The reduction is real. Before #49, the two repository
-   entry files had 2,901 words (`CLAUDE.md` 1,870, `AGENTS.md` 1,031). At
-   `09f4bd0` they had 863 words plus the import line; at `99bde86` and current
-   `main`, 911 words. A Claude session receives the
-   reduction directly, because it loaded both files before #49. A Codex session
-   loads only `AGENTS.md`, so it receives only a small part of the reduction.
+1. **Instruction size.** The reduction is real, but the file total and the
+   per-engine injection are different measures.
+   - *File total.* Before #49, the two repository entry files had 2,901 words
+     (`CLAUDE.md` 1,870, `AGENTS.md` 1,031). At `09f4bd0` they had 863 words
+     plus the import line; at `99bde86` and current `main`, 911 words. This
+     measures the guide text that the repository keeps. No single session
+     loaded the 2,901-word total.
+   - *Claude injection.* Before #49, the repository `CLAUDE.md` did not import
+     `AGENTS.md` (`git show '09f4bd0^:CLAUDE.md'` has no reference to it), so a
+     Claude session loaded only `CLAUDE.md`: 1,870 words, 12,441 characters.
+     At `99bde86` it loads the import line and `AGENTS.md`: 911 words, 6,835
+     characters as raw files (the transcript attachment holds 6,833). The
+     Claude-side reduction is therefore about 5,600 characters, or 45%.
+   - *Codex injection.* A Codex session loads only `AGENTS.md`, so it receives
+     only a small part of the reduction. The second #52 comment measured the
+     injected block at 546 characters smaller after #49.
 2. **Observed context behavior.** The Claude sample read no duplicate guidance
    and no whole reference document. It ran no generic skill chain. The Codex
    sample had one duplicate guide read. Neither sample showed the failure mode
@@ -103,14 +113,19 @@ The repository guide is about one quarter of the size of the host skill catalog.
    tokens and the last request was 234,283 tokens; 98.6% of the cumulative
    input was cache reads. The repository guide is a fixed part of the opening
    context, and the host system prompt and skill catalog are each larger than
-   it. The duplicated guide text that #49 removed was about 12,600
-   characters: 19,450 bytes before `09f4bd0`, 6,833 characters at `99bde86`. At
-   a rough four characters per token, that is about 3,000 tokens per request,
-   or about 2% of the median request context. This is an estimate, not a
-   measurement. These two samples differ in engine, mode, prompt, and task,
-   so they give no A/B savings percentage.
-4. **Charges.** Not measured. No reported cost is available for either sample.
-   The token counters are not billing records.
+   it. For a Claude session, #49 removed about 5,600 characters of injected
+   repository guide (12,441 characters before `09f4bd0`, 6,835 at `99bde86`;
+   see conclusion 1). At a rough four characters per token, that is about
+   1,400 tokens per request, or about 0.9% of the 156,359-token median request
+   context. This is an estimate, not a measurement. The combined two-file
+   reduction is not a per-request figure, because no session loaded both files
+   before #49. These two samples differ in engine, mode, prompt, and task, so
+   they give no A/B savings percentage.
+4. **Charges.** Not measured. The Claude transcript holds a client-reported
+   cost estimate of about $6.53 for the session; this is the host's own
+   estimate, not a billing record. The Codex session holds no monetary figure.
+   Actual charges and quota attribution are not available for either sample,
+   and the token counters are not billing records.
 
 ## Remaining work
 
@@ -139,12 +154,15 @@ No further repository change is necessary.
   `effort` from the records; usage from assistant `message.usage`, deduplicated
   by message ID; tool calls from `tool_use` blocks; injected sizes from the
   `instructions`, `skill_listing`, `prompt_snapshot`, and
-  `hook_additional_context` attachments; test and sentinel results from the
+  `hook_additional_context` attachments; the client-reported cost estimate from
+  the terminal `cost-state` record; test and sentinel results from the
   session's final messages. A local script extracted these fields. The
   transcript bodies were not read.
 - Pipeline records: `.claude/worktrees/.tick-log/` `engine_result_summary`
   entries, as retained on 1 November 2026. Tick-log retention can remove
   older files.
 - Change size, CI, review, and merge state: `gh pr view`.
-- Word and byte counts: `git show <rev>:<file> | wc` for `AGENTS.md` and
-  `CLAUDE.md` at `09f4bd0^`, `09f4bd0`, `99bde86`, and current `main`.
+- Word, byte, and character counts: `git show <rev>:<file> | wc` for
+  `AGENTS.md` and `CLAUDE.md` at `09f4bd0^`, `09f4bd0`, `99bde86`, and current
+  `main`. Per-session injection uses raw-file character counts (`wc -m`)
+  before and after, so both sides use the same unit.
