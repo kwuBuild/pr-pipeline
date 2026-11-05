@@ -40,7 +40,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 |---|---|
 | 0 | Full tick completed: HARVEST then DISPATCH |
 | 1 | Reconcile failed or target parse failed; dispatch gated |
-| 2 | Reconcile OK, authoritative in-flight label read failed; dispatch gated |
+| 2 | Reconcile OK; dispatch gated because the authoritative in-flight label read failed, or because an installed doc a stage requires is unreadable (`skill_unresolved` with `pr: null`; repair the install, no relabel needed) |
 | 3 | Startup rejected: missing tools/Python >= 3.11, invalid target/config, or missing/unreadable label vocabulary |
 | 4 | Unhandled exception; traceback written to tick log when possible; `--loop` returns without another tick |
 | 5 | Tick mutex already held by another invocation |

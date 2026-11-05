@@ -19841,6 +19841,79 @@ def test_run_tick_body_limits_stale_reconciliation_to_target(
     )
 
 
+def test_run_tick_body_blocks_only_stages_whose_installed_guidance_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A missing doc holds the stages that bind it; recovery and others still run.
+
+    The fixer and the reviewer bind ``review-response-hygiene``; the
+    implementer does not. The check runs after HARVEST and stale-label
+    recovery, reports once, and gates the tick as PARTIAL (exit 2).
+    """
+    import shutil
+
+    import pipeline
+    import tick  # type: ignore[import-untyped]
+    from tick import TickLog, _run_tick_body  # type: ignore[import-untyped]
+
+    install = tmp_path / "skills"
+    shutil.copytree(pipeline.INSTALL_SKILLS_ROOT, install)
+    doc = install / pipeline.REVISION_HYGIENE_SKILL / "SKILL.md"
+    doc.unlink()
+    monkeypatch.setattr(pipeline, "INSTALL_SKILLS_ROOT", install)
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    monkeypatch.setattr(tick, "WT_ROOT", str(wt_root))
+    log_dir = tmp_path / "tick-log"
+    log_dir.mkdir()
+    tick_log = TickLog.open(str(log_dir))
+    order: list[str] = []
+
+    def record(name: str, value: object = None) -> Callable[..., object]:
+        def call(*_args: object, **_kwargs: object) -> object:
+            order.append(name)
+            return value
+        return call
+
+    stale = [pipeline.InFlightRef(kind="issue", number=5, label=pipeline.LABEL_IMPLEMENTING)]
+    with contextlib.ExitStack() as stack:
+        for name in ("harvest_reviewers", "harvest_implementers", "harvest_fixers"):
+            stack.enter_context(mock.patch(f"tick.{name}", side_effect=record(name, True)))
+        stack.enter_context(mock.patch(
+            "tick.read_authoritative_in_flight_labels", return_value=stale,
+        ))
+        stack.enter_context(mock.patch(
+            "tick._reconcile_stale_in_flight_labels", side_effect=record("recover"),
+        ))
+        for name in ("dispatch_reviewers", "dispatch_implementers", "dispatch_fixers"):
+            stack.enter_context(mock.patch(f"tick.{name}", side_effect=record(name)))
+        stack.enter_context(mock.patch(
+            "tick._compute_post_dispatch_state", return_value=(0, True, ()),
+        ))
+        outcome = _run_tick_body(tick_log, None, "claude")
+
+    assert order == [
+        "harvest_reviewers", "harvest_implementers", "harvest_fixers",
+        "recover", "dispatch_implementers",
+    ]
+    assert outcome.exit_code == 2
+    assert outcome.cadence is not None and not outcome.cadence.stop
+    reports = [e for e in tick_log.tail() if e["action"] == "skill_unresolved"]
+    assert len(reports) == 1
+    assert reports[0]["pr"] is None
+    assert reports[0]["details"] == {
+        "blocked_stages": ["review", "fix"],
+        "skills": [pipeline.REVISION_HYGIENE_SKILL],
+        "probe_paths": [str(doc)],
+    }
+    err = capsys.readouterr().err
+    assert err.count(str(doc)) == 1
+    assert "Status: PARTIAL (dispatch blocked: installed guidance unreadable)" in err
+    assert "tick-state: status=PARTIAL in_flight=0 queue=true" in err
+
+
 def test_main_ok_path_emits_tick_state_line(tmp_path: Path) -> None:
     """main() return-0 path emits the tick-state line with computed state."""
     from tick import main  # type: ignore[import-untyped]

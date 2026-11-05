@@ -56,7 +56,7 @@ import traceback
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import Any, NamedTuple, TypedDict, cast
+from typing import Any, Literal, NamedTuple, TypedDict, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import claude_stream_wrapper
@@ -504,19 +504,106 @@ def unresolved_skill_docs(names: Sequence[str]) -> list[str]:
     and absent from the install — rather than anything about the item being
     dispatched.
 
+    A doc resolves only when it reads as non-blank UTF-8 text. That is the same
+    bar the native loaders apply at launch (``native_skills.claude_plugin`` and
+    ``native_skills.prepare_reviewer``), so a blank or undecodable doc is
+    caught here rather than at a later per-item setup step.
+
     Args:
         names: Skill directory names to resolve.
 
     Returns:
-        The subset of ``names`` with no readable ``SKILL.md``, in input order.
-        Empty means every doc resolved.
+        The subset of ``names`` with no readable, non-blank ``SKILL.md``, in
+        input order. Empty means every doc resolved.
     """
     unresolved: list[str] = []
     for name in names:
-        path = skill_doc_path(name)
-        if not os.path.isfile(path) or not os.access(path, os.R_OK):
+        try:
+            text = Path(skill_doc_path(name)).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            text = ""
+        if not text.strip():
             unresolved.append(name)
     return unresolved
+
+
+# The installed docs each DISPATCH stage binds, with the stage-target key and
+# the entity kind that stage dispatches. The reviewer loads its whole catalog
+# at launch, so its set is the catalog rather than a prompt binding.
+_DISPATCH_STAGE_GUIDANCE: tuple[
+    tuple[str, Literal["reviewer", "implementer", "fixer"], str, tuple[str, ...]], ...
+] = (
+    ("review", "reviewer", "pr", tuple(native_skills.REVIEW_SKILLS)),
+    ("implement", "implementer", "issue", IMPLEMENTER_SKILLS),
+    ("fix", "fixer", "pr", FIXER_SKILLS),
+)
+
+
+def _guidance_blocked_stages(
+    stage_targets: StageTargets,
+    tick_log: TickLog | None,
+) -> frozenset[str]:
+    """Check the installed guidance once for every stage this tick may dispatch.
+
+    An unreadable doc is a defect in the install, shared by every item of the
+    stage that binds it. The per-item guard (:func:`_bound_skills_resolve`)
+    escalates the one item it is dispatching, so on its own a single
+    packaging defect moves the eligible backlog to ``ai:needs-human-decision``
+    one batch per tick. This check runs before any worktree, lease, label
+    change or engine launch, and holds only the stages whose docs failed. The
+    items stay at their eligible labels, so a repaired install resumes them
+    on the next tick. The per-item guard stays as the backstop for an install
+    that changes between this check and a launch.
+
+    A stage whose target scope excludes it (an issue target has no review
+    stage unless it has an open closing PR) is not checked.
+
+    Args:
+        stage_targets: The stage scopes this tick resolved.
+        tick_log: Tick log handle, or ``None``.
+
+    Returns:
+        The stage-target keys (``"reviewer"``, ``"implementer"``,
+        ``"fixer"``) whose dispatch is blocked this tick. Empty when every
+        in-scope stage resolved its docs.
+    """
+    blocked: list[tuple[str, str]] = []
+    unresolved: list[str] = []
+    for stage, key, kind, skills in _DISPATCH_STAGE_GUIDANCE:
+        target = stage_targets[key]
+        if target is not None and target[0] != kind:
+            continue
+        missing = unresolved_skill_docs(skills)
+        if missing:
+            blocked.append((stage, key))
+            unresolved.extend(name for name in missing if name not in unresolved)
+    if not blocked:
+        return frozenset()
+
+    probe_paths = [skill_doc_path(name) for name in unresolved]
+    stages = [stage for stage, _key in blocked]
+    reason = (
+        "prompt-bound skill docs unreadable in the pipeline install: "
+        f"{', '.join(probe_paths)}"
+    )
+    print(
+        f"tick: dispatch blocked for {', '.join(stages)}: {reason}",
+        file=sys.stderr,
+    )
+    if tick_log:
+        tick_log.log(
+            pr=None,
+            phase="dispatch",
+            stage="all",
+            action="skill_unresolved",
+            reason=reason,
+            details={
+                "blocked_stages": stages,
+                "skills": unresolved,
+                "probe_paths": probe_paths,
+            },
+        )
+    return frozenset(key for _stage, key in blocked)
 
 
 def _engine_env() -> dict[str, str]:
@@ -9661,10 +9748,11 @@ def _bound_skills_resolve(
     Resolving the doc before spending anything turns that into a visible
     escalation.
 
-    The fault this now reports is a packaging defect rather than anything about
-    the item, but the disposition is unchanged deliberately: an item left at its
-    pre-dispatch label would be retried every tick against an install that
-    cannot satisfy it, so the escalation is what puts a person in front of it.
+    The fault this reports is a packaging defect rather than anything about the
+    item. :func:`_guidance_blocked_stages` catches it once per tick before
+    DISPATCH and holds the stage without touching labels, so this probe is the
+    backstop for an install that changed between that check and this launch.
+    Its per-item escalation is unchanged; it now fires only in that window.
 
     The probe emits its own ``skill_unresolved`` entry *before* escalating so the
     operator grep list distinguishes "the binding is broken" from the generic
@@ -14410,6 +14498,12 @@ def _run_tick_body(
         )
         return TickOutcome(1, decision)
 
+    # Check the installed guidance once, before any stage creates a worktree or
+    # touches a label. A stage whose docs are unreadable is held for this tick
+    # and its items keep their eligible labels. HARVEST and stale-label
+    # recovery have already run above and do not read these docs.
+    guidance_blocked = _guidance_blocked_stages(stage_targets, tick_log)
+
     authoritative_in_flight: list[pipeline.InFlightRef] | None = None
     try:
         authoritative_in_flight = read_authoritative_in_flight_labels()
@@ -14421,37 +14515,40 @@ def _run_tick_body(
     if authoritative_in_flight is not None:
         # All three stages admit against the one cap startup validated, over
         # this machine's dispatch markers
-        dispatch_reviewers(
-            tick_log=tick_log, target=stage_targets["reviewer"],
-            authoritative_in_flight=authoritative_in_flight,
-            review_model=review_model,
-            review_effort=review_effort,
-            trusted_author=trusted_author,
-            max_in_flight=max_in_flight,
-            timeout_seconds=tuning.review_timeout_seconds,
-        )
-        dispatch_implementers(
-            tick_log=tick_log, target=stage_targets["implementer"],
-            authoritative_in_flight=authoritative_in_flight,
-            impl_engine=impl_engine,
-            model=model,
-            permission_mode=permission_mode,
-            max_in_flight=max_in_flight,
-            timeout_seconds=tuning.implementer_timeout_seconds,
-            stall_seconds=tuning.engine_stall_seconds,
-            stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
-        )
-        dispatch_fixers(
-            tick_log=tick_log, target=stage_targets["fixer"],
-            authoritative_in_flight=authoritative_in_flight,
-            impl_engine=fix_engine,
-            model=fix_model,
-            permission_mode=permission_mode,
-            max_in_flight=max_in_flight,
-            timeout_seconds=tuning.fixer_timeout_seconds,
-            stall_seconds=tuning.engine_stall_seconds,
-            stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
-        )
+        if "reviewer" not in guidance_blocked:
+            dispatch_reviewers(
+                tick_log=tick_log, target=stage_targets["reviewer"],
+                authoritative_in_flight=authoritative_in_flight,
+                review_model=review_model,
+                review_effort=review_effort,
+                trusted_author=trusted_author,
+                max_in_flight=max_in_flight,
+                timeout_seconds=tuning.review_timeout_seconds,
+            )
+        if "implementer" not in guidance_blocked:
+            dispatch_implementers(
+                tick_log=tick_log, target=stage_targets["implementer"],
+                authoritative_in_flight=authoritative_in_flight,
+                impl_engine=impl_engine,
+                model=model,
+                permission_mode=permission_mode,
+                max_in_flight=max_in_flight,
+                timeout_seconds=tuning.implementer_timeout_seconds,
+                stall_seconds=tuning.engine_stall_seconds,
+                stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
+            )
+        if "fixer" not in guidance_blocked:
+            dispatch_fixers(
+                tick_log=tick_log, target=stage_targets["fixer"],
+                authoritative_in_flight=authoritative_in_flight,
+                impl_engine=fix_engine,
+                model=fix_model,
+                permission_mode=permission_mode,
+                max_in_flight=max_in_flight,
+                timeout_seconds=tuning.fixer_timeout_seconds,
+                stall_seconds=tuning.engine_stall_seconds,
+                stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
+            )
     else:
         if tick_log:
             tick_log.log(
@@ -14484,7 +14581,7 @@ def _run_tick_body(
         parsed_target, target_state=target_state,
     )
     tick_state = pipeline.derive_tick_state(
-        status="ok",
+        status="PARTIAL" if guidance_blocked else "ok",
         in_flight_count=in_flight_count,
         has_actionable_queue=has_queue,
         held_count=len(held_items) if in_flight_count is not None else None,
@@ -14517,10 +14614,11 @@ def _run_tick_body(
         tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
     )
     _print_summary(
-        tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
+        tick_log, reconcile_ok, guidance_blocked=bool(guidance_blocked),
+        tick_state=tick_state, cadence=decision,
     )
 
-    return TickOutcome(0, decision, held_items)
+    return TickOutcome(2 if guidance_blocked else 0, decision, held_items)
 
 
 def _log_tick_summary(
@@ -14583,6 +14681,7 @@ def _print_summary(
     reconcile_ok: bool = True,
     *,
     dispatch_skipped: bool = False,
+    guidance_blocked: bool = False,
     tick_state: pipeline.TickState | None = None,
     cadence: pipeline.CadenceDecision | None = None,
 ) -> None:
@@ -14591,6 +14690,8 @@ def _print_summary(
         status = "FAILED (dispatch skipped: reconcile failed)"
     elif dispatch_skipped:
         status = "PARTIAL (dispatch skipped: auth labels read failed)"
+    elif guidance_blocked:
+        status = "PARTIAL (dispatch blocked: installed guidance unreadable)"
     else:
         status = "ok"
     print(f"Tick complete. Status: {status}", file=sys.stderr)
