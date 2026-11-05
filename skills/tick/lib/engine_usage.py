@@ -11,7 +11,10 @@ import math
 import re
 
 _MAX_TOKENS = 2**63 - 1
-_CLAUDE_COUNTERS = (
+# Public: claude_stream_wrapper sums exactly this set across result events, so
+# the wrapper and the normalizer must agree on which counters cross the
+# boundary. _CODEX_COUNTERS has no second consumer and stays private.
+CLAUDE_COUNTERS = (
     "input_tokens",
     "cache_read_input_tokens",
     "cache_creation_input_tokens",
@@ -89,7 +92,7 @@ def valid_codex_usage(payload: object) -> bool:
 
 
 def _normalize(raw: object, *, engine: str) -> dict[str, object]:
-    keys = _CLAUDE_COUNTERS if engine == "claude" else _CODEX_COUNTERS
+    keys = CLAUDE_COUNTERS if engine == "claude" else _CODEX_COUNTERS
     raw = raw if isinstance(raw, dict) else {}
     native = {
         key: raw[key]
@@ -98,7 +101,7 @@ def _normalize(raw: object, *, engine: str) -> dict[str, object]:
     }
     invalid = any(key in raw and key not in native for key in keys)
     if engine == "claude":
-        parts = _CLAUDE_COUNTERS[:3]
+        parts = CLAUDE_COUNTERS[:3]
         total = (
             sum(native[key] for key in parts)
             if all(key in native for key in parts)

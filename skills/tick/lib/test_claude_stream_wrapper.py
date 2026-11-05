@@ -10,7 +10,57 @@ from unittest import mock
 
 import pytest
 
-from claude_stream_wrapper import ProgressHeartbeat, collect_stream, main
+from claude_stream_wrapper import ProgressHeartbeat, aggregate_results, collect_stream, main
+
+
+@pytest.fixture
+def reentered_results() -> list[dict]:
+    """Two terminal result events from one session re-entered by a task notification.
+
+    Captured from a real ``claude -p --output-format stream-json`` run whose
+    turn ended while a background Bash task was pending: the CLI emits one
+    ``result`` event per segment, each covering only that segment. Sums were
+    cross-checked against the session transcript and cost-state.
+    """
+    return [
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "STOP",
+            "num_turns": 3,
+            "duration_ms": 12569,
+            "usage": {
+                "input_tokens": 19794,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 20096,
+                "output_tokens": 577,
+            },
+            "total_cost_usd": 0.123443,
+            "modelUsage": {"claude-opus-5-5": {"inputTokens": 19794, "outputTokens": 577}},
+            "uuid": "seg-0",
+            "result_index": 0,
+        },
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "DONE",
+            "num_turns": 2,
+            "duration_ms": 4745,
+            "usage": {
+                "input_tokens": 391,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 40832,
+                "output_tokens": 103,
+            },
+            "total_cost_usd": 0.148389,
+            "modelUsage": {"claude-opus-5-5": {"inputTokens": 20185, "outputTokens": 680}},
+            "origin": {"kind": "task-notification", "producer": "session-task", "runId": "run-1"},
+            "uuid": "seg-1",
+            "result_index": 1,
+        },
+    ]
 
 
 def test_collect_stream_extracts_skill_calls_and_terminal_result() -> None:
@@ -25,7 +75,7 @@ def test_collect_stream_extracts_skill_calls_and_terminal_result() -> None:
 
     result, skills = collect_stream(io.StringIO("".join(json.dumps(e) + "\n" for e in events)))
 
-    assert result == events[-1]
+    assert result == [events[-1]]
     assert skills == ["docs-contract-review"]
 
 
@@ -41,7 +91,7 @@ def test_collect_stream_ignores_malformed_and_non_skill_events() -> None:
 
     result, skills = collect_stream(stream)
 
-    assert result == {"type": "result", "result": "done"}
+    assert result == [{"type": "result", "result": "done"}]
     assert skills == []
 
 
@@ -58,8 +108,112 @@ def test_collect_stream_counts_only_correlated_successful_native_calls():
         {"type": "tool_result", "tool_use_id": "ok", "is_error": False},
     ]}}, {"type": "result", "result": "done"}]
     result, skills = collect_stream(json.dumps(event) for event in events)
-    assert result == events[-1]
+    assert result == [events[-1]]
     assert skills == ["pr-pipeline:definition-of-done"]
+
+
+def test_collect_stream_returns_every_result_event_in_order(
+    reentered_results: list[dict],
+) -> None:
+    """A re-entered session emits one result event per segment; keep them all."""
+    results, skills = collect_stream(
+        json.dumps(event) for event in reentered_results
+    )
+
+    assert [result["uuid"] for result in results] == ["seg-0", "seg-1"]
+    assert results[-1]["result"] == "DONE"
+    assert skills == []
+
+
+def test_aggregate_results_sums_usage_turns_and_duration_across_segments(
+    reentered_results: list[dict],
+) -> None:
+    """The published result covers the whole session, not only the last segment."""
+    merged = aggregate_results(reentered_results)
+
+    assert merged is not None
+    assert merged["usage"] == {
+        "input_tokens": 20185,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 60928,
+        "output_tokens": 680,
+    }
+    assert merged["num_turns"] == 5
+    assert merged["duration_ms"] == 17314
+    assert merged["result_events"] == 2
+    # Terminal authority stays with the last segment's event; cost and model
+    # usage are already cumulative across the session.
+    assert merged["result"] == "DONE"
+    assert merged["is_error"] is False
+    assert merged["total_cost_usd"] == 0.148389
+    assert merged["modelUsage"] == {
+        "claude-opus-5-5": {"inputTokens": 20185, "outputTokens": 680}
+    }
+    assert merged["origin"] == {
+        "kind": "task-notification",
+        "producer": "session-task",
+        "runId": "run-1",
+    }
+
+
+def test_aggregate_results_leaves_a_single_result_event_unchanged(
+    reentered_results: list[dict],
+) -> None:
+    """One segment means one event: the published result is the CLI's own."""
+    single = reentered_results[0]
+    merged = aggregate_results([single])
+
+    assert merged == single
+    assert "result_events" not in merged
+
+
+def test_aggregate_results_drops_counters_a_segment_cannot_contribute(
+    reentered_results: list[dict],
+) -> None:
+    """An unsummable counter is omitted, so normalization reports partial."""
+    reentered_results[1]["usage"]["input_tokens"] = "12"
+    merged = aggregate_results(reentered_results)
+
+    assert merged is not None
+    assert "input_tokens" not in merged["usage"]
+    assert merged["usage"]["output_tokens"] == 680
+    assert merged["result_events"] == 2
+
+
+def test_aggregate_results_reports_segment_count_when_turns_cannot_sum(
+    reentered_results: list[dict],
+) -> None:
+    """The re-entry is still marked when num_turns cannot be aggregated."""
+    reentered_results[0]["num_turns"] = None
+    merged = aggregate_results(reentered_results)
+
+    assert merged is not None
+    assert "num_turns" not in merged
+    assert merged["result_events"] == 2
+
+
+def test_main_publishes_whole_session_usage_for_a_reentered_engine(
+    capfd,
+    monkeypatch,
+    reentered_results: list[dict],
+) -> None:
+    """The wrapper's one published object holds whole-session usage."""
+    script = "print(" + repr("\n".join(json.dumps(e) for e in reentered_results)) + ")"
+
+    with open(os.devnull) as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        exit_status = main(["--", sys.executable, "-c", script])
+
+    assert exit_status == 0
+    published = json.loads(capfd.readouterr().out)
+    assert published["usage"]["input_tokens"] == 20185
+    assert published["usage"]["cache_read_input_tokens"] == 60928
+    assert published["usage"]["output_tokens"] == 680
+    assert published["num_turns"] == 5
+    assert published["duration_ms"] == 17314
+    assert published["result_events"] == 2
+    assert published["result"] == "DONE"
+    assert published["total_cost_usd"] == 0.148389
 
 
 def test_collect_stream_advances_the_heartbeat_as_events_arrive(
