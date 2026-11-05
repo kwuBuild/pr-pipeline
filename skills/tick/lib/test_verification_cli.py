@@ -183,48 +183,108 @@ def test_cli_implementer_scope_proof_grants(offline_tick, permission_mode):
     assert not (wt / "skills").exists()
 
 
-@pytest.mark.parametrize("missing_doc", [False, True])
-def test_cli_implementer_uses_installed_completion_guidance(offline_tick, tmp_path, missing_doc):
+def test_cli_implementer_uses_installed_completion_guidance(offline_tick, tmp_path):
     """An installed tick binds its own guidance before launch in a bare target."""
     root, state, cfg, env = offline_tick
-    install = tmp_path / "plugin-cache" / "pr-pipeline" / "skills"
-    source = Path(__file__).resolve().parents[2]
-    shutil.copytree(source, install, ignore=shutil.ignore_patterns("__pycache__"))
-    shutil.copytree(source.parent / ".claude-plugin", install.parent / ".claude-plugin")
+    install = copy_install(tmp_path)
     doc = install / "definition-of-done" / "SKILL.md"
     launch_receipt = tmp_path / "engine-launched"
-    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", f'''
-import json, pathlib, sys
-pathlib.Path({str(launch_receipt)!r}).write_text(sys.stdin.read())
-print(json.dumps({{"type": "result", "is_error": False,
-                  "result": "NEEDS_HUMAN_DECISION"}}))
-''')
-    if missing_doc:
-        doc.unlink()
-    result = subprocess.run(
-        ["bash", str(install / "tick" / "tick.sh"), "#7"],
-        cwd=root, env=env, capture_output=True, text=True, timeout=30,
-    )
+    write_receipt_engine(env, launch_receipt)
+    result = run_installed_tick(install, root, env, ["#7"])
     assert result.returncode == 0, result.stdout + result.stderr
     wt = root / ".claude" / "worktrees" / "issue-7"
     data = json.loads(state.read_text())
-    if missing_doc:
-        assert data["labels"] == ["ai:needs-human-decision"]
-        assert not launch_receipt.exists()
-        assert not wt.exists()
-        assert str(doc) in "\n".join(data["comments"])
+    wait_until(launch_receipt.exists)
+    assert f"installed source `{doc}`" in launch_receipt.read_text()
+    assert "invoke `pr-pipeline:definition-of-done`" in launch_receipt.read_text()
+    assert not (wt / "skill-context.json").exists()
+    assert not wt.with_name("issue-7-scrub").exists()
+    assert data["labels"] == ["ai:implementing"]
+    assert (wt / "dispatch.json").is_file()
+    assert not (wt / "skills").exists()
+
+
+@pytest.mark.parametrize("defect", ["missing", "empty"])
+@pytest.mark.parametrize(
+    ("target", "blocked_stages"),
+    [(["#7"], ["implement"]), ([], ["review", "implement", "fix"])],
+    ids=["targeted", "global"],
+)
+def test_cli_unreadable_installed_doc_blocks_dispatch_until_repaired(
+    offline_tick, tmp_path, defect, target, blocked_stages,
+):
+    """One packaging defect holds DISPATCH, not the backlog.
+
+    The install is checked once per tick before any worktree or label change,
+    so repeated ticks leave every eligible item where it was. Repairing the
+    install is the whole recovery: the next tick dispatches the same issue.
+    """
+    root, state, cfg, env = offline_tick
+    install = copy_install(tmp_path)
+    doc = install / "definition-of-done" / "SKILL.md"
+    original = doc.read_text()
+    launch_receipt = tmp_path / "engine-launched"
+    write_receipt_engine(env, launch_receipt)
+    if defect == "missing":
+        doc.unlink()
     else:
-        for _ in range(100):
-            if launch_receipt.exists():
-                break
-            time.sleep(0.02)
-        assert f"installed source `{doc}`" in launch_receipt.read_text()
-        assert "invoke `pr-pipeline:definition-of-done`" in launch_receipt.read_text()
-        assert not (wt / "skill-context.json").exists()
-        assert not wt.with_name("issue-7-scrub").exists()
-        assert data["labels"] == ["ai:implementing"]
-        assert (wt / "dispatch.json").is_file()
-        assert not (wt / "skills").exists()
+        doc.write_text(" \n")
+
+    for _ in range(2):
+        result = run_installed_tick(install, root, env, target)
+        assert result.returncode == 2, result.stdout + result.stderr
+        assert result.stderr.count(str(doc)) == 1, result.stderr
+        assert (
+            "Status: PARTIAL (dispatch blocked: installed guidance unreadable)"
+            in result.stderr
+        ), result.stderr
+
+    data = json.loads(state.read_text())
+    assert data["labels"] == ["ai:available"]
+    assert "comments" not in data
+    assert not launch_receipt.exists()
+    assert not (root / ".claude" / "worktrees" / "issue-7").exists()
+    calls = [json.loads(line) for line in Path(str(state) + ".calls").read_text().splitlines()]
+    assert not [call for call in calls if call[:2] in (
+        ["issue", "edit"], ["issue", "comment"], ["pr", "edit"], ["pr", "comment"],
+    )], calls
+    reports = [entry for entry in tick_log_entries(root) if entry["action"] == "skill_unresolved"]
+    assert len(reports) == 2, "the failed paths are reported once per tick"
+    for report in reports:
+        assert report["pr"] is None
+        assert report["details"]["blocked_stages"] == blocked_stages
+        assert report["details"]["skills"] == ["definition-of-done"]
+        assert report["details"]["probe_paths"] == [str(doc)]
+
+    doc.write_text(original)
+    result = run_installed_tick(install, root, env, target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    wait_until(launch_receipt.exists)
+    assert json.loads(state.read_text())["labels"] == ["ai:implementing"]
+    assert (root / ".claude" / "worktrees" / "issue-7" / "dispatch.json").is_file()
+
+
+def test_cli_blocked_dispatch_still_harvests_finished_work(offline_tick, tmp_path):
+    """HARVEST does not depend on the guidance that only DISPATCH needs."""
+    root, state, cfg, env = offline_tick
+    install = copy_install(tmp_path)
+    doc = install / "definition-of-done" / "SKILL.md"
+    first = run_installed_tick(install, root, env, ["#7"])
+    assert first.returncode == 0, first.stdout + first.stderr
+    wt = root / ".claude" / "worktrees" / "issue-7"
+    wait_until(lambda: (wt / "result.json").exists() and (wt / "result.json").stat().st_size)
+    doc.unlink()
+
+    result = run_installed_tick(install, root, env, ["#7"])
+
+    assert result.returncode == 2, result.stdout + result.stderr
+    data = json.loads(state.read_text())
+    assert data.get("existing_pr") is True, "the finished engine was not harvested"
+    assert "ai:implementing" not in data["labels"]
+    assert not (wt / "dispatch.json").exists()
+    actions = [entry["action"] for entry in tick_log_entries(root)]
+    assert "harvest" in actions
+    assert actions.index("skill_unresolved") > actions.index("harvest")
 
 
 def test_cli_malformed_verification_is_a_startup_error(offline_tick):
@@ -627,6 +687,47 @@ sys.argv = sys.argv[1:]
 sys.path[0] = os.path.dirname(os.path.abspath(script))
 runpy.run_path(script, run_name="__main__")
 '''
+
+
+def copy_install(tmp_path):
+    """Copy the pipeline the way a plugin cache holds it; return its skills root."""
+    install = tmp_path / "plugin-cache" / "pr-pipeline" / "skills"
+    source = Path(__file__).resolve().parents[2]
+    shutil.copytree(source, install, ignore=shutil.ignore_patterns("__pycache__"))
+    shutil.copytree(source.parent / ".claude-plugin", install.parent / ".claude-plugin")
+    return install
+
+
+def write_receipt_engine(env, receipt):
+    write_peer(Path(env["PATH"].split(os.pathsep)[0]) / "claude", f'''
+import json, pathlib, sys
+pathlib.Path({str(receipt)!r}).write_text(sys.stdin.read())
+print(json.dumps({{"type": "result", "is_error": False,
+                  "result": "NEEDS_HUMAN_DECISION"}}))
+''')
+
+
+def run_installed_tick(install, root, env, args):
+    return subprocess.run(
+        ["bash", str(install / "tick" / "tick.sh"), *args],
+        cwd=root, env=env, capture_output=True, text=True, timeout=30,
+    )
+
+
+def tick_log_entries(root):
+    return [
+        json.loads(line)
+        for log in sorted((root / ".claude" / "worktrees" / ".tick-log").glob("*.jsonl"))
+        for line in log.read_text().splitlines()
+    ]
+
+
+def wait_until(predicate):
+    for _ in range(250):
+        if predicate():
+            return
+        time.sleep(0.02)
+    raise AssertionError("condition not reached")
 
 
 def write_peer(path, code):

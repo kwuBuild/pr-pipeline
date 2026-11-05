@@ -422,7 +422,10 @@ tick, and where to inspect outcomes.
 Runs one full tick: HARVEST all three stages (review → implement → fix) with full
 side-effect processing (PR creation, comment posting, label transitions), then
 DISPATCH all three stages (reviewer → implementer → fixer). Exit code is 0 on
-success, 1 when reconciliation failed and dispatch was skipped.
+success, 1 when reconciliation failed and dispatch was skipped, and 2 when a
+DISPATCH gate held some or all dispatch: the authoritative in-flight label read
+failed, or an installed doc a stage requires is unreadable (see
+[prompt-bound skills](#prompt-bound-skills-skill_unresolved)).
 
 ### Targeted (single issue/PR)
 
@@ -1233,17 +1236,37 @@ Repeat commands for the opt-in real-engine checks are at the top of
 classification of transitive guidance references remains
 [issue #77](https://github.com/kwuBuild/pr-pipeline/issues/77).
 
-Dispatch resolves mandatory installed documents before spending anything. An
-unreadable doc means the *install* is missing a file its own prompt names — a
-packaging defect, not anything about the item. It logs `skill_unresolved` (with
-the skill names and the probed paths), escalates the item to
+Dispatch resolves mandatory installed documents before spending anything. A
+doc that is missing, unreadable, blank or not UTF-8 text means the *install* is
+missing a file its own prompt names — a packaging defect, not anything about
+the item. The tick checks this once, after HARVEST and stale-label recovery and
+before DISPATCH creates a worktree or changes a label:
+
+| Stage | Installed docs it requires |
+|---|---|
+| Review | Every `native_skills.REVIEW_SKILLS` entry |
+| Implement | `tick.IMPLEMENTER_SKILLS` (`definition-of-done`) |
+| Fix | `tick.FIXER_SKILLS` (`review-response-hygiene`, `definition-of-done`) |
+
+Only stages in the tick's target scope are checked. A stage with an unreadable
+doc does not dispatch in that tick; the other stages dispatch normally. The tick
+prints one `tick: dispatch blocked for <stages>: ...` line naming the failed
+paths and logs one `skill_unresolved` entry with `pr: null` and
+`details.blocked_stages`, `details.skills` and `details.probe_paths`. The status
+line reads `PARTIAL (dispatch blocked: installed guidance unreadable)`, the
+`tick-state:` status is `PARTIAL`, and the tick exits `2`. Eligible issues and
+PRs keep their labels, so repeated ticks do not move the backlog to
+`ai:needs-human-decision`. Recover by repairing the install — reinstall or
+update the plugin, or check out the missing doc in a development checkout. The
+next tick dispatches the eligible items with no relabeling.
+
+The per-item launch guard remains as a backstop for an install that changes
+between that check and a launch. If an item's own probe then finds an unreadable
+doc, it logs `skill_unresolved` with the item number, escalates that item to
 `ai:needs-human-decision`, and removes the worktree — no lease, no relabel to
-`ai:fixing` or `ai:implementing`, no engine launched. The escalation is per item
-because an item left at `ai:changes-requested` or `ai:available` would otherwise
-be retried every tick against an install that cannot satisfy it. Recover by
-repairing the install — reinstall or update the plugin, or check out the missing
-doc in a development checkout — then relabel the PR back to
-`ai:changes-requested`, or the issue back to `ai:available`.
+`ai:fixing` or `ai:implementing`, no engine launched. After repairing the
+install, relabel that PR back to `ai:changes-requested`, or that issue back to
+`ai:available`.
 
 ### Governing context the fixer is handed
 

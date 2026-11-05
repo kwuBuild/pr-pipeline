@@ -630,8 +630,12 @@ the normal result/envelope for failures. See [skill observations](README.md#skil
   own copy, not the engine worktree's, so a target repository needs no copy of
   its own. Native discovery loads the existing installed `pr-pipeline` plugin;
   the Codex optional catalog is `native_skills.REVIEW_SKILLS`.
-  Unreadable means the install is missing a file its prompt names, which logs
-  `skill_unresolved` and escalates (see README "Prompt-bound skills")
+  Unreadable means the install is missing a file its prompt names. The tick
+  checks once before DISPATCH: a `skill_unresolved` entry with `pr: null` names
+  `blocked_stages` and `probe_paths`, those stages do not dispatch, labels stay
+  unchanged, and the tick exits `2`. A `skill_unresolved` entry with an item
+  number is the per-item launch backstop, which escalates that item (see README
+  "Prompt-bound skills")
 - Reviewer/fixer context: inspect the prompt's `.pr-pipeline-context-*/discussion.json`
   and any selected-report files in the stage worktree. `bodyParts`, `diffHunkParts`
   and `textParts` concatenate without separators. A required read/page or file
