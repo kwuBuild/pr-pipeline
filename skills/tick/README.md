@@ -1981,6 +1981,16 @@ log has expired. `engine_reported_turns` is Claude's `num_turns`, not a model/AP
 call count; the latter is not reported here. Engine names identify the route
 (`claude`, `claude-ds`, `codex`); usage source names identify the CLI schema.
 
+A background-task notification re-enters the session, and Claude prints one
+`result` event per segment, each covering only that segment. The stream wrapper
+sums `usage`, `num_turns` and `duration_ms` across all of a session's result
+events before it publishes `result.json`, so the recorded values cover the whole
+session. The `engine_result_summary` detail `result_events` reports how many
+events were summed (`null` for a legacy result without the field); a counter
+that a segment cannot contribute is omitted and the usage status becomes
+`partial`. `total_cost_usd` and `modelUsage` are already cumulative across the
+session and come from the last event.
+
 ### 3. Worktree markers — `dispatch.json` (per-engine, authoritative)
 
 Every dispatched engine gets a `dispatch.json` in its worktree:

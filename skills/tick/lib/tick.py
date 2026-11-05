@@ -2040,6 +2040,14 @@ def _engine_result_summary(
     turns = result_obj.get("num_turns")
     details["num_turns"] = turns if type(turns) is int and 0 <= turns <= 2**63 - 1 else None
 
+    # The wrapper sums usage, turns and duration across the CLI's per-segment
+    # result events when a background task re-entered the session; this count
+    # marks that aggregation (1 means a single result event; absent is legacy).
+    result_events = result_obj.get("result_events")
+    details["result_events"] = (
+        result_events if type(result_events) is int and 1 <= result_events <= 2**63 - 1 else None
+    )
+
     details["result_excerpt"] = _result_excerpt(result_obj.get("result"))
     details["permission_denial_count"] = (
         len(permission_denials) if isinstance(permission_denials, list) else 0

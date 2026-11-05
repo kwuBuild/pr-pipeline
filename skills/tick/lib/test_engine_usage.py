@@ -295,7 +295,9 @@ def test_oversized_and_deep_events_cannot_hide_later_terminal(
     assert observation["usage"]["input_tokens"] == 131
 
 
-@pytest.mark.parametrize("value", [True, -1, "4", 4.5])
+@pytest.mark.parametrize(
+    "value", [True, -1, "4", 4.5]
+)
 def test_engine_reported_turns_remain_a_numeric_count(
     claude_result: dict, value: object
 ) -> None:
@@ -309,6 +311,103 @@ def test_engine_reported_turns_remain_a_numeric_count(
         harvest_label="",
     )
     assert details["num_turns"] is None
+
+
+@pytest.mark.parametrize("value", [2, 0, -1, "2", True, None, 2**63])
+def test_reentered_result_event_count_is_bounded(
+    claude_result: dict, value: object
+) -> None:
+    import tick
+
+    if value is not None:
+        claude_result["result_events"] = value
+    details = tick._engine_result_summary(
+        result_raw=json.dumps(claude_result),
+        harvest_result={},
+        harvest_action="",
+        harvest_label="",
+    )
+    assert details["result_events"] == (2 if value == 2 else None)
+
+
+def test_harvest_records_whole_session_usage_for_a_reentered_engine(
+    tmp_path: Path,
+) -> None:
+    """Wrapper-aggregated result.json reaches the summary with full-session sums."""
+    import tick
+
+    first = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "STOP",
+        "num_turns": 3,
+        "duration_ms": 12569,
+        "usage": {
+            "input_tokens": 19794,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 20096,
+            "output_tokens": 577,
+        },
+        "total_cost_usd": 0.123443,
+        "modelUsage": {"claude-opus-5-5": {"inputTokens": 19794, "outputTokens": 577}},
+        "uuid": "seg-0",
+        "result_index": 0,
+    }
+    second = {
+        "type": "result",
+        "subtype": "success",
+        "is_error": False,
+        "result": "DONE",
+        "num_turns": 2,
+        "duration_ms": 4745,
+        "usage": {
+            "input_tokens": 391,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 40832,
+            "output_tokens": 103,
+        },
+        "total_cost_usd": 0.148389,
+        "modelUsage": {"claude-opus-5-5": {"inputTokens": 20185, "outputTokens": 680}},
+        "origin": {"kind": "task-notification", "producer": "session-task", "runId": "run-1"},
+        "uuid": "seg-1",
+        "result_index": 1,
+    }
+    wrapper = Path(__file__).with_name("claude_stream_wrapper.py")
+    script = "print(" + repr("\n".join(json.dumps(e) for e in (first, second))) + ")"
+    result = subprocess.run(
+        [sys.executable, str(wrapper), "--", sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    log = tick.TickLog.open(str(tmp_path / "tick-summary.jsonl"))
+    tick._log_engine_result_summary(
+        tick_log=log,
+        number=7,
+        stage="implement",
+        dispatch_id="reentered-7",
+        result_raw=result.stdout,
+        harvest_result={},
+        harvest_action="escalate",
+        harvest_label="ai:needs-human-decision",
+        engine="claude",
+    )
+    entry = json.loads(Path(log.path).read_text())
+    details = entry["details"]
+    assert details["usage"]["status"] == "complete"
+    assert details["usage"]["input_tokens"] == 81113  # total: 20185 + 60928 + 0
+    assert details["usage"]["cached_input_tokens"] == 60928
+    assert details["usage"]["output_tokens"] == 680
+    assert details["usage"]["reported_cost"] == {
+        "amount": 0.148389,
+        "unit": "USD",
+        "source": "claude.result.total_cost_usd",
+    }
+    assert details["num_turns"] == 5
+    assert details["duration_ms"] == 17314
+    assert details["result_events"] == 2
+    assert details["reported_models"] == ["claude-opus-5-5"]
 
 
 @pytest.mark.parametrize(

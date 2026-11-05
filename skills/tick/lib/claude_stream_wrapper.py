@@ -12,6 +12,7 @@ import time
 from collections.abc import Iterable
 from typing import Any
 
+import engine_usage
 import fixer_reports
 
 # Name of the progress-heartbeat file, written next to the engine's
@@ -73,18 +74,24 @@ class ProgressHeartbeat:
 def collect_stream(
     stream: Iterable[str],
     heartbeat: ProgressHeartbeat | None = None,
-) -> tuple[dict[str, Any] | None, list[str]]:
-    """Extract the terminal result and successful Skill tool calls from Claude JSONL.
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Extract every terminal result event and successful Skill calls from Claude JSONL.
+
+    A background-task notification re-enters the session and the CLI emits one
+    ``result`` event per segment, each covering only that segment's usage,
+    turns and duration. All of them are returned in stream order so
+    :func:`aggregate_results` can publish one whole-session result.
 
     Args:
         stream: The engine's JSONL stdout, one event per line.
         heartbeat: Progress heartbeat to bump as lines arrive, or ``None``.
 
     Returns:
-        The terminal ``result`` event (or ``None``) and calls with matching
-        successful results. This does not prove instruction compliance.
+        The terminal ``result`` events in order (empty when none arrived) and
+        calls with matching successful results. This does not prove instruction
+        compliance.
     """
-    result: dict[str, Any] | None = None
+    results: list[dict[str, Any]] = []
     skills: list[str] = []
     pending: dict[str, str] = {}
     for line in stream:
@@ -118,8 +125,66 @@ def collect_stream(
                         and name not in skills and len(skills) < 64):
                     skills.append(name)
         if event.get("type") == "result":
-            result = event
-    return result, skills
+            results.append(event)
+    return results, skills
+
+
+def aggregate_results(results: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Merge one stream's result events into a single whole-session result.
+
+    Each ``result`` event reports only its own segment's ``usage``,
+    ``num_turns`` and ``duration_ms``; a session re-entered by a background-task
+    notification therefore under-reports them unless the events are summed.
+    ``total_cost_usd`` and ``modelUsage`` are already cumulative across the
+    session, so the last event keeps them and all other terminal authority
+    (``result``, ``is_error``, ``stop_reason``). A counter a segment cannot
+    contribute (missing or not a non-negative int) is omitted from the merged
+    usage so normalization reports partial instead of a wrong sum. The merged
+    result records how many events it covers in ``result_events``.
+
+    Args:
+        results: The result events in stream order, from
+            :func:`collect_stream`.
+
+    Returns:
+        The merged result, or ``None`` when ``results`` is empty. A single
+        event is returned unchanged.
+    """
+    if not results:
+        return None
+    terminal = results[-1]
+    if len(results) == 1:
+        return terminal
+    merged = dict(terminal)
+    usage = merged.get("usage")
+    merged_usage = dict(usage) if isinstance(usage, dict) else usage
+    for key in engine_usage.CLAUDE_COUNTERS:
+        values: list[int] = []
+        for result in results:
+            segment_usage = result.get("usage")
+            value = (
+                segment_usage.get(key)
+                if isinstance(segment_usage, dict)
+                else None
+            )
+            if type(value) is not int or value < 0:
+                values = []
+                break
+            values.append(value)
+        if isinstance(merged_usage, dict):
+            if values:
+                merged_usage[key] = sum(values)
+            else:
+                merged_usage.pop(key, None)
+    merged["usage"] = merged_usage
+    for key in ("num_turns", "duration_ms"):
+        values = [result.get(key) for result in results]
+        if all(type(value) is int and value >= 0 for value in values):
+            merged[key] = sum(values)
+        else:
+            merged.pop(key, None)
+    merged["result_events"] = len(results)
+    return merged
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -153,8 +218,9 @@ def main(argv: list[str] | None = None) -> int:
         print("claude-stream-wrapper: engine spawn failed", file=sys.stderr)
         return 1
     assert proc.stdout is not None
-    result, skills = collect_stream(proc.stdout, ProgressHeartbeat(heartbeat_path))
+    results, skills = collect_stream(proc.stdout, ProgressHeartbeat(heartbeat_path))
     exit_status = proc.wait()
+    result = aggregate_results(results)
     if result is None:
         return exit_status or 1
     result["skills_used"] = skills
