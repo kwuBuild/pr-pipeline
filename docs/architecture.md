@@ -157,6 +157,9 @@ Native mode consumes the tick's emitted cadence decision without a second
 observation or stop counter.
 Targeted runs stop from target completion; quiet heartbeats alone never mark an
 unfinished target as done. See the [counter and completion rules](../skills/tick/README.md#target-completion-and-cadence).
+An `--only` list has no terminal stop: it uses its own quiet streak, and a
+quiet observation requires that no listed item is dispatchable and that this
+machine owns no engine. See the [dispatch list rules](../skills/tick/README.md#dispatch-list---only).
 The harness `/loop` + `ScheduleWakeup` path has no in-process sleep to interrupt
 and stays purely timer-paced.
 
@@ -165,7 +168,9 @@ Concurrency is bounded by the operator's `max_in_flight` cap (shipped default
 launches beyond it, and the cadence tightens to ~270s while saturated so slots
 free promptly. The full queue reaches quiescence when no supervisable engines
 or actionable work remain. It then heartbeats slowly and stops at the configured
-quiet threshold. Targeted runs use the target completion rule instead.
+quiet threshold. Targeted runs use the target completion rule instead. An
+`--only` list bounds new launches only; HARVEST, stale reconciliation, and
+occupancy stay global so unlisted engines still free their slots.
 
 Admission counts **local dispatch markers only** — those classified `live`,
 `launching`, or `hung`, or whose process group is still alive — keyed by
@@ -1362,7 +1367,8 @@ active revision, and removing the label would leave the issue carrying no
 pipeline label. A per-item point-read runs only so `stale_label_retained` is
 logged against the item's authoritative current label rather than a stale search
 index row; a failed or malformed read leaves the label unchanged either way. In
-targeted mode the sweep is restricted to the requested item. Global in-flight
+targeted mode the sweep is restricted to the requested item; an `--only` list
+does not restrict it. Global in-flight
 labels participate in no admission accounting at all: the cap counts this
 machine's dispatch markers. See
 [Why custody is not inferred, and not yet proven](#why-custody-is-not-inferred-and-not-yet-proven).

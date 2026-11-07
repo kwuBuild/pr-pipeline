@@ -132,6 +132,7 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
         "trusted_author": "",
         "max_in_flight": 3,
         "timeout_seconds": 1200,
+        "only": None,
     }
     assert di.call_args.kwargs["target"] == ("issue", 462)
     assert di.call_args.kwargs["authoritative_in_flight"] is authoritative
@@ -5241,7 +5242,7 @@ def test_parse_cli_args_reads_review_model_and_effort_flags() -> None:
     from tick import parse_cli_args  # type: ignore[import-untyped]
 
     assert parse_cli_args([]) == {
-        "target": None, "impl_engine": "", "model": "",
+        "target": None, "only": "", "impl_engine": "", "model": "",
         "fix_engine": "", "fix_model": "",
         "review_model": "", "review_effort": "",
         "permission_mode": "", "loop": False,

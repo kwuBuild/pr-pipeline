@@ -15,6 +15,10 @@
 #   2. worktree markers   = live engine state (pid liveness, deadline, result)
 #
 # Sections:
+#   DISPATCH SCOPE     — the newest tick's scope (full queue, positional target,
+#                        or --only list with its expansion; requested but
+#                        unresolved after an early failure) and whether that
+#                        tick-log evidence is active, ended, or STALE.
 #   IN-FLIGHT ENGINES  — one row per live dispatch.json: which PR, stage, engine,
 #                        whether the PID is still alive, whether its result file
 #                        has landed, how long since the engine last produced
@@ -84,6 +88,19 @@ PROGRESS_VERDICTS=$("$PY" "$TICK_LIB/tick.py" engine-progress \
 
 echo "PR PIPELINE  ·  $(date '+%Y-%m-%d %H:%M:%S')  ·  repo $REPO"
 echo "================================================================"
+
+# --- DISPATCH SCOPE (tick-log evidence) ------------------------------------
+# The dashboard cannot see the loop process. The banner reports what the newest
+# tick log recorded and whether its advertised next wake has passed, so a
+# list-scoped loop that died reads STALE rather than as a live scope.
+PIPELINE="$SKILL_DIR/../tick/lib/pipeline.py"
+TICK_LOG_DIR="$ROOT/.claude/worktrees/.tick-log"
+if [[ -n "$PY" ]] && SCOPE=$("$PY" "$PIPELINE" dispatch-scope --log-dir "$TICK_LOG_DIR" 2>/dev/null) \
+   && [[ -n "$SCOPE" ]]; then
+  echo "DISPATCH SCOPE: $SCOPE"
+else
+  echo "DISPATCH SCOPE: unavailable — scope report could not be produced"
+fi
 
 # --- IN-FLIGHT ENGINES (worktree markers) ---------------------------------
 echo
@@ -192,8 +209,6 @@ fi
 # --- LAST TICK LOG SUMMARY ------------------------------------------------------
 echo
 echo "LAST TICK AUDIT LOG"
-PIPELINE="$SKILL_DIR/../tick/lib/pipeline.py"
-TICK_LOG_DIR="$ROOT/.claude/worktrees/.tick-log"
 if entries=$("$PY" "$PIPELINE" tick-log-tail --log-dir "$TICK_LOG_DIR" 2>/dev/null) \
    && [ "$(printf '%s' "$entries" | jq 'length' 2>/dev/null)" -gt 0 ]; then
   printf '%s' "$entries" \

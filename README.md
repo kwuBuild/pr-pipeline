@@ -245,11 +245,14 @@ to those issues only. A run can also focus on one item:
 | `/pr-pipeline:tick` | Every issue and pull request that waits for work |
 | `/pr-pipeline:tick #42` | Issue 42, then its pull request through review and fixes |
 | `/pr-pipeline:tick pr:57` | Pull request 57 only |
+| `/pr-pipeline:tick --only '#42,pr:57'` | Start new work only for the listed items, in list order; finished work elsewhere is still collected |
 
 The launcher accepts the same targets, for example
 `pr-pipeline tick --loop '#42'`. A targeted loop goes quiet when that item
 finishes or waits for you, even if other items still wait. Targeting does not
-skip any safety gate.
+skip any safety gate. A list loop (`--only`) stops after its listed items have
+no work left and no agent is still running. A run accepts one target or one
+`--only` list, not both.
 
 Targets and flags apply only to the run that receives them. Each new run starts
 with the whole queue and your configured defaults, so pass the same target and

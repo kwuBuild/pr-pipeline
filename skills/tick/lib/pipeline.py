@@ -889,6 +889,7 @@ def compute_next_wake(
     max_poll_seconds: int = LOOP_MAX_POLL_SECONDS,
     heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
     target_state: TargetCadenceState | None = None,
+    scope_description: str | None = None,
 ) -> CadenceDecision:
     """Compute the next wake interval from end-of-tick state.
 
@@ -909,6 +910,10 @@ def compute_next_wake(
     Quiescent                              heartbeat (1800s)
     Queue quiet for N heartbeats            stop (caller notifies developer)
     ======================================  ===================================
+
+    An ``--only`` list uses the same table with its own quiet streak and no
+    immediate terminal stop: it stops after N quiet heartbeats in which no
+    listed item was dispatchable and no local engine was in flight.
 
     Args:
         in_flight_count: Number of engines currently occupying a concurrency
@@ -943,6 +948,9 @@ def compute_next_wake(
             queue. A terminal target stops immediately, regardless of unrelated
             occupancy. An unfinished target never stops from quiet heartbeats;
             an unknown target stays on the short poll.
+        scope_description: Description of an ``--only`` scope and its
+            observed items, or ``None``. It prefixes every reason, and a
+            quiescent stop names the list as exhausted.
         short_poll_seconds: Wake while work is queued, at capacity, or when
             state is unknown.
         max_poll_seconds: Longest wait while an engine is in flight.
@@ -966,6 +974,8 @@ def compute_next_wake(
     def _with_custody(reason: str) -> str:
         if target_state is not None:
             reason = f"{target_state.description}; not terminal; {reason}"
+        elif scope_description is not None:
+            reason = f"{scope_description}; {reason}"
         if not held_items:
             return reason
         return f"{reason}; awaiting human decision: {', '.join(held_items)}"
@@ -1046,6 +1056,16 @@ def compute_next_wake(
         # Observing quiet after a nudge does not count as another heartbeat.
         quiet_count = consecutive_quiescent_ticks + int(count_quiescent_heartbeat)
         stop = quiet_count >= quiescent_stop_after
+        if scope_description is not None and stop:
+            return CadenceDecision(
+                next_wake_seconds=heartbeat_seconds,
+                stop=True,
+                reason=_with_custody(
+                    "--only list exhausted: no listed item dispatchable and no "
+                    "local engine in flight; quiescent (heartbeat "
+                    f"{quiet_count}/{quiescent_stop_after}) → stop"
+                ),
+            )
         return CadenceDecision(
             next_wake_seconds=heartbeat_seconds,
             stop=stop,
@@ -5542,6 +5562,200 @@ def read_latest_tick_log(log_dir: str) -> list[dict[str, object]]:
     return entries
 
 
+# A scheduled tick may start this long after its advertised wake before the
+# dashboard calls the evidence stale. The /loop harness clamps short wakes up
+# to 60 seconds, so the grace must exceed that.
+SCOPE_EVIDENCE_GRACE_SECONDS = 120
+# A tick log that has started but not completed is "in progress" for this
+# long; after that it is stale (the process likely died mid-tick).
+SCOPE_TICK_IN_PROGRESS_SECONDS = 1800
+_SCOPE_ACTIONS = frozenset({
+    "only_scope_resolved", "only_scope_unreadable", "target_scope_resolved",
+})
+# Logged by every tick that holds the lock, before any fallible startup work,
+# so a tick that fails before resolving its scope still names what it was
+# asked to do. A resolved record later in the same log supersedes it.
+_SCOPE_REQUEST_ACTION = "tick_scope_requested"
+_LOOP_STOP_ACTIONS = frozenset({
+    "loop_only_stop", "loop_target_stop", "loop_quiescent_stop",
+})
+
+
+def _scope_tokens(value: object) -> str | None:
+    """Join logged scope tokens, or ``None`` when the record is malformed."""
+    if not isinstance(value, list) or not value or not all(
+        isinstance(token, str) and token for token in value
+    ):
+        return None
+    return ",".join(value)
+
+
+def _describe_scope(entries: list[dict[str, object]]) -> str:
+    """Describe the dispatch scope one tick log records."""
+    scope = next(
+        (entry for entry in reversed(entries) if entry.get("action") in _SCOPE_ACTIONS),
+        None,
+    )
+    if scope is None:
+        return _describe_requested_scope(entries)
+    details = scope.get("details")
+    details = details if isinstance(details, dict) else {}
+    action = scope.get("action")
+    if action == "target_scope_resolved":
+        target = details.get("target")
+        items = _scope_tokens(details.get("scope"))
+        if not isinstance(target, str) or items is None:
+            return "positional target (scope record malformed)"
+        return f"target {target} (scope {items})"
+    listed = _scope_tokens(details.get("only"))
+    if listed is None:
+        return "--only (scope record malformed)"
+    if action == "only_scope_unreadable":
+        return f"--only {listed} (scope UNREADABLE at last tick; no engine started)"
+    items = _scope_tokens(details.get("scope"))
+    if items is None:
+        return f"--only {listed} (scope record malformed)"
+    return f"--only {listed} (dispatch scope {items})"
+
+
+def _describe_requested_scope(entries: list[dict[str, object]]) -> str:
+    """Describe a tick that logged no resolved scope record.
+
+    Only an explicit request names the full queue. A list or target request
+    without a resolved record means the tick stopped (or has not yet reached
+    the point) before resolving its scope, so no engine started from it. A
+    log with no request at all does not prove any scope.
+    """
+    request = next(
+        (entry for entry in reversed(entries)
+         if entry.get("action") == _SCOPE_REQUEST_ACTION),
+        None,
+    )
+    if request is None:
+        return "scope unknown (no scope record)"
+    details = request.get("details")
+    details = details if isinstance(details, dict) else {}
+    mode = details.get("mode")
+    unresolved = "(requested; scope not resolved; no engine started)"
+    if mode == "full":
+        return "full queue"
+    if mode == "target" and isinstance(details.get("target"), str) and details["target"]:
+        return f"target {details['target']} {unresolved}"
+    if mode == "only":
+        listed = _scope_tokens(details.get("only"))
+        if listed is not None:
+            return f"--only {listed} {unresolved}"
+    return "scope record malformed"
+
+
+def _clock(ts: float) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def dispatch_scope_report(log_dir: str, *, now: float) -> str:
+    """Describe the newest tick's dispatch scope and how current that evidence is.
+
+    The dashboard cannot see the loop process, so this reads only retained
+    tick logs. The newest log holding a tick (a ``tick_complete`` summary, a
+    ``tick_scope_requested`` record, or a resolved scope record) names the
+    scope: an ``--only`` list with its expanded items, an unreadable list, a
+    positional target, or the full queue. A list or target that was requested
+    but never resolved (startup, target resolution, or harvest failed first)
+    is named as requested and unresolved. A log with no scope record names no
+    scope; missing evidence is never read as the full queue. Logs holding
+    only a ``lock_held`` refusal or a loop-stop notice are not ticks; a stop
+    notice newer than the tick marks the run as ended.
+
+    Evidence states:
+
+    * ``active`` — the tick completed and its advertised next wake (plus
+      :data:`SCOPE_EVIDENCE_GRACE_SECONDS`) has not passed, or a tick started
+      within :data:`SCOPE_TICK_IN_PROGRESS_SECONDS` and has not completed.
+    * ``ended`` — a loop-stop notice followed the tick, or its cadence
+      reported ``stop=true``.
+    * ``STALE`` — the next wake is overdue with no newer tick, the tick never
+      completed, or it reported no cadence.
+
+    Args:
+        log_dir: Directory holding ``tick-*.jsonl`` files.
+        now: Current epoch seconds.
+
+    Returns:
+        One banner line.
+    """
+    if not os.path.isdir(log_dir):
+        return "no tick evidence"
+    stop: dict[str, object] | None = None
+    for path in sorted(glob.glob(os.path.join(log_dir, "tick-*.jsonl")), reverse=True):
+        entries: list[dict[str, object]] = []
+        try:
+            with open(path) as handle:
+                for line in handle:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(obj, dict):
+                        entries.append(obj)
+        except OSError:
+            continue
+        actions = {entry.get("action") for entry in entries}
+        if (
+            "tick_complete" not in actions
+            and not actions & _SCOPE_ACTIONS
+            and _SCOPE_REQUEST_ACTION not in actions
+        ):
+            if stop is None:
+                stop = next(
+                    (e for e in reversed(entries) if e.get("action") in _LOOP_STOP_ACTIONS),
+                    None,
+                )
+            continue
+        scope = _describe_scope(entries)
+        if stop is not None:
+            reason = stop.get("reason")
+            return f"{scope} · log evidence ended: {reason if isinstance(reason, str) else stop.get('action')}"
+        summary = next(
+            (e for e in reversed(entries) if e.get("action") == "tick_complete"), None,
+        )
+        timestamps = [
+            float(e["ts"]) for e in entries
+            if isinstance(e.get("ts"), (int, float)) and not isinstance(e.get("ts"), bool)
+        ]
+        if summary is None:
+            started = min(timestamps) if timestamps else 0.0
+            if now - started <= SCOPE_TICK_IN_PROGRESS_SECONDS:
+                return f"{scope} · log evidence active: tick in progress since {_clock(started)}"
+            return f"{scope} · log evidence STALE: tick started {_clock(started)} never completed"
+        details = summary.get("details")
+        cadence = details.get("cadence") if isinstance(details, dict) else None
+        ts = summary.get("ts")
+        if (
+            not isinstance(cadence, dict)
+            or not isinstance(ts, (int, float))
+            or not isinstance(cadence.get("next_wake_seconds"), int)
+        ):
+            return f"{scope} · log evidence STALE: last tick reported no cadence"
+        if cadence.get("stop") is True:
+            return f"{scope} · log evidence ended: {cadence.get('reason')}"
+        due = float(ts) + cadence["next_wake_seconds"]
+        if now <= due + SCOPE_EVIDENCE_GRACE_SECONDS:
+            return (
+                f"{scope} · log evidence active: last tick {_clock(ts)}, "
+                f"next due by {_clock(due)}"
+            )
+        return (
+            f"{scope} · log evidence STALE: last tick {_clock(ts)}, next was due "
+            f"{_clock(due)}; no newer tick"
+        )
+    return "no tick evidence"
+
+
+def _cmd_dispatch_scope(args: argparse.Namespace) -> int:
+    print(dispatch_scope_report(args.log_dir, now=time.time()))
+    return 0
+
+
 def _cmd_tick_log_open(args: argparse.Namespace) -> int:
     path = tick_log_open(log_dir=args.log_dir, keep=args.keep)
     print(path)
@@ -5801,6 +6015,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     p_tlog_tail.add_argument("--log-dir", required=True, help="Directory for tick logs")
     p_tlog_tail.set_defaults(func=_cmd_tick_log_tail)
+
+    p_scope = sub.add_parser(
+        "dispatch-scope",
+        help="Print the newest tick's dispatch scope and evidence state",
+    )
+    p_scope.add_argument("--log-dir", required=True, help="Directory for tick logs")
+    p_scope.set_defaults(func=_cmd_dispatch_scope)
 
     args = parser.parse_args(argv)
     func: object = args.func

@@ -9990,6 +9990,8 @@ def dispatch_reviewers(
     trusted_author: str = "",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
     timeout_seconds: int = REVIEW_TIMEOUT,
+    *,
+    only: Sequence[tuple[str, int]] | None = None,
 ) -> None:
     """Dispatch reviewer engines for PRs at ai:implemented / ai:revised.
 
@@ -10021,6 +10023,12 @@ def dispatch_reviewers(
         timeout_seconds: Reviewer deadline from dispatch. The tick passes the
             ``review_timeout_seconds`` its startup gate validated; the default
             serves direct callers.
+        only: Resolved ``--only`` scope items, or ``None``. When set, each
+            listed PR is read directly in list order and the label queue is
+            not listed, so a listed PR beyond the bounded queue page is still
+            found and an unlisted PR is never read or written. Trust and
+            eligibility gates still apply. Unlike ``target`` this scopes new
+            launches alone; HARVEST stays global.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     # Target type gate: only dispatch for pr targets.
@@ -10052,33 +10060,39 @@ def dispatch_reviewers(
         except (subprocess.CalledProcessError, ValueError):
             return
 
-    # Collect candidate PR numbers from both pre-dispatch labels.
-    candidate_nums: set[int] = set()
-    for pre_label in (pipeline.LABEL_IMPLEMENTED, pipeline.LABEL_REVISED):
-        try:
-            lines = gh_text(
-                "pr", "list",
-                "--label", pre_label,
-                "--state", "open",
-                # Match the actionable-queue scan limit: held candidates now
-                # stay on their pre-dispatch label, so a default-size page
-                # they fill would starve eligible work beyond it.
-                "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
-                "--json", "number",
-                "-q", ".[].number",
-            )
-        except subprocess.CalledProcessError:
-            continue
-        for line in lines.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                candidate_nums.add(int(line))
+    # An --only list reads its PRs directly, in list order, so a listed PR
+    # beyond the bounded label page is still found and an unlisted PR is
+    # never read. Otherwise collect both pre-dispatch label queues.
+    if only is not None:
+        candidates = _read_listed_prs(only, stage="review", tick_log=tick_log)
+    else:
+        candidate_nums: set[int] = set()
+        for pre_label in (pipeline.LABEL_IMPLEMENTED, pipeline.LABEL_REVISED):
+            try:
+                lines = gh_text(
+                    "pr", "list",
+                    "--label", pre_label,
+                    "--state", "open",
+                    # Match the actionable-queue scan limit: held candidates
+                    # now stay on their pre-dispatch label, so a default-size
+                    # page they fill would starve eligible work beyond it.
+                    "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
+                    "--json", "number",
+                    "-q", ".[].number",
+                )
+            except subprocess.CalledProcessError:
+                continue
+            for line in lines.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    candidate_nums.add(int(line))
+        # Sort for deterministic dispatch order.
+        candidates = sorted(candidate_nums)
 
-    if not candidate_nums:
+    if not candidates:
         return
 
-    # Sort for deterministic dispatch order.
-    for pr_number in sorted(candidate_nums):
+    for pr_number in candidates:
         # Target filter
         if target is not None and pr_number != target[1]:
             continue
@@ -10826,6 +10840,7 @@ def dispatch_implementers(
     timeout_seconds: int = IMPLEMENTER_TIMEOUT,
     stall_seconds: int = ENGINE_STALL_SECONDS,
     stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
+    only: Sequence[tuple[str, int]] | None = None,
 ) -> None:
     """Dispatch implementer engines for issues at ai:available.
 
@@ -10863,6 +10878,10 @@ def dispatch_implementers(
             dispatch marker for stall detection to read.
         stall_startup_grace_seconds: Extra silence allowed before the first
             output event, recorded beside ``stall_seconds``.
+        only: Resolved ``--only`` scope items, or ``None``. When set, each
+            listed issue is read directly in list order and the issue queue
+            is not listed, so an unlisted issue is never read or written.
+            Trust and eligibility gates still apply. HARVEST stays global.
     """
     # Target type gate: only dispatch for issue targets.
     if target is not None and target[0] != "issue":
@@ -10879,8 +10898,9 @@ def dispatch_implementers(
             return
 
     # Filter on the server so other authors cannot consume the scan budget.
-    # A targeted run reads its issue directly, including its author: the target
-    # may be older than the bounded queue page, but never bypasses trust.
+    # A targeted or --only run reads its issues directly, including the author:
+    # a listed issue may be older than the bounded queue page, but never
+    # bypasses trust. An unlisted issue is never read.
     try:
         if target is not None:
             candidate = gh_json(
@@ -10890,6 +10910,8 @@ def dispatch_implementers(
             if not isinstance(candidate, dict) or candidate.get("state") != "OPEN":
                 return
             available = [candidate]
+        elif only is not None:
+            available = _read_listed_issues(only, tick_log=tick_log)
         else:
             available = gh_json(
                 "issue", "list",
@@ -10905,7 +10927,7 @@ def dispatch_implementers(
     if not isinstance(available, list):
         return
 
-    if target is None and tick_log is not None:
+    if target is None and only is None and tick_log is not None:
         _log_filtered_issue_count(available, tick_log)
 
     dispatched = 0
@@ -11020,6 +11042,107 @@ def dispatch_implementers(
             reason=f"available={len(available)}, dispatched=0",
             engine=impl_engine,
         )
+
+
+def _read_listed_issues(
+    only: Sequence[tuple[str, int]], *, tick_log: TickLog | None = None,
+) -> list[dict]:
+    """Read each listed issue directly, in list order, for implementer pickup.
+
+    One unreadable, closed, or mismatched issue is skipped for this tick
+    rather than blocking the rest of the list; its own label and trust gates
+    still run in the dispatch loop for every issue returned here.
+
+    Args:
+        only: Resolved ``--only`` scope items; PR items are ignored.
+        tick_log: Tick log handle for the per-issue ``skip`` record.
+
+    Returns:
+        Open issue payloads with ``number``, ``title``, ``author``, ``state``.
+    """
+    available: list[dict] = []
+    for kind, number in only:
+        if kind != "issue":
+            continue
+        try:
+            payload = gh_json(
+                "issue", "view", str(number),
+                "--json", "number,title,author,state",
+            )
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            payload = None
+            reason = f"listed issue unreadable: {type(exc).__name__}"
+        else:
+            reason = "listed issue is not an open issue with that number"
+        if (
+            isinstance(payload, dict)
+            and payload.get("number") == number
+            and payload.get("state") == "OPEN"
+        ):
+            available.append(payload)
+        elif tick_log:
+            tick_log.log(
+                pr=number, phase="dispatch", stage="implement", action="skip",
+                reason=f"{reason} — retried next tick",
+            )
+    return available
+
+
+def _read_listed_prs(
+    only: Sequence[tuple[str, int]], *, stage: str, tick_log: TickLog | None = None,
+) -> list[int]:
+    """Read each listed PR directly, in list order, for one PR stage's pickup.
+
+    This replaces the stage's label-queue listing for an ``--only`` tick, so
+    the bounded queue page cannot hide a listed PR. It applies the same
+    selection the queue query applies — open, and carrying one of the stage's
+    pickup labels — and leaves every eligibility, custody, trust, and
+    admission decision to the dispatch loop. An unreadable, closed, or
+    mismatched PR is skipped for this tick rather than blocking the rest of
+    the list. A PR at another stage's label is not a candidate here.
+
+    Args:
+        only: Resolved ``--only`` scope items; issue items are ignored.
+        stage: ``"review"`` or ``"fix"``.
+        tick_log: Tick log handle for the per-PR ``skip`` record.
+
+    Returns:
+        Candidate PR numbers in list order.
+    """
+    pickup = set(pipeline.STAGE_PICKUP_LABELS[stage])
+    candidates: list[int] = []
+    for kind, number in only:
+        if kind != "pr" or number in candidates:
+            continue
+        try:
+            payload = gh_json(
+                "pr", "view", str(number), "--json", "number,state,labels",
+            )
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            payload = None
+            reason = f"listed PR unreadable: {type(exc).__name__}"
+        else:
+            reason = "listed PR is not an open PR with readable labels"
+        # The strict parser rejects the whole payload when any label entry or
+        # name is malformed, so a bad payload takes the logged skip below
+        # instead of escaping as a TypeError.
+        labels = _pipeline_labels(payload)
+        names = set(labels) if labels is not None else None
+        if (
+            names is None
+            or not isinstance(payload, dict)
+            or payload.get("number") != number
+            or payload.get("state") != "OPEN"
+        ):
+            if tick_log:
+                tick_log.log(
+                    pr=number, phase="dispatch", stage=stage, action="skip",
+                    reason=f"{reason} — retried next tick",
+                )
+            continue
+        if names & pickup:
+            candidates.append(number)
+    return candidates
 
 
 def _dispatch_one_implementer(
@@ -11392,6 +11515,7 @@ def dispatch_fixers(
     timeout_seconds: int = FIXER_TIMEOUT,
     stall_seconds: int = ENGINE_STALL_SECONDS,
     stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
+    only: Sequence[tuple[str, int]] | None = None,
 ) -> None:
     """Dispatch fixer engines for PRs at ai:changes-requested.
 
@@ -11426,6 +11550,12 @@ def dispatch_fixers(
             dispatch marker for stall detection to read.
         stall_startup_grace_seconds: Extra silence allowed before the first
             output event, recorded beside ``stall_seconds``.
+        only: Resolved ``--only`` scope items, or ``None``. When set, each
+            listed PR is read directly in list order and the label queue is
+            not listed, so a listed PR beyond the bounded queue page is still
+            found and an unlisted PR is never read or written. Trust and
+            eligibility gates still apply. Unlike ``target`` this scopes new
+            launches alone; HARVEST stays global.
     """
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
@@ -11441,32 +11571,38 @@ def dispatch_fixers(
         except (subprocess.CalledProcessError, ValueError):
             return
 
-    # Query PRs with ai:changes-requested.
-    try:
-        lines = gh_text(
-            "pr", "list",
-            "--label", pipeline.LABEL_CHANGES_REQUESTED,
-            "--state", "open",
-            # Match the actionable-queue scan limit: held candidates now
-            # stay on their pre-dispatch label, so a default-size page
-            # they fill would starve eligible work beyond it.
-            "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
-            "--json", "number",
-            "-q", ".[].number",
-        )
-    except subprocess.CalledProcessError:
+    # An --only list reads its PRs directly, in list order, so a listed PR
+    # beyond the bounded label page is still found and an unlisted PR is
+    # never read. Otherwise query PRs with ai:changes-requested.
+    if only is not None:
+        candidates = _read_listed_prs(only, stage="fix", tick_log=tick_log)
+    else:
+        try:
+            lines = gh_text(
+                "pr", "list",
+                "--label", pipeline.LABEL_CHANGES_REQUESTED,
+                "--state", "open",
+                # Match the actionable-queue scan limit: held candidates now
+                # stay on their pre-dispatch label, so a default-size page
+                # they fill would starve eligible work beyond it.
+                "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
+                "--json", "number",
+                "-q", ".[].number",
+            )
+        except subprocess.CalledProcessError:
+            return
+
+        candidate_nums: set[int] = set()
+        for line in lines.splitlines():
+            line = line.strip()
+            if line.isdigit():
+                candidate_nums.add(int(line))
+        candidates = sorted(candidate_nums)
+
+    if not candidates:
         return
 
-    candidate_nums: set[int] = set()
-    for line in lines.splitlines():
-        line = line.strip()
-        if line.isdigit():
-            candidate_nums.add(int(line))
-
-    if not candidate_nums:
-        return
-
-    for pr_number in sorted(candidate_nums):
+    for pr_number in candidates:
         # Target filter
         if target is not None and pr_number != target[1]:
             continue
@@ -12401,9 +12537,119 @@ def _resolve_stage_targets(
     return targets
 
 
+_ONLY_TOKEN = re.compile(r"(#|pr:)([0-9]+)")
+
+
+def _parse_only_list(raw: str) -> tuple[tuple[str, int], ...]:
+    """Parse a ``--only`` value into ordered, unique ``(type, number)`` pairs.
+
+    Tokens use the positional target's grammar (``#N`` for an issue, ``pr:N``
+    for a PR) with a positive ASCII number. Surrounding spaces are ignored.
+    Order is the operator's priority statement, so a duplicate keeps its
+    *first* position.
+
+    Args:
+        raw: The comma-separated list, for example ``"#598,pr:660"``.
+
+    Returns:
+        The listed items in first-occurrence order.
+
+    Raises:
+        SystemExit: If the list or any element is empty or malformed. The
+            whole run is refused rather than narrowed: a dropped element would
+            dispatch a different set than the operator asked for, and that
+            reads exactly like success.
+    """
+    resolved: list[tuple[str, int]] = []
+    for element in raw.split(","):
+        token = element.strip()
+        match = _ONLY_TOKEN.fullmatch(token)
+        if not token:
+            print(f"tick: invalid --only list {raw!r}: empty element", file=sys.stderr)
+            raise SystemExit(1)
+        if match is None or int(match.group(2)) <= 0:
+            print(
+                f"tick: invalid --only element {token!r}: use '#N' or 'pr:N' "
+                "with a positive number",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        item = ("issue" if match.group(1) == "#" else "pr", int(match.group(2)))
+        if item not in resolved:
+            resolved.append(item)
+    return tuple(resolved)
+
+
+def _only_token(item: tuple[str, int]) -> str:
+    """Render one ``--only`` item in the operator's own token grammar."""
+    entity, number = item
+    return f"#{number}" if entity == "issue" else f"pr:{number}"
+
+
+def _only_text(items: Sequence[tuple[str, int]]) -> str:
+    """Render ``--only`` items as the comma-separated text an operator types."""
+    return ",".join(_only_token(item) for item in items)
+
+
+class OnlyScope(NamedTuple):
+    """One tick's resolved ``--only`` dispatch scope.
+
+    Attributes:
+        listed: The parsed list, in operator order.
+        items: The items dispatch may launch and cadence observes, in list
+            order. A listed issue is followed by its one open closing PR, so
+            review and fix can finish work the list started.
+    """
+
+    listed: tuple[tuple[str, int], ...]
+    items: tuple[tuple[str, int], ...]
+
+
+def _resolve_only_scope(only: tuple[tuple[str, int], ...]) -> OnlyScope:
+    """Expand an ``--only`` list once for this tick's dispatch and cadence.
+
+    Each entry goes through :func:`_resolve_stage_targets`, the strict
+    zero-or-one closing-PR resolver the positional target uses; there is no
+    second resolver. A listed issue keeps its implementation scope and gains
+    its one open closing PR immediately after it. Duplicates keep their first
+    position. The tick calls this once, after HARVEST, and reuses the result
+    for all three dispatch stages and the cadence report; the next tick reads
+    GitHub again so a closing PR opened in between joins the scope.
+
+    Args:
+        only: The parsed list, in operator order.
+
+    Returns:
+        The resolved scope.
+
+    Raises:
+        subprocess.CalledProcessError: If a GitHub read fails.
+        ValueError: If a closing-PR response is malformed or ambiguous.
+    """
+    items: list[tuple[str, int]] = []
+    for entry in only:
+        stages = _resolve_stage_targets(entry)
+        for scoped in (stages["implementer"], stages["reviewer"], stages["fixer"]):
+            if scoped is not None and scoped not in items:
+                items.append(scoped)
+    return OnlyScope(listed=only, items=tuple(items))
+
+
+def _only_counter_scope(only: Sequence[tuple[str, int]]) -> str:
+    """Return the quiet-counter key for one ``--only`` list.
+
+    The key names the listed *set*: reordering the same items keeps one quiet
+    streak, while a different set starts its own. It never shares a file with
+    the full-queue counter or a positional target's counter.
+    """
+    canonical = _only_text(sorted(set(only)))
+    return "only-" + hashlib.sha256(canonical.encode()).hexdigest()[:16]
+
+
 def main(
     target: str | None = None,
     *,
+    only: str = "",
     impl_engine: str = "",
     model: str = "",
     fix_engine: str = "",
@@ -12424,6 +12670,10 @@ def main(
 
     Args:
         target: Optional targeting argument (``"pr:N"``, ``"#N"``).
+        only: Optional ordered dispatch list (``"#598,pr:660"``). It bounds
+            new launches only; HARVEST, stale reconciliation, and occupancy
+            stay global. Empty means no list. Mutually exclusive with
+            ``target``.
         impl_engine: Engine for implementation dispatch (``"claude"`` or
             ``"claude-ds"``).
         model: Implementer model. A resolved blank omits ``--model`` so the
@@ -12468,6 +12718,13 @@ def main(
 
     try:
         parsed_target = _parse_target(target)
+        parsed_only = _parse_only_list(only) if only else None
+        if parsed_only is not None and parsed_target is not None:
+            print(
+                "tick: --only and a positional target are mutually exclusive",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
     except SystemExit:
         tick_state = pipeline.derive_tick_state(status="FAILED")
         tick_log = None
@@ -12499,11 +12756,12 @@ def main(
             return _run_loop_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
-                fix_engine=fix_engine, fix_model=fix_model,
+                fix_engine=fix_engine, fix_model=fix_model, only=parsed_only,
             )
         return _run_single_tick_locked(
             parsed_target, impl_engine, model, review_model, review_effort,
             permission_mode, fix_engine=fix_engine, fix_model=fix_model,
+            only=parsed_only,
         ).exit_code
     finally:
         tick_lock.release()
@@ -12542,6 +12800,37 @@ def _log_lock_held() -> None:
     sys.stderr.flush()
 
 
+def _log_requested_scope(
+    tick_log: TickLog | None,
+    parsed_target: tuple[str, int] | None,
+    only: Sequence[tuple[str, int]] | None,
+) -> None:
+    """Log the scope this tick was invoked with, for the status banner.
+
+    This is the request, not its resolution: ``target_scope_resolved`` or
+    ``only_scope_resolved``/``only_scope_unreadable`` later in the same log
+    supersede it. A tick that fails before resolving still names its list or
+    target, and only this record names the full queue.
+    """
+    if tick_log is None:
+        return
+    if only is not None:
+        details: dict[str, object] = {
+            "mode": "only", "only": [_only_token(item) for item in only],
+        }
+        reason = f"--only {_only_text(only)}"
+    elif parsed_target is not None:
+        details = {"mode": "target", "target": _only_token(parsed_target)}
+        reason = f"target {_only_token(parsed_target)}"
+    else:
+        details = {"mode": "full"}
+        reason = "full queue"
+    tick_log.log(
+        pr=None, phase="startup", stage="", action="tick_scope_requested",
+        reason=reason, details=details,
+    )
+
+
 def _run_single_tick_locked(
     parsed_target: tuple[str, int] | None,
     impl_engine: str,
@@ -12555,6 +12844,7 @@ def _run_single_tick_locked(
     count_quiescent_heartbeat: bool = True,
     unattended: bool = False,
     quiescent_stop_after: int | None = None,
+    only: tuple[tuple[str, int], ...] | None = None,
 ) -> TickOutcome:
     """Run one tick while the caller owns the tick mutex.
 
@@ -12580,6 +12870,8 @@ def _run_single_tick_locked(
             setup prompt; an unconfigured target is logged as skipped.
         quiescent_stop_after: Optional test override, applied to the same
             cadence decision the tick reports and the native loop consumes.
+        only: Parsed ``--only`` list, or ``None``. Forwarded to the tick body,
+            which expands it once per tick after HARVEST.
 
     Returns:
         Exit status and the cadence reported by the completed tick, if any.
@@ -12602,6 +12894,10 @@ def _run_single_tick_locked(
             _log_startup_context(tick_log)
         except Exception:  # noqa: BLE001
             pass
+    # Record what this tick was asked to do before any step that can fail, so
+    # the status banner never reads an early failure as a full-queue tick.
+    # The startup context stays the log's first entry.
+    _log_requested_scope(tick_log, parsed_target, only)
 
     probe = _startup_probe()
     if tick_log is not None:
@@ -12785,6 +13081,7 @@ def _run_single_tick_locked(
             count_quiescent_heartbeat=count_quiescent_heartbeat,
             config=config,
             quiescent_stop_after=quiescent_stop_after,
+            only=only,
         )
     except Exception:
         exc_value = sys.exc_info()[1]
@@ -12949,17 +13246,23 @@ def _compute_nearest_deadline_s() -> float | None:
     return None if nearest is None else nearest - time.time()
 
 
-def _quiescent_counter_path(target: tuple[str, int] | None) -> str:
-    """Return the queue counter or the parsed target's private counter."""
+def _quiescent_counter_path(target: tuple[str, int] | str | None) -> str:
+    """Return the queue counter, a target's counter, or an ``--only`` counter.
+
+    ``None`` is the full queue, a tuple is a positional target, and a string
+    is the key :func:`_only_counter_scope` derives for a listed set.
+    """
     if target is None:
         return _QUIESCENT_COUNTER_FILE
+    if isinstance(target, str):
+        return os.path.join(os.path.dirname(_QUIESCENT_COUNTER_FILE), f"{target}.txt")
     entity, number = target
     return os.path.join(
         os.path.dirname(_QUIESCENT_COUNTER_FILE), f"{entity}-{number}.txt",
     )
 
 
-def _read_quiescent_counter(target: tuple[str, int] | None = None) -> int:
+def _read_quiescent_counter(target: tuple[str, int] | str | None = None) -> int:
     """Read the consecutive quiescent ticks counter from disk.
 
     Returns 0 when the counter file does not exist or is unparseable.
@@ -12972,7 +13275,7 @@ def _read_quiescent_counter(target: tuple[str, int] | None = None) -> int:
 
 
 def _write_quiescent_counter(
-    value: int, target: tuple[str, int] | None = None,
+    value: int, target: tuple[str, int] | str | None = None,
 ) -> None:
     """Atomically write the consecutive quiescent ticks counter to disk."""
     path = _quiescent_counter_path(target)
@@ -12982,7 +13285,7 @@ def _write_quiescent_counter(
 
 def _advance_quiescent_counter(
     *, is_quiescent: bool, count_heartbeat: bool,
-    target: tuple[str, int] | None = None,
+    target: tuple[str, int] | str | None = None,
 ) -> int:
     """Update the persisted quiescent streak and return prior heartbeats.
 
@@ -12993,8 +13296,8 @@ def _advance_quiescent_counter(
     not prove elapsed time, and both modes reuse the scope's retained streak.
 
     Args:
-        target: Parsed CLI target, or ``None`` for the queue. Only this scope
-            is read and reset.
+        target: Parsed CLI target, an ``--only`` counter key, or ``None`` for
+            the queue. Only this scope is read and reset.
         is_quiescent: Whether this tick observed a quiescent pipeline. A
             non-quiescent tick resets the streak whatever woke it.
         count_heartbeat: True for the invocation's first tick, one-shot ticks,
@@ -13019,6 +13322,7 @@ def _compute_post_dispatch_state(
     target: tuple[str, int] | None = None,
     *,
     target_state: pipeline.TargetCadenceState | None = None,
+    only_state: pipeline.TargetCadenceState | None = None,
 ) -> tuple[int | None, bool | None, tuple[str, ...]]:
     """Compute in-flight count and queue state after dispatch.
 
@@ -13034,6 +13338,9 @@ def _compute_post_dispatch_state(
             allowed to dispatch.
         target_state: Reuse the tick's target observation for both the queue
             and terminal decision. Direct callers can omit it.
+        only_state: The tick's ``--only`` observation. When set, its tri-state
+            ``actionable`` is the queue value; occupancy stays global, so a
+            list run cannot report quiet while this machine owns an engine.
 
     Returns:
         ``(supervisable_in_flight, has_actionable_queue, held_items)`` —
@@ -13049,6 +13356,9 @@ def _compute_post_dispatch_state(
     except (RuntimeError, ValueError, subprocess.CalledProcessError):
         in_flight_count = None
         held_items = ()
+
+    if only_state is not None:
+        return in_flight_count, only_state.actionable, held_items
 
     if target is not None:
         state = target_state or _observe_target_state(target)
@@ -13082,8 +13392,9 @@ def _run_loop_locked(
     fix_engine: str = "",
     fix_model: str = "",
     quiescent_stop_after: int | None = None,
+    only: tuple[tuple[str, int], ...] | None = None,
 ) -> int:
-    """Run until interrupted, the target is terminal, or the queue is quiescent.
+    """Run until interrupted, the target is terminal, or the scope is quiescent.
 
     The flags are forwarded unresolved (empty means none was typed): each
     tick resolves the operator's config for itself, so a config edit mid-loop
@@ -13091,7 +13402,9 @@ def _run_loop_locked(
     a tick is paced from the configuration that tick validated.
 
     ``quiescent_stop_after`` pins the stop count for tests; ``None`` uses the
-    tick's validated ``loop_quiescent_stop_after``.
+    tick's validated ``loop_quiescent_stop_after``. ``only`` is the parsed
+    ``--only`` list; each tick expands it again, and its stop is reported as
+    list exhaustion rather than full-queue quiescence.
     """
     stop_event = threading.Event()
     old_sigint = signal.getsignal(signal.SIGINT)
@@ -13125,6 +13438,7 @@ def _run_loop_locked(
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
                 quiescent_stop_after=quiescent_stop_after,
+                only=only,
             )
             last_rc = outcome.exit_code
             if last_rc in (
@@ -13146,6 +13460,8 @@ def _run_loop_locked(
             if decision.stop:
                 if parsed_target is not None:
                     _notify_loop_target_stop(decision.reason)
+                elif only is not None:
+                    _notify_loop_only_stop(decision.reason)
                 else:
                     _notify_loop_quiescent_stop(outcome.held_items)
                 return last_rc
@@ -14117,6 +14433,65 @@ def _observe_target_state(target: tuple[str, int]) -> pipeline.TargetCadenceStat
     )
 
 
+def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
+    """Read the tri-state dispatch eligibility of a resolved ``--only`` scope.
+
+    Uses the scope this tick already resolved for dispatch, so cadence and
+    dispatch judge the same items and the list is not expanded again. Each
+    item is judged by :func:`pipeline.resolve_pickup_eligibility`, the rule
+    dispatch applies, and a listed issue must still pass the issue author
+    gate. Unlike a positional target there is no terminal claim: the list
+    stops only through quiet heartbeats, once nothing listed is dispatchable
+    and no local engine remains.
+
+    Args:
+        scope: The scope this tick resolved.
+
+    Returns:
+        ``actionable`` is ``True`` when any item is dispatchable, ``False``
+        when every item is proven non-dispatchable or closed, and ``None``
+        when any read or payload could not be trusted. ``terminal`` is always
+        ``False``.
+    """
+    name = f"--only {_only_text(scope.listed)}"
+    details: list[str] = []
+    actionable = False
+    try:
+        for entity, number in scope.items:
+            payload = gh_json(
+                entity, "view", str(number),
+                "--json", "labels,state,author" if entity == "issue" else "labels,state",
+            )
+            if not isinstance(payload, dict):
+                raise ValueError("invalid scope item payload")
+            state = payload.get("state")
+            if state not in ("OPEN", "CLOSED", "MERGED"):
+                raise ValueError("invalid scope item state")
+            if state != "OPEN":
+                details.append(f"{entity} #{number} {state}")
+                continue
+            labels = _pipeline_labels(payload)
+            if labels is None:
+                raise ValueError("invalid scope item labels")
+            details.append(
+                f"{entity} #{number} {', '.join(sorted(labels)) or 'no ai: label'}",
+            )
+            dispatchable = bool(
+                pipeline.resolve_pickup_eligibility(labels, entity=entity).label,
+            )
+            if dispatchable and entity == "issue":
+                trusted = _issue_author_trust(payload)
+                if trusted is None:
+                    raise ValueError("unknown issue author")
+                dispatchable = trusted
+            actionable = actionable or dispatchable
+    except (subprocess.CalledProcessError, ValueError):
+        return pipeline.TargetCadenceState(None, False, f"{name}: state unknown")
+    return pipeline.TargetCadenceState(
+        actionable, False, f"{name}: " + "; ".join(details),
+    )
+
+
 def _issue_author_trust(metadata: object) -> bool | None:
     """Adapt the issue trust predicate for cadence's unknown-stays-warm rule.
 
@@ -14232,6 +14607,26 @@ def _notify_loop_target_stop(reason: str) -> None:
     _emit_operator_notification(title="PR pipeline target stopped", message=reason)
 
 
+def _notify_loop_only_stop(reason: str) -> None:
+    """Report an exhausted ``--only`` list without claiming queue quiescence.
+
+    The reason comes from the tick's own cadence decision, so it already names
+    the list and any human-held slots. Work outside the list may still be
+    queued; the event name keeps that stop distinct from a drained backlog.
+    """
+    print(f"tick: {reason}", file=sys.stderr)
+    try:
+        os.makedirs(TICK_LOG_DIR, exist_ok=True)
+        tick_log = TickLog.open(TICK_LOG_DIR)
+    except (OSError, FileExistsError):
+        tick_log = None
+    if tick_log is not None:
+        tick_log.log(
+            pr=None, phase="loop", stage="", action="loop_only_stop", reason=reason,
+        )
+    _emit_operator_notification(title="PR pipeline --only list done", message=reason)
+
+
 def _notify_loop_quiescent_stop(held_items: Sequence[str] = ()) -> None:
     """Notify the operator that loop mode stopped after quiescence."""
     reason = "PR pipeline loop stopped after consecutive quiescent heartbeats"
@@ -14298,11 +14693,20 @@ def _run_tick_body(
     count_quiescent_heartbeat: bool = True,
     config: pipeline.ResolvedConfig | None = None,
     quiescent_stop_after: int | None = None,
+    only: tuple[tuple[str, int], ...] | None = None,
 ) -> TickOutcome:
     """Run the HARVEST → DISPATCH → Summary body of a tick.
 
     Extracted from ``main()`` so the try/except wrapper in ``main()``
     catches unexpected exceptions without catching intentional early returns.
+
+    ``only`` bounds new launches alone. HARVEST, stale-label reconciliation,
+    and occupancy stay global, so engines outside the list are still reaped
+    and free their admission slots. The list is expanded once, after that
+    custody work, and the same :class:`OnlyScope` feeds all three dispatchers
+    and the cadence report. If the expansion read fails, the tick has
+    already harvested; it then starts no engine, logs
+    ``only_scope_unreadable``, and stays warm. The next tick reads again.
 
     Args:
         tick_log: Tick log handle, or ``None``.
@@ -14326,6 +14730,8 @@ def _run_tick_body(
             reads its deadlines, stall limits, round limit, cooldowns, fixer
             route and cadence from it. ``None`` — direct callers only — runs
             the shipped defaults with the fixer on the implementer's route.
+        only: Parsed ``--only`` list, or ``None``. Mutually exclusive with
+            ``parsed_target``.
 
     Returns:
         Exit status and the exact cadence supplied to both summary outputs.
@@ -14339,6 +14745,14 @@ def _run_tick_body(
     if quiescent_stop_after is not None:
         cadence["quiescent_stop_after"] = quiescent_stop_after
     max_in_flight = tuning.max_in_flight
+    # Each scope owns one quiet streak: the queue, a positional target, or
+    # the listed set. Every reset below touches only this tick's own scope.
+    counter_scope: tuple[str, int] | str | None = (
+        _only_counter_scope(only) if only is not None else parsed_target
+    )
+    # Every list-run cadence reason names the list, including the failure
+    # paths that end before the list's items are observed.
+    unobserved_scope = f"--only {_only_text(only)}: not observed" if only else None
     try:
         stage_targets = _resolve_stage_targets(parsed_target)
     except (subprocess.CalledProcessError, ValueError) as exc:
@@ -14359,6 +14773,20 @@ def _run_tick_body(
         _log_tick_summary(tick_log, False, tick_state=tick_state, cadence=decision)
         _print_summary(tick_log, False, tick_state=tick_state, cadence=decision)
         return TickOutcome(1, decision)
+    if tick_log and parsed_target is not None:
+        # Scope evidence for the status dashboard banner.
+        scoped = [parsed_target]
+        for stage in ("reviewer", "fixer"):
+            if stage_targets[stage] is not None and stage_targets[stage] not in scoped:
+                scoped.append(stage_targets[stage])
+        tick_log.log(
+            pr=None, phase="target", stage="all", action="target_scope_resolved",
+            reason=f"target {_only_token(parsed_target)}",
+            details={
+                "target": _only_token(parsed_target),
+                "scope": [_only_token(item) for item in scoped],
+            },
+        )
 
     # Also reap on timed ticks if the advisory watcher could not start or died.
     _reap_engine_children()
@@ -14487,9 +14915,10 @@ def _run_tick_body(
             in_flight_count=None,
             has_actionable_queue=None,
             at_capacity=None,
+            scope_description=unobserved_scope,
             **cadence,
         )
-        _write_quiescent_counter(0, parsed_target)
+        _write_quiescent_counter(0, counter_scope)
         _log_tick_summary(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
@@ -14497,6 +14926,51 @@ def _run_tick_body(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
         return TickOutcome(1, decision)
+
+    # Phase 1c: resolve the --only scope once, after custody work. A failed
+    # read cannot strand unlisted engines — HARVEST and stale reconciliation
+    # above already ran globally — so it only withholds new launches.
+    only_scope: OnlyScope | None = None
+    if only is not None:
+        try:
+            only_scope = _resolve_only_scope(only)
+        except (subprocess.CalledProcessError, ValueError) as exc:
+            reason = str(exc) or type(exc).__name__
+            if isinstance(exc, subprocess.CalledProcessError):
+                reason = f"GitHub read failed: {reason}"
+            if tick_log:
+                tick_log.log(
+                    pr=None, phase="dispatch", stage="all",
+                    action="only_scope_unreadable",
+                    reason=f"--only scope expansion failed; no engine started: {reason}",
+                    details={"only": [_only_token(item) for item in only]},
+                )
+            tick_state = pipeline.derive_tick_state(status="PARTIAL")
+            decision = pipeline.compute_next_wake(
+                in_flight_count=None, has_actionable_queue=None, at_capacity=None,
+                scope_description=unobserved_scope,
+                **cadence,
+            )
+            _write_quiescent_counter(0, counter_scope)
+            _log_tick_summary(
+                tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
+            )
+            _print_summary(
+                tick_log, reconcile_ok, dispatch_skipped=True,
+                skip_reason="--only scope unreadable",
+                tick_state=tick_state, cadence=decision,
+            )
+            return TickOutcome(2, decision)
+        if tick_log:
+            tick_log.log(
+                pr=None, phase="dispatch", stage="all",
+                action="only_scope_resolved",
+                reason=f"--only {_only_text(only_scope.listed)}",
+                details={
+                    "only": [_only_token(item) for item in only_scope.listed],
+                    "scope": [_only_token(item) for item in only_scope.items],
+                },
+            )
 
     # Check the installed guidance once, before any stage creates a worktree or
     # touches a label. A stage whose docs are unreadable is held for this tick
@@ -14513,6 +14987,7 @@ def _run_tick_body(
         authoritative_in_flight = None
 
     if authoritative_in_flight is not None:
+        dispatch_items = only_scope.items if only_scope is not None else None
         # All three stages admit against the one cap startup validated, over
         # this machine's dispatch markers
         if "reviewer" not in guidance_blocked:
@@ -14524,6 +14999,7 @@ def _run_tick_body(
                 trusted_author=trusted_author,
                 max_in_flight=max_in_flight,
                 timeout_seconds=tuning.review_timeout_seconds,
+                only=dispatch_items,
             )
         if "implementer" not in guidance_blocked:
             dispatch_implementers(
@@ -14536,6 +15012,7 @@ def _run_tick_body(
                 timeout_seconds=tuning.implementer_timeout_seconds,
                 stall_seconds=tuning.engine_stall_seconds,
                 stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
+                only=dispatch_items,
             )
         if "fixer" not in guidance_blocked:
             dispatch_fixers(
@@ -14548,6 +15025,7 @@ def _run_tick_body(
                 timeout_seconds=tuning.fixer_timeout_seconds,
                 stall_seconds=tuning.engine_stall_seconds,
                 stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
+                only=dispatch_items,
             )
     else:
         if tick_log:
@@ -14561,9 +15039,10 @@ def _run_tick_body(
             in_flight_count=None,
             has_actionable_queue=None,
             at_capacity=None,
+            scope_description=unobserved_scope,
             **cadence,
         )
-        _write_quiescent_counter(0, parsed_target)
+        _write_quiescent_counter(0, counter_scope)
         _log_tick_summary(
             tick_log, reconcile_ok, tick_state=tick_state, cadence=decision,
         )
@@ -14577,8 +15056,11 @@ def _run_tick_body(
     target_state = (
         _observe_target_state(parsed_target) if parsed_target is not None else None
     )
+    # The list's cadence observes the scope dispatch just used; it does not
+    # expand the list a second time. Occupancy stays global.
+    only_state = _observe_only_state(only_scope) if only_scope is not None else None
     in_flight_count, has_queue, held_items = _compute_post_dispatch_state(
-        parsed_target, target_state=target_state,
+        parsed_target, target_state=target_state, only_state=only_state,
     )
     tick_state = pipeline.derive_tick_state(
         status="PARTIAL" if guidance_blocked else "ok",
@@ -14593,7 +15075,7 @@ def _run_tick_body(
     prior_quiescent = _advance_quiescent_counter(
         is_quiescent=is_quiescent,
         count_heartbeat=count_quiescent_heartbeat,
-        target=parsed_target,
+        target=counter_scope,
     )
     decision = pipeline.compute_next_wake(
         in_flight_count=in_flight_count,
@@ -14607,6 +15089,7 @@ def _run_tick_body(
         count_quiescent_heartbeat=count_quiescent_heartbeat,
         held_items=held_items,
         target_state=target_state,
+        scope_description=only_state.description if only_state is not None else None,
         **cadence,
     )
 
@@ -14682,6 +15165,7 @@ def _print_summary(
     *,
     dispatch_skipped: bool = False,
     guidance_blocked: bool = False,
+    skip_reason: str = "auth labels read failed",
     tick_state: pipeline.TickState | None = None,
     cadence: pipeline.CadenceDecision | None = None,
 ) -> None:
@@ -14689,7 +15173,7 @@ def _print_summary(
     if not reconcile_ok:
         status = "FAILED (dispatch skipped: reconcile failed)"
     elif dispatch_skipped:
-        status = "PARTIAL (dispatch skipped: auth labels read failed)"
+        status = f"PARTIAL (dispatch skipped: {skip_reason})"
     elif guidance_blocked:
         status = "PARTIAL (dispatch blocked: installed guidance unreadable)"
     else:
@@ -14708,6 +15192,7 @@ class CliArgs(TypedDict):
     """Parsed tick CLI arguments."""
 
     target: str | None
+    only: str
     impl_engine: str
     model: str
     fix_engine: str
@@ -14720,6 +15205,7 @@ class CliArgs(TypedDict):
 
 # Flags that take a value, mapped to their CliArgs key.
 _VALUE_FLAGS = {
+    "--only": "only",
     "--impl-engine": "impl_engine",
     "--model": "model",
     "--fix-engine": "fix_engine",
@@ -14734,7 +15220,8 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
     """Parse tick CLI arguments.
 
     Supports ``--loop``, the value flags in :data:`_VALUE_FLAGS` in both
-    ``--flag value`` and ``--flag=value`` form, and a positional target.
+    ``--flag value`` and ``--flag=value`` form, and at most one positional
+    target. ``--only`` and a positional target are mutually exclusive.
 
     Args:
         argv: Arguments without the program name (i.e. ``sys.argv[1:]``).
@@ -14749,10 +15236,24 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
             is empty — or when ``--permission-mode`` is not one of the
             supported modes. Failing here, before any state transition, is
             what keeps a typo'd flag from crashing the tick mid-dispatch.
+            Also raised for a malformed or repeated ``--only`` list, a
+            second positional target, or ``--only`` combined with a
+            positional target: a silently replaced or narrowed scope would
+            dispatch a different set than the operator asked for.
     """
     values: dict[str, str] = dict.fromkeys(_VALUE_FLAGS.values(), "")
+    seen_flags: set[str] = set()
     target: str | None = None
     loop = False
+
+    def set_value(flag: str, value: str) -> None:
+        # Route flags keep their last-value behavior. A second --only list
+        # would silently replace the first priority statement, so refuse it.
+        if flag == "--only" and flag in seen_flags:
+            print(f"tick: {flag} given more than once", file=sys.stderr)
+            raise SystemExit(1)
+        seen_flags.add(flag)
+        values[_VALUE_FLAGS[flag]] = value
 
     i = 0
     while i < len(argv):
@@ -14771,7 +15272,7 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
             if not value or value.startswith("-"):
                 print(f"tick: {arg} requires a value", file=sys.stderr)
                 raise SystemExit(1)
-            values[_VALUE_FLAGS[arg]] = value
+            set_value(arg, value)
             i += 2
             continue
 
@@ -14785,12 +15286,34 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
             if not value:
                 print(f"tick: {prefixed} requires a value", file=sys.stderr)
                 raise SystemExit(1)
-            values[_VALUE_FLAGS[prefixed]] = value
+            set_value(prefixed, value)
             i += 1
             continue
 
+        # A second positional used to replace the first silently, so
+        # `--loop '#101' pr:66` ran pr:66 alone. Refuse it instead.
+        if target is not None:
+            print(
+                "tick: only one positional target is allowed "
+                f"(got {target!r} and {arg!r}); use --only for a list",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
         target = arg
         i += 1
+
+    # A positional target scopes HARVEST as well as DISPATCH; --only scopes
+    # new launches alone. Accepting both would leave the harvest scope to
+    # whichever one a reader noticed, so neither wins.
+    if values["only"] and target is not None:
+        print(
+            "tick: --only and a positional target are mutually exclusive "
+            f"(got --only {values['only']!r} and target {target!r})",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    if values["only"]:
+        _parse_only_list(values["only"])
 
     # "" means the flag was not typed, which is what lets the operator's
     # configured permission_mode apply. Defaulting it here would make every
@@ -14810,6 +15333,7 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
     # startup, and a default here would shadow that configuration.
     return {
         "target": target,
+        "only": values["only"],
         "impl_engine": values["impl_engine"],
         "model": values["model"],
         "fix_engine": values["fix_engine"],
@@ -14831,6 +15355,7 @@ if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(
         main(
             target=cli_args["target"],
+            only=cli_args["only"],
             impl_engine=cli_args["impl_engine"],
             model=cli_args["model"],
             fix_engine=cli_args["fix_engine"],

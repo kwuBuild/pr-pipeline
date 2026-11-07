@@ -146,6 +146,9 @@ while true; do clear; ~/.claude/pr-pipeline/bin/pr-pipeline status; sleep 5; don
 ~/.claude/pr-pipeline/bin/pr-pipeline tick pr:468
 ~/.claude/pr-pipeline/bin/pr-pipeline tick '#439'
 
+# 4b. Launch only listed work, in list order (harvest stays global)
+~/.claude/pr-pipeline/bin/pr-pipeline tick --only '#439,pr:468'
+
 # 5. Verify the dispatch landed (use find to avoid bare-glob errors in zsh)
 find .claude/worktrees -maxdepth 2 -name dispatch.json -path '*/issue-*' \
   -exec jq '{engine, stage, pid}' {} \;
@@ -439,6 +442,9 @@ same-number issue scope. For `#N`, implementation stays scoped to issue `N`, whi
 zero or one open closing PR scopes the reviewer and fixer. With no open closing PR,
 only the issue implementation scope is active. An ambiguous or malformed
 closing-PR response, or GitHub read failure, stops before scratch/worktree or GitHub workflow mutation; the audit log, tick lock, and target quiet counter are excepted. Invalid target syntax has the same workflow-mutation boundary and exits `1`.
+Only one positional target is accepted: a second one (for example
+`tick --loop '#101' pr:66`) exits `1` before any work instead of silently
+replacing the first. Use [`--only`](#dispatch-list---only) for several items.
 
 HARVEST, stale-label reconciliation, and DISPATCH use those resolved stage scopes.
 Safety gates (`reconcile_failed`, `max_in_flight` admission cap) still apply
@@ -485,7 +491,8 @@ admission capacity remain global. Thus `tick-state` can report an unrelated
 engine in flight while `tick-cadence` reports that the requested target stopped.
 
 Quiet streaks live under `.claude/worktrees/.tick-state/quiescent-counters/`:
-`queue.txt` for the full queue, `issue-N.txt` for `#N`, and `pr-N.txt` for `pr:N`.
+`queue.txt` for the full queue, `issue-N.txt` for `#N`, `pr-N.txt` for `pr:N`,
+and `only-<key>.txt` for an [`--only` list](#dispatch-list---only).
 Each tick reads, advances, or resets only its own scope, including on failures.
 The target key remains the requested issue even after handoff to its closing PR.
 The former shared `quiescent-counter.txt` is ignored because its prior scope
@@ -500,6 +507,89 @@ can stop it sooner. Nudge-triggered ticks do not advance that streak.
 If a nudge first observes a quiet queue after activity, the count stays zero
 and the loop waits, even when the configured stop threshold is one.
 
+### Dispatch list (`--only`)
+
+```bash
+~/.claude/pr-pipeline/bin/pr-pipeline tick --only '#439,pr:468'
+~/.claude/pr-pipeline/bin/pr-pipeline tick --loop --only='#439,pr:468,#440'
+```
+
+`--only` lets an operator drain a chosen set of items concurrently without
+changing GitHub labels. It bounds which items a tick may **launch**. It does
+not narrow custody work: HARVEST, stale-label reconciliation, and admission
+occupancy stay global. This deliberately differs from a positional target,
+whose HARVEST is scoped to the target.
+
+Normal flow of one tick with a list:
+
+1. HARVEST and stale-label reconciliation run for every engine this machine
+   owns, listed or not. A finished unlisted engine is harvested and relabeled
+   as usual; harvest removes its local dispatch marker, which frees its
+   admission slot.
+2. The tick expands the list once. A listed issue keeps implementation scope
+   and gains its one open closing PR immediately after it, so review and fix
+   can finish work the list started. The expansion uses the same strict
+   zero-or-one closing-PR resolver as a positional `#N`. The tick logs the
+   result as `only_scope_resolved` (`details.only` and `details.scope`).
+3. DISPATCH runs in the usual stage order: reviewers, implementers, fixers.
+   Each stage considers only listed items of its own kind, in list order.
+   No stage lists its label queue. The implement stage reads each listed
+   issue directly. The review and fix stages read each listed or expanded PR
+   directly and keep it only when it is open and carries one of the stage's
+   pickup labels, the same selection the queue query makes. So an item
+   outside the bounded 200-item queue page is still found, and an unlisted
+   item receives no read and no write. An unreadable, closed, or mismatched
+   listed item logs a `skip` and is read again next tick. All stages
+   share the one `max_in_flight` cap, so under limited capacity the earlier
+   list position wins within a stage. Strict ordering across stages is not
+   provided.
+4. Cadence observes the same expanded scope; it does not expand the list a
+   second time. The next tick expands it again, so a closing PR opened in
+   between joins the scope.
+
+`--only` does not bypass trust, eligibility, reconciliation, or admission
+gates. A listed issue by another author, a held item, or an item at an
+in-flight label is skipped exactly as in a full-queue tick.
+
+Input rules. Tokens are `#N` (issue) or `pr:N` (PR) with a positive number,
+separated by commas; spaces around tokens are ignored. A duplicate keeps its
+first position. The CLI exits `1` before the tick lock or any GitHub call for
+an empty list or element, a malformed token, a repeated `--only`, or `--only`
+combined with a positional target.
+
+**Expansion read failure.** When a GitHub read for the expansion fails, or a
+closing-PR response is malformed or ambiguous, the tick has already completed
+HARVEST and stale reconciliation (step 1). It then starts no new engine, logs
+`only_scope_unreadable` with the reason and the requested list, prints
+`PARTIAL (dispatch skipped: --only scope unreadable)`, exits `2`, and reports
+`state unknown` on the short poll. The next tick reads the list again. This
+differs from the positional target, which fails closed before HARVEST; that
+path is unchanged.
+
+**Completion and quiet counter.** A list has no immediate terminal stop like
+the [target completion rule](#target-completion-and-cadence). It uses the
+quiescent table below with a quiet streak of its own:
+
+- The list's queue value is tri-state: `true` when any listed or expanded item
+  is dispatchable, `false` when every item is proven non-dispatchable or
+  closed, and `unknown` when any read or payload cannot be trusted. Unknown
+  stays on the short poll and resets the list's streak.
+- Occupancy stays global. While this machine owns any engine, listed or not,
+  the tick is not quiet, so a loop never stops while it still owes a harvest.
+- The streak lives in `quiescent-counters/only-<key>.txt`. The key is a hash
+  of the listed *set*, so reordering the same items keeps one streak and a
+  different set starts its own. It never shares a file with `queue.txt` or a
+  target's `issue-N.txt`/`pr-N.txt`, and a list tick never reads or resets
+  those.
+- After `loop_quiescent_stop_after` qualifying quiet observations, the cadence
+  reports `stop=true` with a reason that starts with `--only <list>:`, names
+  each item's labels, and says `--only list exhausted`. `--loop` reports it
+  through stderr, the `loop_only_stop` log event, and an operator
+  notification. Work outside the list may still be queued.
+
+Every cadence reason in a list run starts with `--only <list>:` and the
+observed item states, so the one-shot `/loop` path can report progress.
+
 ### Looped (autonomous polling)
 
 ```bash
@@ -508,7 +598,8 @@ and the loop waits, even when the configured stop threshold is one.
 
 Runs ticks inside one Python process. `--loop` keeps the same HARVEST →
 DISPATCH ordering as one-shot mode and self-paces between ticks. A targeted loop
-uses the [target completion rule](#target-completion-and-cadence). The full queue
+uses the [target completion rule](#target-completion-and-cadence). A list loop
+uses the [dispatch list rule](#dispatch-list---only). The full queue
 exits after the configured number of quiescent heartbeats.
 
 Every tick invocation, looped or one-shot, takes a non-blocking mutex at
@@ -525,6 +616,7 @@ possible, and does no harvest or dispatch work.
 | At `max_in_flight`, saturated | `loop_short_poll_seconds` (270s) |
 | Quiescent (no supervisable engines or actionable work) | `loop_heartbeat_seconds` (1800s) heartbeat |
 | Full queue quiescent for `loop_quiescent_stop_after` (3) consecutive heartbeats | stop + notify |
+| `--only` list drained, no local engine, for `loop_quiescent_stop_after` (3) heartbeats | stop + notify (`loop_only_stop`); see [dispatch list](#dispatch-list---only) |
 
 The intervals are [operator configuration](#deadlines-stall-limits-routing-and-cadence).
 Both loop paths — the one-shot `tick-cadence:` line and `--loop` — pace from the
@@ -1248,7 +1340,8 @@ before DISPATCH creates a worktree or changes a label:
 | Implement | `tick.IMPLEMENTER_SKILLS` (`definition-of-done`) |
 | Fix | `tick.FIXER_SKILLS` (`review-response-hygiene`, `definition-of-done`) |
 
-Only stages in the tick's target scope are checked. A stage with an unreadable
+Only stages in the tick's target scope are checked. An `--only` tick has no
+positional target, so it checks every stage after its list resolves. A stage with an unreadable
 doc does not dispatch in that tick; the other stages dispatch normally. The tick
 prints one `tick: dispatch blocked for <stages>: ...` line naming the failed
 paths and logs one `skill_unresolved` entry with `pr: null` and
@@ -1762,8 +1855,38 @@ watch -n 5 '~/.claude/pr-pipeline/bin/pr-pipeline status'
 while true; do clear; ~/.claude/pr-pipeline/bin/pr-pipeline status; sleep 5; done
 ```
 
-Read-only — safe to run alongside a live tick. It reads GitHub labels and worktree
-markers; it never writes, edits labels, or touches engines.
+Read-only — safe to run alongside a live tick. It reads GitHub labels, worktree
+markers, and tick logs; it never writes, edits labels, or touches engines.
+
+#### DISPATCH SCOPE
+
+The first line under the header names the newest tick's dispatch scope and
+how current that evidence is:
+
+```
+DISPATCH SCOPE: --only #439,pr:468 (dispatch scope #439,pr:470,pr:468) · log evidence active: last tick 14:32:15, next due by 14:36:45
+```
+
+The dashboard cannot see the loop process, so the banner reads only retained
+tick logs. The scope is `full queue`, `target #N (scope …)`,
+`--only <list> (dispatch scope <expanded items>)`, or
+`--only <list> (scope UNREADABLE at last tick; no engine started)`.
+
+Every tick that takes the lock logs `tick_scope_requested` right after its
+startup context, before any startup check. When a list or target tick stops before it resolves its scope
+(a startup refusal, a target resolution failure, or a failed harvest), the
+banner shows `--only <list> (requested; scope not resolved; no engine
+started)` or `target #N (requested; …)`. Only a `tick_scope_requested` record
+with mode `full` shows `full queue`. A tick log with no scope record shows
+`scope unknown (no scope record)`; the banner never reads missing evidence as
+the full queue. Logs that hold only a `lock_held` refusal or a loop-stop
+notice are skipped as ticks.
+
+| Evidence | Meaning |
+|---|---|
+| `active` | The newest tick completed and its advertised next wake, plus 120 s, has not passed; or a tick started within 30 minutes and is still running |
+| `ended` | A `loop_only_stop`, `loop_target_stop`, or `loop_quiescent_stop` followed the tick, or its cadence reported `stop=true` |
+| `STALE` | The next wake is overdue with no newer tick, the tick never completed, or it reported no cadence. The scope shown is history, not a running loop |
 
 #### IN-FLIGHT ENGINES
 
