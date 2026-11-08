@@ -10,6 +10,68 @@ Each entry lists the changes users notice and any step that users must do
 after they update. Versions follow [Semantic Versioning](https://semver.org/).
 Before 1.0.0, a minor version can contain breaking changes.
 
+## [0.2.0] - 2026-11-08
+
+Tuning, visibility, and richer agent reports. Your 0.1.0 configuration keeps
+working unchanged.
+
+### Added
+
+- `tick --only '#N,pr:M'` starts new work only for the listed items, in list
+  order. Harvest still collects finished work everywhere, and a list loop
+  stops when its items have no work left. `/pr-pipeline:status` shows the
+  active dispatch scope.
+- `pr-pipeline events` shows a local feed of pipeline handoffs, with follow
+  mode, a target filter, and JSON lines output.
+- Operator configuration keys for the admission cap (`max_in_flight`), agent
+  deadlines and stall limits, the review limit (`max_iterations`), engine and
+  model routes for each stage, and loop cadence. Set them in `[defaults]` or
+  for each repository. The defaults keep the 0.1.0 behavior.
+- `--fix-engine` and `--fix-model` give the fixer its own route.
+  `/pr-pipeline:setup` records the implementation route it tested, and the
+  tick warns at startup when a configuration or flag selects a different one.
+- Reviewer and fixer runs receive the full, current pull request and linked
+  issue discussion.
+- Codex reviewers publish detailed reports with reasoning, verification, and
+  risks. Fixers publish a complete report for each finding.
+- Pipeline stages load installed skills natively. The isolated Codex reviewer
+  receives the plugin's review skills as optional guidance.
+- Implementers must follow `definition-of-done` and record evidence before
+  they report completion. A pull request without that evidence gets a visible
+  notice.
+
+### Changed
+
+- The pipeline accepts its own earlier comments only when the operator wrote
+  them and nobody edited them. An edited or forged comment cannot guide an
+  agent or change the review count.
+- The tick log records whole-session token use, turns, and duration for
+  Claude Code sessions that resume after a background task.
+
+### Fixed
+
+- `/pr-pipeline:setup` read manifests longer than 45 bytes as invalid,
+  because it did not decode GitHub's line-wrapped base64.
+- A targeted run now stops when its item reaches a final state, without
+  waiting for unrelated work.
+- Harvest keeps the report that an agent wrote for its pull request, including
+  its layout and any human edits.
+- A fixer resolves linked issues in the correct repository.
+- An unreadable installed skill document holds dispatch for the affected stage
+  for one tick and reports the paths. It no longer moves each eligible item to
+  `ai:needs-human-decision`.
+
+### Upgrade steps
+
+- Restart Claude Code and any running `tick --loop` after the update. A
+  running process keeps the 0.1.0 code.
+- If you use the terminal launcher, rerun `skills/tick/install-launcher.sh`
+  from the new install. This adds the `events` command. It does not change
+  your configuration.
+- Optional: rerun `/pr-pipeline:setup` for each repository that you set up
+  with 0.1.0. This records the tested implementation route, so the tick can
+  warn when you select a different route.
+
 ## [0.1.0] - 2026-10-03
 
 First release as an installable Claude Code plugin.
