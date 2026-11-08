@@ -44,7 +44,10 @@ loop smoke scenarios remain in issue #34.
    only after every evidence copy and diagnostic snapshot succeeds.
 10. **Targeted ticks do not mutate unrelated work** — admission still counts
     every engine this machine launched, but HARVEST, stale-label reconciliation, and
-    DISPATCH side effects remain scoped to the requested issue or PR.
+    DISPATCH side effects remain scoped to the requested issue or PR. An `--only`
+    list is different by design: it bounds new launches only, and HARVEST,
+    stale reconciliation, and occupancy stay global, so unlisted engines are
+    still harvested and relabeled.
 11. **Successful reads still validate shape** — authoritative admission queries
     must return lists of positive integer item numbers. A malformed exit-zero
     response skips dispatch exactly like a transport failure.
@@ -602,13 +605,49 @@ with `engine_result_summary` (Claude) or `reviewer_skill_observation` (Codex).
 No observation means use is unknown; it is not proof of missing guidance. Inspect
 the normal result/envelope for failures. See [skill observations](README.md#skill-observations).
 
+## `--only` dispatch lists
+
+The authoritative contract is README "[Dispatch list](README.md#dispatch-list---only)".
+Use these log entries to check what a list-scoped tick did:
+
+| Entry | Meaning |
+|---|---|
+| `only_scope_resolved` | The list was expanded after HARVEST. `details.only` is the parsed list; `details.scope` is the expanded dispatch scope, including each listed issue's open closing PR |
+| `tick_scope_requested` | Logged by every tick that takes the lock, right after `startup_context` and before any startup check. `details.mode` is `full`, `target` (`details.target`), or `only` (`details.only`). A later resolved or unreadable record supersedes it; without one, the tick stopped before resolving its scope and started no engine |
+| `skip` (`listed PR unreadable` / `listed PR is not an open PR with readable labels`, or the issue equivalents) | A listed item could not be read directly, is closed, or returned a malformed payload. It is read again next tick. List ticks never page a label queue, so an unlisted item receives no read and no write |
+| `only_scope_unreadable` | Expansion failed after HARVEST and stale reconciliation. No engine started; exit `2`; the next tick reads again. `reason` holds the GitHub or validation error |
+| `loop_only_stop` | `--loop` stopped because the list's quiet streak reached the threshold. Work outside the list may still be queued |
+
+Triage:
+
+```bash
+# What scope did each tick request, and did list expansion succeed or fail?
+jq -c 'select(.action=="tick_scope_requested" or .action=="only_scope_resolved" or .action=="only_scope_unreadable") | {ts, action, reason, details}' .claude/worktrees/.tick-log/tick-*.jsonl
+# Why was a listed item not dispatched?
+jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-log/tick-*.jsonl
+```
+
+- A listed item that never launches is ineligible or unreadable: look for its
+  `skip` entry (hold, in-flight label, untrusted author, admission, or a
+  direct read that failed). A listed PR at another stage's pickup label is
+  silently not a candidate for that stage.
+- A banner that shows `(requested; scope not resolved; no engine started)`
+  means the newest tick stopped at startup, target resolution, or harvest
+  before it resolved its scope. Check that tick's startup and
+  `skip_reconcile_failed` entries.
+- Repeated `only_scope_unreadable` with the same ambiguity reason (for
+  example, multiple open closing PRs) will not clear by itself. The loop stays
+  warm and harvests; resolve the ambiguity or restart without that item.
+- The status banner reads tick logs. `STALE` there means no tick has run since
+  the advertised next wake, so the list shown is history, not a live loop.
+
 ## Constants and boundaries
 
 - Worktree root: `.claude/worktrees`
 - Tick log directory: `.claude/worktrees/.tick-log`
 - Tick mutex: `.claude/worktrees/.tick.lock`
 - Wake-request file: `.claude/worktrees/.tick-state/wake-request`
-- Quiescent streak: `.claude/worktrees/.tick-state/quiescent-counters/{queue,issue-N,pr-N}.txt`
+- Quiescent streak: `.claude/worktrees/.tick-state/quiescent-counters/{queue,issue-N,pr-N,only-<key>}.txt`
   (counts qualifying quiet observations — see the
   [counter rules](README.md#target-completion-and-cadence))
 - Wake watcher poll: 5s; nudge debounce floor: 10s, capped by the scheduled

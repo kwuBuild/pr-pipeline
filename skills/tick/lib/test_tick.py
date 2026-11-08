@@ -2579,7 +2579,7 @@ def test_main_loop_mode_uses_locked_loop_runner(
     # Every flag is forwarded unresolved: each tick resolves the config for
     # itself, so an edit mid-loop applies on the next tick.
     run_loop.assert_called_once_with(
-        None, "", "", "", "", "", fix_engine="", fix_model="",
+        None, "", "", "", "", "", fix_engine="", fix_model="", only=None,
     )
     run_single.assert_not_called()
 

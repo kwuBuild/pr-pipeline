@@ -583,6 +583,39 @@ JQ_KEYWORDS = (
 )
 
 
+def test_status_shows_the_dispatch_scope_banner_from_tick_log_evidence(tmp_path):
+    repo = install_status_script(tmp_path)
+    log_dir = repo / ".claude/worktrees/.tick-log"
+    log_dir.mkdir(parents=True)
+    now = time.time()
+    (log_dir / "tick-20260101T000000-000001.jsonl").write_text("".join(json.dumps(entry) + "\n" for entry in [
+        {"ts": now - 10, "pr": None, "phase": "dispatch", "stage": "all",
+         "action": "only_scope_resolved", "reason": "--only #5,pr:7",
+         "details": {"only": ["#5", "pr:7"], "scope": ["#5", "pr:9", "pr:7"]}},
+        {"ts": now - 5, "pr": None, "phase": "summary", "stage": "",
+         "action": "tick_complete", "reason": "",
+         "details": {"cadence": {"next_wake_seconds": 270, "stop": False, "reason": "x"}}},
+    ]))
+
+    result = run_status(repo)
+
+    assert result.returncode == 0, result.stderr
+    banner = [line for line in result.stdout.splitlines() if line.startswith("DISPATCH SCOPE")]
+    assert len(banner) == 1, result.stdout
+    assert "--only #5,pr:7 (dispatch scope #5,pr:9,pr:7)" in banner[0]
+    assert "log evidence active" in banner[0]
+    assert result.stdout.index("DISPATCH SCOPE") < result.stdout.index("IN-FLIGHT ENGINES")
+
+
+def test_status_scope_banner_reports_missing_evidence(tmp_path):
+    repo = install_status_script(tmp_path)
+
+    result = run_status(repo)
+
+    assert result.returncode == 0, result.stderr
+    assert "DISPATCH SCOPE: no tick evidence" in result.stdout
+
+
 def stalled_quiet_seconds() -> float:
     """Seconds of heartbeat silence that must render ``STALLED``.
 

@@ -23,7 +23,14 @@ It reads only the state sources the pipeline externalizes:
    from that reading; see the `pr-pipeline:tick` README, "Markerless in-flight
    items".
 3. **Tick logs** (`.claude/worktrees/.tick-log/tick-*.jsonl`) — the most recent
-   tick's durable decision trail.
+   tick's durable decision trail. The **DISPATCH SCOPE** banner at the top reads
+   them to name the newest tick's scope (full queue, target, or `--only` list
+   with its expansion; a list or target that failed before resolving shows as
+   requested but not resolved, and a log with no scope record shows
+   `scope unknown`) and whether that evidence is `active`, `ended`, or
+   `STALE`. The dashboard cannot see the loop process; `STALE` means no tick
+   ran after the advertised next wake. See the `pr-pipeline:tick` README,
+   "DISPATCH SCOPE".
 
 ## Run
 
