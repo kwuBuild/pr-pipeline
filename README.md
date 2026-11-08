@@ -2,16 +2,16 @@
 
 [![CI](https://github.com/kwuBuild/pr-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/kwuBuild/pr-pipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Version 0.1.0](https://img.shields.io/badge/version-0.1.0-orange.svg)
+![Version 0.2.0](https://img.shields.io/badge/version-0.2.0-orange.svg)
 
 **Smart agents, dumb pipes.**
 
 You scope it. Agents ship it. You merge it.
 
-pr-pipeline is a Claude Code plugin that turns a GitHub issue into a reviewed
-pull request. Claude Code writes the change. Codex reviews it. Claude Code
-answers the review, round after round, until the pull request is ready for you
-to merge. Every step happens on GitHub, where you can follow it and step in. A
+Build your own AI software factory on GitHub. pr-pipeline is a Claude Code
+plugin that turns each issue you hand it into a reviewed pull request. Claude
+Code writes the change. Codex reviews it. Claude Code answers the review, round
+after round, until the pull request is ready for you to merge. Every step happens on GitHub, where you can follow it and step in. A
 small Python pipeline carries the work between the agents, so you don't.
 
 <!-- Demo recording goes here: a short terminal capture of /pr-pipeline:tick
@@ -374,7 +374,7 @@ use: `definition-of-done`, `review-response-hygiene`,
 
 ## Project status
 
-pr-pipeline is at version 0.1.0. Until version 1.0.0, a minor release can
+pr-pipeline is at version 0.2.0. Until version 1.0.0, a minor release can
 contain breaking changes. Each [changelog](CHANGELOG.md) entry lists the steps
 that an upgrade needs.
 
