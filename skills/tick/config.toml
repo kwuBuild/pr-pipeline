@@ -167,7 +167,7 @@ max_iterations = 5
 # --- Engine routing ---
 #
 # Explicit CLI flags (--impl-engine, --model, --fix-engine, --fix-model,
-# --review-model, --review-effort) override these for one run. A malformed
+# --effort, --fix-effort, --review-model, --review-effort) override these for one run. A malformed
 # value is a startup error naming the key.
 
 # Implementer engine: "claude" or "claude-ds". /pr-pipeline:setup writes the
@@ -188,6 +188,13 @@ model = ""
 # provider's model.
 fix_engine = ""
 fix_model = ""
+
+# Implementer and fixer effort (CLAUDE_CODE_EFFORT_LEVEL): low, medium, high,
+# xhigh or max. Blank effort sets nothing on claude, so the inherited
+# environment and settings apply, and runs claude-ds at max. Blank fix_effort
+# inherits effort on any fixer engine.
+effort = ""
+fix_effort = ""
 
 # Codex reviewer model and reasoning effort. Blank reads the operator's codex
 # config ($CODEX_HOME/config.toml), then the pinned fallback.

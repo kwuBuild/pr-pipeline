@@ -6552,6 +6552,8 @@ def test_resolve_config_tuning_defaults_are_todays_values(
     assert config.fix_model == ""
     assert config.review_model == ""
     assert config.review_effort == ""
+    assert config.effort == ""
+    assert config.fix_effort == ""
     assert config.loop_short_poll_seconds == 270
     assert config.loop_max_poll_seconds == 270
     assert config.loop_heartbeat_seconds == 30 * 60
@@ -6565,7 +6567,7 @@ def test_resolve_config_tuning_defaults_are_todays_values(
         assert isinstance(shipped, dict)
         assert set(pipeline._INT_SETTINGS) | {
             "impl_engine", "model", "fix_engine", "fix_model",
-            "review_model", "review_effort",
+            "review_model", "review_effort", "effort", "fix_effort",
         } <= set(shipped), "the shipped floor must state every default"
 
 
@@ -6750,6 +6752,9 @@ def test_resolve_config_fixer_route_inherits_only_a_usable_model(
     ("fix_model", "7"),
     ("review_model", '"--yolo"'),
     ("review_effort", '"high; rm"'),
+    ("effort", '"ultra"'),
+    ("effort", "3"),
+    ("fix_effort", '"--loop"'),
 ])
 def test_resolve_config_reports_an_unusable_route(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, key: str, value: str,
@@ -6760,6 +6765,54 @@ def test_resolve_config_reports_an_unusable_route(
     config = pipeline.resolve_config("owner/name")
 
     assert any(key in e for e in config.errors), config.errors
+
+
+@pytest.mark.parametrize("text, efforts", [
+    # No layer sets effort: neither stage gets an override.
+    ("", ("", "")),
+    # A blank fix_effort inherits effort on the implementer's engine.
+    ('effort = "high"\n', ("high", "high")),
+    # It also inherits on another engine: effort levels belong to no provider.
+    ('effort = "high"\nfix_engine = "claude-ds"\n', ("high", "high")),
+    # A set fix_effort replaces effort for the fixer only.
+    ('effort = "high"\nfix_effort = "low"\n', ("high", "low")),
+    ('fix_effort = "max"\n', ("", "max")),
+])
+def test_resolve_config_fixer_effort_inherits_on_any_engine(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    text: str, efforts: tuple[str, str],
+) -> None:
+    """A blank fix_effort is the implementer's effort on every fixer engine."""
+    operator_config(monkeypatch, tmp_path, f'[defaults]\n{text}')
+
+    config = pipeline.resolve_config("owner/name")
+
+    assert config.errors == ()
+    assert (config.effort, config.fix_effort) == efforts
+
+
+def test_resolve_config_effort_flags_outrank_every_layer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """--effort and --fix-effort beat the repository section and [defaults]."""
+    operator_config(
+        monkeypatch, tmp_path,
+        '[defaults]\neffort = "low"\nfix_effort = "low"\n'
+        '\n[repos."owner/name"]\neffort = "medium"\nfix_effort = "medium"\n',
+    )
+
+    config = pipeline.resolve_config("owner/name", cli_overrides={
+        "effort": "xhigh", "fix_effort": "max",
+    })
+    refused = pipeline.resolve_config(
+        "owner/name", cli_overrides={"fix_effort": "ultra"},
+    )
+
+    assert config.errors == ()
+    assert (config.effort, config.fix_effort) == ("xhigh", "max")
+    assert any(
+        "fix_effort" in e and "the command line" in e for e in refused.errors
+    )
 
 
 def test_resolve_config_route_flags_outrank_the_config(

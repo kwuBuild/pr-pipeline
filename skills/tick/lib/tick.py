@@ -620,7 +620,9 @@ def _engine_env() -> dict[str, str]:
     return dict(os.environ)
 
 
-def _resolve_engine(impl_engine: str, model: str = "") -> tuple[str, dict[str, str]]:
+def _resolve_engine(
+    impl_engine: str, model: str = "", effort: str = "",
+) -> tuple[str, dict[str, str]]:
     """Translate an engine name to a binary and extra env vars.
 
     ``"claude-ds"`` is a shell function that wraps ``claude`` with DeepSeek
@@ -633,13 +635,21 @@ def _resolve_engine(impl_engine: str, model: str = "") -> tuple[str, dict[str, s
             ``"claude-ds"``, sets ``ANTHROPIC_MODEL`` to this value instead
             of the default ``deepseek-v4-pro[1m]``. Ignored for ``"claude"``
             (the model is passed directly to ``--model`` on the CLI).
+        effort: Optional effort level, already validated against
+            :data:`pipeline.ENGINE_EFFORT_LEVELS`. ``"claude-ds"`` sets
+            ``CLAUDE_CODE_EFFORT_LEVEL`` to it, or to ``max`` when blank.
+            ``"claude"`` sets it only when non-blank, so a blank effort keeps
+            the inherited environment and Claude settings.
 
     Returns:
         ``(binary, extra_env)`` — the binary name and any additional env
         vars to merge into the Popen env.
     """
     if impl_engine != "claude-ds":
-        return (impl_engine, {})
+        return (
+            impl_engine,
+            {"CLAUDE_CODE_EFFORT_LEVEL": effort} if effort else {},
+        )
 
     token = os.environ.get("DEEPSEEK_API_KEY", "")
     if not token:
@@ -690,7 +700,7 @@ def _resolve_engine(impl_engine: str, model: str = "") -> tuple[str, dict[str, s
         "ANTHROPIC_DEFAULT_SONNET_MODEL": resolved_model,
         "ANTHROPIC_DEFAULT_HAIKU_MODEL": "deepseek-v4-flash",
         "CLAUDE_CODE_SUBAGENT_MODEL": resolved_model,
-        "CLAUDE_CODE_EFFORT_LEVEL": "max",
+        "CLAUDE_CODE_EFFORT_LEVEL": effort or "max",
     }
     return ("claude", extra)
 
@@ -10835,6 +10845,7 @@ def dispatch_implementers(
     *,
     impl_engine: str = "claude",
     model: str = "",
+    effort: str = "",
     permission_mode: str = "auto",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
     timeout_seconds: int = IMPLEMENTER_TIMEOUT,
@@ -11020,6 +11031,7 @@ def dispatch_implementers(
             tick_log=tick_log,
             impl_engine=impl_engine,
             model=model,
+            effort=effort,
             permission_mode=permission_mode,
             timeout_seconds=timeout_seconds,
             stall_seconds=stall_seconds,
@@ -11153,6 +11165,7 @@ def _dispatch_one_implementer(
     tick_log: TickLog | None = None,
     impl_engine: str = "claude",
     model: str = "",
+    effort: str = "",
     permission_mode: str = "auto",
     timeout_seconds: int = IMPLEMENTER_TIMEOUT,
     stall_seconds: int = ENGINE_STALL_SECONDS,
@@ -11385,7 +11398,9 @@ def _dispatch_one_implementer(
 
     # Resolve engine name to binary + extra env (claude-ds is a shell function).
     try:
-        engine_bin, engine_extra_env = _resolve_engine(impl_engine, model=model)
+        engine_bin, engine_extra_env = _resolve_engine(
+            impl_engine, model=model, effort=effort,
+        )
     except RuntimeError:
         _escalate_dispatch_setup_failure(
             entity="issue",
@@ -11499,7 +11514,11 @@ def _dispatch_one_implementer(
             reason=f"pid={proc.pid}, title={issue_title[:60]}",
             engine=impl_engine,
             dispatch_id=dispatch_id,
-            details={"model": model or None, "effort": None},
+            # The effort the tick handed the engine; None means it set none.
+            details={
+                "model": model or None,
+                "effort": engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+            },
         )
 
 
@@ -11510,6 +11529,7 @@ def dispatch_fixers(
     *,
     impl_engine: str = "claude",
     model: str = "",
+    effort: str = "",
     permission_mode: str = "auto",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
     timeout_seconds: int = FIXER_TIMEOUT,
@@ -11667,6 +11687,7 @@ def dispatch_fixers(
             tick_log=tick_log,
             impl_engine=impl_engine,
             model=model,
+            effort=effort,
             permission_mode=permission_mode,
             timeout_seconds=timeout_seconds,
             stall_seconds=stall_seconds,
@@ -11871,6 +11892,7 @@ def _dispatch_one_fixer(
     tick_log: TickLog | None = None,
     impl_engine: str = "claude",
     model: str = "",
+    effort: str = "",
     permission_mode: str = "auto",
     timeout_seconds: int = FIXER_TIMEOUT,
     stall_seconds: int = ENGINE_STALL_SECONDS,
@@ -12204,7 +12226,9 @@ def _dispatch_one_fixer(
 
     # Resolve engine name to binary + extra env (claude-ds is a shell function).
     try:
-        engine_bin, engine_extra_env = _resolve_engine(impl_engine, model=model)
+        engine_bin, engine_extra_env = _resolve_engine(
+            impl_engine, model=model, effort=effort,
+        )
     except RuntimeError:
         _escalate_dispatch_setup_failure(
             entity="pr",
@@ -12316,7 +12340,11 @@ def _dispatch_one_fixer(
             reason=f"pid={proc.pid}",
             engine=impl_engine,
             dispatch_id=dispatch_id,
-            details={"head_sha": head_sha[:8], "model": model or None, "effort": None},
+            details={
+                "head_sha": head_sha[:8],
+                "model": model or None,
+                "effort": engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+            },
         )
 
 
@@ -12658,13 +12686,15 @@ def main(
     review_effort: str = "",
     permission_mode: str = "",
     loop: bool = False,
+    effort: str = "",
+    fix_effort: str = "",
 ) -> int:
     """Run one PR-pipeline tick: HARVEST → DISPATCH → Summary.
 
     Every engine-route argument is the explicit per-invocation flag. Empty
     (the default) means no flag was typed, so the operator's configured value
     applies (``impl_engine``, ``model``, ``fix_engine``, ``fix_model``,
-    ``review_model``, ``review_effort`` in ``[defaults]`` or
+    ``effort``, ``fix_effort``, ``review_model``, ``review_effort`` in ``[defaults]`` or
     ``[repos."owner/name"]``). A typed value outranks every config layer and
     is validated like one at startup.
 
@@ -12695,6 +12725,10 @@ def main(
             the packaged floor sets to ``"auto"``. A value passed here is the
             explicit per-invocation flag and outranks every config layer.
         loop: When True, run ticks in-process until interrupted or quiescent.
+        effort: Implementer effort (``CLAUDE_CODE_EFFORT_LEVEL``). A resolved
+            blank sets nothing on claude and means ``max`` on claude-ds.
+        fix_effort: Fixer effort. A resolved blank inherits ``effort`` on any
+            fixer engine.
 
     Returns:
         Process exit code: 0 = full tick completed, 1 = reconcile failed
@@ -12757,11 +12791,12 @@ def main(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
                 fix_engine=fix_engine, fix_model=fix_model, only=parsed_only,
+                effort=effort, fix_effort=fix_effort,
             )
         return _run_single_tick_locked(
             parsed_target, impl_engine, model, review_model, review_effort,
             permission_mode, fix_engine=fix_engine, fix_model=fix_model,
-            only=parsed_only,
+            only=parsed_only, effort=effort, fix_effort=fix_effort,
         ).exit_code
     finally:
         tick_lock.release()
@@ -12841,6 +12876,8 @@ def _run_single_tick_locked(
     *,
     fix_engine: str = "",
     fix_model: str = "",
+    effort: str = "",
+    fix_effort: str = "",
     count_quiescent_heartbeat: bool = True,
     unattended: bool = False,
     quiescent_stop_after: int | None = None,
@@ -12864,6 +12901,8 @@ def _run_single_tick_locked(
             fixer engines (``"auto"`` or ``"dontAsk"``).
         fix_engine: ``--fix-engine`` flag.
         fix_model: ``--fix-model`` flag.
+        effort: ``--effort`` flag.
+        fix_effort: ``--fix-effort`` flag.
         count_quiescent_heartbeat: Forwarded to :func:`_run_tick_body`; only
             the in-process loop passes ``False``, for a nudge-initiated tick.
         unattended: True under the in-process loop, where nobody can answer a
@@ -12937,6 +12976,8 @@ def _run_single_tick_locked(
         "model": model,
         "fix_engine": fix_engine,
         "fix_model": fix_model,
+        "effort": effort,
+        "fix_effort": fix_effort,
         "review_model": review_model,
         "review_effort": review_effort,
     }
@@ -13391,6 +13432,8 @@ def _run_loop_locked(
     *,
     fix_engine: str = "",
     fix_model: str = "",
+    effort: str = "",
+    fix_effort: str = "",
     quiescent_stop_after: int | None = None,
     only: tuple[tuple[str, int], ...] | None = None,
 ) -> int:
@@ -13435,6 +13478,7 @@ def _run_loop_locked(
                 parsed_target, impl_engine, model,
                 review_model, review_effort, permission_mode,
                 fix_engine=fix_engine, fix_model=fix_model,
+                effort=effort, fix_effort=fix_effort,
                 count_quiescent_heartbeat=after_heartbeat,
                 unattended=True,
                 quiescent_stop_after=quiescent_stop_after,
@@ -14741,6 +14785,10 @@ def _run_tick_body(
         (config.fix_engine, config.fix_model) if config is not None
         else (impl_engine, model)
     )
+    # Blank is "no override": claude keeps its inherited effort, claude-ds max.
+    effort, fix_effort = (
+        (config.effort, config.fix_effort) if config is not None else ("", "")
+    )
     cadence = tuning.cadence()
     if quiescent_stop_after is not None:
         cadence["quiescent_stop_after"] = quiescent_stop_after
@@ -15007,6 +15055,7 @@ def _run_tick_body(
                 authoritative_in_flight=authoritative_in_flight,
                 impl_engine=impl_engine,
                 model=model,
+                effort=effort,
                 permission_mode=permission_mode,
                 max_in_flight=max_in_flight,
                 timeout_seconds=tuning.implementer_timeout_seconds,
@@ -15020,6 +15069,7 @@ def _run_tick_body(
                 authoritative_in_flight=authoritative_in_flight,
                 impl_engine=fix_engine,
                 model=fix_model,
+                effort=fix_effort,
                 permission_mode=permission_mode,
                 max_in_flight=max_in_flight,
                 timeout_seconds=tuning.fixer_timeout_seconds,
@@ -15197,6 +15247,8 @@ class CliArgs(TypedDict):
     model: str
     fix_engine: str
     fix_model: str
+    effort: str
+    fix_effort: str
     review_model: str
     review_effort: str
     permission_mode: str
@@ -15210,6 +15262,8 @@ _VALUE_FLAGS = {
     "--model": "model",
     "--fix-engine": "fix_engine",
     "--fix-model": "fix_model",
+    "--effort": "effort",
+    "--fix-effort": "fix_effort",
     "--review-model": "review_model",
     "--review-effort": "review_effort",
     "--permission-mode": "permission_mode",
@@ -15338,6 +15392,8 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
         "model": values["model"],
         "fix_engine": values["fix_engine"],
         "fix_model": values["fix_model"],
+        "effort": values["effort"],
+        "fix_effort": values["fix_effort"],
         "review_model": values["review_model"],
         "review_effort": values["review_effort"],
         "permission_mode": permission_mode,
@@ -15360,6 +15416,8 @@ if __name__ == "__main__":  # pragma: no cover
             model=cli_args["model"],
             fix_engine=cli_args["fix_engine"],
             fix_model=cli_args["fix_model"],
+            effort=cli_args["effort"],
+            fix_effort=cli_args["fix_effort"],
             review_model=cli_args["review_model"],
             review_effort=cli_args["review_effort"],
             permission_mode=cli_args["permission_mode"],
