@@ -280,8 +280,8 @@ Three labels stop automation and wait for you:
 
 | Label | Meaning |
 |---|---|
-| `ai:needs-human-decision` | An agent or the pipeline found a scope or design question, or a conflict over who owns the item, that it must not decide alone. An agent that ran past its deadline or kept failing also lands here. |
-| `ai:max-iterations` | The pull request reached the review limit (five completed reviews by default) without approval. |
+| `ai:needs-human-decision` | An agent or the pipeline found a scope or design question, or a conflict over who owns the item, that it must not decide alone. An agent that ran past its deadline or kept failing also lands here. To resume a pull request, comment on it as an approved reviewer: the next tick returns it to `ai:changes-requested` and the fixer acts on your comment. |
+| `ai:max-iterations` | The pull request reached the configured round limit (five by default) without approval. See the [round budget](skills/tick/README.md#comment-trust-and-incomplete-history), which also counts approved-input fixes and local reservations. |
 | `ai:blocked` | You set this to hold an item for a dependency or a decision. |
 
 ### Each run harvests, then dispatches
@@ -318,8 +318,16 @@ recovery; the [diagnostics guide](skills/tick/DEBUG.md) explains how.
   gate is off by default, because only your own issues and pull requests enter
   the pipeline. Set `allow_touching = false` to send those pull requests to
   `ai:needs-human-decision` instead.
+- **Only approved reviewers direct fixes.** The fixer acts on the pipeline's
+  own review, or on a newer PR comment or submitted change-request/comment
+  review from your login or `approved_reviewers`. Approved input can carry one
+  leading review marker; other control markers and unapproved authors cannot
+  direct fixes. See [comment trust](skills/tick/README.md#comment-trust-and-incomplete-history).
+  `ai:blocked` always holds.
 - **Review cycles have a limit.** The pipeline stops a pull request at
-  `ai:max-iterations` instead of letting the review and fix cycle continue.
+  `ai:max-iterations` instead of letting the review and fix cycle continue. A
+  fix that starts from a distinct approved input counts as a review round.
+  The cap also applies before resuming a human hold.
 - **Manual work is left alone.** If you, or an agent that you direct, take an
   item, the pipeline does not take it back.
 - **Setup does not change your repository's files.** It creates the `ai:`

@@ -28,6 +28,8 @@ The controller pinned this finding snapshot from the exact report above:
 
 Use each complete finding reference (originating review identity plus ID) in a
 finding response. Historical findings have ordinal IDs in original order.
+An approved reviewer's comment without controller metadata is one finding with
+the ID `C1`: respond to the whole comment under that single reference.
 Additional observations are context, not required findings. Do not infer a new
 finding set or cross-round carry-forward from prose.
 

@@ -359,6 +359,11 @@ elif a[:2] in (["issue", "edit"], ["pr", "edit"]):
     sys.exit(0)
 elif a[:2] in (["issue", "comment"], ["pr", "comment"]):
     print("https://example.invalid/comment/1"); sys.exit(0)
+elif a[:2] == ["api", "graphql"] and "--slurp" in a:
+    # Held PRs read their comment history to decide a resume; none is present.
+    result = [{"data": {"repository": {"pullRequest": {"reviews": {"totalCount": 0, "nodes": [],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}, "comments": {
+        "totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}]
 else:
     (root / "unexpected").write_text(repr(a))
     raise AssertionError(a)

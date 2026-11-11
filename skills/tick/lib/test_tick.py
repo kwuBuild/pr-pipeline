@@ -6090,7 +6090,10 @@ def test_each_dispatcher_queries_exactly_its_stages_pickup_labels(
             with mock.patch("tick.verify_codex_bin"):
                 dispatchers[stage](authoritative_in_flight=[])
 
-    assert set(queried) == set(pipeline.STAGE_PICKUP_LABELS[stage])
+    # The fixer also lists ai:needs-human-decision PRs, only to resume a hold
+    # an approved reviewer answered; that listing is not a pickup query.
+    resume = {pipeline.LABEL_NEEDS_HUMAN} if stage == "fix" else set()
+    assert set(queried) == set(pipeline.STAGE_PICKUP_LABELS[stage]) | resume
 
 
 @pytest.mark.parametrize("stage", ["review", "fix"])
@@ -14233,6 +14236,7 @@ def test_harvest_one_fixer_rechecks_and_relabels(
         body_revision="",
         dispatch_id="d-12",
         review_sha256="",
+        approved_input_sha256="",
         report_protocol_version=None, review_handoff=None,
     )
     converge_mock.assert_called_once_with(

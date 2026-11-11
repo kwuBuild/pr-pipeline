@@ -201,6 +201,7 @@ login = "your-github-login"   # whose issues are picked up and PRs reviewed
 
 [defaults]                    # operator-wide; every key is overridable per repo
 allow_touching  = true        # auto-review PRs that edit reviewer-governing files
+approved_reviewers = []       # logins whose PR comments direct the fixer; login is implicit
 checklist_paths = []          # the target's own review checklists, repo-relative
 verify_tools    = ["<your test command> *"]  # engine Bash grants, replaced wholesale
 base_ref        = ""          # "" = discover the target's GitHub default branch
@@ -233,6 +234,10 @@ Per-repository keys override `[defaults]`; lists replace wholesale, so
 `verify_tools = []` grants no verification commands. Explicit CLI overrides win.
 The [resolver contract](../../docs/working/pr-pipeline-internals.md#7-operator-configuration-resolution)
 owns the complete precedence and validation rules.
+
+`approved_reviewers` lists GitHub logins, beside `[operator] login`, whose PR
+conversation comments and submitted reviews the fixer acts on. See
+[Comment trust and incomplete history](#comment-trust-and-incomplete-history).
 
 Bad configuration exits 3 and names the offending key. The exception is
 `allow_touching`: an unusable value keeps the conservative gate, warns, and lets
@@ -1699,22 +1704,83 @@ holds the PR for a later tick. These checks detect changing history; they do not
 provide an atomic GitHub snapshot or cover a change after the final read.
 
 Only unedited comments by that operator, with an exact marker on the first line,
-can supply fixer instructions, no-change review context, review-round counts, or
-review replay proof. A newer comment from another author cannot replace a trusted
-review. The same published review token counts once; older trusted comments
-without a round token still count individually. LF and CRLF separators are
-accepted; header whitespace is not. Raw bodies stay unchanged for fingerprints.
+can supply controller metadata or review replay proof. The same published review
+token counts once; older trusted
+comments without a round token still count individually. LF and CRLF separators
+are accepted; header whitespace is not. Raw bodies stay unchanged for fingerprints.
+
+Fixer input is one approved source, selected as follows:
+
+1. An *approved input* is a PR conversation comment or a submitted review body
+   from the operator login or a login in `approved_reviewers` (compared without
+   case). Submitted reviews must be `CHANGES_REQUESTED` or `COMMENTED`;
+   pending, dismissed, and approval reviews do not start fixes. Inline threads
+   remain discussion context, not separate fixer inputs.
+2. An approved input can have no marker or one exact leading
+   `<!-- pr-pipeline:review -->` marker. Any other pipeline marker, including a
+   quoted marker or controller metadata supplied by another approved author,
+   disqualifies it. Existing operator-authored pipeline review reports retain
+   their controller finding set.
+3. Operator conversation comments with control markers are *pipeline actions*.
+   The newest approved input after the last action wins. Without one, the
+   latest operator pipeline review is the fixer input. Submitted reviews use
+   `submittedAt`, not draft creation time; comments use `createdAt`. A pipeline
+   action wins a same-timestamp tie with a submitted review.
+4. Each approved input is one finding, `C1`. Dispatch pins both its body SHA-256
+   and the SHA-256 of `id:<GraphQL source ID>`. Harvest publishes the latter as
+   `pr-pipeline:approved-input` in its controller header. Each distinct source
+   counts as a round even if its text repeats an earlier input. Publication
+   retries count once, and source deletion cannot erase the published round.
+   Existing body-only pins retain their historical counting rule. Operator
+   review-marker comments already counted as reviews are not counted twice.
+
+Fixer selection and resume read both comment and review connections twice,
+with the same complete-pagination and stable-snapshot checks described above.
+An approved input needs explicit unedited provenance, or a valid edit timestamp
+and a known editor matching its author. Unknown or malformed edit provenance
+blocks progress; an edit by another user is not eligible. Operator conversation
+comments retain the stricter unedited-only rule below. Submitted reviews never
+supply controller metadata, even when authored by the operator.
+
+A newer approved input also releases a hold. Each tick lists open
+`ai:needs-human-decision` PRs (or the `--only` PRs). With no other workflow label
+except `ai:changes-requested`, no dispatch marker, and an unused approved input,
+the tick checks `max_iterations` before replacing the human hold with
+`ai:changes-requested`. Every direct fixer dispatch, including one selected from
+a pipeline review, applies the same budget check. Reviewer harvest uses the same
+combined round count before choosing the next label.
+At the cap, the tick sets `ai:max-iterations` and launches no fixer. This covers
+repeated fix → human decision → reply cycles and subsequent re-review. An approved
+candidate uses an available round; its optional review marker does not make it a
+previously spent round. Historical controller reviews retain their existing count.
+`ai:blocked`, `ai:max-iterations`, and in-flight labels keep the hold. The loop
+does not wake for a comment; resume occurs on the next tick that runs.
+
+Before launch, dispatch records the source ID in
+`WT_ROOT/.receipts/pr-<N>-approved-inputs.json`. Resume refuses a consumed input.
+The budget counts each source once across receipts, published fix headers and
+operator review comments. Receipts without published fix headers remain counted,
+so silent or resultless outcomes cannot reset spending on this checkout. A receipt
+for the current input without a published result can retry dispatch after a pre-launch
+crash; the existing dispatch-attempt cap still applies. A failed receipt write
+skips launch, and an unreadable receipt blocks resume, all fixer admission and
+reviewer harvest while preserving custody. Receipts are local: another checkout
+cannot reconstruct silent attempts, while published source pins remain available
+through GitHub.
 
 GitHub's `lastEditedAt`, `editor`, and `includesCreatedEdit` must explicitly report
 no edit on every operator-authored comment. Original authorship and matching REST
 timestamps do not authenticate the current body. An edited operator comment holds
 processing even when its marker is gone, since ignoring it could erase a review
-round. This also holds ordinary operator notes and operator-made edits. A known
-foreign author's comment still has no authority, edited or otherwise.
+round. This also holds ordinary operator notes and operator-made edits. Authors outside the approved set cannot direct fixes. Only the operator
+can supply controller metadata.
 
-Known foreign authors are ignored and recorded locally as
-`comment_authors_ignored`. If a fixer has no trusted review, setup escalates to
-`ai:needs-human-decision` without launching an engine. Missing/malformed authors,
+Controller-history accounting logs non-operator entries as
+`comment_authors_ignored`; `fixer_input` identifies the input actually selected.
+If a fixer has neither a trusted review nor a newer
+approved comment, setup escalates to `ai:needs-human-decision` without launching
+an engine. An approved comment with missing edit provenance logs
+`comment_history_refused` and holds the PR. Missing/malformed authors,
 missing edit provenance, edited operator comments, malformed bodies or pages,
 changing histories, and failed page reads are different: the tick records
 `comment_history_refused`, retains the current label and existing evidence, and

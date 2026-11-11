@@ -605,6 +605,31 @@ with `engine_result_summary` (Claude) or `reviewer_skill_observation` (Codex).
 No observation means use is unknown; it is not proof of missing guidance. Inspect
 the normal result/envelope for failures. See [skill observations](README.md#skill-observations).
 
+## Fixer input escalations and resumed holds
+
+The selection rule is in
+[Comment trust and incomplete history](README.md#comment-trust-and-incomplete-history).
+Use these tick-log entries to find which branch a PR took:
+
+| Entry (`stage: fix`) | Meaning | Action |
+|---|---|---|
+| `fixer_input` | The fixer selected an input; admission and launch can still fail. `details.kind` is `review` or `approved`, and `details.author` names the comment author. | None. |
+| `escalate`, reason `no trusted pipeline review comment or approved reviewer comment found — nothing to fix` | No operator review exists, and no approved comment is newer than the last pipeline comment. | Post a PR conversation comment or submit a change-request/comment review from the operator login or `approved_reviewers`. Only one leading review marker is allowed; inline-only threads do not start fixes. |
+| `resume` | A newer approved comment moved the PR from `ai:needs-human-decision` to `ai:changes-requested`. | None; the fixer runs when admission allows. |
+| `hold_retained` | The held PR kept its hold: `ai:blocked` or another workflow label, a local `dispatch.json`, unreadable labels, a failed relabel, an unreadable `.receipts/pr-<N>-approved-inputs.json`, a newest approved input that already started a fix, or the configured round cap (`ai:max-iterations`). | Remove the named label or resolve the marker; for an already-used comment, post a new comment. A failed read retries next tick. |
+| `comment_history_refused` | History was incomplete, changed between reads, or an approved comment had unknown edit provenance. | Retry; no label changed and no engine started. |
+
+An unreadable approved-input receipt also emits `hold_retained` at `stage: review`
+and retains the reviewer marker and result. Inspect the receipt before retrying;
+deleting it would erase local silent-attempt accounting. All fixer inputs and
+reviewer harvest use the [shared round budget](README.md#comment-trust-and-incomplete-history).
+
+An approved comment that was posted before the escalation comment does not
+resume the PR: the pipeline already answered it. Post a new comment. A comment
+from a login outside the approved list, or an approved comment that another
+user edited, never starts a fix. Each distinct approved input counts as a
+review round, so the PR can still reach `ai:max-iterations`.
+
 ## `--only` dispatch lists
 
 The authoritative contract is README "[Dispatch list](README.md#dispatch-list---only)".
@@ -723,7 +748,7 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   `includeIf`, worktree settings and engine `GIT_CONFIG_*` environment. Correct
   the configuration and rerun the tick; do not discard retained review evidence.
 - Configuration errors: a malformed `base_ref`, `permission_mode`,
-  `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`, engine
+  `[operator] login`, `approved_reviewers`, `verify_tools`, `checklist_paths`, `[scan] repos`, engine
   route (`impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`,
   `fix_effort`, `review_model`, `review_effort`, or the matching flag), or any deadline, stall, round,
   cooldown or cadence key exits 3 with `startup_config_invalid` naming the key —

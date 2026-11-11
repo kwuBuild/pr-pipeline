@@ -305,7 +305,10 @@ pr:ai:reviewing
     ──[ai:reviewing with missing/corrupt marker]──▶ pr:ai:reviewing   (retained; no proof of custody)
 
 pr:ai:changes-requested
-    ──[tick dispatches fixer]──▶ pr:ai:fixing
+    ──[tick dispatches fixer]──▶ pr:ai:fixing   (input: latest operator review, or a newer approved comment/submitted review)
+
+pr:ai:needs-human-decision   (no ai:blocked or other workflow label, no local marker)
+    ──[unused approved input newer than the last pipeline action, below round cap]──▶ pr:ai:changes-requested   (resume)
 
 pr:ai:fixing
     ──[harvest: FIXES_PUSHED, head advanced]──▶ pr:ai:revised
@@ -1264,6 +1267,11 @@ since a malformed value would silently degrade the drift guard to the merge-base
 fallback. The optional `fix_round` is also review-only and must be a lowercase
 64-hex token. The optional `review_sha256` is fix-only and must also be a
 lowercase 64-hex fingerprint; it pins the review handed to that fixer.
+`approved_input_sha256`, when present, is fix-only, lowercase 64-hex, and requires
+an approved-comment handoff (version 3). It pins the GraphQL source identity
+independently of body text. Harvest preserves it in the controller header;
+re-review resolves that exact source and body. See the authoritative
+[selection and round rules](../skills/tick/README.md#comment-trust-and-incomplete-history).
 An invalid marker is treated as marker-less, and marker absence is
 never evidence: reconciliation **retains** the `ai:reviewing` label and takes no
 action rather than driving an incorrect revert from a corrupt record. The one

@@ -761,7 +761,7 @@ reads them from the configuration its startup gate validated and passes that
 | `max_in_flight` | all three dispatchers and both cadence paths, from the same startup `ResolvedConfig` |
 | `implementer_timeout_seconds`, `fixer_timeout_seconds`, `review_timeout_seconds` | the dispatchers, which record the marker `deadline` that reconciliation enforces |
 | `engine_stall_seconds`, `engine_stall_startup_grace_seconds` | implementer/fixer dispatch, which records them in the marker as `stall_seconds` and `stall_startup_grace_seconds`; `tick._engine_progress` reads them there for the tick, the `--loop` watcher, and the status dashboard |
-| `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)` |
+| `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)`; hold release and all fixer dispatch → `tick._fix_within_budget`, using the [shared round budget](../../skills/tick/README.md#comment-trust-and-incomplete-history) |
 | `transient_cooldown_seconds`, `transient_cooldown_reset_buffer_seconds` | implementer/fixer harvest → `transient_cooldown_until` |
 | `impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`, `fix_effort`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |
 | `loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`, `loop_quiescent_stop_after` | `pipeline.compute_next_wake` in the tick body, through `ResolvedConfig.cadence()`; `_run_loop_locked` consumes the returned `TickOutcome.cadence` unchanged |
@@ -844,7 +844,7 @@ Malformation splits two ways:
   reading and appends to `ResolvedConfig.warnings`. The tick logs
   `startup_config_warning` and runs.
 - **Has none** (`base_ref`, `permission_mode`, `engine_settings`,
-  `max_in_flight`, `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`, the
+  `max_in_flight`, `[operator] login`, `approved_reviewers`, `verify_tools`, `checklist_paths`, `[scan] repos`, the
   engine routes, and every integer tuning key) — appends to
   `ResolvedConfig.errors`. The tick logs `startup_config_invalid` and exits 3,
   naming the key. So does a container declared as something other than a table:
