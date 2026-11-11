@@ -201,8 +201,12 @@ def test_real_target_loop_stops_on_next_tick_with_unrelated_engine_live(loop_rep
             proc = subprocess.Popen(["bash", script, "--loop", target], cwd=repo, env=env,
                                     stdout=err, stderr=err, start_new_session=True)
             wait_for(lambda: cadence_lines(stderr), proc, stderr, timeout=90)
-            assert "stop=false" in cadence_lines(stderr)[0]
-            assert "in-flight" in cadence_lines(stderr)[0]
+            first = cadence_lines(stderr)[0]
+            # On failure, show the loop's own log: the cadence line alone
+            # cannot say why the live fixture engine was not counted.
+            assert "stop=false" in first and "in-flight" in first, (
+                first + "\n" + tick_log_text(repo)
+            )
             # The emitted cadence is the loop decision; no second target
             # read can change this tick after the summary appears.
             targets[f"pr:{terminal_number}"]["labels"] = [{"name": "ai:ready-for-human"}]
@@ -410,6 +414,12 @@ def run_until_reported_stop(repo, env, args):
 def scope_item(number, label=None):
     return {"number": number, "state": "OPEN", "author": {"login": "test-owner"},
             "labels": [] if label is None else [{"name": label}]}
+
+
+def tick_log_text(repo):
+    return "\n".join(
+        log.read_text() for log in sorted((repo / ".claude/worktrees/.tick-log").glob("*.jsonl"))
+    )
 
 
 def cadence_lines(path):
