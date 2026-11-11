@@ -95,6 +95,18 @@ python3.13 -m venv .venv && .venv/bin/pip install pytest
 .venv/bin/python -m pytest skills/ -q
 ```
 
+The full suite takes about 19 minutes when it runs serially, because many tests
+run the real `tick.sh` against subprocess shims. When `pytest-xdist` is
+available, add `-n auto` to run it in parallel (about 5 minutes on 10 cores).
+pytest-xdist is an optional test tool, not a runtime dependency:
+
+```bash
+.venv/bin/pip install pytest-xdist
+.venv/bin/python -m pytest skills/ -q -n auto
+# Or, without a venv:
+uv run --python 3.13 --with pytest --with pytest-xdist python -m pytest skills/ -q -n auto
+```
+
 Never use bare `python3` or a bare `pytest` selected through `uv run --python`:
 PATH can resolve them to Python 3.9. `gh`, `git`, and `codex` must resolve on PATH
 for the startup probe; their real invocations are mocked in tests.
