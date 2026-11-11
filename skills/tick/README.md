@@ -218,6 +218,8 @@ base_ref     = "master"
 verify_tools = ["<that repo's test command> *"]
 impl_engine  = "claude"       # editable routing defaults, initially set by setup
 model        = ""
+effort       = "high"         # implementer CLAUDE_CODE_EFFORT_LEVEL; "" = no override
+fix_effort   = "medium"       # fixer effort; "" inherits effort
 probed_impl_engine = "claude" # setup evidence: refresh through setup
 probed_model       = ""
 ```
@@ -331,6 +333,8 @@ activity. Each one can be set in `[defaults]` and overridden in
 | `model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
 | `fix_engine` | — | `""` | blank (the implementer's engine), `"claude"`, or `"claude-ds"` | fixer launch |
 | `fix_model` | — | `""` | blank, or a model id | fixer `--model`; blank inherits `model` only while the fixer runs on the implementer's engine |
+| `effort` | — | `""` | blank, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | implementer `CLAUDE_CODE_EFFORT_LEVEL`; blank sets nothing on claude (the inherited environment and settings apply) and means `max` on claude-ds |
+| `fix_effort` | — | `""` | blank, or a level allowed for `effort` | fixer `CLAUDE_CODE_EFFORT_LEVEL`; blank inherits `effort` on any fixer engine |
 | `review_model` | — | `""` | blank (codex config, then `gpt-5.5`), or a model id | reviewer `--model` |
 | `review_effort` | — | `""` | blank (codex config, then `high`), or a bare token | reviewer `model_reasoning_effort` |
 | `loop_short_poll_seconds` | seconds | 270 | integer ≥ 60, not 300 | wake while work is queued, at capacity, or state is unknown |
@@ -343,7 +347,8 @@ activity. Each one can be set in `[defaults]` and overridden in
 Precedence is the same as for every key: explicit CLI flags, then
 `[repos."owner/name"]`, then `[defaults]`, then the packaged floor. Only the
 route keys have flags: `--impl-engine`, `--model`, `--fix-engine`,
-`--fix-model`, `--review-model`, and `--review-effort`. A typed flag is
+`--fix-model`, `--effort`, `--fix-effort`, `--review-model`, and
+`--review-effort`. A typed flag is
 validated like a config value.
 
 Integer keys accept integers only. A boolean, float, or string, a value below
@@ -991,6 +996,26 @@ Anthropic model aliases and so has no operator default to inherit.
 
 When given, `--model` overrides the `--model` CLI flag for the `claude` engine
 and additionally sets `ANTHROPIC_MODEL` for `claude-ds`.
+
+### Implementer and fixer effort (`--effort`, `--fix-effort`)
+
+```bash
+~/.claude/pr-pipeline/bin/pr-pipeline tick --effort high --fix-effort medium
+```
+
+Sets the effort level that the implementer and the fixer receive as
+`CLAUDE_CODE_EFFORT_LEVEL` (config keys `effort` and `fix_effort`). The allowed
+levels are `low`, `medium`, `high`, `xhigh` and `max`; any other value stops the
+tick at startup with an error that names the key. A blank `fix_effort` inherits
+`effort` on any fixer engine, because effort levels are not specific to one
+provider (a model id is, which is why `fix_model` inherits only on the same
+engine).
+
+When the resolved effort is blank, `claude` gets no `CLAUDE_CODE_EFFORT_LEVEL`
+from the tick, so an exported value or the Claude settings apply as before.
+`claude-ds` defaults to `max`; a set effort replaces that default. The
+implementer and fixer `launch` log events record the effort the tick set in
+`details.effort` (`null` when the tick set none).
 
 ### Reviewer model and effort (`--review-model`, `--review-effort`)
 

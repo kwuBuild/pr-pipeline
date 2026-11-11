@@ -2580,6 +2580,7 @@ def test_main_loop_mode_uses_locked_loop_runner(
     # itself, so an edit mid-loop applies on the next tick.
     run_loop.assert_called_once_with(
         None, "", "", "", "", "", fix_engine="", fix_model="", only=None,
+        effort="", fix_effort="",
     )
     run_single.assert_not_called()
 
@@ -3436,6 +3437,29 @@ def test_launch_claude_engine_writes_the_heartbeat_from_a_relative_worktree(
     # to be there. Advancement across the throttle interval is proven at the
     # wrapper level, where the interval is injectable.
     assert os.path.getmtime(heartbeat) >= launched_at
+
+
+def test_resolve_engine_claude_sets_effort_only_when_given() -> None:
+    """Plain claude gets CLAUDE_CODE_EFFORT_LEVEL only for a set effort."""
+    from tick import _resolve_engine  # type: ignore[import-untyped]
+
+    assert _resolve_engine("claude", effort="high") == (
+        "claude", {"CLAUDE_CODE_EFFORT_LEVEL": "high"})
+    # Blank adds nothing, so an exported value in the tick's env still wins.
+    assert _resolve_engine("claude", effort="") == ("claude", {})
+
+
+@pytest.mark.parametrize("effort, expected", [("", "max"), ("medium", "medium")])
+def test_resolve_engine_claude_ds_effort_defaults_to_max(
+    effort: str, expected: str,
+) -> None:
+    """claude-ds keeps max as its default and honours a set effort."""
+    from tick import _resolve_engine  # type: ignore[import-untyped]
+
+    with mock.patch.dict("os.environ", {"DEEPSEEK_API_KEY": "sk-test"}, clear=True):
+        _binary, extra = _resolve_engine("claude-ds", effort=effort)
+
+    assert extra["CLAUDE_CODE_EFFORT_LEVEL"] == expected
 
 
 def test_resolve_engine_claude_ds_respects_model_override() -> None:
@@ -20363,6 +20387,7 @@ def test_main_route_flags_override_the_configured_routes(
             impl_engine="claude-ds", model="deepseek-v4-flash",
             fix_engine="claude", fix_model="sonnet",
             review_model="gpt-7", review_effort="low",
+            effort="high", fix_effort="medium",
         ) == 0
 
     implementer = stages["dispatch_implementers"].call_args.kwargs
@@ -20372,6 +20397,7 @@ def test_main_route_flags_override_the_configured_routes(
         "claude-ds", "deepseek-v4-flash")
     assert (fixer["impl_engine"], fixer["model"]) == ("claude", "sonnet")
     assert (reviewer["review_model"], reviewer["review_effort"]) == ("gpt-7", "low")
+    assert (implementer["effort"], fixer["effort"]) == ("high", "medium")
 
 
 @pytest.mark.parametrize("text, key", [
@@ -20382,6 +20408,8 @@ def test_main_route_flags_override_the_configured_routes(
     ("max_iterations = true\n", "max_iterations"),
     ('impl_engine = "codex"\n', "impl_engine"),
     ('fix_model = "-p"\n', "fix_model"),
+    ('effort = "ultra"\n', "effort"),
+    ('fix_effort = "--loop"\n', "fix_effort"),
     ("loop_heartbeat_seconds = 300\n", "loop_heartbeat_seconds"),
     ("transient_cooldown_seconds = 1.5\n", "transient_cooldown_seconds"),
 ])
@@ -20547,6 +20575,8 @@ def test_lock_held_cadence_falls_back_to_the_shipped_short_poll(
 @pytest.mark.parametrize("flag, key", [
     ("--fix-engine", "fix_engine"),
     ("--fix-model", "fix_model"),
+    ("--effort", "effort"),
+    ("--fix-effort", "fix_effort"),
 ])
 def test_parse_cli_args_reads_the_fixer_route_flags(flag: str, key: str) -> None:
     """The fixer route has its own flags, unset unless typed."""
@@ -20556,6 +20586,31 @@ def test_parse_cli_args_reads_the_fixer_route_flags(flag: str, key: str) -> None
     assert tick.parse_cli_args([])["impl_engine"] == ""
     assert tick.parse_cli_args([flag, "claude-ds"])[key] == "claude-ds"
     assert tick.parse_cli_args([f"{flag}=claude"])[key] == "claude"
+
+
+def test_parse_cli_args_refuses_a_flag_as_the_effort_value() -> None:
+    """``--fix-effort --loop`` is a missing value, not effort "--loop"."""
+    import tick  # type: ignore[import-untyped]
+
+    for argv in (["--fix-effort", "--loop"], ["--effort"]):
+        with pytest.raises(SystemExit):
+            tick.parse_cli_args(argv)
+
+
+def test_main_refuses_a_flagged_effort_outside_the_allowed_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A typed --fix-effort is validated like config and named on refusal."""
+    import tick  # type: ignore[import-untyped]
+
+    write_tuned_config(monkeypatch, tmp_path, "")
+    stderr = io.StringIO()
+    with tick_stage_mocks(tmp_path) as stages, mock.patch("sys.stderr", stderr):
+        assert tick.main(fix_effort="--loop") == 3
+
+    assert "fix_effort" in stderr.getvalue()
+    for stage in stages.values():
+        stage.assert_not_called()
 
 
 def test_main_prompts_setup_for_a_target_with_no_repository_section(

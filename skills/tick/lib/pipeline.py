@@ -1954,7 +1954,14 @@ _CONFIG_KEYS = (
     "fix_model",
     "review_model",
     "review_effort",
+    "effort",
+    "fix_effort",
 )
+
+# Claude Code effort levels the implementer and fixer accept. The value
+# reaches CLAUDE_CODE_EFFORT_LEVEL, so a level outside this set is a startup
+# error naming the key rather than an engine that silently ignores it.
+ENGINE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
 
 # The integer settings: ``key -> (shipped default, minimum)``. None of them has
 # a conservative reading — a shorter deadline kills work, a longer one spends
@@ -2096,6 +2103,10 @@ class ResolvedConfig:
             codex config, then the pinned fallback.
         review_effort: The reviewer reasoning effort, resolved like
             ``review_model``.
+        effort: The implementer effort, one of :data:`ENGINE_EFFORT_LEVELS`;
+            ``""`` is no override (``claude-ds`` then runs at ``max``).
+        fix_effort: The fixer effort. A blank key inherits ``effort`` on any
+            fixer engine: effort levels belong to no single provider.
         probed_route: The repository's ``(probed_impl_engine, probed_model)``
             setup evidence, independent of routing defaults and CLI flags.
             ``None`` for older setups without evidence or invalid metadata
@@ -2140,6 +2151,8 @@ class ResolvedConfig:
     fix_model: str = ""
     review_model: str = ""
     review_effort: str = ""
+    effort: str = ""
+    fix_effort: str = ""
     probed_route: tuple[str, str] | None = None
     loop_short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS
     loop_max_poll_seconds: int = LOOP_MAX_POLL_SECONDS
@@ -2819,6 +2832,8 @@ def resolve_config(
         fix_model=routes["fix_model"],
         review_model=routes["review_model"],
         review_effort=routes["review_effort"],
+        effort=routes["effort"],
+        fix_effort=routes["fix_effort"],
         probed_route=probed_route,
         login=login,
         allow_touching=allow_touching,
@@ -2967,6 +2982,8 @@ def _resolve_routes(
     A blank fixer key inherits the implementer's. The fixer model inherits only
     while the fixer runs on the implementer's engine: a model id names one
     provider's model, and handing it to another provider fails at launch.
+    The fixer effort inherits on any engine: effort levels are not
+    provider-specific.
 
     Args:
         layers: ``(label, table)`` pairs, lowest precedence first.
@@ -3008,6 +3025,14 @@ def _resolve_routes(
         lambda v: REVIEW_EFFORT_RE.fullmatch(v) is not None,
         "the operator's codex effort",
     )
+
+    def is_effort(value: str) -> bool:
+        return value in ENGINE_EFFORT_LEVELS
+
+    effort = resolve("effort", "", is_effort, "the engine's default effort")
+    fix_effort = resolve(
+        "fix_effort", "", is_effort, "the implementer's effort",
+    ) or effort
     return {
         "impl_engine": impl_engine,
         "model": model,
@@ -3015,6 +3040,8 @@ def _resolve_routes(
         "fix_model": fix_model,
         "review_model": review_model,
         "review_effort": review_effort,
+        "effort": effort,
+        "fix_effort": fix_effort,
     }, problems
 
 

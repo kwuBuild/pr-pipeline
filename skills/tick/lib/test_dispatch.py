@@ -545,6 +545,36 @@ def test_dispatch_one_implementer_uses_claude_ds_engine(
     )
 
 
+@pytest.mark.parametrize("engine, effort, env_effort, logged", [
+    ("claude", "high", "high", "high"),
+    # No override: the tick sets nothing and an exported value still reaches.
+    ("claude", "", "low", None),
+    ("claude-ds", "", "max", "max"),
+    ("claude-ds", "medium", "medium", "medium"),
+])
+def test_dispatch_one_implementer_sends_and_logs_the_effort(
+    tmp_path: Path, engine: str, effort: str, env_effort: str,
+    logged: str | None,
+) -> None:
+    """The engine env carries the effort, and the launch log records it."""
+    from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
+
+    tick_log = mock.Mock()
+    env = {"DEEPSEEK_API_KEY": "k", "CLAUDE_CODE_EFFORT_LEVEL": "low",
+           "HOME": "/tmp", "PATH": "/usr/bin"}
+    popen_mock = run_effort_launch(
+        tmp_path, env, lambda: _dispatch_one_implementer(
+            issue_number=461, issue_title="t", tick_log=tick_log,
+            impl_engine=engine, effort=effort,
+        ),
+    )
+
+    assert popen_mock.call_args[1]["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == env_effort
+    launch = [c.kwargs for c in tick_log.log.call_args_list
+              if c.kwargs.get("action") == "launch"]
+    assert launch[-1]["details"]["effort"] == logged
+
+
 def test_dispatch_one_implementer_handles_missing_codex(
     tmp_path: Path,
 ) -> None:
@@ -1188,6 +1218,51 @@ def test_dispatch_one_fixer_terminates_on_relabel_failure(
     assert (
         archives[0] / "scratch" / "recovery.txt"
     ).read_text() == "fixer label-flip evidence"
+
+
+@pytest.mark.parametrize("engine, effort, logged", [
+    ("claude", "low", "low"),
+    ("claude", "", None),
+    ("claude-ds", "", "max"),
+])
+def test_dispatch_one_fixer_sends_and_logs_the_effort(
+    tmp_path: Path, engine: str, effort: str, logged: str | None,
+) -> None:
+    """The fixer env carries its effort, and the launch log records it."""
+    from tick import _dispatch_one_fixer  # type: ignore[import-untyped]
+
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    tick_log = mock.Mock()
+    env = {"DEEPSEEK_API_KEY": "k", "HOME": "/tmp", "PATH": "/usr/bin"}
+
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", side_effect=fixer_git(repo_root)), \
+            mock.patch("tick.gh_text", side_effect=["main", "abc123", "fix-branch"]), \
+            mock.patch("tick.gh_json", side_effect=fixer_gh_json(comments=[
+                {"lastEditedAt": None, "editor": None,
+                 "includesCreatedEdit": False, "author": {"login": "test-owner"},
+                 "body": legacy_review("findings here")},
+            ])), \
+            mock.patch("tick.pipeline.atomic_write", side_effect=lambda path, data: (
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                or Path(path).write_text(data))), \
+            mock.patch("tick._publish_marker_or_revert", return_value=True), \
+            mock.patch("tick.relabel"), \
+            mock.patch("subprocess.Popen") as popen, \
+            mock.patch.dict("os.environ", env, clear=True):
+        popen.return_value = mock.MagicMock(pid=12345)
+        _dispatch_one_fixer(
+            pr_number=42, tick_log=tick_log, impl_engine=engine, effort=effort,
+        )
+
+    sent = popen.call_args[1]["env"].get("CLAUDE_CODE_EFFORT_LEVEL")
+    assert sent == logged
+    launch = [c.kwargs for c in tick_log.log.call_args_list
+              if c.kwargs.get("action") == "launch"]
+    assert launch[-1]["details"]["effort"] == logged
 
 
 def test_dispatch_one_reviewer_escalates_on_base_fetch_failure(
@@ -5243,7 +5318,7 @@ def test_parse_cli_args_reads_review_model_and_effort_flags() -> None:
 
     assert parse_cli_args([]) == {
         "target": None, "only": "", "impl_engine": "", "model": "",
-        "fix_engine": "", "fix_model": "",
+        "fix_engine": "", "fix_model": "", "effort": "", "fix_effort": "",
         "review_model": "", "review_effort": "",
         "permission_mode": "", "loop": False,
     }
@@ -6416,6 +6491,27 @@ def test_reviewer_scrub_dir_is_outside_candidate_worktree(
 
 
 # --- Helpers ---
+
+
+def run_effort_launch(
+    tmp_path: Path, env: dict[str, str], launch: Callable[[], None],
+) -> mock.MagicMock:
+    """Run one implementer launch under ``env`` and return the Popen mock."""
+    wt_root = tmp_path / "worktrees"
+    wt_root.mkdir()
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    with mock.patch("tick.WT_ROOT", str(wt_root)), \
+            mock.patch("tick.git", return_value=str(repo_root)), \
+            mock.patch("tick.pipeline.atomic_write", side_effect=lambda path, data: (
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                or Path(path).write_text(data))), \
+            mock.patch("subprocess.Popen") as popen_mock, \
+            mock.patch("tick.relabel"), \
+            mock.patch.dict("os.environ", env, clear=True):
+        popen_mock.return_value = mock.MagicMock(pid=12345)
+        launch()
+    return popen_mock
 
 
 # PR title/body payload the tick's authenticated gh_json read returns before

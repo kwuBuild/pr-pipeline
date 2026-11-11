@@ -724,8 +724,8 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   the configuration and rerun the tick; do not discard retained review evidence.
 - Configuration errors: a malformed `base_ref`, `permission_mode`,
   `[operator] login`, `verify_tools`, `checklist_paths`, `[scan] repos`, engine
-  route (`impl_engine`, `model`, `fix_engine`, `fix_model`, `review_model`,
-  `review_effort`, or the matching flag), or any deadline, stall, round,
+  route (`impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`,
+  `fix_effort`, `review_model`, `review_effort`, or the matching flag), or any deadline, stall, round,
   cooldown or cadence key exits 3 with `startup_config_invalid` naming the key —
   none of them has a reading that is both conservative and the one the operator
   wrote. An integer key holding a boolean, float or string, a value below its
