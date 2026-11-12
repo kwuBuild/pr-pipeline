@@ -1480,14 +1480,21 @@ def relabel(
     """
     if from_label == to_label:
         return
-    if from_label:
-        gh(
-            entity, "edit", str(number),
-            "--add-label", to_label,
-            "--remove-label", from_label,
-        )
-    else:
-        gh(entity, "edit", str(number), "--add-label", to_label)
+    try:
+        if from_label:
+            gh(
+                entity, "edit", str(number),
+                "--add-label", to_label,
+                "--remove-label", from_label,
+            )
+        else:
+            gh(entity, "edit", str(number), "--add-label", to_label)
+    except subprocess.CalledProcessError:
+        if to_label in _TERMINAL_LABELS:
+            _log_terminal_label_failure(
+                entity, number, to_label, tick_log, phase, stage, "label edit failed",
+            )
+        raise
     if to_label in _TERMINAL_LABELS and tick_log is not None:
         _notify_terminal_label(entity, number, to_label, tick_log, phase, stage)
 
@@ -1515,6 +1522,35 @@ def _notify_terminal_label(
     _emit_operator_notification(
         title="PR pipeline terminal label",
         message=reason,
+    )
+
+
+def _log_terminal_label_failure(
+    entity: str,
+    number: int,
+    label: str,
+    tick_log: "TickLog | None",
+    phase: str,
+    stage: str,
+    failure: str,
+) -> None:
+    """Record a terminal label that did not land, for the operator event feed.
+
+    The success path logs ``notify_terminal_label``; without this record a
+    failed transition leaves the feed silent while the item keeps its earlier
+    label. The record changes no retry state: each caller keeps its own
+    custody and retries on a later tick. The reason is stable across those
+    retries so that the feed reports one unchanged failure once.
+    """
+    if tick_log is None:
+        return
+    tick_log.log(
+        pr=number,
+        phase=phase,
+        stage=stage,
+        action="terminal_label_failed",
+        reason=f"{entity} #{number} could not move to {label}",
+        details={"entity": entity, "label": label, "failure": failure},
     )
 
 
@@ -1797,8 +1833,16 @@ def _converge_pipeline_labels(
     except (subprocess.CalledProcessError, ValueError):
         # ValueError covers malformed/truncated JSON from a zero-exit gh.
         labels = None
-    if labels is None:
+
+    def terminal_failed(failure: str) -> bool:
+        if target_label in _TERMINAL_LABELS:
+            _log_terminal_label_failure(
+                entity, number, target_label, tick_log, phase, stage, failure,
+            )
         return False
+
+    if labels is None:
+        return terminal_failed("label read failed")
 
     expected = [target_label] if target_label else []
     if sorted(set(labels)) == expected:
@@ -1846,7 +1890,7 @@ def _converge_pipeline_labels(
     try:
         gh(entity, "edit", str(number), *mutation_args)
     except subprocess.CalledProcessError:
-        return False
+        return terminal_failed("label edit failed")
 
     try:
         final_labels = _pipeline_labels(
@@ -1874,7 +1918,7 @@ def _converge_pipeline_labels(
             )
         return False
     if sorted(set(final_labels)) != expected:
-        return False
+        return terminal_failed("label set did not converge")
 
     if target_label in _TERMINAL_LABELS:
         _notify_terminal_label(
@@ -12627,10 +12671,14 @@ class OnlyScope(NamedTuple):
         items: The items dispatch may launch and cadence observes, in list
             order. A listed issue is followed by its one open closing PR, so
             review and fix can finish work the list started.
+        closing_prs: ``(issue, pr)`` pairs for each listed issue that
+            expanded to an open closing PR. Cadence uses them to recognize an
+            unlabelled issue that has handed off to its PR.
     """
 
     listed: tuple[tuple[str, int], ...]
     items: tuple[tuple[str, int], ...]
+    closing_prs: tuple[tuple[int, int], ...] = ()
 
 
 def _resolve_only_scope(only: tuple[tuple[str, int], ...]) -> OnlyScope:
@@ -12655,12 +12703,16 @@ def _resolve_only_scope(only: tuple[tuple[str, int], ...]) -> OnlyScope:
         ValueError: If a closing-PR response is malformed or ambiguous.
     """
     items: list[tuple[str, int]] = []
+    closing_prs: list[tuple[int, int]] = []
     for entry in only:
         stages = _resolve_stage_targets(entry)
         for scoped in (stages["implementer"], stages["reviewer"], stages["fixer"]):
             if scoped is not None and scoped not in items:
                 items.append(scoped)
-    return OnlyScope(listed=only, items=tuple(items))
+        reviewer = stages["reviewer"]
+        if entry[0] == "issue" and reviewer is not None and reviewer[0] == "pr":
+            closing_prs.append((entry[1], reviewer[1]))
+    return OnlyScope(listed=only, items=tuple(items), closing_prs=tuple(closing_prs))
 
 
 def _only_counter_scope(only: Sequence[tuple[str, int]]) -> str:
@@ -14484,9 +14536,15 @@ def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
     dispatch judge the same items and the list is not expanded again. Each
     item is judged by :func:`pipeline.resolve_pickup_eligibility`, the rule
     dispatch applies, and a listed issue must still pass the issue author
-    gate. Unlike a positional target there is no terminal claim: the list
-    stops only through quiet heartbeats, once nothing listed is dispatchable
-    and no local engine remains.
+    gate.
+
+    ``terminal`` reports a *settled* scope: every item is closed or merged,
+    carries ``ai:needs-human-decision`` (the human hold outranks any other
+    label), carries exactly one of ``ai:ready-for-human``,
+    ``ai:max-iterations``, or ``ai:blocked``, or is an open unlabelled issue
+    that handed off to its closing PR, which this observation saw open.
+    Cadence stops a settled list at once when no local engine remains;
+    otherwise the list stops only through quiet heartbeats.
 
     Args:
         scope: The scope this tick resolved.
@@ -14494,13 +14552,20 @@ def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
     Returns:
         ``actionable`` is ``True`` when any item is dispatchable, ``False``
         when every item is proven non-dispatchable or closed, and ``None``
-        when any read or payload could not be trusted. ``terminal`` is always
-        ``False``.
+        when any read or payload could not be trusted. ``terminal`` is
+        ``True`` only when every item is settled and every read was trusted.
     """
     name = f"--only {_only_text(scope.listed)}"
     details: list[str] = []
     actionable = False
+    settled = True
+    open_prs = {
+        number for entity, number in scope.items if entity == "pr"
+    }
+    handoffs = dict(scope.closing_prs)
     try:
+        # Read every item first: an issue's handoff needs its PR's state.
+        payloads: list[dict] = []
         for entity, number in scope.items:
             payload = gh_json(
                 entity, "view", str(number),
@@ -14511,6 +14576,11 @@ def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
             state = payload.get("state")
             if state not in ("OPEN", "CLOSED", "MERGED"):
                 raise ValueError("invalid scope item state")
+            if state != "OPEN" and entity == "pr":
+                open_prs.discard(number)
+            payloads.append(payload)
+        for (entity, number), payload in zip(scope.items, payloads):
+            state = payload["state"]
             if state != "OPEN":
                 details.append(f"{entity} #{number} {state}")
                 continue
@@ -14519,6 +14589,12 @@ def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
                 raise ValueError("invalid scope item labels")
             details.append(
                 f"{entity} #{number} {', '.join(sorted(labels)) or 'no ai: label'}",
+            )
+            settled = settled and _only_item_settled(
+                labels,
+                handed_off=(
+                    entity == "issue" and handoffs.get(number) in open_prs
+                ),
             )
             dispatchable = bool(
                 pipeline.resolve_pickup_eligibility(labels, entity=entity).label,
@@ -14532,8 +14608,33 @@ def _observe_only_state(scope: OnlyScope) -> pipeline.TargetCadenceState:
     except (subprocess.CalledProcessError, ValueError):
         return pipeline.TargetCadenceState(None, False, f"{name}: state unknown")
     return pipeline.TargetCadenceState(
-        actionable, False, f"{name}: " + "; ".join(details),
+        actionable, settled, f"{name}: " + "; ".join(details),
     )
+
+
+# A listed item in one of these states needs a human before the pipeline can
+# act on it again, so an --only run has nothing left to do for it.
+_ONLY_SETTLED_LABELS = frozenset({
+    pipeline.LABEL_READY_FOR_HUMAN,
+    pipeline.LABEL_MAX_ITERATIONS,
+    pipeline.LABEL_BLOCKED,
+})
+
+
+def _only_item_settled(labels: Sequence[str], *, handed_off: bool) -> bool:
+    """Return whether one open ``--only`` item is terminal or held.
+
+    ``ai:needs-human-decision`` settles the item beside any other label,
+    the same human-hold priority as target completion. Another settled label
+    must stand alone, so a hold beside an in-flight label stays unsettled. An
+    unlabelled issue is settled only when ``handed_off`` says its closing PR
+    is in scope and open; that PR then decides completion.
+    """
+    if pipeline.LABEL_NEEDS_HUMAN in labels:
+        return True
+    if not labels:
+        return handed_off
+    return len(labels) == 1 and labels[0] in _ONLY_SETTLED_LABELS
 
 
 def _issue_author_trust(metadata: object) -> bool | None:
@@ -15140,6 +15241,7 @@ def _run_tick_body(
         held_items=held_items,
         target_state=target_state,
         scope_description=only_state.description if only_state is not None else None,
+        scope_settled=only_state is not None and only_state.terminal,
         **cadence,
     )
 

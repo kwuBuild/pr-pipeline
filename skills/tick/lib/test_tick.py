@@ -8511,6 +8511,141 @@ def test_reconcile_one_hung_dual_label_kills_but_never_relabels(
     assert (wt_dir / "dispatch.json").is_file()
 
 
+def test_cancelled_kill_escalation_reaches_the_event_feed_as_attention_only(
+    tmp_path: Path,
+) -> None:
+    """A failed termination cancels the escalation; the feed must not claim it.
+
+    ``_reconcile_one`` logs ``kill_escalate`` before it terminates the engine
+    and downgrades to ``leave`` when termination fails. Two such ticks are fed
+    through the shipped events reader: one attention event, no escalation.
+    """
+    from pipeline import StageConfig  # type: ignore[attr-defined]
+    from tick import TickLog, _reconcile_one  # type: ignore[import-untyped]
+
+    config = StageConfig(
+        stage="fix", worktree_prefix="pr", attempts_key_prefix="",
+        result_file="result.json", in_flight_label="ai:fixing",
+        pre_label="ai:changes-requested", strict_dual_label=True,
+        tick_abort_on_enum_failure=True,
+    )
+    wt_dir = tmp_path / "pr-42"
+    wt_dir.mkdir()
+    (wt_dir / "dispatch.json").write_text(json.dumps({
+        "engine": "claude", "stage": "fix", "pr_number": 42,
+        "deadline": 1000.0, "base_ref": "main", "base_sha": "b1",
+        "head_sha": "h1", "pre_label": "ai:changes-requested",
+        "dispatch_id": "fix-42", "pid": 99999, "start_time": 500.0,
+        "pgid": 99999,
+    }))
+    log_dir = tmp_path / "logs"
+    decisions = []
+    for _ in range(2):
+        tick_log = TickLog.open(str(log_dir))
+        with mock.patch("tick.gh_text", return_value="OPEN"), \
+                mock.patch("tick.gh_json", return_value={"labels": [{"name": "ai:fixing"}]}), \
+                mock.patch("tick.gh") as gh_mock, \
+                mock.patch("tick._classify_marker", return_value=("hung", "matched", True)), \
+                mock.patch("tick.process_control.terminate_process_group", return_value=False):
+            decisions.append(_reconcile_one(42, str(wt_dir), config, tick_log=tick_log))
+        gh_mock.assert_not_called()
+        time.sleep(0.01)  # A distinct tick log per tick.
+
+    assert [d["action"] for d in decisions] == ["leave", "leave"]
+    actions = [json.loads(line)["action"] for path in sorted(log_dir.glob("tick-*.jsonl"))
+               for line in path.read_text().splitlines()]
+    assert actions.count("kill_escalate") == 2 and actions.count("kill_failed") == 2
+    events_py = Path(__file__).resolve().parents[2] / "status" / "events.py"
+    feed = subprocess.run([sys.executable, str(events_py), "--repo", "example/repo",
+                           "--log-dir", str(log_dir), "--json"],
+                          capture_output=True, text=True, timeout=30)
+    assert feed.returncode == 0, feed.stderr
+    events = [json.loads(line) for line in feed.stdout.splitlines()]
+    assert [(e["event"], e["number"], e["details"]["source_action"]) for e in events] == [
+        ("attention", 42, "kill_failed"),
+    ]
+    assert (wt_dir / "dispatch.json").is_file()
+
+
+def test_failed_escalation_relabel_reaches_the_event_feed_until_the_label_lands(
+    tmp_path: Path,
+) -> None:
+    """A published escalation whose label edit fails is attention, not silence.
+
+    The first tick posts the comment and fails the label edit; the item keeps
+    its pickup label. The second tick lands the label. The shipped events reader
+    reports one attention event and then the escalation with its reason.
+    """
+    from tick import TickLog, _escalate_dispatch_setup_failure  # type: ignore[import-untyped]
+
+    log_dir = tmp_path / "logs"
+    for fail_edit in (True, False):
+        def record_gh(*args: str, fail_edit: bool = fail_edit) -> object:
+            if args[:2] == ("issue", "edit") and fail_edit:
+                raise subprocess.CalledProcessError(1, ["gh", *args])
+            return mock.Mock(stdout="https://example.invalid/issues/42#c1")
+
+        tick_log = TickLog.open(str(log_dir))
+        with mock.patch("tick.gh", side_effect=record_gh):
+            _escalate_dispatch_setup_failure(
+                entity="issue", number=42, pre_label="ai:available",
+                stage="implement", reason="fetch failed", engine="claude",
+                tick_log=tick_log,
+            )
+        time.sleep(0.01)  # A distinct tick log per tick.
+
+    records = [[json.loads(line) for line in path.read_text().splitlines()]
+               for path in sorted(log_dir.glob("tick-*.jsonl"))]
+    failed = [r for r in records[0] if r["action"] == "terminal_label_failed"]
+    assert [(r["pr"], r["details"]["entity"], r["details"]["label"]) for r in failed] == [
+        (42, "issue", "ai:needs-human-decision"),
+    ]
+    assert "terminal_label_failed" not in [r["action"] for r in records[1]]
+    events_py = Path(__file__).resolve().parents[2] / "status" / "events.py"
+    feed = subprocess.run([sys.executable, str(events_py), "--repo", "example/repo",
+                           "--log-dir", str(log_dir), "--json"],
+                          capture_output=True, text=True, timeout=30)
+    assert feed.returncode == 0, feed.stderr
+    events = [json.loads(line) for line in feed.stdout.splitlines()]
+    assert [(e["event"], e["entity"], e["number"]) for e in events] == [
+        ("attention", "issue", 42), ("terminal", "issue", 42),
+    ]
+    assert events[0]["details"]["source_action"] == "terminal_label_failed"
+    assert events[1]["details"] == {"label": "ai:needs-human-decision", "reason": "fetch failed"}
+
+
+@pytest.mark.parametrize("failure", ["read", "edit", "mismatch"])
+def test_converge_pipeline_labels_logs_a_failed_terminal_transition(
+    tmp_path: Path, failure: str,
+) -> None:
+    """Initial read, edit, and readable mismatch failures leave a failure record."""
+    from tick import TickLog, _converge_pipeline_labels  # type: ignore[import-untyped]
+
+    labels = {"labels": [{"name": "ai:fixing"}]}
+    read_error = subprocess.CalledProcessError(1, ["gh", "pr", "view"])
+    gh_json_side_effects: list[object] = {
+        "read": [read_error],
+        "edit": [labels],
+        "mismatch": [labels, {"labels": [{"name": "ai:fixing"}]}],
+    }[failure]
+    edit_error = subprocess.CalledProcessError(1, ["gh", "pr", "edit"]) if failure == "edit" else None
+    tick_log = TickLog.open(str(tmp_path))
+    with mock.patch("tick.gh_json", side_effect=gh_json_side_effects), \
+            mock.patch("tick.gh", side_effect=edit_error):
+        converged = _converge_pipeline_labels(
+            "pr", 42, "ai:needs-human-decision",
+            tick_log=tick_log, phase="harvest", stage="fix",
+        )
+
+    assert converged is False
+    records = [json.loads(line) for path in tmp_path.glob("tick-*.jsonl")
+               for line in path.read_text().splitlines()]
+    assert [(r["action"], r["pr"], r["stage"], r["details"]["entity"], r["details"]["label"])
+            for r in records] == [
+        ("terminal_label_failed", 42, "fix", "pr", "ai:needs-human-decision"),
+    ]
+
+
 @pytest.mark.parametrize("failure_index", [0, 1])
 def test_converge_pipeline_labels_retains_incomplete_remote_transition(
     failure_index: int,

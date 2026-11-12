@@ -24,6 +24,7 @@ from test_smoke_loop import ENGINE_SHIM, GIT_SHIM, VERSION_SHIM
 
 
 TICK_SH = str(Path(__file__).parents[1] / "tick.sh")
+EVENTS_SH = str(Path(__file__).parents[2] / "status" / "events.sh")
 
 
 @pytest.fixture
@@ -158,12 +159,87 @@ def test_expansion_failure_harvests_but_starts_no_engine(only_repo):
     assert items(repo)["issue:5"] == ["ai:implementing"]
 
 
+def test_native_loop_stops_on_first_tick_when_listed_items_settle(only_repo):
+    # Default quiet streak (3): a settled list must not wait for heartbeats.
+    repo, env = only_repo
+    write_items(repo, {
+        "issue:5": ["ai:ready-for-human"],
+        "pr:7": ["ai:needs-human-decision"],
+        "issue:6": ["ai:available"],
+    })
+
+    result = subprocess.run(["bash", TICK_SH, "--loop", "--only", "#5,pr:7"], cwd=repo,
+                            env=env, capture_output=True, text=True, timeout=120)
+
+    assert result.returncode == 0, result.stderr
+    cadence = [line for line in result.stderr.splitlines() if line.startswith("tick-cadence:")]
+    assert len(cadence) == 1 and "stop=true" in cadence[0], result.stderr
+    reason = cadence[0].split('reason="', 1)[1][:-1]
+    assert "--only list settled" in reason, reason
+    assert "issue #5 ai:ready-for-human" in reason and "pr #7 ai:needs-human-decision" in reason
+    assert f"tick: {reason}" in result.stderr
+    assert any(entry["action"] == "loop_only_stop" and entry["reason"] == reason
+               for entry in log_entries(repo))
+    assert items(repo)["issue:6"] == ["ai:available"]
+
+
+def test_milestone_watch_armed_after_the_loop_stopped_still_reports_the_stop(only_repo):
+    repo, env = only_repo
+    write_items(repo, {"issue:5": ["ai:ready-for-human"]})
+    run_tick(repo, env, "--only", "#5")  # Retained history the watch must skip.
+    # Documented order: mark, start the loop, arm the watch. This loop settles
+    # and exits on its first tick, before the watch starts.
+    cursor = mark(repo, env)
+    loop = subprocess.run(["bash", TICK_SH, "--loop", "--only", "#5"], cwd=repo, env=env,
+                          capture_output=True, text=True, timeout=120)
+    assert loop.returncode == 0, loop.stderr
+
+    watch = subprocess.run(["bash", EVENTS_SH, "--follow", "--milestones", "--cursor", cursor],
+                           cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+
+    assert watch.returncode == 0, watch.stderr
+    lines = watch.stdout.splitlines()
+    assert len(lines) == 1, lines
+    assert "loop stopped: --only #5: issue #5 ai:ready-for-human; --only list settled" in lines[0]
+
+
+def test_milestone_watch_armed_after_launch_reports_the_whole_run(only_repo):
+    repo, env = only_repo
+    write_items(repo, {"issue:5": ["ai:available"]})
+    cursor = mark(repo, env)
+    loop = subprocess.Popen(["bash", TICK_SH, "--loop", "--only", "#5"], cwd=repo, env=env,
+                            text=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    watch = None
+    try:
+        wait_for_file(repo / "engine-started")  # The launch precedes the watch.
+        watch = subprocess.Popen(["bash", EVENTS_SH, "--follow", "--milestones", "--cursor",
+                                  cursor, "--json"], cwd=repo, env=env, text=True,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert json.loads(watch.stdout.readline())["event"] == "launch"
+        (repo / "engine-exit").touch()
+        stdout, stderr = watch.communicate(timeout=120)
+        _, loop_stderr = loop.communicate(timeout=120)
+    finally:
+        for proc in (watch, loop):
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    assert loop.returncode == 0, loop_stderr
+    assert watch.returncode == 0, stderr
+    events = [json.loads(line) for line in stdout.splitlines()]
+    assert [(e["event"], e["number"]) for e in events] == [("terminal", 5), ("stopped", None)]
+    assert events[0]["details"]["label"] == "ai:needs-human-decision"
+    assert "--only list settled" in events[1]["message"]
+
+
 def test_native_loop_stops_with_list_exhaustion_when_drained(only_repo):
     repo, env = only_repo
     with Path(env["PR_PIPELINE_CONFIG"]).open("a") as config:
         config.write("loop_quiescent_stop_after=1\n")
+    # No ai: label and no closing PR: not dispatchable, but not settled either.
     write_items(repo, {
-        "issue:5": ["ai:ready-for-human"],
+        "issue:5": [],
         "issue:6": ["ai:available"],
     })
 
@@ -174,7 +250,7 @@ def test_native_loop_stops_with_list_exhaustion_when_drained(only_repo):
     cadence = [line for line in result.stderr.splitlines() if line.startswith("tick-cadence:")]
     assert len(cadence) == 1 and "stop=true" in cadence[0], result.stderr
     reason = cadence[0].split('reason="', 1)[1][:-1]
-    assert "--only list exhausted" in reason and "issue #5 ai:ready-for-human" in reason
+    assert "--only list exhausted" in reason and "issue #5 no ai: label" in reason
     assert f"tick: {reason}" in result.stderr
     assert any(entry["action"] == "loop_only_stop" and entry["reason"] == reason
                for entry in log_entries(repo))
@@ -262,6 +338,13 @@ def test_startup_failure_banner_names_the_requested_list(only_repo):
 
 
 # --- Helpers ---
+
+
+def mark(repo, env):
+    result = subprocess.run(["bash", EVENTS_SH, "--mark"], cwd=repo, env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
 
 
 def run_tick(repo, env, *argv):

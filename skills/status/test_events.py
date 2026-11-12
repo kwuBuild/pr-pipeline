@@ -8,6 +8,7 @@ import threading
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -97,6 +98,11 @@ def test_events_text_is_readable_and_does_not_claim_intended_actions_succeeded(c
     ("engine_stalled", {"progress_age_seconds": 2000}, "stalled"),
     ("notify_terminal_label", {"entity": "pr", "label": "ai:needs-human-decision"}, "terminal"),
     ("loop_quiescent_stop", {}, "stopped"),
+    ("loop_only_stop", {}, "stopped"),
+    ("loop_target_stop", {}, "stopped"),
+    ("kill_failed", {}, "attention"),
+    ("escalation_comment_retry", {}, "attention"),
+    ("corrupt_marker_escalate", {}, "attention"),
     ("startup_failed", {}, "startup_failure"),
     ("tick_crash", {}, "crash"),
     ("reviewer_skill_observation", {"usage": {"status": "unavailable"}}, "result"),
@@ -112,6 +118,382 @@ def test_events_covers_operator_events_with_nullable_usage(consumer, action, det
     if expected == "result":
         assert event["details"]["reported_cost"] is None
         assert event["details"]["duration_ms"] is None
+
+
+@pytest.mark.parametrize("deadline, expected", [(1200, 1200), (None, None), ("soon", None)])
+def test_events_stall_reports_time_to_deadline(consumer, deadline, expected):
+    repo, _ = consumer
+    append(repo, "tick-001.jsonl", row("engine_stalled", stage="review", number=81, details={
+        "progress_age_seconds": 900, "seconds_to_deadline": deadline}))
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    details = json.loads(result.stdout)["details"]
+    assert details == {"progress_age_seconds": 900, "seconds_to_deadline": expected}
+
+
+def test_events_escalation_decisions_are_not_reported_as_outcomes(consumer):
+    # A decision is logged before its action runs; only the label proves it.
+    repo, _ = consumer
+    for action in ("escalate", "kill_escalate"):
+        entry = row(action, stage="fix", number=81)
+        entry["reason"] = "hung"
+        append(repo, "tick-001.jsonl", entry)
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+
+
+def test_events_confirmed_escalation_carries_the_same_ticks_decision_reason(consumer):
+    repo, _ = consumer
+    decision = row("kill_escalate", stage="review", number=81, ts=1)
+    decision["reason"] = "hung"
+    terminal = {"entity": "pr", "label": "ai:needs-human-decision"}
+    append(repo, "tick-001.jsonl", decision,
+           row("notify_terminal_label", stage="review", number=81, ts=2, details=terminal))
+    # A later tick's escalation with no decision record gets no stale reason.
+    append(repo, "tick-002.jsonl",
+           row("notify_terminal_label", stage="review", number=81, ts=3, details=terminal))
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["event"], e["details"]) for e in events] == [
+        ("terminal", {"label": "ai:needs-human-decision", "reason": "hung"}),
+        ("terminal", {"label": "ai:needs-human-decision", "reason": None}),
+    ]
+    assert events[0]["message"] == "terminal label: ai:needs-human-decision; escalated: hung"
+
+
+def test_events_failed_termination_is_one_attention_event_until_it_escalates(consumer):
+    # Termination fails on two ticks, then succeeds on a third.
+    repo, _ = consumer
+    for tick, ts in (("tick-001.jsonl", 1), ("tick-002.jsonl", 2)):
+        decision = row("kill_escalate", stage="review", number=81, ts=ts)
+        decision["reason"] = "hung"
+        failure = row("kill_failed", stage="review", number=81, ts=ts)
+        failure["reason"] = "hung engine: terminate_process returned False"
+        append(repo, tick, decision, failure)
+    decision = row("kill_escalate", stage="review", number=81, ts=3)
+    decision["reason"] = "hung"
+    append(repo, "tick-003.jsonl", decision,
+           row("notify_terminal_label", stage="review", number=81, ts=3,
+               details={"entity": "pr", "label": "ai:needs-human-decision"}))
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["event"], e["ts"]) for e in events] == [("attention", 1), ("terminal", 3)]
+    assert events[0]["details"] == {"reason": "hung engine: terminate_process returned False",
+                                    "source_action": "kill_failed"}
+    assert events[0]["message"] == (
+        "needs attention: engine termination failed: hung engine: terminate_process returned False")
+    assert events[1]["details"]["reason"] == "hung"
+
+
+def test_events_held_escalation_publication_is_one_attention_event(consumer):
+    repo, _ = consumer
+    for tick, ts in (("tick-001.jsonl", 1), ("tick-002.jsonl", 2)):
+        decision = row("escalate", stage="review", number=81, ts=ts, dispatch_id="")
+        decision["reason"] = "dispatch setup failed"
+        held = row("escalation_comment_retry", stage="review", number=81, ts=ts, dispatch_id="")
+        held["reason"] = "holding the pre-dispatch label until the escalation is published"
+        append(repo, tick, decision, held)
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [e["event"] for e in events] == ["attention"]
+    assert events[0]["message"].startswith("needs attention: escalation not yet published")
+
+
+def test_events_milestones_report_records_written_after_the_mark(consumer):
+    repo, _ = consumer
+    append(repo, "tick-001.jsonl", row("launch", stage="implement", number=27))
+    cursor = mark(consumer)
+    # Written before any watch runs, as on a loop's first tick.
+    append(repo, "tick-001.jsonl",
+           row("engine_result_summary", stage="implement", number=27, ts=5),
+           row("cooldown_skip", stage="implement", number=28, ts=5))
+    append(repo, "tick-002.jsonl",
+           row("launch", stage="review", number=99, ts=5, dispatch_id="d2"),
+           row("engine_stalled", stage="review", number=99, ts=6, dispatch_id="d2",
+               details={"progress_age_seconds": 900}),
+           row("kill_failed", stage="review", number=98, ts=6),
+           row("notify_terminal_label", stage="review", number=99, ts=7,
+               details={"entity": "pr", "label": "ai:ready-for-human"}))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert first.returncode == 0, first.stderr
+    assert [(e["event"], e["number"]) for e in map(json.loads, first.stdout.splitlines())] == [
+        ("launch", 99), ("stalled", 99), ("attention", 98), ("terminal", 99),
+    ]
+    # The cursor advanced, including the attention episode already reported.
+    append(repo, "tick-003.jsonl", row("kill_failed", stage="review", number=98, ts=8))
+    again = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert again.returncode == 0, again.stderr
+    assert again.stdout == ""
+
+
+def test_events_milestones_rearm_reports_records_written_while_unwatched(consumer):
+    repo, env = consumer
+    cursor = mark(consumer)
+    marked = Path(cursor).read_text()
+    append(repo, "tick-001.jsonl", row("launch", stage="implement", number=27, ts=2))
+    proc = subprocess.Popen(["bash", str(LAUNCHER), "events", "--follow", "--milestones",
+                             "--cursor", cursor, "--json"], cwd=repo, env=env, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try:
+        assert json.loads(proc.stdout.readline())["event"] == "launch"
+        wait_for(lambda: Path(cursor).read_text() != marked)
+    finally:
+        proc.terminate()  # The watch expires.
+        proc.wait(timeout=10)
+        proc.stdout.close()
+    append(repo, "tick-001.jsonl",
+           row("notify_terminal_label", stage="implement", number=27, ts=3,
+               details={"entity": "issue", "label": "ai:needs-human-decision"}))
+    append(repo, "tick-002.jsonl", row("loop_only_stop", ts=4, dispatch_id=""),
+           row("launch", stage="implement", number=30, ts=5, dispatch_id="d3"))
+    rearmed = subprocess.run(["bash", str(LAUNCHER), "events", "--follow", "--milestones",
+                              "--cursor", cursor, "--json"], cwd=repo, env=env, text=True,
+                             capture_output=True, timeout=15)
+    assert rearmed.returncode == 0, rearmed.stderr
+    assert [e["event"] for e in map(json.loads, rearmed.stdout.splitlines())] == [
+        "terminal", "stopped"]
+
+
+@pytest.mark.parametrize("action", ["tick_crash", "startup_probe_failed"])
+def test_events_milestones_end_after_a_loop_ending_failure(consumer, action):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", row(action, ts=3, dispatch_id=""))
+    result = run_events(consumer, "--follow", "--milestones", "--cursor", cursor)
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout.splitlines()) == 1
+
+
+def test_events_milestones_keep_records_after_a_stop_for_the_next_reader(consumer):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", row("loop_only_stop", ts=2, dispatch_id=""))
+    append(repo, "tick-002.jsonl", row("launch", stage="implement", number=30, ts=3, dispatch_id="d3"))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert first.returncode == 0, first.stderr
+    assert [e["event"] for e in map(json.loads, first.stdout.splitlines())] == ["stopped"]
+    second = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert second.returncode == 0, second.stderr
+    assert [e["event"] for e in map(json.loads, second.stdout.splitlines())] == ["launch"]
+
+
+def test_events_milestones_detect_a_log_rewritten_after_the_mark(consumer):
+    repo, _ = consumer
+    path = append(repo, "tick-001.jsonl", row("launch", stage="implement", number=27))
+    cursor = mark(consumer)
+    path.write_text(json.dumps(row("launch", stage="implement", number=28)) + "\n")
+    result = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert result.returncode == 0, result.stderr
+    assert [json.loads(line)["number"] for line in result.stdout.splitlines()] == [28]
+    assert "replaced or truncated" in result.stderr
+
+
+def test_events_mark_prints_a_new_cursor_without_touching_the_repo(consumer):
+    repo, env = consumer
+    append(repo, "tick-001.jsonl", row("launch", stage="implement", number=27))
+    before = snapshot(repo)
+    first, second = mark(consumer), mark(consumer)
+    assert first != second and Path(first).is_file() and Path(second).is_file()
+    assert snapshot(repo) == before
+    assert not Path(env["EVENT_TEST_CALLS"]).exists()
+
+
+@pytest.mark.parametrize("args, message", [
+    (["--follow", "--milestones"], "--milestones requires --cursor"),
+    (["--cursor", "x.json"], "--cursor requires --milestones"),
+    (["--mark", "--follow"], "--mark takes no other option"),
+    (["--milestones", "--cursor", "missing.json"], "cannot read milestone cursor"),
+])
+def test_events_milestone_options_fail_closed(consumer, args, message):
+    result = run_events(consumer, *args)
+    assert result.returncode == 2
+    assert message in result.stderr
+
+
+@pytest.mark.parametrize("content", ["not json", '{"version": 1, "repo": "other/repo", "files": []}'])
+def test_events_milestones_reject_an_unusable_cursor(consumer, tmp_path, content):
+    cursor = tmp_path / "cursor.json"
+    cursor.write_text(content)
+    result = run_events(consumer, "--milestones", "--cursor", str(cursor))
+    assert result.returncode == 2
+    assert "cannot read milestone cursor" in result.stderr
+
+
+def test_events_milestones_resume_keeps_issue_linkage_delivered_before_the_restart(consumer):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl",
+           row("pr_handoff", stage="implement", number=27, ts=2,
+               details={"issue_number": 27, "pr_number": 99, "created": True}),
+           row("launch", stage="review", number=99, ts=3, dispatch_id="d2"))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json", "#27")
+    assert first.returncode == 0, first.stderr
+    assert [(e["event"], e["number"]) for e in map(json.loads, first.stdout.splitlines())] == [
+        ("launch", 99)]
+    append(repo, "tick-002.jsonl",
+           row("notify_terminal_label", stage="review", number=99, ts=4,
+               details={"entity": "pr", "label": "ai:ready-for-human"}))
+    resumed = run_events(consumer, "--milestones", "--cursor", cursor, "--json", "#27")
+    assert resumed.returncode == 0, resumed.stderr
+    assert [(e["event"], e["number"]) for e in map(json.loads, resumed.stdout.splitlines())] == [
+        ("terminal", 99)]
+
+
+def test_events_milestones_resume_keeps_a_pr_event_that_linkage_selects_later(consumer):
+    # Late linkage: a PR event the filter could not select yet stays undelivered.
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", row("launch", stage="review", number=99, ts=2, dispatch_id="d2"))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json", "#27")
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == ""
+    append(repo, "tick-002.jsonl",
+           row("pr_handoff", stage="implement", number=27, ts=3,
+               details={"issue_number": 27, "pr_number": 99, "created": False}))
+    resumed = run_events(consumer, "--milestones", "--cursor", cursor, "--json", "#27")
+    assert resumed.returncode == 0, resumed.stderr
+    assert [(e["event"], e["number"]) for e in map(json.loads, resumed.stdout.splitlines())] == [
+        ("launch", 99)]
+
+
+def test_events_milestones_resume_joins_a_model_record_delivered_before_the_restart(consumer):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", row("model_resolved", stage="review", number=99, engine="codex",
+                                       details={"model": "review-model", "effort": "high"}))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == ""
+    append(repo, "tick-001.jsonl", row("launch", stage="review", number=99, engine="codex", ts=2))
+    resumed = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert resumed.returncode == 0, resumed.stderr
+    assert [json.loads(line)["details"] for line in resumed.stdout.splitlines()] == [
+        {"model": "review-model", "effort": "high"}]
+
+
+def test_events_milestones_resume_keeps_an_escalation_reason_delivered_before_the_restart(consumer):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    decision = row("kill_escalate", stage="review", number=81, ts=2)
+    decision["reason"] = "hung"
+    append(repo, "tick-001.jsonl", decision)
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert first.returncode == 0, first.stderr
+    append(repo, "tick-001.jsonl",
+           row("notify_terminal_label", stage="review", number=81, ts=3,
+               details={"entity": "pr", "label": "ai:needs-human-decision"}))
+    resumed = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert resumed.returncode == 0, resumed.stderr
+    assert [json.loads(line)["details"] for line in resumed.stdout.splitlines()] == [
+        {"label": "ai:needs-human-decision", "reason": "hung"}]
+
+
+@pytest.mark.parametrize("cursor_from", ["resumed", "marked after recovery"])
+def test_events_attention_reports_a_failure_again_after_the_item_recovered(consumer, cursor_from):
+    # Publication fails, a retry lands the label, and a later attempt fails again.
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", *held_escalation(81, ts=2))
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert first.returncode == 0, first.stderr
+    assert [e["event"] for e in map(json.loads, first.stdout.splitlines())] == ["attention"]
+    append(repo, "tick-002.jsonl", row("notify_terminal_label", stage="review", number=81, ts=3,
+                                       dispatch_id="", details={"entity": "pr",
+                                                                "label": "ai:needs-human-decision"}))
+    second = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert second.returncode == 0, second.stderr
+    assert [e["event"] for e in map(json.loads, second.stdout.splitlines())] == ["terminal"]
+    if cursor_from == "marked after recovery":
+        cursor = mark(consumer)
+    append(repo, "tick-003.jsonl", *held_escalation(81, ts=4))
+    later = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert later.returncode == 0, later.stderr
+    assert [(e["event"], e["ts"]) for e in map(json.loads, later.stdout.splitlines())] == [
+        ("attention", 4)]
+
+
+@pytest.mark.parametrize("ending, details", [
+    ("launch", {}),
+    ("review_handoff", {"label": "ai:changes-requested"}),
+])
+def test_events_attention_episode_ends_at_a_new_attempt_or_handoff(consumer, ending, details):
+    repo, _ = consumer
+    append(repo, "tick-001.jsonl", row("kill_failed", stage="review", number=81, ts=1))
+    append(repo, "tick-002.jsonl", row(ending, stage="review", number=81, ts=3, dispatch_id="d2",
+                                       details=details))
+    append(repo, "tick-003.jsonl", row("kill_failed", stage="review", number=81, ts=4))
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    assert [(e["event"], e["ts"]) for e in map(json.loads, result.stdout.splitlines())
+            if e["event"] == "attention"] == [("attention", 1), ("attention", 4)]
+
+
+def test_events_failed_terminal_relabel_is_attention_until_the_label_lands(consumer):
+    repo, _ = consumer
+    for tick, ts in (("tick-001.jsonl", 1), ("tick-002.jsonl", 2)):
+        decision = row("escalate", stage="review", number=81, ts=ts, dispatch_id="")
+        decision["reason"] = "dispatch setup failed"
+        failed = row("terminal_label_failed", stage="review", number=81, ts=ts, dispatch_id="",
+                     details={"entity": "pr", "label": "ai:needs-human-decision"})
+        failed["reason"] = "pr #81 could not move to ai:needs-human-decision"
+        append(repo, tick, decision, failed)
+    decision = row("escalate", stage="review", number=81, ts=3, dispatch_id="")
+    decision["reason"] = "dispatch setup failed"
+    append(repo, "tick-003.jsonl", decision,
+           row("notify_terminal_label", stage="review", number=81, ts=3, dispatch_id="",
+               details={"entity": "pr", "label": "ai:needs-human-decision"}))
+    result = run_events(consumer, "--json")
+    assert result.returncode == 0, result.stderr
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [(e["event"], e["ts"]) for e in events] == [("attention", 1), ("terminal", 3)]
+    assert events[0]["message"] == (
+        "needs attention: terminal label not applied: pr #81 could not move to ai:needs-human-decision")
+    assert events[1]["details"]["reason"] == "dispatch setup failed"
+
+
+@pytest.mark.parametrize("label", ["ai:needs-human-decision", "ai:ready-for-human", "ai:max-iterations"])
+def test_events_unconfirmed_terminal_episode_survives_resume_and_ends_on_recovery(consumer, label):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    unconfirmed = row("label_convergence_unverified", stage="review", number=81,
+                      dispatch_id="", details={"target_label": label})
+    unconfirmed["reason"] = "mutation succeeded; verification read failed"
+    append(repo, "tick-001.jsonl", unconfirmed)
+    plain = run_events(consumer, "--json")
+    first = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert plain.returncode == first.returncode == 0, (plain.stderr, first.stderr)
+    events = [json.loads(line) for line in first.stdout.splitlines()]
+    assert [e["event"] for e in events] == ["attention"]
+    assert [json.loads(line) for line in plain.stdout.splitlines()] == events
+    assert events[0]["details"]["reason"] == f"{label}: {unconfirmed['reason']}"
+    assert "terminal label not confirmed" in events[0]["message"]
+
+    append(repo, "tick-002.jsonl", dict(unconfirmed, ts=2))
+    repeated = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert repeated.returncode == 0 and repeated.stdout == "", repeated.stderr
+    append(repo, "tick-003.jsonl",
+           row("notify_terminal_label", stage="review", number=81, ts=3,
+               dispatch_id="", details={"entity": "pr", "label": label}),
+           dict(unconfirmed, ts=4))
+    recovered = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert recovered.returncode == 0, recovered.stderr
+    assert [(e["event"], e["ts"]) for e in map(json.loads, recovered.stdout.splitlines())] == [
+        ("terminal", 3), ("attention", 4),
+    ]
+
+
+@pytest.mark.parametrize("label", [None, "", "ai:reviewing", "ai:blocked", [], {}])
+def test_events_unconfirmed_nonterminal_transition_does_not_become_a_milestone(consumer, label):
+    repo, _ = consumer
+    cursor = mark(consumer)
+    append(repo, "tick-001.jsonl", row("label_convergence_unverified", stage="review", number=81,
+                                     details={"target_label": label}))
+    result = run_events(consumer, "--milestones", "--cursor", cursor, "--json")
+    assert result.returncode == 0 and result.stdout == "", result.stderr
 
 
 def test_events_coalesces_repeated_cooldowns_but_keeps_changed_deadlines_and_attempts(consumer):
@@ -482,3 +864,26 @@ def following(consumer, *args):
         worker.join(timeout=2)
         proc.stdout.close()
         proc.stderr.close()
+
+
+def mark(consumer):
+    result = run_events(consumer, "--mark")
+    assert result.returncode == 0, result.stderr
+    path = result.stdout.strip()
+    assert Path(path).is_absolute(), result.stdout
+    return path
+
+
+def held_escalation(number, *, ts):
+    decision = row("escalate", stage="review", number=number, ts=ts, dispatch_id="")
+    decision["reason"] = "dispatch setup failed"
+    held = row("escalation_comment_retry", stage="review", number=number, ts=ts, dispatch_id="")
+    held["reason"] = "holding the pre-dispatch label until the escalation is published"
+    return decision, held
+
+
+def wait_for(condition, timeout=10):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        assert time.monotonic() < deadline, "condition not reached"
+        time.sleep(0.05)

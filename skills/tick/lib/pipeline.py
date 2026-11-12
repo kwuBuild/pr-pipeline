@@ -890,6 +890,7 @@ def compute_next_wake(
     heartbeat_seconds: int = LOOP_HEARTBEAT_SECONDS,
     target_state: TargetCadenceState | None = None,
     scope_description: str | None = None,
+    scope_settled: bool = False,
 ) -> CadenceDecision:
     """Compute the next wake interval from end-of-tick state.
 
@@ -907,13 +908,16 @@ def compute_next_wake(
                                             (max poll 270s)
     Actionable queue non-empty             short poll (270s)
     At ``max_in_flight`` with work           short poll (harvest to free a slot)
+    Quiescent ``--only`` list, settled     stop immediately
     Quiescent                              heartbeat (1800s)
     Queue quiet for N heartbeats            stop (caller notifies developer)
     ======================================  ===================================
 
-    An ``--only`` list uses the same table with its own quiet streak and no
-    immediate terminal stop: it stops after N quiet heartbeats in which no
-    listed item was dispatchable and no local engine was in flight.
+    An ``--only`` list uses the same table with two stops. A quiet tick
+    whose listed items are all settled (terminal, held, closed, or handed
+    off) stops at once. Otherwise the list stops after N quiet heartbeats of
+    its own in which no listed item was dispatchable. Both stops require that
+    no local engine is in flight, so the loop never exits owing a harvest.
 
     Args:
         in_flight_count: Number of engines currently occupying a concurrency
@@ -951,6 +955,10 @@ def compute_next_wake(
         scope_description: Description of an ``--only`` scope and its
             observed items, or ``None``. It prefixes every reason, and a
             quiescent stop names the list as exhausted.
+        scope_settled: ``True`` when every item of the ``--only`` scope is
+            settled. With ``scope_description`` set, a quiescent tick then
+            stops immediately, without a quiet streak. Ignored for the full
+            queue and for a positional target.
         short_poll_seconds: Wake while work is queued, at capacity, or when
             state is unknown.
         max_poll_seconds: Longest wait while an engine is in flight.
@@ -1052,6 +1060,18 @@ def compute_next_wake(
             return CadenceDecision(
                 heartbeat_seconds, False,
                 _with_custody(f"waiting → wake {heartbeat_seconds}s"),
+            )
+        # A settled list is finished work, not an idle queue: stop on this
+        # quiet tick, including a nudge tick, without a heartbeat streak.
+        # Quiescence already proves that no local engine is in flight.
+        if scope_description is not None and scope_settled:
+            return CadenceDecision(
+                next_wake_seconds=0,
+                stop=True,
+                reason=_with_custody(
+                    "--only list settled: every listed item is terminal, held, "
+                    "closed, or handed off and no local engine is in flight → stop"
+                ),
             )
         # Observing quiet after a nudge does not count as another heartbeat.
         quiet_count = consecutive_quiescent_ticks + int(count_quiescent_heartbeat)

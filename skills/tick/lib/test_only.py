@@ -599,6 +599,90 @@ def test_list_cadence_stops_only_after_drain_with_no_local_engine() -> None:
     assert "--only list exhausted" in stop.reason and "heartbeat 3/3" in stop.reason
 
 
+def test_settled_list_stops_on_the_first_quiet_tick() -> None:
+    import pipeline
+
+    common = {"quiescent_stop_after": 3, "scope_description": "--only #5, pr:7"}
+    # A nudge-initiated tick does not count as a heartbeat, yet still stops.
+    settled = pipeline.compute_next_wake(
+        in_flight_count=0, has_actionable_queue=False, at_capacity=False,
+        is_quiescent=True, consecutive_quiescent_ticks=0,
+        count_quiescent_heartbeat=False, scope_settled=True, **common,
+    )
+    engine_running = pipeline.compute_next_wake(
+        in_flight_count=1, nearest_deadline_s=100, has_actionable_queue=False,
+        at_capacity=False, is_quiescent=False, scope_settled=True, **common,
+    )
+    unknown = pipeline.compute_next_wake(
+        in_flight_count=None, has_actionable_queue=False, at_capacity=False,
+        scope_settled=True, **common,
+    )
+
+    assert settled.stop and settled.next_wake_seconds == 0
+    assert settled.reason.startswith("--only #5, pr:7; --only list settled")
+    assert not engine_running.stop and "1 in-flight" in engine_running.reason
+    assert not unknown.stop and "state unknown" in unknown.reason
+
+
+def test_full_queue_ignores_settled_and_keeps_the_quiet_streak() -> None:
+    import pipeline
+
+    decision = pipeline.compute_next_wake(
+        in_flight_count=0, has_actionable_queue=False, at_capacity=False,
+        is_quiescent=True, consecutive_quiescent_ticks=0, quiescent_stop_after=3,
+        scope_settled=True,
+    )
+
+    assert not decision.stop and "heartbeat 1/3" in decision.reason
+
+
+@pytest.mark.parametrize(("labels", "settled"), [
+    ({"issue:5": [], "pr:9": ["ai:ready-for-human"], "pr:7": ["ai:max-iterations"]}, True),
+    ({"issue:5": ["ai:blocked"], "pr:9": ["ai:needs-human-decision", "ai:fixing"],
+      "pr:7": ["CLOSED"]}, True),
+    ({"issue:5": [], "pr:9": ["ai:reviewing"], "pr:7": ["ai:ready-for-human"]}, False),
+    ({"issue:5": [], "pr:9": ["ai:ready-for-human"], "pr:7": []}, False),
+    ({"issue:5": ["ai:blocked", "ai:implementing"], "pr:9": ["ai:ready-for-human"],
+      "pr:7": ["ai:ready-for-human"]}, False),
+    ({"issue:5": [], "pr:9": ["CLOSED"], "pr:7": ["ai:ready-for-human"]}, False),
+])
+def test_observe_only_state_reports_settled_list_as_terminal(labels, settled) -> None:
+    import tick  # type: ignore[import-untyped]
+
+    scope = tick.OnlyScope(
+        listed=(("issue", 5), ("pr", 7)),
+        items=(("issue", 5), ("pr", 9), ("pr", 7)),
+        closing_prs=((5, 9),),
+    )
+
+    def view(entity, _verb, number, *_args, **_kwargs):
+        names = labels[f"{entity}:{number}"]
+        if names == ["CLOSED"]:
+            return {"state": "CLOSED", "labels": [], "author": {"login": TRUSTED_AUTHOR}}
+        return {"state": "OPEN", "labels": [{"name": name} for name in names],
+                "author": {"login": TRUSTED_AUTHOR}}
+
+    with mock.patch("tick.gh_json", side_effect=view):
+        state = tick._observe_only_state(scope)
+
+    assert state.terminal is settled
+    assert state.actionable is False
+
+
+def test_resolve_only_scope_records_each_issue_closing_pr() -> None:
+    import tick  # type: ignore[import-untyped]
+
+    resolved = {
+        ("issue", 5): {"reviewer": ("pr", 9), "implementer": ("issue", 5), "fixer": ("pr", 9)},
+        ("issue", 6): {"reviewer": ("issue", 6), "implementer": ("issue", 6), "fixer": ("issue", 6)},
+        ("pr", 7): {"reviewer": ("pr", 7), "implementer": ("pr", 7), "fixer": ("pr", 7)},
+    }
+    with mock.patch("tick._resolve_stage_targets", side_effect=resolved.__getitem__):
+        scope = tick._resolve_only_scope((("issue", 5), ("issue", 6), ("pr", 7)))
+
+    assert scope.closing_prs == ((5, 9),)
+
+
 def test_list_counter_is_separate_from_queue_and_target_counters() -> None:
     import tick  # type: ignore[import-untyped]
 

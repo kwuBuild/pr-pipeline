@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -9,6 +10,7 @@ import math
 import os
 import re
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,9 +30,32 @@ KINDS = {
     "review_handoff": "review_handoff", "revision_handoff": "revision_handoff",
     "transient_revert": "retry", "cooldown_skip": "cooldown",
     "engine_stalled": "stalled", "notify_terminal_label": "terminal",
-    "loop_quiescent_stop": "stopped", "tick_crash": "crash",
+    "loop_quiescent_stop": "stopped", "loop_target_stop": "stopped", "loop_only_stop": "stopped",
+    # An escalation decision is logged before its action runs and can be
+    # cancelled. It only lends its reason to the confirmed terminal label.
+    "escalate": "_escalation", "kill_escalate": "_escalation",
+    "kill_failed": "attention", "escalation_comment_retry": "attention",
+    "corrupt_marker_escalate": "attention", "terminal_label_failed": "attention",
+    "label_convergence_unverified": "attention",
+    "tick_crash": "crash",
     **{action: "startup_failure" for action in STARTUP_FAILURES},
 }
+# --milestones emits only these kinds, and ends after a loop-ending kind.
+MILESTONES = {"launch", "terminal", "attention", "stalled", "stopped", "startup_failure", "crash"}
+LOOP_ENDING = {"stopped", "startup_failure", "crash"}
+ATTENTION = {
+    "kill_failed": "engine termination failed",
+    "escalation_comment_retry": "escalation not yet published",
+    "corrupt_marker_escalate": "corrupt dispatch marker",
+    "terminal_label_failed": "terminal label not applied",
+    "label_convergence_unverified": "terminal label not confirmed",
+}
+# A new attempt, a confirmed handoff, or a landed terminal label ends an item's
+# attention episodes: a later failure on that item is a new episode.
+EPISODE_ENDS = {"launch", "pr_handoff", "review_handoff", "revision_handoff", "terminal"}
+NEEDS_HUMAN = "ai:needs-human-decision"
+TERMINAL_LABELS = {NEEDS_HUMAN, "ai:ready-for-human", "ai:max-iterations"}
+CURSOR_VERSION = 1
 
 
 def clean(value: object) -> str:
@@ -66,6 +91,12 @@ def normalize(entry: object, event_id: str, repo: str) -> dict[str, Any] | None:
     details = entry.get("details", {})
     if not isinstance(details, dict):
         raise ValueError("malformed event details")
+    # Convergence also serves nonterminal handoffs. Only terminal targets
+    # enter the milestone feed, and an unreadable confirmation proves neither
+    # that the label landed nor that the item kept its earlier label.
+    if (action == "label_convergence_unverified"
+            and clean(details.get("target_label")) not in TERMINAL_LABELS):
+        return None
     item = identity(entry.get("pr"))
     if entry.get("pr") is not None and item is None:
         raise ValueError("malformed item identity")
@@ -80,6 +111,8 @@ def normalize(entry: object, event_id: str, repo: str) -> dict[str, Any] | None:
     entity = "issue" if stage == "implement" else "pr" if item else "pipeline"
     if kind in {"startup_failure", "crash", "stopped"}:
         entity, item = "pipeline", None
+    if kind == "attention" and details.get("entity") in {"pr", "issue"} and item is not None:
+        entity = details["entity"]
     if kind == "terminal":
         terminal_entity = details.get("entity")
         if not isinstance(terminal_entity, str) or terminal_entity not in {"pr", "issue"} or item is None:
@@ -123,11 +156,28 @@ def normalize(entry: object, event_id: str, repo: str) -> dict[str, Any] | None:
             message += f": {data['failure_class']}"
         message += f"; retry after {timestamp(data['cooldown_until'])}"
     elif kind == "stalled":
-        data = {"progress_age_seconds": number(details.get("progress_age_seconds"))}
+        data = {"progress_age_seconds": number(details.get("progress_age_seconds")),
+                "seconds_to_deadline": number(details.get("seconds_to_deadline"))}
         message = f"{actor} stalled"
+        if data["progress_age_seconds"] is not None:
+            message += f": no output for {data['progress_age_seconds']:g}s"
+        if data["seconds_to_deadline"] is not None:
+            message += f"; {data['seconds_to_deadline']:g}s to deadline"
     elif kind == "terminal":
-        data = {"label": clean(details.get("label"))}
+        # The reader sets the reason from the same tick's escalation decision.
+        data = {"label": clean(details.get("label")), "reason": None}
         message = f"terminal label: {data['label']}"
+    elif kind == "attention":
+        data = {"reason": clean(entry.get("reason")), "source_action": action}
+        if action == "label_convergence_unverified":
+            # Include the target in both the message and the episode signature.
+            data["reason"] = clean(f"{details['target_label']}: {data['reason']}")
+        message = f"needs attention: {ATTENTION[action]}"
+        if data["reason"]:
+            message += f": {data['reason']}"
+    elif kind == "_escalation":
+        data = {"reason": clean(entry.get("reason"))}
+        message = ""
     else:
         data = {"reason": clean(entry.get("reason")), "source_action": action}
         message = {"stopped": "loop stopped", "startup_failure": "startup failed", "crash": "tick crashed"}[kind]
@@ -150,6 +200,11 @@ class Cursor:
     modified: tuple[int, int] | None = None
     digest: Any = field(default_factory=hashlib.sha256)
     events: list[dict[str, Any]] = field(default_factory=list)
+    # From a milestone cursor: records before ``delivered`` were already
+    # reported, except those at the ``undelivered`` offsets.
+    delivered: int = 0
+    undelivered: frozenset[int] = frozenset()
+    expected: bytes | None = None  # Saved digest of the bytes before ``delivered``.
 
 
 class EventReader:
@@ -160,6 +215,8 @@ class EventReader:
         self.files: dict[Path, Cursor] = {}
         self.consumed: set[str] = set()
         self.warnings: set[str] = set()
+        # Positions restored from a milestone cursor, until their file is read.
+        self.restored: dict[tuple[int, int], Cursor] = {}
 
     def warn(self, text: str) -> None:
         if text not in self.warnings:
@@ -176,6 +233,8 @@ class EventReader:
                 if cursor is None or cursor.identity != file_identity:
                     # Renames retain the cursor and record IDs of the same inode.
                     cursor = known.get(file_identity, cursor)
+                if cursor is not None and cursor.identity == file_identity and cursor.expected is not None:
+                    cursor = self.resume(stream, path, cursor)
                 modified = (stat.st_mtime_ns, stat.st_ctime_ns)
                 rewritten = False
                 if (cursor and cursor.identity == file_identity and cursor.offset
@@ -230,11 +289,35 @@ class EventReader:
                         self.warn(f"malformed record skipped in {path.name}; history is incomplete")
                         continue
                     if event is not None:
+                        if offset < cursor.delivered and offset not in cursor.undelivered:
+                            self.consumed.add(event_id)
                         cursor.events.append(event)
         except FileNotFoundError:
             return  # A concurrent tick pruned this file.
         except OSError as exc:
             raise OSError(f"cannot read {path.name}: {exc.strerror}") from exc
+
+    def resume(self, stream: Any, path: Path, saved: Cursor) -> Cursor:
+        """Re-read a restored file from its start, marking delivered records.
+
+        The whole retained file is read again so that issue linkage, reviewer
+        model records, escalation reasons, and attention episodes written
+        before the restart still apply to the records that follow it.
+        """
+        digest = hashlib.sha256()
+        remaining = saved.delivered
+        while remaining:
+            chunk = stream.read(min(remaining, 65536))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        stream.seek(0)
+        if remaining == 0 and digest.digest() == saved.expected:
+            return Cursor(saved.identity, saved.generation, delivered=saved.delivered,
+                          undelivered=saved.undelivered)
+        self.warn(f"{path.name} was replaced or truncated; history may be incomplete")
+        return Cursor(saved.identity, saved.generation + 1)
 
     def poll(self) -> list[dict[str, Any]]:
         try:
@@ -246,8 +329,12 @@ class EventReader:
         # Keep the old inode map for the whole scan: a new file can reuse the
         # original pathname before the renamed old file is visited.
         known = {cursor.identity: cursor for cursor in self.files.values()}
+        for file_identity, cursor in self.restored.items():
+            known.setdefault(file_identity, cursor)
         for path in paths:
             self.read(path, known)
+        # A restored position whose file is gone has nothing left to read.
+        self.restored.clear()
         self.files = {path: cursor for path, cursor in self.files.items() if path in paths}
         # Timestamps have second precision. Break ties by file and numeric
         # record position, never by the decimal offset embedded in an opaque ID.
@@ -269,6 +356,10 @@ class EventReader:
                   and self.target == ("issue", e["details"]["issue_number"])}
         last: dict[tuple[str, int | None, str], str] = {}
         attempts: set[tuple[tuple[str, int | None, str], str]] = set()
+        # Derived from the whole retained window on every scan, so a resumed
+        # or newly marked reader reaches the same state as one that never stopped.
+        intents: dict[tuple[str, int | None], str] = {}
+        episodes: dict[int | None, set[str]] = {}
         output = []
         for event in events:
             scope = (event["entity"], event["number"], event["stage"])
@@ -289,6 +380,24 @@ class EventReader:
                 attempt = (scope, json.dumps([event["event"], event["dispatch_id"], data], sort_keys=True))
                 duplicate = duplicate or attempt in attempts
                 attempts.add(attempt)
+            tick = event["id"].rsplit(":", 1)[0]  # One log file is one tick.
+            if event["event"] == "_escalation":
+                intents[(tick, event["number"])] = event["details"]["reason"]
+                continue
+            if event["event"] == "terminal" and event["details"]["label"] == NEEDS_HUMAN:
+                reason = intents.pop((tick, event["number"]), None)
+                if reason and event["details"]["reason"] is None:
+                    event["details"]["reason"] = reason
+                    event["message"] += f"; escalated: {reason}"
+            if event["event"] in EPISODE_ENDS:
+                episodes.pop(event["number"], None)
+            if event["event"] == "attention":
+                # A failed action repeats each tick until it succeeds or a
+                # person intervenes; report the unchanged episode once.
+                episode = json.dumps([event["stage"], event["dispatch_id"], event["details"]])
+                active = episodes.setdefault(event["number"], set())
+                duplicate = duplicate or episode in active
+                active.add(episode)
             selected = (self.target is None or event["entity"] == "pipeline"
                         or self.target == (event["entity"], event["number"])
                         or (event["entity"] == "pr" and event["number"] in linked))
@@ -297,6 +406,49 @@ class EventReader:
                     output.append(event)
                 self.consumed.add(event["id"])
         return output
+
+    def save(self, path: Path) -> None:
+        """Persist delivered positions; replace the file atomically.
+
+        Each file records the offset read so far, a digest of the bytes before
+        it, and the offsets of records before it that were not reported, such
+        as a PR record that an issue filter can select after later linkage.
+        """
+        files = []
+        for c in self.files.values():
+            undelivered = sorted(int(e["id"].rsplit(":", 1)[1]) for e in c.events
+                                 if e["id"] not in self.consumed and not e["event"].startswith("_"))
+            files.append({"dev": c.identity[0], "ino": c.identity[1], "generation": c.generation,
+                          "offset": c.offset, "digest": c.digest.digest().hex(),
+                          "undelivered": undelivered})
+        state = {"version": CURSOR_VERSION, "repo": self.repo, "files": files}
+        fd, temporary = tempfile.mkstemp(prefix=".milestones-", dir=path.parent)
+        try:
+            with os.fdopen(fd, "w") as stream:
+                json.dump(state, stream)
+            os.replace(temporary, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+
+    def load(self, path: Path) -> None:
+        """Restore a saved cursor; raise ValueError when it cannot be used."""
+        try:
+            state = json.loads(path.read_text())
+            if (not isinstance(state, dict) or state.get("version") != CURSOR_VERSION
+                    or state.get("repo") != self.repo):
+                raise ValueError("written for another repository or version")
+            for item in state["files"]:
+                file_identity = (item["dev"], item["ino"])
+                values = (*file_identity, item["generation"], item["offset"], *item["undelivered"])
+                if not all(type(v) is int and v >= 0 for v in values):
+                    raise ValueError("malformed position")
+                self.restored[file_identity] = Cursor(
+                    file_identity, item["generation"], delivered=item["offset"],
+                    undelivered=frozenset(item["undelivered"]), expected=bytes.fromhex(item["digest"]))
+        except (OSError, UnicodeError, KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"cannot read milestone cursor {path}: {exc}") from exc
 
 
 def render(event: dict[str, Any]) -> str:
@@ -331,14 +483,58 @@ def main() -> int:
     parser.add_argument("--log-dir", type=Path, required=True, help=argparse.SUPPRESS)
     parser.add_argument("--json", action="store_true", help="emit versioned JSON lines")
     parser.add_argument("--follow", action="store_true", help="replay retained history, then follow new records")
+    parser.add_argument("--mark", action="store_true",
+                        help="record the current end of the retained logs in a new milestone "
+                             "cursor file, print its path, and exit")
+    parser.add_argument("--milestones", action="store_true",
+                        help="emit only milestone events written after --cursor, advance it, and "
+                             "exit after a loop stop, startup failure, or crash")
+    parser.add_argument("--cursor", type=Path, help="milestone cursor file printed by --mark")
     parser.add_argument("target", nargs="?", type=parse_target, help="'#N' (issue and known linked PRs) or pr:N")
     args = parser.parse_args()
-    print(HISTORY_NOTICE, file=sys.stderr, flush=True)
+    if args.mark and (args.milestones or args.follow or args.cursor or args.json or args.target):
+        parser.error("--mark takes no other option")
+    if args.milestones and args.cursor is None:
+        parser.error("--milestones requires --cursor (create one with --mark)")
+    if args.cursor is not None and not args.milestones:
+        parser.error("--cursor requires --milestones")
     reader = EventReader(args.log_dir, args.repo, args.target)
+    if args.mark:
+        # The position is fixed before the caller starts the loop, so the
+        # watch reports every milestone that loop writes, however late it starts.
+        try:
+            reader.poll()
+            fd, name = tempfile.mkstemp(prefix="pr-pipeline-milestones-", suffix=".json")
+            os.close(fd)
+            reader.save(Path(name))
+        except OSError as exc:
+            print(f"events: cannot record milestone cursor: {exc}", file=sys.stderr)
+            return 1
+        print(name)
+        return 0
+    if args.milestones:
+        try:
+            reader.load(args.cursor)
+        except ValueError as exc:
+            print(f"events: {exc}", file=sys.stderr)
+            return 2
+    print(HISTORY_NOTICE, file=sys.stderr, flush=True)
     try:
         while True:
-            for event in reader.poll():
+            batch = reader.poll()
+            for index, event in enumerate(batch):
+                if args.milestones and event["event"] not in MILESTONES:
+                    continue
                 print(json.dumps(event, allow_nan=False) if args.json else render(event), flush=True)
+                if args.milestones and event["event"] in LOOP_ENDING:
+                    # Records after the stop stay unreported for the next reader.
+                    reader.consumed.difference_update(e["id"] for e in batch[index + 1:])
+                    reader.save(args.cursor)
+                    return 0
+            if args.milestones:
+                # Saved after printing: a watch stopped in between repeats
+                # milestones on re-arm rather than losing them.
+                reader.save(args.cursor)
             if not args.follow:
                 if any(cursor.partial or cursor.dropping for cursor in reader.files.values()):
                     print("events: partial final record omitted; use --follow to wait for completion", file=sys.stderr)
