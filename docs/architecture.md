@@ -157,9 +157,11 @@ Native mode consumes the tick's emitted cadence decision without a second
 observation or stop counter.
 Targeted runs stop from target completion; quiet heartbeats alone never mark an
 unfinished target as done. See the [counter and completion rules](../skills/tick/README.md#target-completion-and-cadence).
-An `--only` list has no terminal stop: it uses its own quiet streak, and a
-quiet observation requires that no listed item is dispatchable and that this
-machine owns no engine. See the [dispatch list rules](../skills/tick/README.md#dispatch-list---only).
+An `--only` list stops on the first quiet tick where every listed item is
+settled (terminal, held, closed, or handed off to its closing PR); otherwise it
+uses its own quiet streak. A quiet observation requires that no listed item is
+dispatchable and that this machine owns no engine, so a list loop never exits
+while it owes a harvest. See the [dispatch list rules](../skills/tick/README.md#dispatch-list---only).
 The harness `/loop` + `ScheduleWakeup` path has no in-process sleep to interrupt
 and stays purely timer-paced.
 

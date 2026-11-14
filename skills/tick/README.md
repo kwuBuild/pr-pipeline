@@ -571,26 +571,50 @@ HARVEST and stale reconciliation (step 1). It then starts no new engine, logs
 differs from the positional target, which fails closed before HARVEST; that
 path is unchanged.
 
-**Completion and quiet counter.** A list has no immediate terminal stop like
-the [target completion rule](#target-completion-and-cadence). It uses the
-quiescent table below with a quiet streak of its own:
+**Completion and quiet counter.** A list has two stops. Both require a quiet
+tick: no listed item is dispatchable and this machine owns no engine.
+
+1. **Settled stop.** On a quiet tick where every listed and expanded item is
+   settled, the cadence reports `next_wake=0 stop=true` at once. It does not
+   wait for heartbeats, and a nudge-initiated tick can stop too. Its reason
+   starts with `--only <list>:`, names each item's labels, and says
+   `--only list settled`. An item is settled when one of these is true:
+   - It is closed or merged.
+   - It carries `ai:needs-human-decision`. This hold outranks any other label,
+     the same priority as [target completion](#target-completion-and-cadence).
+   - It carries exactly one label, and that label is `ai:ready-for-human`,
+     `ai:max-iterations`, or `ai:blocked`. A hold beside an in-flight label
+     is not settled.
+   - It is an open listed issue with no `ai:` label whose closing PR is in the
+     scope and was observed open in the same tick. That issue has handed off
+     to the PR, so the PR decides completion.
+2. **Exhausted stop.** Otherwise the list uses the quiescent table below with
+   a quiet streak of its own. An open item with no `ai:` label and no closing
+   PR is not dispatchable and not settled, so it ends through this stop.
+
+Both stops share these rules:
 
 - The list's queue value is tri-state: `true` when any listed or expanded item
   is dispatchable, `false` when every item is proven non-dispatchable or
   closed, and `unknown` when any read or payload cannot be trusted. Unknown
-  stays on the short poll and resets the list's streak.
+  stays on the short poll, resets the list's streak, and cannot prove a
+  settled list.
 - Occupancy stays global. While this machine owns any engine, listed or not,
   the tick is not quiet, so a loop never stops while it still owes a harvest.
+  A settled list therefore keeps polling until an unlisted local engine is
+  harvested.
 - The streak lives in `quiescent-counters/only-<key>.txt`. The key is a hash
   of the listed *set*, so reordering the same items keeps one streak and a
   different set starts its own. It never shares a file with `queue.txt` or a
   target's `issue-N.txt`/`pr-N.txt`, and a list tick never reads or resets
   those.
-- After `loop_quiescent_stop_after` qualifying quiet observations, the cadence
-  reports `stop=true` with a reason that starts with `--only <list>:`, names
-  each item's labels, and says `--only list exhausted`. `--loop` reports it
-  through stderr, the `loop_only_stop` log event, and an operator
-  notification. Work outside the list may still be queued.
+- For the exhausted stop, after `loop_quiescent_stop_after` qualifying quiet
+  observations, the cadence reports `stop=true` with a reason that starts with
+  `--only <list>:`, names each item's labels, and says `--only list exhausted`.
+- `--loop` reports either stop through stderr, the `loop_only_stop` log event,
+  and an operator notification, then exits. The process exit is therefore an
+  accurate "done" signal for a list run. Work outside the list may still be
+  queued.
 
 Every cadence reason in a list run starts with `--only <list>:` and the
 observed item states, so the one-shot `/loop` path can report progress.
@@ -621,7 +645,8 @@ possible, and does no harvest or dispatch work.
 | At `max_in_flight`, saturated | `loop_short_poll_seconds` (270s) |
 | Quiescent (no supervisable engines or actionable work) | `loop_heartbeat_seconds` (1800s) heartbeat |
 | Full queue quiescent for `loop_quiescent_stop_after` (3) consecutive heartbeats | stop + notify |
-| `--only` list drained, no local engine, for `loop_quiescent_stop_after` (3) heartbeats | stop + notify (`loop_only_stop`); see [dispatch list](#dispatch-list---only) |
+| `--only` list settled, no local engine | stop immediately + notify (`loop_only_stop`); see [dispatch list](#dispatch-list---only) |
+| `--only` list drained but not settled, no local engine, for `loop_quiescent_stop_after` (3) heartbeats | stop + notify (`loop_only_stop`); see [dispatch list](#dispatch-list---only) |
 
 The intervals are [operator configuration](#deadlines-stall-limits-routing-and-cadence).
 Both loop paths — the one-shot `tick-cadence:` line and `--loop` — pace from the
@@ -751,8 +776,14 @@ Two properties keep this from becoming a control-plane risk:
 
 Terminal transitions into `ai:ready-for-human`, `ai:needs-human-decision`, or
 `ai:max-iterations` emit a best-effort macOS notification, a stderr line, and a
-`notify_terminal_label` tick-log entry. Notification failure is non-fatal. The
-loop's full-queue quiescent stop emits the same operator-facing signals with
+`notify_terminal_label` tick-log entry. Notification failure is non-fatal. A
+terminal transition whose initial label read or edit fails, or whose verification
+reads a mismatched label set, logs `terminal_label_failed` instead. If the edit
+succeeds but the confirmation read fails or returns malformed labels, it logs
+`label_convergence_unverified`; the label's application is unconfirmed. Both
+records reach the milestone feed as attention, and the caller keeps its own
+retry state. The loop's full-queue quiescent stop emits the same operator-facing
+signals with
 `loop_quiescent_stop`, a terminal target stop with `loop_target_stop`, and a
 detected engine stall with `engine_stalled`. The
 quiescent stop also names any held item occupying a slot when it stops.
@@ -2008,6 +2039,105 @@ An engine result is an observation; a proposed PR creation is not confirmation
 that the PR opened. Scripts should use the versioned JSON-lines format, not
 parse human text. See [Event feed contract](../status/EVENTS.md) for event kinds,
 filters, follow/restart behavior, failure handling, and the output schema.
+
+### Milestone watch
+
+The milestone watch tells the operator when a native-loop run reaches a
+milestone, without a terminal to watch and without a model polling the logs.
+The tick skill runs it with `tick.sh --loop`
+([Run Procedure](SKILL.md#run-procedure) step 3).
+
+The watch has two parts. A **milestone cursor** is a small JSON file that
+records how far the watch has read each tick log, and which records before
+that point it has not reported yet. The **reader** is
+`events.sh --milestones`; it prints only milestones after the cursor
+position, then advances the cursor. The cursor, not the reader's start time,
+decides what is new. A milestone written before the watch starts, or while
+it is being re-armed, is therefore still reported.
+
+The cursor stores positions only. Each reader reads every retained tick log
+again from its start, so context from records the watch already passed still
+applies: issue-to-PR linkage for a `'#N'` filter, reviewer model records,
+escalation reasons, and attention episodes. A PR record that an issue filter
+could not select yet stays unreported in the cursor until its linkage
+appears. A log pruned from retention takes its context with it, as for any
+`events` read.
+
+Normal flow:
+
+1. Before it starts the loop, the session runs `events.sh --mark` from the
+   target repository root. The reader records the current end of the retained
+   tick logs in a new cursor file in the system temporary directory and
+   prints the file's path.
+2. The session starts `tick.sh --loop` in the background.
+3. The session starts the Claude Code `Monitor` tool on
+   `events.sh --follow --milestones --cursor <path>`, run from the target
+   repository root.
+4. For each milestone after the cursor, the reader prints one line and then
+   saves the cursor. Each line wakes the session once. The session sends the
+   operator one short `PushNotification`.
+5. When the `Monitor` watch expires while the loop runs, the session starts
+   the same command again. The new reader continues from the saved cursor.
+6. After it prints a loop stop, startup failure, or crash, the reader exits.
+   The watch ends with it.
+7. When the loop's exit notification arrives, the session stops a watch that
+   still runs with `TaskStop`. It then runs
+   `events.sh --milestones --cursor <path>` once, without `--follow`, to
+   report milestones that the stopped watch had not printed. It does not
+   re-arm the watch.
+
+| Event | Tick-log action | Notification content |
+|---|---|---|
+| `launch` | `launch` | Engine started for the item, with stage and model |
+| `terminal` | `notify_terminal_label` | Item reached a terminal label. For `ai:needs-human-decision`, the escalation reason from the same tick, when that tick logged one. The session adds the summed reported cost and duration of the item's `result` events from `events --json`, or says they are unknown |
+| `attention` | `kill_failed`, `escalation_comment_retry`, `corrupt_marker_escalate`, `terminal_label_failed`, terminal-target `label_convergence_unverified` | An action failed, its outcome is unconfirmed, or custody was retained. The [event feed contract](../status/EVENTS.md#events-and-confirmation) defines terminal targets and episode rules. An unreadable confirmation says "terminal label not confirmed"; the remote label may already have changed |
+| `stalled` | `engine_stalled` | Item stalled, with `progress_age_seconds` and `seconds_to_deadline` |
+| `startup_failure`, `crash` | `startup_*` failures, `tick_crash` | Loop needs attention |
+| `stopped` | `loop_only_stop`, `loop_target_stop`, `loop_quiescent_stop` | Run finished, with the stop reason |
+
+Tick summaries, heartbeats, cooldowns, retries, and engine results never wake
+the session.
+
+**Escalations.** The tick logs `escalate` or `kill_escalate` when it decides
+to escalate, before the action runs. The action can still fail: a failed
+termination changes the decision to `leave`, a failed comment holds the item
+at its label for a retry, and a failed label edit after a published comment
+logs `terminal_label_failed` and retries on a later tick. The reader
+therefore never reports a decision as an outcome. An escalation is reported only by the `terminal` event for
+`ai:needs-human-decision`, which the tick logs after the label lands. A failed
+attempt is reported as `attention`, with the logged reason.
+
+When a label edit succeeds but its confirmation read fails, the reader reports
+the existing `label_convergence_unverified` record as attention for a terminal
+target. This reports uncertainty, not a failed edit or a confirmed escalation.
+If the next tick observes the landed human hold, it can leave the item without
+emitting a terminal record; the earlier attention event still tells the operator
+to inspect it. Repeated unconfirmed observations with the same target and reason
+remain one episode across cursor restarts.
+
+**Token cost.** The reader is a local process, so quiet periods cost no model
+tokens. Each milestone costs one model turn; a single issue run is about 4 to
+6 turns (launches, terminal label, stop). The `Monitor` tool caps one watch at
+30 minutes. Each expiry while the loop still runs costs one short re-arm turn.
+
+**Failure outcomes.**
+
+- `Monitor` or `PushNotification` is not available. The session tells the
+  operator that the run falls back to the loop's exit notification alone.
+- `--mark` fails, or the reader cannot read the cursor. The reader exits
+  non-zero and reports nothing. A missing, malformed, or other-repository
+  cursor exits `2`; the reader never falls back to skipping history. The
+  session tells the operator that the run falls back to the exit
+  notification alone.
+- The loop exits without a stop, startup failure, or crash record, for
+  example after a signal or a held tick lock. The session stops the watch
+  with `TaskStop`, reports any remaining milestones from the cursor, and does
+  not re-arm the watch. No orphan watch remains.
+- A watch stops after it prints a line but before it saves the cursor. The
+  next reader prints that milestone again. A milestone can repeat, but it is
+  not lost.
+- A tick log is truncated or rewritten after the cursor recorded it. The
+  reader warns and reports that log's milestones again from its start.
 
 ### 2. Tick log — `.claude/worktrees/.tick-log/` (structured, queryable)
 

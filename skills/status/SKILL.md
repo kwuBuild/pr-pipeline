@@ -92,8 +92,13 @@ standalone launcher from the target repository:
 ```
 
 This reader makes no GitHub or model calls and changes no pipeline state. Do
-not keep an AI session polling or narrating it automatically. Use `--json` for
-scripts and `'#N'` or `pr:N` to filter. The [event feed contract](EVENTS.md)
+not keep an AI session polling or narrating the full feed automatically. The
+one exception is the tick skill's
+[milestone watch](../tick/README.md#milestone-watch): it runs
+`events --follow --milestones --cursor <path>`, so the session wakes only for
+a milestone. `--mark` writes that cursor file in the system temporary
+directory, outside pipeline state.
+Use `--json` for scripts and `'#N'` or `pr:N` to filter. The [event feed contract](EVENTS.md)
 owns the schema, retention limits, and follow behavior.
 
 ## Progress column

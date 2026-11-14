@@ -616,7 +616,7 @@ Use these log entries to check what a list-scoped tick did:
 | `tick_scope_requested` | Logged by every tick that takes the lock, right after `startup_context` and before any startup check. `details.mode` is `full`, `target` (`details.target`), or `only` (`details.only`). A later resolved or unreadable record supersedes it; without one, the tick stopped before resolving its scope and started no engine |
 | `skip` (`listed PR unreadable` / `listed PR is not an open PR with readable labels`, or the issue equivalents) | A listed item could not be read directly, is closed, or returned a malformed payload. It is read again next tick. List ticks never page a label queue, so an unlisted item receives no read and no write |
 | `only_scope_unreadable` | Expansion failed after HARVEST and stale reconciliation. No engine started; exit `2`; the next tick reads again. `reason` holds the GitHub or validation error |
-| `loop_only_stop` | `--loop` stopped because the list's quiet streak reached the threshold. Work outside the list may still be queued |
+| `loop_only_stop` | `--loop` stopped for the list. `--only list settled` in `reason`: every listed item was terminal, held, closed, or handed off on a quiet tick. `--only list exhausted`: the list's quiet streak reached the threshold. Work outside the list may still be queued |
 
 Triage:
 

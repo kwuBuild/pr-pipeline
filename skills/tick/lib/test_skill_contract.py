@@ -435,6 +435,36 @@ def test_skill_md_defaults_unattended_runs_to_background_native_loop() -> None:
     assert "Optional" in loop_section.split("Paste this prompt into /loop")[0]
 
 
+def test_skill_md_arms_a_milestone_watch_with_the_native_loop() -> None:
+    """The native loop is paired with a filtered watch that notifies on milestones.
+
+    The filter runs outside the model, so quiet periods cost no model tokens;
+    the watch must end with the loop, and an unavailable tool must fall back
+    to the exit notification with the operator told.
+    """
+    text = SKILL.read_text()
+    procedure = text.split("## Run Procedure")[1].split("## Outcome Check")[0]
+
+    assert "Monitor" in procedure and "PushNotification" in procedure
+    # The cursor is marked before the loop starts, so a late or re-armed
+    # watch still reports milestones the loop wrote before it ran.
+    mark = f"bash {PLUGIN_ROOT_VAR}/skills/status/events.sh --mark"
+    loop = f"start `bash {PLUGIN_ROOT_VAR}/skills/tick/tick.sh --loop`"
+    watch = (f"bash {PLUGIN_ROOT_VAR}/skills/status/events.sh --follow --milestones"
+             " --cursor <path>")
+    assert mark in procedure and "Before starting the loop" in procedure
+    assert procedure.index(loop) < procedure.index(mark) < procedure.index(watch)
+    for kind in ("launch", "terminal", "attention", "stalled", "stopped",
+                 "startup_failure", "crash"):
+        assert f"`{kind}`" in procedure, kind
+    assert "`escalated`" not in procedure
+    assert "TaskStop" in procedure and "never re-arm" in procedure
+    assert "once without `--follow`" in procedure
+    assert "falls back to the exit notification" in procedure
+    assert "one turn per milestone" in procedure
+    assert "settled" in procedure and "--only list settled" in procedure
+
+
 def test_skill_md_loops_keep_the_operators_target_and_flags() -> None:
     """Both loop paths must carry the operator's target and flags forward.
 

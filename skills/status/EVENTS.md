@@ -24,6 +24,8 @@ If an older copied launcher rejects `events`, refresh it using the
 | `'#N'` | Show issue N and PR events whose link to N exists in a retained `pr_handoff` record. Quote the `#`. |
 | `pr:N` | Show events owned by PR N. |
 | `--follow` | Replay retained history, then inspect logs every second until interrupted. |
+| `--mark` | Record the current end of the retained logs in a new milestone cursor file in the system temporary directory, print the file's path, and exit `0`. It takes no other option. |
+| `--milestones --cursor PATH` | Emit only `launch`, `terminal`, `attention`, `stalled`, `stopped`, `startup_failure`, and `crash` events written after the cursor position, and save the advanced position after printing. The reader reads all retained logs from their start, so linkage, reviewer model records, escalation reasons, and attention episodes from records before the cursor still apply. A record that the filter did not select stays unreported in the cursor; issue linkage written later can still select it. With `--follow`, keep following; otherwise exit after the new records. Exit `0` after emitting a `stopped`, `startup_failure`, or `crash` event. A missing, malformed, or other-repository cursor exits `2`; there is no history-skipping fallback. A reader stopped between printing and saving prints those events again on its next run. The tick skill's [milestone watch](../tick/README.md#milestone-watch) uses it. Either option alone exits `2`. |
 | `--json` | Emit one version 1 JSON object per event. |
 
 Repository-wide startup failures, crashes, and loop stops remain visible under
@@ -33,7 +35,8 @@ linkage can therefore omit PR history from an issue-filtered view.
 The reader resolves state through the target's Git common directory, like
 `status`. Installed code and consumer state can live in different directories.
 The reader takes no tick lock and writes no labels, markers, caches, or logs.
-It can run while a tick writes events. It does not change notifications,
+Its only write is the milestone cursor file named by `--mark` or `--cursor`,
+outside the repository's pipeline state. It can run while a tick writes events. It does not change notifications,
 scheduling, engine prompts, or spending limits.
 
 ## History and delivery
@@ -58,8 +61,9 @@ scheduling, engine prompts, or spending limits.
    reset this suppression. Distinct crashes, startup failures, loop stops, and
    terminal-label records remain visible even when their projected details
    match. Other observations without a dispatch identity are separate occurrences.
-5. Restarting the reader intentionally replays retained history. There is no
-   durable delivery cursor or exactly-once guarantee across restarts. Renaming a log preserves its consumed records. Log
+5. Restarting the reader intentionally replays retained history. Only a
+   milestone cursor (`--milestones --cursor`) keeps a delivery position across
+   restarts, and it gives at-least-once delivery, not exactly-once. Renaming a log preserves its consumed records. Log
    replacement or truncation starts a new local file generation and warns that
    history may be incomplete.
 
@@ -83,9 +87,10 @@ number. An invalid or missing identity follows the malformed-record warning path
 | `revision_handoff` | Revision publication and re-review label convergence succeeded. This includes a validated no-change result. | `label`, `outcome`, `head_sha` |
 | `retry` | Transient failure was requeued and its cooldown recorded. | `domain`, `failure_class`, `cooldown_until` |
 | `cooldown` | Dispatch was skipped for an active provider cooldown. | `domain`, `failure_class`, `cooldown_until` |
-| `stalled` | The existing stall reporter detected a live engine with no recent output. | `progress_age_seconds` |
-| `terminal` | A terminal workflow label landed. | `label` |
-| `stopped` | Loop stopped after quiescence. | `reason`, `source_action` |
+| `stalled` | The existing stall reporter detected a live engine with no recent output. | `progress_age_seconds`, `seconds_to_deadline` |
+| `terminal` | A terminal workflow label landed. For `ai:needs-human-decision`, `reason` is the escalation reason that the same tick log recorded before the label landed, or `null`. An `escalate` or `kill_escalate` decision is never emitted on its own: it is logged before its action runs and can be cancelled. | `label`, `reason` |
+| `attention` | An action failed, its outcome is unconfirmed, or custody was retained: engine termination failed (`kill_failed`), an escalation comment is held for retry (`escalation_comment_retry`), a marker cannot prove engine death (`corrupt_marker_escalate`), or a terminal label could not be read or edited, or its verification found a mismatched label set (`terminal_label_failed`). A successful edit followed by an unreadable confirmation is `label_convergence_unverified`; only targets `ai:ready-for-human`, `ai:needs-human-decision`, and `ai:max-iterations` are emitted. Its reason includes the target label and its message says "terminal label not confirmed": the remote label may already have changed. An unchanged episode (item, stage, dispatch, source action, reason) is emitted once. A `launch`, a confirmed handoff, or a `terminal` event for the item ends its episodes, so a later failure is emitted again. Episodes are derived from retained history, so a restarted or newly marked reader reaches the same result. | `reason`, `source_action` |
+| `stopped` | The native loop stopped: full-queue quiescence (`loop_quiescent_stop`), a terminal target (`loop_target_stop`), or a settled or exhausted `--only` list (`loop_only_stop`). | `reason`, `source_action` |
 | `startup_failure` | Startup could not proceed with the target, configuration, labels, or required tools. | `reason`, `source_action` |
 | `crash` | Tick recorded an unexpected failure. | `reason`, `source_action` |
 
