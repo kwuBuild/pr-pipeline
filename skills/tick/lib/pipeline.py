@@ -1379,6 +1379,8 @@ def trusted_comment_history(comments: object, *, trusted_author: str) -> list[di
             raise ValueError("comment history contains an unknown author")
         if not isinstance(comment.get("body"), str):
             raise ValueError("comment history contains a malformed body")
+        if comment.get("_input_source") == "review":
+            continue  # Submitted reviews are human input, never controller history.
         if login == trusted_author:
             # Validate even ordinary notes: an edit may have erased a review
             # header. Missing provenance cannot silently remove a genuine round.
@@ -1401,26 +1403,187 @@ def trusted_marker_comments(
         or comment["body"].startswith((marker + "\n", marker + "\r\n"))]
 
 
+# Any controller marker, wherever it appears in a body. The pipeline posts as
+# the operator, so a comment carrying one is a pipeline action (or a quotation
+# of one), never an approved reviewer's instruction.
+_PIPELINE_MARKER_RE = re.compile(r"<!--\s*pr-pipeline:")
+
+# The fixer-input fingerprint a fix comment pins in its controller header.
+_FIX_REVIEW_PIN_RE = re.compile(r"^<!-- pr-pipeline:fix-review ([a-f0-9]{64}) -->$", re.M)
+_APPROVED_INPUT_PIN_RE = re.compile(r"^<!-- pr-pipeline:approved-input ([a-f0-9]{64}) -->$", re.M)
+
+
+def carries_pipeline_marker(body: str) -> bool:
+    """Return whether a comment body carries any pipeline control marker."""
+    return _PIPELINE_MARKER_RE.search(body) is not None
+
+
+def approved_comment_provenance(comment: dict) -> bool:
+    """Require explicit unedited provenance or a known edit by the author."""
+    if not {"lastEditedAt", "editor", "includesCreatedEdit"} <= comment.keys():
+        raise ValueError("approved comment has unknown edit provenance")
+    edited, editor, includes = (comment["lastEditedAt"], comment["editor"],
+                                comment["includesCreatedEdit"])
+    if type(includes) is not bool:
+        raise ValueError("approved comment has invalid edit provenance")
+    if edited is None and editor is None and includes is False:
+        return True
+    if not isinstance(edited, str) or not isinstance(editor, dict):
+        raise ValueError("approved comment has unknown edit provenance")
+    try:
+        timestamp = datetime.datetime.fromisoformat(edited.replace("Z", "+00:00"))
+        if timestamp.tzinfo is None:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("approved comment has invalid edit provenance") from exc
+    login = editor.get("login")
+    if not isinstance(login, str) or not _LOGIN_RE.fullmatch(login):
+        raise ValueError("approved comment has unknown edit provenance")
+    return login.casefold() == comment["author"]["login"].casefold()
+
+
+def _approved_input_body(body: str) -> bool:
+    """Allow only an optional leading review marker, never control metadata."""
+    if body == REVIEW_MARKER:
+        return False
+    if body.startswith((REVIEW_MARKER + "\n", REVIEW_MARKER + "\r\n")):
+        body = body[len(REVIEW_MARKER):]
+    return bool(body.strip()) and not carries_pipeline_marker(body)
+
+
+def fixer_input_comment(
+    comments: object, *, trusted_author: str,
+    approved_reviewers: Iterable[str] = (),
+) -> dict[str, Any] | None:
+    """Select the comment the next fixer must act on, or ``None``.
+
+    Two kinds of comment qualify:
+
+    - ``"review"``: an operator comment headed by :data:`REVIEW_MARKER`.
+    - ``"approved"``: a comment from the operator or a login in
+      ``approved_reviewers``, or their submitted change-request/comment review.
+      It can carry one leading review marker but no controller metadata, and
+      must be newer than the last operator pipeline action. Comments a pipeline
+      action already answered are not selected again.
+
+    The newer kind wins: an approved comment after the last pipeline action
+    always follows the latest review. Only operator conversation comments
+    supply controller metadata; approved inputs supply one finding, C1. An
+    approved comment that somebody else edited is not fixer input.
+
+    Raises:
+        ValueError: The history is malformed, has an unknown author, an edited
+            operator comment, or unknown edit provenance on an approved comment.
+
+    Returns:
+        ``{"kind": "review" | "approved", "comment": <entry>}`` or ``None``.
+    """
+    trusted_comment_history(comments, trusted_author=trusted_author)
+    assert isinstance(comments, list)  # Validated above.
+    approved = {login.casefold() for login in approved_reviewers}
+    approved.add(trusted_author.casefold())
+    review: dict[str, Any] | None = None
+    latest_approved: dict[str, Any] | None = None
+    for comment in comments:
+        login = comment["author"]["login"]
+        body = comment["body"]
+        submitted = comment.get("_input_source") == "review"
+        if submitted and comment["state"] not in {"CHANGES_REQUESTED", "COMMENTED"}:
+            continue
+        if (carries_pipeline_marker(body) and login == trusted_author and not submitted
+                and not _approved_input_body(body)):
+            latest_approved = None
+            if body == REVIEW_MARKER or body.startswith(
+                (REVIEW_MARKER + "\n", REVIEW_MARKER + "\r\n"),
+            ):
+                review = comment
+            continue
+        if login.casefold() not in approved:
+            continue
+        if not approved_comment_provenance(comment) or not _approved_input_body(body):
+            continue
+        latest_approved = comment
+    if latest_approved is not None:
+        return {"kind": "approved", "comment": latest_approved}
+    if review is not None:
+        return {"kind": "review", "comment": review}
+    return None
+
+
+def fixer_input_handoff(body: str, *, kind: str = "review") -> dict:
+    """Pin the finding identity of a selected fixer input body.
+
+    A selected pipeline report keeps its controller finding set. An approved
+    input is one finding, even when it starts with the review marker. The caller
+    must pass the authenticated selection kind, not infer authority from text.
+    """
+    lines = body.replace("\r\n", "\n").split("\n", 1)
+    if kind == "review" and lines[0] == REVIEW_MARKER:
+        return review_reports.handoff(body)
+    if not _approved_input_body(body):
+        raise ValueError("A marked comment is not an approved reviewer comment.")
+    return review_reports.comment_handoff(body)
+
+
+def approved_input_identity(comment: dict) -> str:
+    """Fingerprint the immutable GraphQL source ID, independent of body text."""
+    source_id = comment.get("id")
+    if not isinstance(source_id, str) or not source_id:
+        raise ValueError("approved input has no source identity")
+    return hashlib.sha256(("id:" + source_id).encode()).hexdigest()
+
+
+def approved_input_pin(body: str) -> str:
+    """Read source identity only from the controller header of a fix comment."""
+    header = body.replace("\r\n", "\n").split("\n\n", 1)[0]
+    pins = _APPROVED_INPUT_PIN_RE.findall(header)
+    if "<!-- pr-pipeline:approved-input" in header and len(pins) != 1:
+        raise ValueError("invalid approved-input identity in fix header")
+    return pins[0] if pins else ""
+
+
+def approved_input_rounds(comments: list[object], *, trusted_author: str) -> set[str]:
+    """Source identities authenticated by operator-owned fix headers."""
+    return {pin for entry in trusted_marker_comments(
+        comments, FIX_MARKER, trusted_author=trusted_author,
+    ) if (pin := approved_input_pin(entry["body"]))}
+
+
 def count_review_rounds(
     comments: list[object], marker: str = REVIEW_MARKER, *, trusted_author: str,
+    approved_input_reservations: Iterable[str] = (),
 ) -> int:
-    """Count authenticated rounds, deduplicating published round tokens.
+    """Count review tokens and distinct approved sources; deduplicate retries.
 
-    Tokenless historical headers still count individually. Missing identity or
-    malformed history raises rather than resetting the runaway-spend valve.
+    New fix headers pin source IDs, so equal bodies on separate comments count
+    separately even after deletion. Historical headers keep their body-pin
+    fallback. Controller-owned local reservations also count until publication;
+    source IDs deduplicate them against fix headers and operator reviews.
     """
     tokens: set[str] = set()
     legacy = 0
-    for comment in trusted_marker_comments(
-        comments, marker, trusted_author=trusted_author,
-    ):
+    review_digests: set[str] = set()
+    review_sources: set[str] = set()
+    for comment in trusted_marker_comments(comments, marker, trusted_author=trusted_author):
+        review_digests.add(hashlib.sha256(comment["body"].encode()).hexdigest())
+        if comment.get("id"):
+            review_sources.add(approved_input_identity(comment))
         lines = comment["body"].splitlines()
         token = lines[1] if len(lines) > 1 else ""
         if token.startswith(_ROUND_MARKER_PREFIX) and token.endswith(" -->"):
             tokens.add(token)
         else:
             legacy += 1
-    return legacy + len(tokens)
+    if marker != REVIEW_MARKER:
+        return legacy + len(tokens)
+    legacy_pins: set[str] = set()
+    for comment in trusted_marker_comments(comments, FIX_MARKER, trusted_author=trusted_author):
+        if not approved_input_pin(comment["body"]):
+            header = comment["body"].replace("\r\n", "\n").split("\n\n", 1)[0]
+            legacy_pins.update(_FIX_REVIEW_PIN_RE.findall(header))
+    return (legacy + len(tokens) + len(legacy_pins - review_digests)
+            + len((approved_input_rounds(comments, trusted_author=trusted_author)
+                   | set(approved_input_reservations)) - review_sources))
 
 
 def at_max_iterations(rounds: int, threshold: int = MAX_ITERATIONS) -> bool:
@@ -1730,6 +1893,7 @@ def decide_review_harvest(
     trusted_author: str,
     report_protocol_version: int | None = None,
     review_identity: str = "",
+    approved_input_reservations: Iterable[str] = (),
 ) -> dict[str, object]:
     """Decide the full outcome of harvesting one finished review.
 
@@ -1762,6 +1926,7 @@ def decide_review_harvest(
         pre_label: The PR's label *before* this review was dispatched
             (``ai:implemented`` or ``ai:revised``). A discard reverts to it so an
             ``ai:revised`` PR is not silently downgraded to ``ai:implemented``.
+        approved_input_reservations: Source fingerprints from controller-owned local receipts.
         threshold: Runaway-spend cap; defaults to :data:`MAX_ITERATIONS`.
         diff_base_sha: The merge-base recorded at dispatch — the anchor the
             reviewer's diff actually ran from. Embedded in the audit
@@ -1788,7 +1953,10 @@ def decide_review_harvest(
         ``post_comment`` (bool), and ``comment_body`` (str, empty when not
         posting).
     """
-    rounds = count_review_rounds(comments, trusted_author=trusted_author)
+    rounds = count_review_rounds(
+        comments, trusted_author=trusted_author,
+        approved_input_reservations=approved_input_reservations,
+    )
     verdict = validate_review(review_obj, report_protocol_version=report_protocol_version)
 
     # A retargeted PR invalidates the review outright: the diff was anchored
@@ -1962,6 +2130,7 @@ def decide_review_harvest(
 # failure this file's layering exists to make impossible, so it is reported.
 _CONFIG_KEYS = (
     "allow_touching",
+    "approved_reviewers",
     "checklist_paths",
     "verify_tools",
     "base_ref",
@@ -2076,6 +2245,10 @@ class ResolvedConfig:
             refuses to run on.
         allow_touching: Whether PRs editing reviewer-governing files may be
             auto-reviewed. Fails closed to ``False``.
+        approved_reviewers: GitHub logins whose PR conversation comments and
+            submitted change-request/comment reviews are fixer input. :attr:`login` is always an implicit
+            member and is not listed here. A malformed value lands in
+            :attr:`errors` and resolves to the empty tuple.
         checklist_paths: Repo-relative paths naming the target's own review
             checklists.
         verify_tools: Bash permission bodies the engines may run for
@@ -2158,6 +2331,7 @@ class ResolvedConfig:
     warnings: tuple[str, ...]
     repo_configured: bool = False
     engine_settings: str = ""
+    approved_reviewers: tuple[str, ...] = ()
     max_in_flight: int = DEFAULT_MAX_IN_FLIGHT
     implementer_timeout_seconds: int = IMPLEMENTER_TIMEOUT_SECONDS
     fixer_timeout_seconds: int = FIXER_TIMEOUT_SECONDS
@@ -2785,6 +2959,23 @@ def resolve_config(
         errors.append(problem)
         verify_tools = ()
 
+    # approved_reviewers widens who may start a fix, so a malformed list has no
+    # safe partial reading: an error refuses startup and nothing is approved.
+    picked_reviewers = _pick(layers, "approved_reviewers")
+    approved_reviewers, problem = _resolve_str_list(
+        picked_reviewers, "approved_reviewers",
+    )
+    if not problem and picked_reviewers is not None:
+        bad = next((e for e in approved_reviewers if not _LOGIN_RE.match(e)), None)
+        if bad is not None:
+            problem = (
+                f"{picked_reviewers[0]} approved_reviewers: {bad!r} is not a "
+                "GitHub login"
+            )
+    if problem:
+        errors.append(problem)
+        approved_reviewers = ()
+
     base_ref, problem = _resolve_string(
         _pick(layers, "base_ref"), "base_ref", "", _valid_base_ref,
         blank_means="the target's default branch",
@@ -2857,6 +3048,7 @@ def resolve_config(
         probed_route=probed_route,
         login=login,
         allow_touching=allow_touching,
+        approved_reviewers=approved_reviewers,
         checklist_paths=checklist_paths,
         verify_tools=verify_tools,
         base_ref=base_ref,
@@ -3651,6 +3843,7 @@ def render_fix_comment(
     body_revision: str = "",
     no_change_round: str = "",
     review_sha256: str = "",
+    approved_input_sha256: str = "",
     marker: str = FIX_MARKER,
 ) -> str:
     """Render the PR comment recording one finished fixer run.
@@ -3682,6 +3875,7 @@ def render_fix_comment(
         no_change_round: Stable dispatch-derived identity for an accepted
             no-change completion. Empty for pushed fixes and escalations.
         review_sha256: Fingerprint of the original review handed to the fixer.
+        approved_input_sha256: Controller-pinned source identity for approved input.
         marker: The fixed header string; defaults to :data:`FIX_MARKER`.
 
     Returns:
@@ -3700,6 +3894,7 @@ def render_fix_comment(
         marker,
         *([f"<!-- pr-pipeline:no-change {no_change_round} -->"] if no_change_round else []),
         *([f"<!-- pr-pipeline:fix-review {review_sha256} -->"] if review_sha256 else []),
+        *([f"<!-- pr-pipeline:approved-input {approved_input_sha256} -->"] if approved_input_sha256 else []),
         "",
         f"**Fixer run** (head `{before}` → `{after}`)",
         "",
@@ -3768,7 +3963,10 @@ def fixer_original_review(
 
     Never substitute a newer review or an edited copy. Missing provenance or
     a deleted/edited original returns empty so no-change review fails closed.
-    Both the fixer summary and the original review require operator authorship.
+    The fixer summary requires operator authorship. The original is an operator
+    review comment, or an approved input selected by :func:`fixer_input_comment`.
+    New approved inputs require both source identity and body fingerprints;
+    historical body-only pins retain the unmarked-comment fallback.
     """
     trusted_fixes = trusted_marker_comments(
         comments, FIX_MARKER, trusted_author=trusted_author,
@@ -3781,11 +3979,33 @@ def fixer_original_review(
     match = re.search(r"^<!-- pr-pipeline:fix-review ([a-f0-9]{64}) -->$", header, re.M)
     if match is None:
         return ""
+    try:
+        source_identity = approved_input_pin(fixer_summary)
+    except ValueError:
+        return ""
+    if source_identity:
+        for comment in comments:
+            if (comment.get("id") and approved_input_identity(comment) == source_identity
+                    and hashlib.sha256(comment["body"].encode()).hexdigest() == match[1]):
+                try:
+                    if approved_comment_provenance(comment):
+                        return comment["body"]
+                except ValueError:
+                    return ""
+        return ""
     for comment in trusted_marker_comments(
         comments, REVIEW_MARKER, trusted_author=trusted_author,
     ):
         body = comment["body"]
         if hashlib.sha256(body.encode()).hexdigest() == match[1]:
+            return body
+    # An approved reviewer comment that started the fix. The operator's fix
+    # comment pinned its exact fingerprint at dispatch, so an identical unmarked
+    # body is that input whoever posted it; a marked body never is.
+    for comment in comments:
+        body = comment["body"] if isinstance(comment, dict) else None
+        if (isinstance(body, str) and not carries_pipeline_marker(body)
+                and hashlib.sha256(body.encode()).hexdigest() == match[1]):
             return body
     return ""
 
@@ -4125,6 +4345,7 @@ def decide_fix_harvest(
     body_revision: str = "",
     dispatch_id: str = "",
     review_sha256: str = "",
+    approved_input_sha256: str = "",
     verification_unconfigured: bool = False,
     report_protocol_version: int | None = None,
     review_handoff: object = None,
@@ -4201,6 +4422,7 @@ def decide_fix_harvest(
             dispatch_id=dispatch_id, pinned_head=pinned_head, current_head=current_head,
             review_sha256=review_sha256, review_handoff=review_handoff,
             verification_unconfigured=verification_unconfigured, body_revision=body_revision,
+            approved_input_sha256=approved_input_sha256,
         )
     sentinel = parse_fix_result(result_obj)
     report = _sanitize_engine_report(
@@ -4244,6 +4466,7 @@ def decide_fix_harvest(
                 ),
                 no_change_round=no_change_round,
                 review_sha256=review_sha256,
+                approved_input_sha256=approved_input_sha256,
             ) + "\n\n" + fixer_reports.LEGACY_NOTE,
         }
         if not head_advanced:
@@ -4285,7 +4508,7 @@ def decide_fix_harvest(
 def _decide_fixer_report(
     *, result_obj: object, report_protocol_version: object, dispatch_id: str,
     pinned_head: str, current_head: str, review_sha256: str, review_handoff: object,
-    verification_unconfigured: bool, body_revision: str,
+    verification_unconfigured: bool, body_revision: str, approved_input_sha256: str,
 ) -> dict[str, object]:
     report, problem = fixer_reports.parse_result(result_obj, report_protocol_version)
     if report:
@@ -4304,6 +4527,7 @@ def _decide_fixer_report(
         body_revision=body_revision if recheck else ("not-applied" if body_revision == "ready" else body_revision),
         no_change_round=hashlib.sha256(dispatch_id.encode()).hexdigest() if recheck and sentinel == SENTINEL_NO_CHANGES else "",
         review_sha256=review_sha256,
+        approved_input_sha256=approved_input_sha256,
     )
     metadata, rest = header.split("\n\n", 1)
     header = (metadata + "\n" + fixer_reports.COMMENT_MARKER
@@ -4320,6 +4544,7 @@ def _decide_fixer_report(
             action=action, label=label, sentinel=sentinel, pinned_head=pinned_head, current_head=current_head,
             escalation_reason=problem + " Complete source is retained in the harvest-evidence archive; operator recovery is required.",
             review_sha256=review_sha256,
+            approved_input_sha256=approved_input_sha256,
         )
     else:
         body = rendered
@@ -4402,7 +4627,8 @@ _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
     {"pid", "start_time", "pgid", "state", "base_tip_sha", "pr_body",
      "fix_round", "review_sha256", "verification_unconfigured",
      "permission_mode", "verify_tools", "stall_seconds",
-     "stall_startup_grace_seconds", "report_protocol_version", "review_handoff"}
+     "stall_startup_grace_seconds", "report_protocol_version", "review_handoff",
+     "approved_input_sha256"}
 )
 
 # The stall limits an implementer/fixer was dispatched under, with the minimum
@@ -4630,6 +4856,15 @@ def valid_marker(
         if stage != "fix" or not isinstance(review_sha256, str):
             return False
         if not re.fullmatch(r"[a-f0-9]{64}", review_sha256):
+            return False
+
+    if "approved_input_sha256" in obj:
+        identity = obj["approved_input_sha256"]
+        handoff = obj.get("review_handoff")
+        if (stage != "fix" or not isinstance(identity, str)
+                or not re.fullmatch(r"[a-f0-9]{64}", identity)
+                or not isinstance(handoff, dict)
+                or handoff.get("version") != review_reports.COMMENT_HANDOFF_VERSION):
             return False
 
     if "report_protocol_version" in obj:
@@ -4992,6 +5227,7 @@ def harvest_review(
     trusted_author: str,
     report_protocol_version: int | None = None,
     review_identity: str = "",
+    approved_input_reservations: Iterable[str] = (),
 ) -> HarvestResult:
     """Decide the outcome of harvesting one finished review.
 
@@ -5004,6 +5240,7 @@ def harvest_review(
         pinned_head: The head SHA recorded at dispatch (reviewed commit).
         current_head: The PR head resolved now.
         pre_label: The PR's label before this review was dispatched.
+        approved_input_reservations: Source fingerprints from controller-owned local receipts.
         threshold: Runaway-spend cap.
         diff_base_sha: The merge-base the reviewer's diff was anchored to
             (audit/idempotency truth). Defaults to ``pinned_base`` for markers
@@ -5041,6 +5278,7 @@ def harvest_review(
         fix_round=fix_round,
         report_protocol_version=report_protocol_version,
         review_identity=review_identity,
+        approved_input_reservations=approved_input_reservations,
     )
     return result  # type: ignore[return-value]
 
@@ -5125,6 +5363,7 @@ def harvest_fix(
     body_revision: str = "",
     dispatch_id: str = "",
     review_sha256: str = "",
+    approved_input_sha256: str = "",
     verification_unconfigured: bool = False,
     report_protocol_version: int | None = None,
     review_handoff: object = None,
@@ -5164,6 +5403,7 @@ def harvest_fix(
         body_revision=body_revision,
         dispatch_id=dispatch_id,
         review_sha256=review_sha256,
+        approved_input_sha256=approved_input_sha256,
     )
     return decision  # type: ignore[return-value]
 
@@ -5324,6 +5564,7 @@ def _cmd_harvest_review(args: argparse.Namespace) -> int:
         fix_round=args.fix_round,
         report_protocol_version=args.report_protocol_version,
         review_identity=args.review_identity,
+        approved_input_reservations=args.approved_input_reservation,
     )
     print(json.dumps(decision))
     return 0
@@ -5420,6 +5661,7 @@ def _cmd_harvest_fix(args: argparse.Namespace) -> int:
         body_revision=args.body_revision,
         dispatch_id=args.dispatch_id,
         review_sha256=args.review_sha256,
+        approved_input_sha256=args.approved_input_sha256,
         report_protocol_version=args.report_protocol_version,
         review_handoff=_load_json(args.review_handoff, None) if args.review_handoff else None,
         verification_unconfigured=args.verification_unconfigured,
@@ -5845,6 +6087,10 @@ def main(argv: list[str] | None = None) -> int:
     p_harvest.add_argument("--review", required=True, help="Path to review.json")
     p_harvest.add_argument("--comments", required=True, help="Path to complete normalized comments JSON")
     p_harvest.add_argument(
+        "--approved-input-reservation", action="append", default=[],
+        help="Controller-owned source fingerprint from local receipts (repeat for each source)",
+    )
+    p_harvest.add_argument(
         "--pinned-base", required=True,
         help="base tip snapshot from dispatch.json (base_tip_sha; freshness anchor)",
     )
@@ -5947,6 +6193,9 @@ def main(argv: list[str] | None = None) -> int:
     p_harvest_fix.add_argument("--report-protocol-version", type=int)
     p_harvest_fix.add_argument("--review-handoff", help="Path to the dispatch-pinned review_handoff JSON")
     p_harvest_fix.add_argument("--verification-unconfigured", action="store_true")
+    p_harvest_fix.add_argument(
+        "--approved-input-sha256", default="", help="Approved source identity from dispatch.json",
+    )
     p_harvest_fix.add_argument(
         "--review-sha256", default="", help="Original review fingerprint from dispatch.json",
     )

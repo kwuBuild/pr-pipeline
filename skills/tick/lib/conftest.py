@@ -889,7 +889,8 @@ def comment_pages(comments: list[dict[str, object]]) -> list[dict[str, object]]:
     nodes = [{"id": str(i + 1), "lastEditedAt": None, "editor": None,
               "includesCreatedEdit": False, **comment} for i, comment in enumerate(comments)]
     chunks = [nodes[i:i + 100] for i in range(0, len(nodes), 100)] or [[]]
-    return [{"data": {"repository": {"pullRequest": {"comments": {
+    return [{"data": {"repository": {"pullRequest": {"reviews": {
+        "totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}, "comments": {
         "totalCount": len(nodes), "nodes": chunk,
         "pageInfo": {"hasNextPage": i < len(chunks) - 1,
                      "endCursor": f"cursor-{i}" if chunk else None},

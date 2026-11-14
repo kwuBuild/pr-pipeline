@@ -517,7 +517,8 @@ elif a[:2] == ["api", "graphql"]:
                 "title": "Fixture title", "author": {"login": "owner"},
                 "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-02T00:00:00Z", **record}
     if "--slurp" in a:
-        result = [{"data": {"repository": {"pullRequest": {"comments": {
+        result = [{"data": {"repository": {"pullRequest": {"reviews": {"totalCount": 0, "nodes": [],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}, "comments": {
             "totalCount": 1, "nodes": [{"id": "1", "author": {"login": "test-owner"},
             "body": item["comments"][0]["body"], "lastEditedAt": None, "editor": None,
             "includesCreatedEdit": False}], "pageInfo": {"hasNextPage": False, "endCursor": "one"}}}}}}]

@@ -834,7 +834,10 @@ def test_dispatch_fixers_noop_when_no_changes_requested() -> None:
                     authoritative_in_flight=[],
                 )
 
-    gh_text_mock.assert_called_once()
+    # One listing of held PRs for resume, one of the changes-requested queue.
+    labels = [call.args[call.args.index("--label") + 1]
+              for call in gh_text_mock.call_args_list]
+    assert labels == ["ai:needs-human-decision", "ai:changes-requested"]
     cdn_mock.assert_not_called()
     dispatch_one.assert_not_called()
 
@@ -942,12 +945,15 @@ def test_dispatch_fixers_lists_queue_with_scan_limit() -> None:
             authoritative_in_flight=[],
         )
 
-    gh_text_mock.assert_called_once()
-    args = gh_text_mock.call_args[0]
-    assert args[:2] == ("pr", "list")
-    assert ("--limit", str(tick._ACTIONABLE_QUEUE_SCAN_LIMIT)) in zip(
-        args, args[1:]
-    )
+    # The resume listing of held PRs and the queue listing both page past
+    # held candidates.
+    assert gh_text_mock.call_count == 2
+    for call in gh_text_mock.call_args_list:
+        args = call[0]
+        assert args[:2] == ("pr", "list")
+        assert ("--limit", str(tick._ACTIONABLE_QUEUE_SCAN_LIMIT)) in zip(
+            args, args[1:]
+        )
 
 
 def test_dispatch_fixers_respects_target_filter() -> None:
@@ -2555,9 +2561,10 @@ def test_dispatch_one_fixer_handles_escalation_relabel_failure(
                     "fix-branch", # head_ref (new)
                 ]
                 with mock.patch("tick.gh_json") as gh_json_mock:
-                    # No pipeline review comment → escalation path
+                    # No pipeline review and no approved comment → escalation
+                    # path. An unmarked operator note would be fixer input.
                     gh_json_mock.side_effect = fixer_gh_json(
-                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "test-owner"}, "body": "just a human note"}],
+                        comments=[{"lastEditedAt": None, "editor": None, "includesCreatedEdit": False, "author": {"login": "outside-user"}, "body": "just a human note"}],
                     )
                     with mock.patch("tick.pipeline.atomic_write") as atomic_write:
                         atomic_write.side_effect = lambda path, data: (

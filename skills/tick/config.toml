@@ -33,6 +33,7 @@
 #
 #   [defaults]
 #   allow_touching  = true
+#   approved_reviewers = []          # logins whose PR comments direct the fixer
 #   checklist_paths = []
 #   verify_tools    = ["uv run pytest *"]
 #   base_ref        = ""
@@ -81,6 +82,15 @@ allow_touching = true
 # the tick stops the gate keeps every usable path any layer named: a typo in a
 # per-repository override must not quietly unprotect a valid [defaults] list.
 checklist_paths = []
+
+# GitHub logins whose PR comments and submitted change-request/comment reviews
+# direct the fixer, beside the implicit operator login. New input after the last
+# pipeline action can resume ai:needs-human-decision within max_iterations.
+# A single leading review marker is allowed; other control markers are not.
+# See README.md, "Comment trust and incomplete history", for trust and replay rules.
+# Comments from any other login are never fixer instructions. Each entry must be
+# a GitHub login; any other value is a startup error naming this key.
+approved_reviewers = []
 
 # The verification commands an engine is permitted to run, as Bash permission
 # bodies (each is wrapped in `Bash(...)`). This is a permission grant, not an

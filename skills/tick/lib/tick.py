@@ -1271,7 +1271,7 @@ _COMMENT_HISTORY_QUERY = """query(
         pullRequest(number: $number) {
             comments(first: 100, after: $endCursor) {
                 totalCount
-                nodes { id body author { login } lastEditedAt editor { login } includesCreatedEdit }
+                nodes { id body createdAt author { login } lastEditedAt editor { login } includesCreatedEdit }
                 pageInfo { hasNextPage endCursor }
             }
         }
@@ -1279,17 +1279,24 @@ _COMMENT_HISTORY_QUERY = """query(
 }"""
 
 
-def _comment_history_snapshot(number: int) -> list[object]:
+_REVIEW_INPUT_QUERY = _COMMENT_HISTORY_QUERY.replace(
+    "comments(first:", "reviews(first:",
+).replace("id body createdAt", "id body createdAt submittedAt state")
+
+
+def _comment_history_snapshot(number: int, *, reviews: bool = False) -> list[object]:
     """Read a cursor traversal with consistent counts and unique records.
 
     GraphQL supplies edit provenance, which REST authorship/timestamps cannot
     establish. Cardinality checks detect deletion during traversal even if a
     cursor implementation were to skip a shifted record.
     """
+    field = "reviews" if reviews else "comments"
+    query = _REVIEW_INPUT_QUERY if reviews else _COMMENT_HISTORY_QUERY
     owner, name = TRUSTED_HEAD_REPO.split("/", 1)
     pages = gh_json(
         "api", "graphql", "--hostname", "github.com", "--paginate", "--slurp",
-        "-f", f"query={_COMMENT_HISTORY_QUERY}", "-f", f"owner={owner}",
+        "-f", f"query={query}", "-f", f"owner={owner}",
         "-f", f"name={name}", "-F", f"number={number}",
     )
     if not isinstance(pages, list) or not pages:
@@ -1302,7 +1309,7 @@ def _comment_history_snapshot(number: int) -> list[object]:
         try:
             if page.get("errors"):
                 raise ValueError("comment query returned GraphQL errors")
-            connection = page["data"]["repository"]["pullRequest"]["comments"]
+            connection = page["data"]["repository"]["pullRequest"][field]
             nodes = connection["nodes"]
             count = connection["totalCount"]
             info = connection["pageInfo"]
@@ -1337,9 +1344,42 @@ def _comment_history_snapshot(number: int) -> list[object]:
     return comments
 
 
+def _fixer_input_history_snapshot(number: int) -> list[object]:
+    """Read both connections; submitted reviews never become control records."""
+    comments = _comment_history_snapshot(number)
+    reviews = _comment_history_snapshot(number, reviews=True)
+    if not reviews:
+        return comments
+    entries = list(comments)
+    for review in reviews:
+        state = review.get("state")
+        if not isinstance(state, str) or state not in {
+            "PENDING", "DISMISSED", "APPROVED", "COMMENTED", "CHANGES_REQUESTED",
+        }:
+            raise ValueError("submitted review has unknown state")
+        if state == "PENDING":
+            continue
+        entries.append({**review, "_input_source": "review", "createdAt": review.get("submittedAt")})
+    # At equal timestamps a controller comment wins: an ambiguous same-second
+    # submitted review must not release a hold. Within each connection keep order.
+    def order(entry: dict) -> tuple:
+        value = entry.get("createdAt")
+        try:
+            if not isinstance(value, str):
+                raise ValueError
+            timestamp = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if timestamp.tzinfo is None:
+                raise ValueError
+        except ValueError as exc:
+            raise ValueError("fixer input has unknown publication time") from exc
+        return timestamp, entry.get("_input_source") != "review"
+    return sorted(entries, key=order)
+
+
 def _read_comment_history(
     number: int, *, phase: str, stage: str, tick_log: TickLog | None,
     trusted_author: str | None = None,
+    include_reviews: bool = False, approved_reviewers: Sequence[str] = (),
 ) -> list[object] | None:
     """Require two matching complete traversals before trusting comment history.
 
@@ -1349,10 +1389,15 @@ def _read_comment_history(
     """
     author = TRUSTED_REVIEW_AUTHOR if trusted_author is None else trusted_author
     try:
-        comments = _comment_history_snapshot(number)
+        snapshot = _fixer_input_history_snapshot if include_reviews else _comment_history_snapshot
+        comments = snapshot(number)
         trusted = pipeline.trusted_comment_history(comments, trusted_author=author)
-        confirmed = _comment_history_snapshot(number)
+        if include_reviews:
+            pipeline.fixer_input_comment(comments, trusted_author=author, approved_reviewers=approved_reviewers)
+        confirmed = snapshot(number)
         pipeline.trusted_comment_history(confirmed, trusted_author=author)
+        if include_reviews:
+            pipeline.fixer_input_comment(confirmed, trusted_author=author, approved_reviewers=approved_reviewers)
         if confirmed != comments:
             raise ValueError("comment history changed between complete reads")
     except (subprocess.CalledProcessError, ValueError) as exc:
@@ -6631,6 +6676,14 @@ def _harvest_one_reviewer(
     if comments is None:
         return
 
+    try:
+        reservations = _approved_input_reservations(n, wt_root=wt_root)
+    except ValueError as exc:
+        if tick_log:
+            tick_log.log(pr=n, phase="harvest", stage="review", action="hold_retained",
+                         reason=f"review round accounting refused: {exc} — retained for retry")
+        return
+
     # Decide outcome
     try:
         harvest_result = pipeline.harvest_review(
@@ -6649,6 +6702,7 @@ def _harvest_one_reviewer(
             threshold=max_iterations,
             report_protocol_version=marker.get("report_protocol_version"),
             review_identity=marker.get("dispatch_id", ""),
+            approved_input_reservations=reservations,
         )
     except Exception:
         # A persistent parse error in harvest_review would loop
@@ -8966,6 +9020,7 @@ def _harvest_one_fixer(
             body_revision=revision_state,
             dispatch_id=dispatch_id,
             review_sha256=review_sha256,
+            approved_input_sha256=marker.get("approved_input_sha256", ""),
             report_protocol_version=marker.get("report_protocol_version"),
             review_handoff=marker.get("review_handoff"),
         )
@@ -10429,7 +10484,7 @@ def _dispatch_one_reviewer(
     original_finding_references = "No originating finding snapshot."
     fix_comments = _read_comment_history(
         pr_number, phase="dispatch", stage="review", tick_log=tick_log,
-        trusted_author=trusted_author,
+        trusted_author=trusted_author, include_reviews=pre_label == pipeline.LABEL_REVISED,
     )
     if fix_comments is None:
         return
@@ -10442,7 +10497,8 @@ def _dispatch_one_reviewer(
         )
         if original_review:
             try:
-                original_finding_references = json.dumps(pipeline.review_reports.handoff(original_review))
+                original_finding_references = json.dumps(pipeline.fixer_input_handoff(
+                    original_review, kind="approved" if pipeline.approved_input_pin(fixer_summary) else "review"))
             except ValueError:
                 if tick_log:
                     tick_log.log(pr=pr_number, phase="dispatch", stage="review", action="skip",
@@ -11566,6 +11622,235 @@ def _dispatch_one_implementer(
         )
 
 
+# Receipt kind recording the approved comments that already started a fix.
+_APPROVED_INPUT_KIND = "approved-inputs"
+
+
+def _approved_input_key(comment: dict) -> str:
+    """Identify one approved comment: its GraphQL id, else its fingerprint."""
+    comment_id = comment.get("id")
+    if isinstance(comment_id, str) and comment_id:
+        return "id:" + comment_id
+    return "sha256:" + hashlib.sha256(comment["body"].encode()).hexdigest()
+
+
+def _consumed_approved_inputs(number: int, *, wt_root: str | None = None) -> set[str] | None:
+    """Read the approved comments that already started a fix on one PR.
+
+    Returns ``None`` when the receipt exists but cannot be read or parsed, so a
+    caller fails closed instead of treating it as empty.
+    """
+    path = _comment_receipt_path(
+        WT_ROOT if wt_root is None else wt_root, "pr", number, _APPROVED_INPUT_KIND,
+    )
+    try:
+        with open(path) as fh:
+            keys = json.load(fh)
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+        return None
+    return set(keys)
+
+
+def _approved_input_reservations(number: int, *, wt_root: str | None = None) -> set[str]:
+    """Return controller-owned source fingerprints, refusing unreadable receipts."""
+    consumed = _consumed_approved_inputs(number, wt_root=wt_root)
+    if consumed is None:
+        raise ValueError("approved-input receipt unreadable")
+    return {hashlib.sha256(key.encode()).hexdigest() for key in consumed}
+
+
+def _record_approved_input(number: int, comment: dict) -> bool:
+    """Record that an approved comment started a fix, before the launch.
+
+    A fixer can end at ``ai:needs-human-decision`` without posting a comment
+    (for example, the resultless attempt cap in reconcile). The approved comment
+    is then still newer than the last pipeline comment, so this receipt is what
+    stops :func:`_resume_answered_holds` from resuming on it again.
+    """
+    consumed = _consumed_approved_inputs(number)
+    if consumed is None:
+        return False
+    consumed.add(_approved_input_key(comment))
+    path = _comment_receipt_path(WT_ROOT, "pr", number, _APPROVED_INPUT_KIND)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pipeline.atomic_write(path, json.dumps(sorted(consumed)))
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _fix_within_budget(
+    number: int, comments: list, selected: dict, *, pre_label: str,
+    max_iterations: int, tick_log: TickLog | None,
+) -> bool:
+    """Bound all fixer spend at both hold release and direct dispatch.
+
+    Receipts include silent/resultless attempts; published source pins survive
+    deletion and checkout changes. A receipt without a publication for the
+    current input may be a pre-launch crash, so that same input can retry under
+    the existing dispatch-attempt cap.
+    """
+    try:
+        reservations = _approved_input_reservations(number)
+        if selected["kind"] == "approved":
+            reservations.discard(pipeline.approved_input_identity(selected["comment"]))
+            # Admission counts prior rounds. An operator's single review marker
+            # does not make this pending approved input a completed round.
+            # Published fix headers remain in history and still count its source.
+            comments = [entry for entry in comments
+                        if entry.get("id") != selected["comment"]["id"]]
+        rounds = pipeline.count_review_rounds(
+            comments, trusted_author=TRUSTED_REVIEW_AUTHOR,
+            approved_input_reservations=reservations,
+        )
+        if not pipeline.at_max_iterations(rounds, max_iterations):
+            return True
+        relabel("pr", number, pre_label, pipeline.LABEL_MAX_ITERATIONS)
+        reason = f"fixer input reached round cap ({rounds}/{max_iterations})"
+    except (ValueError, subprocess.CalledProcessError) as exc:
+        reason = f"fixer admission refused: {exc} — retained for retry"
+    if tick_log:
+        tick_log.log(pr=number, phase="dispatch", stage="fix", action="hold_retained", reason=reason)
+    return False
+
+
+def _resume_answered_holds(
+    *,
+    target: tuple[str, int] | None,
+    only: Sequence[tuple[str, int]] | None,
+    authoritative_in_flight: list[pipeline.InFlightRef],
+    approved_reviewers: Sequence[str],
+    tick_log: TickLog | None,
+    max_iterations: int = pipeline.MAX_ITERATIONS,
+) -> list[int]:
+    """Return held PRs to the fix queue when an approved reviewer answered.
+
+    An ``ai:needs-human-decision`` PR is resumed when its newest fixer input
+    (see :func:`pipeline.fixer_input_comment`) is an approved reviewer's
+    input posted after the last pipeline action. The transition
+    removes ``ai:needs-human-decision`` and adds ``ai:changes-requested`` in
+    one edit. Every other case keeps the hold:
+
+    - ``ai:blocked`` or any workflow label other than
+      ``ai:changes-requested`` is present;
+    - the PR is in flight this tick, or a local dispatch marker exists;
+    - the approved comment already started a fix (see
+      :func:`_record_approved_input`);
+    - labels, comment history, or the receipt are unreadable or untrusted
+      (fail closed).
+
+    Args:
+        target: Optional ``("pr", N)`` restriction.
+        only: Resolved ``--only`` scope items, or ``None`` to list held PRs.
+        authoritative_in_flight: In-flight refs known to this tick.
+        approved_reviewers: Logins beside the operator whose comments qualify.
+        tick_log: Tick log handle, or ``None``.
+
+    Returns:
+        The PR numbers relabeled to ``ai:changes-requested``.
+    """
+    def log(number: int, action: str, reason: str) -> None:
+        if tick_log:
+            tick_log.log(pr=number, phase="dispatch", stage="fix",
+                         action=action, reason=reason)
+
+    if only is not None:
+        numbers = list(dict.fromkeys(n for kind, n in only if kind == "pr"))
+    else:
+        try:
+            lines = gh_text(
+                "pr", "list",
+                "--label", pipeline.LABEL_NEEDS_HUMAN,
+                "--state", "open",
+                "--limit", str(_ACTIONABLE_QUEUE_SCAN_LIMIT),
+                "--json", "number",
+                "-q", ".[].number",
+            )
+        except subprocess.CalledProcessError:
+            return []
+        numbers = sorted({int(line) for line in lines.split() if line.isdigit()})
+
+    resumed: list[int] = []
+    for number in numbers:
+        if target is not None and number != target[1]:
+            continue
+        if any(ref.kind == "pr" and ref.number == number
+               for ref in authoritative_in_flight):
+            continue
+        try:
+            payload = gh_json("pr", "view", str(number), "--json", "number,state,labels")
+        except (subprocess.CalledProcessError, ValueError):
+            payload = None
+        labels = _pipeline_labels(payload)
+        if (labels is None or not isinstance(payload, dict)
+                or payload.get("number") != number or payload.get("state") != "OPEN"):
+            if only is None:
+                log(number, "hold_retained", "held PR labels unreadable — retried next tick")
+            continue
+        if pipeline.LABEL_NEEDS_HUMAN not in labels:
+            continue
+        others = set(labels) - {pipeline.LABEL_NEEDS_HUMAN, pipeline.LABEL_CHANGES_REQUESTED}
+        if others:
+            log(number, "hold_retained",
+                "hold retained: " + ", ".join(sorted(others)) + " present")
+            continue
+        if os.path.exists(os.path.join(WT_ROOT, f"pr-{number}", "dispatch.json")):
+            log(number, "hold_retained", "hold retained: a local dispatch marker exists")
+            continue
+        comments = _read_comment_history(
+            number, phase="dispatch", stage="fix", tick_log=tick_log,
+            include_reviews=True, approved_reviewers=approved_reviewers,
+        )
+        if comments is None:
+            continue
+        try:
+            selected = pipeline.fixer_input_comment(
+                comments, trusted_author=TRUSTED_REVIEW_AUTHOR,
+                approved_reviewers=approved_reviewers,
+            )
+        except ValueError as exc:
+            log(number, "comment_history_refused",
+                f"comment history unavailable or untrusted: {exc} — retained for retry")
+            continue
+        if selected is None or selected["kind"] != "approved":
+            continue
+        consumed = _consumed_approved_inputs(number)
+        if consumed is None:
+            log(number, "hold_retained", "hold retained: approved-input receipt unreadable")
+            continue
+        if _approved_input_key(selected["comment"]) in consumed:
+            log(number, "hold_retained",
+                "hold retained: the newest approved comment already started a fix "
+                "— post a new comment to resume")
+            continue
+        if not _fix_within_budget(
+            number, comments, selected, pre_label=pipeline.LABEL_NEEDS_HUMAN,
+            max_iterations=max_iterations, tick_log=tick_log,
+        ):
+            continue
+        try:
+            relabel("pr", number, pipeline.LABEL_NEEDS_HUMAN,
+                    pipeline.LABEL_CHANGES_REQUESTED)
+        except subprocess.CalledProcessError:
+            log(number, "hold_retained", "resume relabel failed — retried next tick")
+            continue
+        if tick_log:
+            tick_log.log(
+                pr=number, phase="dispatch", stage="fix", action="resume",
+                reason=(f"approved reviewer comment newer than the last pipeline "
+                        f"action — {pipeline.LABEL_NEEDS_HUMAN} → "
+                        f"{pipeline.LABEL_CHANGES_REQUESTED}"),
+                details={"author": selected["comment"]["author"]["login"]},
+            )
+        resumed.append(number)
+    return resumed
+
+
 def dispatch_fixers(
     tick_log: TickLog | None = None,
     target: tuple[str, int] | None = None,
@@ -11580,11 +11865,15 @@ def dispatch_fixers(
     stall_seconds: int = ENGINE_STALL_SECONDS,
     stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
     only: Sequence[tuple[str, int]] | None = None,
+    approved_reviewers: Sequence[str] = (),
+    max_iterations: int = pipeline.MAX_ITERATIONS,
 ) -> None:
     """Dispatch fixer engines for PRs at ai:changes-requested.
 
-    Queries open PRs with the ``ai:changes-requested`` label, checks the
-    admission cap, and launches a fixer engine for each eligible PR.
+    First resumes ``ai:needs-human-decision`` PRs that an approved reviewer
+    answered (see :func:`_resume_answered_holds`). Then queries open PRs with
+    the ``ai:changes-requested`` label, checks the admission cap, and launches
+    a fixer engine for each eligible PR.
 
     Args:
         tick_log: Tick log handle, or ``None`` to skip logging.
@@ -11620,6 +11909,8 @@ def dispatch_fixers(
             found and an unlisted PR is never read or written. Trust and
             eligibility gates still apply. Unlike ``target`` this scopes new
             launches alone; HARVEST stays global.
+        approved_reviewers: Logins whose comments and submitted reviews are fixer input,
+            beside the implicit operator login.
     """
     # Target type gate: only dispatch for pr targets.
     if target is not None and target[0] != "pr":
@@ -11634,6 +11925,15 @@ def dispatch_fixers(
             authoritative_in_flight = read_authoritative_in_flight_labels()
         except (subprocess.CalledProcessError, ValueError):
             return
+
+    # A held PR that an approved reviewer answered returns to the fix queue
+    # before the queue is read, so it is a candidate in this same tick.
+    resumed = _resume_answered_holds(
+        target=target, only=only,
+        authoritative_in_flight=authoritative_in_flight,
+        approved_reviewers=approved_reviewers, tick_log=tick_log,
+        max_iterations=max_iterations,
+    )
 
     # An --only list reads its PRs directly, in list order, so a listed PR
     # beyond the bounded label page is still found and an unlisted PR is
@@ -11656,7 +11956,7 @@ def dispatch_fixers(
         except subprocess.CalledProcessError:
             return
 
-        candidate_nums: set[int] = set()
+        candidate_nums: set[int] = set(resumed)
         for line in lines.splitlines():
             line = line.strip()
             if line.isdigit():
@@ -11736,6 +12036,8 @@ def dispatch_fixers(
             timeout_seconds=timeout_seconds,
             stall_seconds=stall_seconds,
             stall_startup_grace_seconds=stall_startup_grace_seconds,
+            approved_reviewers=approved_reviewers,
+            max_iterations=max_iterations,
         )
 
         # Track this new engine in the in-flight set.
@@ -11941,6 +12243,8 @@ def _dispatch_one_fixer(
     timeout_seconds: int = FIXER_TIMEOUT,
     stall_seconds: int = ENGINE_STALL_SECONDS,
     stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
+    approved_reviewers: Sequence[str] = (),
+    max_iterations: int = pipeline.MAX_ITERATIONS,
 ) -> None:
     """Launch a single fixer engine for one PR.
 
@@ -11965,6 +12269,8 @@ def _dispatch_one_fixer(
             dispatch marker for stall detection to read.
         stall_startup_grace_seconds: Extra silence allowed before the first
             output event, recorded beside ``stall_seconds``.
+        approved_reviewers: Logins whose comments and submitted reviews are fixer input,
+            beside the implicit operator login.
     """
     wt_dir = os.path.join(WT_ROOT, f"pr-{pr_number}")
     dispatch_id = f"fix-{pr_number}-{int(time.time())}-{uuid.uuid4().hex}"
@@ -12081,24 +12387,48 @@ def _dispatch_one_fixer(
     # Authenticate history before creating scratch or acquiring a launch lease.
     comments = _read_comment_history(
         pr_number, phase="dispatch", stage="fix", tick_log=tick_log,
+        include_reviews=True, approved_reviewers=approved_reviewers,
     )
     if comments is None:
         return
-    reviews = pipeline.trusted_marker_comments(
-        comments, pipeline.REVIEW_MARKER, trusted_author=TRUSTED_REVIEW_AUTHOR,
-    )
-    review_body = reviews[-1]["body"] if reviews else ""
+    # Fixer input is the latest operator review, or an approved reviewer's
+    # input posted after the last pipeline action. Edit provenance
+    # on an approved comment is validated here; unknown provenance fails closed.
+    try:
+        selected = pipeline.fixer_input_comment(
+            comments, trusted_author=TRUSTED_REVIEW_AUTHOR,
+            approved_reviewers=approved_reviewers,
+        )
+    except ValueError as exc:
+        reason = f"comment history unavailable or untrusted: {exc} — retained for retry"
+        print(f"tick: PR #{pr_number}: {reason}", file=sys.stderr)
+        if tick_log:
+            tick_log.log(pr=pr_number, phase="dispatch", stage="fix",
+                         action="comment_history_refused", reason=reason)
+        return
+    review_body = selected["comment"]["body"] if selected else ""
     if not review_body:
         _escalate_dispatch_setup_failure(
             entity="pr", number=pr_number,
             pre_label=pipeline.LABEL_CHANGES_REQUESTED, stage="fix",
-            reason="no trusted pipeline review comment found — nothing to fix",
+            reason=("no trusted pipeline review comment or approved reviewer "
+                    "comment found — nothing to fix"),
             engine=impl_engine, tick_log=tick_log,
         )
         return
+    if tick_log:
+        tick_log.log(
+            pr=pr_number, phase="dispatch", stage="fix", action="fixer_input",
+            reason=f"fixer input is the {selected['kind']} comment",
+            engine=impl_engine,
+            details={"kind": selected["kind"],
+                     "author": selected["comment"]["author"]["login"]},
+        )
 
     try:
-        review_handoff = pipeline.review_reports.handoff(review_body)
+        review_handoff = pipeline.fixer_input_handoff(review_body, kind=selected["kind"])
+        approved_input_sha256 = (pipeline.approved_input_identity(selected["comment"])
+                                 if selected["kind"] == "approved" else "")
     except ValueError as exc:
         _escalate_dispatch_setup_failure(
             entity="pr", number=pr_number,
@@ -12106,6 +12436,12 @@ def _dispatch_one_fixer(
             reason=f"review finding identity is ambiguous: {exc}",
             engine=impl_engine, tick_log=tick_log,
         )
+        return
+
+    if not _fix_within_budget(
+        pr_number, comments, selected, pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+        max_iterations=max_iterations, tick_log=tick_log,
+    ):
         return
 
     # Create an isolated git worktree at the remote tip of the PR branch in
@@ -12132,6 +12468,20 @@ def _dispatch_one_fixer(
             tick_log=tick_log,
             cleanup_dir=wt_dir,
         )
+        return
+
+    # Record an approved input as consumed before anything can launch on it, so
+    # a run that later ends without a comment cannot be resumed from it again.
+    if selected and selected["kind"] == "approved" and not _record_approved_input(
+        pr_number, selected["comment"],
+    ):
+        cleanup_scratch(wt_dir)
+        if tick_log:
+            tick_log.log(
+                pr=pr_number, phase="dispatch", stage="fix", action="skip",
+                reason="approved-input receipt write failed — retained for retry",
+                engine=impl_engine,
+            )
         return
 
     # Resolve every skill the fixer prompt binds against the install that
@@ -12201,6 +12551,8 @@ def _dispatch_one_fixer(
     # through harvest's comment so re-review cannot substitute a later review.
     lease_marker["review_sha256"] = hashlib.sha256(review_body.encode()).hexdigest()
     lease_marker["review_handoff"] = review_handoff
+    if approved_input_sha256:
+        lease_marker["approved_input_sha256"] = approved_input_sha256
     lease_marker["report_protocol_version"] = pipeline.fixer_reports.VERSION
     try:
         pipeline.atomic_write(
@@ -15177,6 +15529,8 @@ def _run_tick_body(
                 stall_seconds=tuning.engine_stall_seconds,
                 stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
                 only=dispatch_items,
+                approved_reviewers=tuning.approved_reviewers,
+                max_iterations=tuning.max_iterations,
             )
     else:
         if tick_log:

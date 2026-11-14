@@ -63,6 +63,10 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
 # --fix-round carries dispatch.json's optional fix_round token after an accepted
 # no-change fixer; omit it for other reviews. Distinct no-change dispatches count
 # as new rounds at the same head, while replaying one dispatch counts once.
+# For a replay with local approved-input receipts, repeat
+# --approved-input-reservation with the SHA-256 fingerprint of each receipt key.
+# The tick supplies these directly to the Python API. Omitting them models only
+# published history; it cannot reproduce this checkout's silent-attempt budget.
 "$PY" "$PIPELINE" harvest-review \
   --review review.json --comments comments.json --trusted-author <login> \
   --pinned-base <sha> --current-base <sha> \
@@ -70,6 +74,7 @@ PY=$(bash $PR_PIPELINE_HOME/skills/tick/resolve-python.sh)
   --pinned-head <sha> --current-head <sha> \
   [--pinned-base-ref <ref> --current-base-ref <ref>] \
   [--fix-round <sha256-token>] \
+  [--approved-input-reservation <sha256-source>] \
   [--pre-label ai:implemented|ai:revised] [--threshold 5]
 
 # Decide a finished fixer's outcome (prints a decision JSON object). The
@@ -233,7 +238,7 @@ historical queries can read them.
 | `base_retarget` | `true` if the PR's base *branch* changed under the review (→ `discard`, checked before SHA drift — a retarget is invisible to the SHA checks when the old ref's tip and the head are unchanged) |
 | `base_drift` | `true` if the base moved under the review (→ `discard`) |
 | `head_drift` | `true` if the PR head moved under the review (→ `discard`) |
-| `rounds` | prior recorded review rounds (iteration authority is the PR comments) |
+| `rounds` | prior recorded review rounds, combining authenticated PR comments and unmatched controller-owned local reservations |
 | `post_comment` | whether to post `comment_body` (`false` on an idempotent replay) |
 | `comment_body` | rendered review comment (marker + per-round diff-base:base-tip:head:base-ref token, extended by `:no-change:<fix_round>` when supplied; empty when not posting) |
 

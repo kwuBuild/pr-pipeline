@@ -8,6 +8,7 @@ out cleanly against any target repository. Run with::
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import io
 import json
@@ -3381,7 +3382,9 @@ def test_no_change_rounds_reach_cap_on_unchanged_head_and_replay_once() -> None:
                         "NO_CHANGES_RECHECK_NEEDED"},
             pre_label=pipeline.LABEL_CHANGES_REQUESTED,
             pinned_head="a", current_head="a", dispatch_id=f"fix-{round_index}",
-            review_sha256="e" * 64,
+            # The fixer pins the review it was handed; an unmatched pin would
+            # count as a fix from an approved comment.
+            review_sha256=hashlib.sha256(decision["comment_body"].encode()).hexdigest(),
         )
         assert fix["label"] == pipeline.LABEL_REVISED
         # Even loss of the local publication receipt can only duplicate this

@@ -577,7 +577,8 @@ if a[:2] == ["api", "graphql"] and "--slurp" in a:
     nodes = [{"id": str(i), "body": body, "author": {"login": "test-owner"},
               "lastEditedAt": None, "editor": None, "includesCreatedEdit": False}
              for i, body in enumerate(reports)]
-    print(json.dumps([{"data": {"repository": {"pullRequest": {"comments": {
+    print(json.dumps([{"data": {"repository": {"pullRequest": {"reviews": {"totalCount": 0, "nodes": [],
+            "pageInfo": {"hasNextPage": False, "endCursor": None}}, "comments": {
         "totalCount": len(nodes), "nodes": nodes,
         "pageInfo": {"hasNextPage": False, "endCursor": "end" if nodes else None}}}}}}]))
     sys.exit(0)

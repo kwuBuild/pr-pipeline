@@ -202,7 +202,9 @@ def test_dispatch_fixers_follows_list_order_and_never_touches_unlisted() -> None
                             only=(("pr", 6), ("issue", 8), ("pr", 4)),
                         )
 
-    assert [call.args[2] for call in reads.call_args_list] == ["6", "4"]
+    # The resume pass, then the pickup pass, each read only listed PRs in
+    # list order.
+    assert [call.args[2] for call in reads.call_args_list] == ["6", "4", "6", "4"]
     assert [call.args[1] for call in eligible.call_args_list] == [6, 4]
     assert [call.kwargs["pr_number"] for call in launch.call_args_list] == [6, 4]
     text.assert_not_called()

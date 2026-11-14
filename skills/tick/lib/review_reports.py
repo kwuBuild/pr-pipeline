@@ -7,6 +7,10 @@ import json
 import re
 
 VERSION = 2
+# Handoff version for an approved reviewer's comment. It has no controller
+# metadata, so the whole comment is one finding, ``C1``.
+COMMENT_HANDOFF_VERSION = 3
+COMMENT_FINDING_ID = "C1"
 COMMENT_LIMIT = 60_000  # Both Unicode characters and UTF-8 bytes, including metadata.
 # Leave space for controller identity and headings. Final rendering is still the
 # authority: escaping markers and unusual ref names can consume more space.
@@ -185,10 +189,27 @@ def handoff(body: str) -> dict:
     return snapshot
 
 
+def comment_handoff(body: str) -> dict:
+    """Pin an approved input body as one finding.
+
+    The caller owns authentication: :func:`pipeline.fixer_input_comment` selects
+    the input from an approved author and refuses controller metadata. Prose is
+    never split into findings; the complete comment is finding ``C1``.
+    """
+    identity = digest(body)
+    snapshot = {"version": COMMENT_HANDOFF_VERSION, "identity": identity,
+                "report_sha256": identity, "comment_sha256": identity,
+                "finding_refs": [f"{identity}:{COMMENT_FINDING_ID}"]}
+    if not valid_handoff(snapshot):
+        raise ValueError("Invalid approved comment identity.")
+    return snapshot
+
+
 def valid_handoff(obj: object) -> bool:
     if (not isinstance(obj, dict)
             or set(obj) != {"version", "identity", "report_sha256", "comment_sha256", "finding_refs"}
-            or type(obj["version"]) is not int or obj["version"] not in {1, VERSION}):
+            or type(obj["version"]) is not int
+            or obj["version"] not in {1, VERSION, COMMENT_HANDOFF_VERSION}):
         return False
     if not all(isinstance(obj[k], str) and re.fullmatch(r"[a-f0-9]{64}", obj[k])
                for k in ("identity", "report_sha256", "comment_sha256")):
