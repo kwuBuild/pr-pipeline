@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/kwuBuild/pr-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/kwuBuild/pr-pipeline/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Version 0.2.0](https://img.shields.io/badge/version-0.2.0-orange.svg)
+![Version 0.3.0](https://img.shields.io/badge/version-0.3.0-orange.svg)
 
 **Smart agents, dumb pipes.**
 
@@ -382,7 +382,7 @@ use: `definition-of-done`, `review-response-hygiene`,
 
 ## Project status
 
-pr-pipeline is at version 0.2.0. Until version 1.0.0, a minor release can
+pr-pipeline is at version 0.3.0. Until version 1.0.0, a minor release can
 contain breaking changes. Each [changelog](CHANGELOG.md) entry lists the steps
 that an upgrade needs.
 

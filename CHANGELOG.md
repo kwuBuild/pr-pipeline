@@ -10,6 +10,49 @@ Each entry lists the changes users notice and any step that users must do
 after they update. Versions follow [Semantic Versioning](https://semver.org/).
 Before 1.0.0, a minor version can contain breaking changes.
 
+## [0.3.0] - 2026-11-15
+
+Effort control, milestone notifications, and trusted reviewer input. Your
+0.2.0 configuration keeps working unchanged.
+
+### Added
+
+- Configuration keys `effort` and `fix_effort`, and the flags `--effort` and
+  `--fix-effort`, set `CLAUDE_CODE_EFFORT_LEVEL` for the implementer and the
+  fixer: `low`, `medium`, `high`, `xhigh`, or `max`. A blank `fix_effort`
+  inherits `effort`. A blank `effort` leaves plain `claude` unchanged and keeps
+  `claude-ds` at `max`. The launch log records the effort that the tick set.
+- Configuration key `approved_reviewers` lists GitHub logins, beside the
+  operator, whose PR comments and submitted change-request or comment reviews
+  direct the fixer. New approved input can resume an item from
+  `ai:needs-human-decision`, within `max_iterations`. Edited, forged, or
+  marker-carrying input is refused.
+- `pr-pipeline events --milestones` prints only launch, terminal, attention,
+  stall, and stop milestones. `--mark` and `--cursor PATH` let a reader resume
+  without losing or skipping milestones. During `/pr-pipeline:tick --loop`,
+  the tick skill uses them to send one notification for each milestone.
+
+### Changed
+
+- An `--only` loop stops on the first quiet tick where every listed item, and
+  the pull request that closes a listed issue, is settled.
+- Fixer rounds from approved input, silent attempts, and published results
+  share one count against `max_iterations`.
+
+### Fixed
+
+- A terminal label edit that the tick could not confirm now appears as an
+  attention milestone (`terminal label not confirmed`). It does not appear as
+  a success or as a failed label.
+
+### Upgrade steps
+
+- Restart Claude Code and any running `tick --loop` after the update. A
+  running process keeps the 0.2.0 code.
+- None of the new configuration keys are required. To use them, add
+  `effort`, `fix_effort`, or `approved_reviewers` to `[defaults]` or to a
+  repository section of your operator configuration.
+
 ## [0.2.0] - 2026-11-08
 
 Tuning, visibility, and richer agent reports. Your 0.1.0 configuration keeps
