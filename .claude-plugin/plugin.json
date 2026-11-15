@@ -1,7 +1,7 @@
 {
   "name": "pr-pipeline",
   "description": "Smart agents, dumb pipes. Label a GitHub issue: Claude Code implements it, Codex reviews it, and Claude Code fixes the findings until the pull request is ready for you to merge. Every step is visible on GitHub.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "author": {
     "name": "Keith Wu"
   },
