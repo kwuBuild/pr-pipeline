@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,67 @@ def test_wrapper_writes_marker_with_process_identity(tmp_path: Path) -> None:
     # pgid must equal the wrapper's own PID (os.setpgrp makes it the group leader)
     assert marker["pgid"] == os.getpid()
     assert "state" not in marker
+
+
+def test_wrapper_keeps_existing_process_group_leadership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wrapper that already leads its group must not call setpgrp again.
+
+    Dispatch launches the wrapper with ``start_new_session=True``, so it is a
+    session leader. Linux refuses ``setpgid`` for a session leader with EPERM;
+    the wrapper must still run the engine and record its own PGID.
+    """
+    monkeypatch.setattr(engine_wrapper.os, "getpgrp", os.getpid)
+    monkeypatch.setattr(
+        engine_wrapper.os,
+        "setpgrp",
+        lambda: (_ for _ in ()).throw(
+            PermissionError(errno.EPERM, "Operation not permitted")
+        ),
+    )
+
+    assert run_wrapper_with_echo(tmp_path, exit_code=0, valid_review=True) == 0
+
+    envelope = json.loads((tmp_path / "completion.json").read_text())
+    marker = json.loads((tmp_path / "dispatch.json").read_text())
+    assert envelope["result_valid"] is True
+    assert marker["pgid"] == os.getpid()
+
+
+def test_wrapper_runs_engine_when_launched_as_session_leader(tmp_path: Path) -> None:
+    """The wrapper runs its engine when dispatch starts it in a new session."""
+    script = (
+        "import sys; args = sys.argv[1:]; "
+        "open(args[args.index('-o') + 1], 'w').write("
+        "'{\"verdict\": \"ready_for_human\", \"findings\": []}')"
+    )
+    wrapper_path = Path(__file__).resolve().parent.parent / "engine_wrapper.py"
+    proc = subprocess.Popen(
+        [
+            sys.executable, str(wrapper_path), "run",
+            "--dispatch-id", "d-session",
+            "--marker-path", str(tmp_path / "dispatch.json"),
+            "--result-path", str(tmp_path / "review.json"),
+            "--envelope-path", str(tmp_path / "completion.json"),
+            "--engine", "codex", "--stage", "review",
+            "--pr-number", "1", "--deadline", "9999999999",
+            "--base-ref", "main", "--base-sha", "b1",
+            "--head-sha", "h1", "--pre-label", "ai:implemented",
+            "--", sys.executable, "-c", script, "-o", "placeholder.json",
+        ],
+        stdin=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    _, stderr = proc.communicate(timeout=30)
+
+    assert proc.returncode == 0, stderr.decode()
+    envelope = json.loads((tmp_path / "completion.json").read_text())
+    marker = json.loads((tmp_path / "dispatch.json").read_text())
+    assert envelope["result_valid"] is True
+    assert marker["pid"] == marker["pgid"] == proc.pid
+    assert json.loads((tmp_path / "review.json").read_text())["verdict"] == "ready_for_human"
 
 
 def test_wrapper_records_os_start_time_when_available(tmp_path: Path) -> None:
@@ -227,6 +290,8 @@ def test_wrapper_writes_failure_envelope_before_engine_starts(
         lambda pid: 1234.5,
     )
     if failure_point == "ownership":
+        # Not yet a group leader, so the wrapper must call setpgrp.
+        monkeypatch.setattr(engine_wrapper.os, "getpgrp", lambda: os.getpid() + 1)
         monkeypatch.setattr(
             engine_wrapper.os,
             "setpgrp",

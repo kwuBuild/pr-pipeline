@@ -30,7 +30,7 @@ and finding references through the existing authenticated comment history.
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
 | Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | none — JSONL is sanitized for observations, not a heartbeat; the review timeout bounds the run |
 | Timeout | `implementer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_implementer`][tick]) | `fixer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_fixer`][tick]) | `review_timeout_seconds`, 20 min shipped ([`tick._dispatch_one_reviewer`][tick]) |
-| Process group | `start_new_session=True` | `start_new_session=True` | `os.setpgrp()` in wrapper ([`engine_wrapper.run_engine`][engine_wrapper]) |
+| Process group | `start_new_session=True` | `start_new_session=True` | `start_new_session=True` on the wrapper; it calls `os.setpgrp()` only when it does not already lead its group ([`engine_wrapper.run_engine`][engine_wrapper]) |
 
 ## 2. Model and reasoning effort
 
@@ -686,7 +686,7 @@ its own session.
 | Project rules blocked | No | Yes (`--ignore-rules`) |
 | Policy gate | N/A (implementers don't review) | Enabled by `allow_touching = false` (`touches_review_policy`) |
 | Worktree isolation | Yes | Yes |
-| Process group isolation | Yes (`start_new_session`) | Yes (`os.setpgrp()`) |
+| Process group isolation | Yes (`start_new_session`) | Yes (`start_new_session` on the wrapper) |
 | Trusted-candidate gate | Implementer: operator issue author (`trusted_issue_candidate`) | Yes (`trusted_review_candidate`) |
 | Residual read+exfil risk | Accepted within the operator-equivalent local trust boundary | Accepted; trusted-candidate gate is the primary control, with an optional policy gate (see section 4) |
 

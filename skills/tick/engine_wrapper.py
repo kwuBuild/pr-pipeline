@@ -78,13 +78,16 @@ def run_engine(
     temp_result: str | None = None
     try:
         # 1. Write ownership record with process identity BEFORE spawning the engine.
-        # Create a dedicated process group so the wrapper and its engine child can be
-        # terminated together via os.killpg. After setpgrp, the wrapper's PGID equals
-        # its own PID, and the child inherits this group.
+        # Lead a dedicated process group so the wrapper and its engine child can be
+        # terminated together via os.killpg. The wrapper's PGID then equals its own
+        # PID, and the child inherits this group. Dispatch already starts the wrapper
+        # with start_new_session=True, which makes it a group leader; Linux rejects
+        # setpgrp from a session leader with EPERM, so call it only when needed.
         os_start = process_control.get_process_start_time(wrapper_pid)
         if os_start is not None:
             wrapper_start_time = os_start
-        os.setpgrp()
+        if os.getpgrp() != wrapper_pid:
+            os.setpgrp()
         marker = dict(marker_template)
         marker["dispatch_id"] = dispatch_id
         marker["pid"] = wrapper_pid
