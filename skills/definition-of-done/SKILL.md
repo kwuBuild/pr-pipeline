@@ -14,6 +14,10 @@ edit. Phase B tries to disprove the work before you hand it on. Reviewers use
 the same bar, but they get the answers from the diff instead of from the author,
 and they report a finding when an answer is wrong instead of when it is missing.
 
+The result is a reviewable account of which requirements this revision meets,
+the observations that support that conclusion, and the remaining uncertainty.
+Test count or coverage percentage alone does not establish completion.
+
 `references/why.md` holds the defects that each rule below comes from. Read it
 when a Phase B answer comes out as "nothing here can fail in that way".
 
@@ -42,6 +46,11 @@ you write the proof** — which composition root a test calls, what to assert. T
 repository owns that, in its `CLAUDE.md` or `AGENTS.md` or in a skill that it
 names. Where the repository states a testing contract, that contract controls
 the construction and this skill still controls the bar.
+
+For a workflow-only change, exercise the guidance through its actual consumer
+on a representative task or handoff. Record what the agent or operator could
+establish, including failures. Do not invent an application entry point or claim
+that a successful guidance exercise proves a runtime enforcement mechanism.
 
 ## Phase A — Declare the Contract Before You Edit
 
@@ -75,6 +84,13 @@ only cheap moment to find a scope error.
    validator that rejects an incomplete result. A prompt can request behavior. A
    prompt cannot give authority, supply missing context, or enforce completion.
 
+5. **Acceptance and evidence plan.** Derive observable acceptance criteria from
+   the request and governing requirements, including relevant failure outcomes.
+   Name their source, the existing checks that cover them, and the missing proof.
+   Choose the smallest set of checks that can establish the claim through its
+   real boundaries. Do not weaken a requirement to fit the implementation; resolve
+   a genuine scope change against the governing request before continuing.
+
 Write the result to `tmp/done-declaration-<branch>.md`, with each `/` in the
 branch name replaced by `-`, so that the name stays one file instead of a nested
 path. `tmp/` is not in version control, but the file is on disk, so Phase B
@@ -90,6 +106,8 @@ Entry:      <entry point> in <mode>; authoritative mode: <mode>
 Invariant:  <invariant> — owned by <runtime owner>
 Boundary:   <shared gate/finalizer/classifier expected to move>
 Controller: <required engine inputs/tools/policy and result validator, or "n/a — no engine">
+Acceptance: <requirement source -> observable acceptance criteria>
+Proof plan: <existing checks to reuse; missing evidence and how to obtain it>
 Excluded:   <invariants and paths deliberately not in this change>
 ```
 
@@ -136,6 +154,16 @@ because each one leaks alone.
    between the two runs is either one that the claim predicts or a second change
    that you did not declare.
 
+   For each acceptance criterion, compare the expected outcome with what was
+   actually observed. Record the tested revision, command or probe, relevant
+   result, and evidence location. Inspect outputs or durable effects rather than
+   inferring success from an exit code or a helper call. Name substituted external
+   services, injected lifecycle state, and other limits on what the run proves.
+   Attribute CI and author-supplied results to their source and revision; prose
+   saying "passed" is not an execution record. Retain the relevant output in a
+   location available to the reviewer, or include a concise excerpt and exact
+   reproduction steps. A deleted temporary log is not available evidence.
+
 2. **Shared-boundary sweep.** Search for the boundary symbol that Phase A named,
    and read each result. Fix each one, or defer it and name its owner and its
    consequence. Silence is not a deferral, and a named deferral is not a
@@ -179,6 +207,46 @@ because each one leaks alone.
    absorb it silently turns a reviewable change into an unreviewable one. Delete
    the file after you write the block.
 
+   Reconcile every declared acceptance criterion with the observed evidence.
+   Required proof that failed, is unavailable, or applies only to an earlier
+   affected revision prevents a completion claim: state the missing proof and use
+   the repository's existing incomplete/blocked outcome. Nonessential checks not
+   run remain explicit limitations; they do not automatically block completion.
+
+## Keep Verification Proportionate
+
+Reuse or extend adequate existing coverage before adding a test. Each addition
+must protect a distinct requirement, failure mode, or boundary. For a regression,
+show that the check detects the original defect. Keep focused tests for isolated
+logic and use integration or end-to-end checks when the claim spans those paths;
+do not impose a fixed mix or duplicate every case at every layer.
+
+Separate evidence gathered for this change from permanent regression coverage.
+Exploratory probes can remain review artifacts; retain repeatable tests where
+they provide continuing protection. Explain the distinct value and significant
+runtime cost of additions, and justify removed assertions, expanded mocks, or
+skipped tests. Do not discard useful regression protection merely to reduce count.
+
+Run the repository's required checks. Beyond those, repeat successful checks
+only for relevant changes, failures, stale evidence, or an unresolved concern.
+This skill does not waive required verification or authorize a CI configuration
+change. Another full suite or another collection of helper tests is not a
+substitute for missing acceptance evidence.
+
+## Independent Review
+
+Assess the requirement-to-evidence mapping against the governing request, diff,
+and actual artifacts. Check that the exercised path owns the claimed behaviour
+and that test changes preserve meaningful assertions. Reproduce material gaps
+with targeted probes when permitted; otherwise report the missing evidence and
+its consequence through the existing review outcome. Do not routinely regenerate
+tests or repeat successful CI. Distinguish independently observed results from
+supplied evidence and explain relevant checks not run.
+
+An author's self-review does not supply independent approval. A populated report
+or passing suite does not prove every requirement, and this guidance does not
+make a controller's structural report check validate execution or approve a merge.
+
 ## Required Output
 
 Phase B ends in one block. When you publish the change as a PR, the block goes
@@ -197,6 +265,13 @@ Name what you reached and what it showed. Each line must name something that a
 reviewer can run again or read again: a command, a path, a symbol, or a call
 site. "Verified end to end" names nothing and is not evidence. Name the call
 sites instead of counting them: a count is stale after the next commit.
+
+Within the existing block, connect acceptance criteria to observed results and
+evidence references, and explain the regression coverage and remaining gaps.
+Use continuation lines or a compact table where useful; do not duplicate the
+same evidence across a second report. Keep the decision readable and link to
+long logs. Preserve the required labels below; no new report field or score is
+needed to express this evidence.
 
 ```
 Phase A: <declared before first edit | waived by <owner> — <where recorded>>

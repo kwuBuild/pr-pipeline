@@ -70,6 +70,16 @@ is a valid limitation. If required evidence, access or authority prevents a
 defensible conclusion, use needs_human_decision and explain why; nonessential
 checks not run do not automatically require that outcome.
 
+Assess the acceptance criteria from the governing request against observed
+results and the actual diff. Check the tested revision, evidence source, exercised
+production path, and limits introduced by mocks or injected state. A populated
+report or a test count does not prove the requirement. Evaluate whether added
+tests protect distinct behaviour and whether removed assertions, expanded mocks,
+or skipped tests weaken that protection. Use targeted probes for material gaps
+when permitted; otherwise explain the missing evidence and its consequence in
+verification and the verdict. Do not routinely regenerate tests or repeat
+successful CI. Author self-review is supplied evidence, not independent approval.
+
 Give each finding a unique ID, severity, precise location where applicable,
 trigger and consequence, and supporting evidence or reproduction. Explanations
 and evidence may use paragraphs, lists and code fences. Suggested resolutions
