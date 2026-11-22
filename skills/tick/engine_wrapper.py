@@ -56,6 +56,7 @@ def run_engine(
     result_path: str,
     envelope_path: str,
     observation_path: str | None = None,
+    heartbeat_path: str | None = None,
     engine_cmd: list[str],
     marker_template: dict[str, object],
 ) -> int:
@@ -67,6 +68,7 @@ def run_engine(
         result_path: Final path for the engine's result file.
         envelope_path: Path for the completion envelope.
         observation_path: Optional path for a sanitized Codex JSONL summary.
+        heartbeat_path: Optional mtime-only output signal beside the result.
         engine_cmd: The engine command to execute (e.g. codex exec ...).
         marker_template: Marker fields to merge with process identity.
 
@@ -113,7 +115,7 @@ def run_engine(
             stdin=subprocess.DEVNULL,
             stdout=(
                 subprocess.PIPE
-                if observation_path is not None
+                if observation_path is not None or heartbeat_path is not None
                 else subprocess.DEVNULL
             ),
             stderr=subprocess.DEVNULL,
@@ -159,9 +161,10 @@ def run_engine(
 
     signal.signal(signal.SIGTERM, _forward_sigterm)
     try:
-        if observation_path is not None:
-            observation = _observe_engine_stdout(proc)
-            _write_observation(observation_path, observation)
+        if observation_path is not None or heartbeat_path is not None:
+            observation = _observe_engine_stdout(proc, heartbeat_path=heartbeat_path)
+            if observation_path is not None:
+                _write_observation(observation_path, observation)
         proc.wait()
         exit_status = proc.returncode
     except OSError:
@@ -230,13 +233,16 @@ def run_engine(
 
 def _observe_engine_stdout(
     proc: subprocess.Popen[bytes],
+    *,
+    heartbeat_path: str | None = None,
 ) -> dict[str, object]:
     """Drain child stdout and return sanitized evidence without affecting custody."""
     if proc.stdout is None:
         return reviewer_observability.unavailable_observation()
     try:
         return reviewer_observability.observe_event_stream(
-            proc.stdout, skill_home=Path(os.environ["HOME"]) if os.environ.get("HOME") else None,
+            proc.stdout, heartbeat_path=heartbeat_path,
+            skill_home=Path(os.environ["HOME"]) if os.environ.get("HOME") else None,
         )
     except Exception:
         # Observability is deliberately non-authoritative. If parsing fails in
@@ -324,6 +330,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="Path for a sanitized reviewer skill observation",
     )
+    p_run.add_argument("--heartbeat", default=None, help="Path for an mtime-only progress heartbeat")
+    p_run.add_argument("--stall-seconds", type=int, default=pipeline.ENGINE_STALL_SECONDS)
+    p_run.add_argument("--stall-startup-grace-seconds", type=int,
+                       default=pipeline.ENGINE_STALL_STARTUP_GRACE_SECONDS)
     p_run.add_argument("--engine", required=True, help="Engine name (e.g. codex)")
     p_run.add_argument("--stage", required=True, help="Pipeline stage (e.g. review)")
     p_run.add_argument("--pr-number", type=int, required=True, help="PR number")
@@ -359,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
         "base_sha": args.base_sha,
         "head_sha": args.head_sha,
         "pre_label": args.pre_label,
+        "stall_seconds": args.stall_seconds,
+        "stall_startup_grace_seconds": args.stall_startup_grace_seconds,
     }
     if args.base_tip_sha:
         marker_template["base_tip_sha"] = args.base_tip_sha
@@ -373,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         result_path=args.result_path,
         envelope_path=args.envelope_path,
         observation_path=args.observation_path,
+        heartbeat_path=args.heartbeat,
         engine_cmd=engine_cmd,
         marker_template=marker_template,
     )

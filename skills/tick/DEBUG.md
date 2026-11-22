@@ -111,11 +111,10 @@ Debugging notes:
 `kill -0` proves an engine process exists; it does not prove the engine is doing
 anything. An engine wedged on a network call that never returns, a permission
 wait, or a silent retry loop passes every liveness probe and burns its whole
-deadline (`implementer_timeout_seconds`/`fixer_timeout_seconds`, 60 minutes
-shipped) before the pipeline reacts.
+deadline (all three stage deadlines ship at 60 minutes) before the pipeline reacts.
 
-The implementer/fixer stream wrapper already owns the engine's stdout, so it
-bumps the mtime of a `heartbeat` file next to that engine's `result.json` as
+Each stage's wrapper owns the engine's stdout and bumps the mtime of a
+`heartbeat` file beside its result (`review.json` for reviewers) as
 output events arrive (throttled to at most one write per 5s; the mtime *is* the
 whole payload). A heartbeat write failure is swallowed — it must never affect
 whether the engine's result reaches harvest.
@@ -199,11 +198,14 @@ Debugging notes:
   marker's `start_time` plus the startup grace on top of the threshold (the
   marker's `stall_startup_grace_seconds`, from `engine_stall_startup_grace_seconds`;
   5 minutes shipped).
-- **Only implement/fix stages.** The reviewer wrapper deliberately discards
-  engine output, so there is no progress signal to read; its stall cost is
-  already bounded by the review deadline (`review_timeout_seconds`, 20 minutes
-  shipped), and inventing a weaker proxy
-  for it is deferred rather than guessed at.
+- **All three stages.** Implementers and fixers use the stream wrapper;
+  reviewers use the existing bounded Codex JSONL reader in `engine_wrapper.py`
+  and `reviewer_observability.py`. The reader updates the heartbeat before
+  parsing each event and retains only sanitized observations. It stores no raw
+  event content. Review completion still requires `review.json` and the validated
+  completion envelope. The shipped review deadline is 3600 seconds (60 minutes).
+  Startup requires `engine_stall_seconds` to be less than all three engine
+  deadlines, including an explicitly configured `review_timeout_seconds`.
 - The stall check runs only after the cheap mtime test says something is wrong,
   and then uses the same identity-verified classification harvest trusts. A
   reused PID or an already-`hung` marker is somebody else's business and is not
@@ -678,14 +680,14 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
 - Wake watcher poll: 5s; nudge debounce floor: 10s, capped by the scheduled
   cadence deadline (`--loop` only)
 - Engine progress heartbeat: `<worktree>/heartbeat` (mtime only), written at
-  most once per 5s by the implement/fix stream wrapper
+  most once per 5s by each stage's existing stdout reader
 - Stall threshold: `engine_stall_seconds`, 1800s shipped (3x the 600s longest
   legitimate silence, `MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`); plus
   `engine_stall_startup_grace_seconds`, 300s shipped, when no heartbeat file
   exists yet. Both are recorded per engine in `dispatch.json`.
 - Admission cap: `max_in_flight` from the operator config (shipped default 3),
   read once at tick startup
-- Timeouts: `review_timeout_seconds` 1200s, `implementer_timeout_seconds`
+- Timeouts: `review_timeout_seconds` 3600s, `implementer_timeout_seconds`
   3600s, `fixer_timeout_seconds` 3600s shipped; each engine's is its marker
   `deadline`
 - Round limit: `max_iterations`, 5 shipped
@@ -755,7 +757,7 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   none of them has a reading that is both conservative and the one the operator
   wrote. An integer key holding a boolean, float or string, a value below its
   minimum, a wake of exactly 300s, or a stall threshold that is not between
-  600s and both engine deadlines is refused this way. A malformed
+  600s and all three engine deadlines is refused this way. A malformed
   `allow_touching` does: it logs `startup_config_warning`, resolves to the
   closed gate, and the tick runs. A container declared as a non-table
   (`[[defaults]]`, `[[scan]]`) and a relative `$PR_PIPELINE_CONFIG` /

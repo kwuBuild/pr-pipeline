@@ -10,6 +10,28 @@ Each entry lists the changes users notice and any step that users must do
 after they update. Versions follow [Semantic Versioning](https://semver.org/).
 Before 1.0.0, a minor version can contain breaking changes.
 
+## [Unreleased]
+
+### Changed
+
+- Reviewers now publish the same advisory output-recency heartbeat as
+  implementers and fixers. Status and stall notifications use the resolved
+  stall threshold and startup grace. Heartbeat write failures do not change
+  review completion, and no raw event content is stored.
+- The shipped `review_timeout_seconds` increases from 1200 to 3600 seconds.
+  Explicit operator deadlines remain unchanged.
+
+### Migration
+
+- Startup now requires `engine_stall_seconds` to be less than each of
+  `implementer_timeout_seconds`, `fixer_timeout_seconds`, and
+  `review_timeout_seconds`. Existing configurations with a review deadline at
+  or below the stall threshold now fail startup with both keys and values in
+  the error. For example, `engine_stall_seconds = 1800` with an explicit
+  `review_timeout_seconds = 1200` is incompatible. Raise the configured review
+  deadline or lower the stall threshold (which must remain greater than 600).
+  Startup does not change either explicit value or disable reviewer stalls.
+
 ## [0.3.0] - 2026-11-15
 
 Effort control, milestone notifications, and trusted reviewer input. Your

@@ -305,22 +305,21 @@ def test_status_applies_the_startup_grace_to_a_missing_heartbeat(
     assert "quiet-0m" in row
 
 
-def test_status_leaves_the_reviewer_stage_without_a_stall_verdict(
+@pytest.mark.parametrize("with_heartbeat", [False, True])
+def test_status_reports_reviewer_output_recency(
     tmp_path: Path,
     live_engine: tuple[int, float],
+    with_heartbeat: bool,
 ) -> None:
-    """The reviewer wrapper discards engine output, so it has no heartbeat.
-
-    Falling back to the dispatch clock for it would flag every review that
-    outlives the threshold, which is a normal long review, not a stall.
-    """
+    """The dashboard uses the shared review-stage progress and stall verdict."""
     pid, start_time = live_engine
     repo = install_status_script(tmp_path)
     worktree_dir = repo / ".claude/worktrees/pr-577"
     worktree_dir.mkdir(parents=True)
+    quiet = stalled_quiet_seconds()
     write_marker_with_heartbeat(
         worktree_dir,
-        quiet_seconds=None,
+        quiet_seconds=quiet if with_heartbeat else None,
         pid=pid,
         start_time=start_time,
         stage="review",
@@ -329,10 +328,8 @@ def test_status_leaves_the_reviewer_stage_without_a_stall_verdict(
     result = run_status(repo)
 
     assert result.stderr == ""
-    # `-`, not `?`: the report was produced and said this stage has no
-    # progress contract. `?` would mean the dashboard could not reach the
-    # classifier at all, which is a different claim to the operator.
-    assert progress_cell(result.stdout, pr_number=577) == "-"
+    expected = f"STALLED-{int(quiet // 60)}m" if with_heartbeat else "quiet-0m"
+    assert progress_cell(result.stdout, pr_number=577) == expected
 
 
 def test_status_marks_the_progress_column_unknown_when_the_report_fails(

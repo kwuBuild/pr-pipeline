@@ -126,7 +126,7 @@ for marker in "$WT_ROOT"/pr-*/dispatch.json "$WT_ROOT"/issue-*/dispatch.json; do
 
   # Progress column. Liveness above proves the process exists; this says
   # whether it is still producing — `quiet-Nm`, `STALLED-Nm`, or `-` where no
-  # progress contract exists (the reviewer stage discards engine output). The
+  # progress clock exists (for example, a marker without a start time). The
   # verdict is looked up, never derived: `?` means the report above could not
   # be produced, which is different from "no progress contract" and must not
   # be rendered as either a clean row or a stall.

@@ -330,9 +330,9 @@ activity. Each one can be set in `[defaults]` and overridden in
 |---|---|---|---|---|
 | `implementer_timeout_seconds` | seconds | 3600 | integer ≥ 60, greater than `engine_stall_seconds` | implementer dispatch, recorded as the marker `deadline` |
 | `fixer_timeout_seconds` | seconds | 3600 | integer ≥ 60, greater than `engine_stall_seconds` | fixer dispatch, recorded as the marker `deadline` |
-| `review_timeout_seconds` | seconds | 1200 | integer ≥ 60 | reviewer dispatch, recorded as the marker `deadline` |
-| `engine_stall_seconds` | seconds | 1800 | integer > 600 and less than both engine deadlines | implementer/fixer dispatch, recorded in the marker for stall detection |
-| `engine_stall_startup_grace_seconds` | seconds | 300 | integer ≥ 0 | implementer/fixer dispatch, recorded in the marker |
+| `review_timeout_seconds` | seconds | 3600 | integer ≥ 60, greater than `engine_stall_seconds` | reviewer dispatch, recorded as the marker `deadline` |
+| `engine_stall_seconds` | seconds | 1800 | integer > 600 and less than all three engine deadlines | all three stage dispatchers, recorded in the marker for stall detection |
+| `engine_stall_startup_grace_seconds` | seconds | 300 | integer ≥ 0 | all three stage dispatchers, recorded in the marker |
 | `max_iterations` | review/fix rounds | 5 | integer ≥ 1 | reviewer harvest: the round that reaches it gets `ai:max-iterations` |
 | `impl_engine` | — | `"claude"` | `"claude"` or `"claude-ds"` | implementer launch |
 | `model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
@@ -739,10 +739,10 @@ a sleep into an early tick:
 
    This is the generic nudge interface for external transports (an operator, a
    webhook forwarder) — none of them need to know anything about tick internals.
-3. **Engine stall.** The same watcher poll checks whether a live implementer or
-   fixer has stopped *producing*. Its stream wrapper bumps the mtime of a
-   `heartbeat` file beside `result.json` as engine output events arrive; when
-   that mtime has not moved for the engine's stall threshold (`engine_stall_seconds`,
+3. **Engine stall.** The same watcher poll checks whether a live implementer, fixer,
+   or reviewer has stopped *producing*. Its wrapper bumps the mtime of a
+   `heartbeat` file beside `result.json` (`review.json` for reviewers) as output
+   events arrive. When that mtime has not moved for the engine's stall threshold (`engine_stall_seconds`,
    30 minutes shipped, recorded in its marker) the loop wakes and the operator gets
    an `engine_stalled` tick-log entry and a notification. See
    [Engine progress heartbeats](DEBUG.md#engine-progress-heartbeats-engine_stalled).

@@ -2337,11 +2337,13 @@ def test_valid_marker_accepts_implement_lease_with_claude_ds_engine() -> None:
 
 
 def test_valid_marker_accepts_stall_limits_on_engine_markers() -> None:
-    """Implementer and fixer markers record the stall limits they run under."""
+    """Every stage records its resolved stall limits in leases and full markers."""
     limits = {"stall_seconds": 900, "stall_startup_grace_seconds": 0}
 
     assert pipeline.valid_marker(impl_marker(**limits)) is True
     assert pipeline.valid_marker(impl_lease(**limits)) is True
+    assert pipeline.valid_marker(marker(**limits)) is True
+    assert pipeline.valid_marker(lease(**limits)) is True
 
 
 @pytest.mark.parametrize("limits", [
@@ -2357,11 +2359,8 @@ def test_valid_marker_rejects_unusable_stall_limits(
 ) -> None:
     """A stall limit that is not a usable integer is not this writer's marker."""
     assert pipeline.valid_marker(impl_marker(**limits)) is False
-
-
-def test_valid_marker_rejects_stall_limits_on_a_review_marker() -> None:
-    """The reviewer has no progress contract, so only corruption writes these."""
-    assert pipeline.valid_marker(marker(stall_seconds=900)) is False
+    assert pipeline.valid_marker(marker(**limits)) is False
+    assert pipeline.valid_marker(lease(**limits)) is False
 
 
 # --- reconcile_dispatch: implement stage ---
@@ -6545,7 +6544,7 @@ def test_resolve_config_tuning_defaults_are_todays_values(
     assert config.warnings == ()
     assert config.implementer_timeout_seconds == 60 * 60
     assert config.fixer_timeout_seconds == 60 * 60
-    assert config.review_timeout_seconds == 20 * 60
+    assert config.review_timeout_seconds == 60 * 60
     assert config.engine_stall_seconds == 30 * 60
     assert config.engine_stall_startup_grace_seconds == 5 * 60
     assert config.max_iterations == pipeline.MAX_ITERATIONS == 5
@@ -6587,7 +6586,7 @@ def test_resolve_config_tuning_layers_like_every_other_key(
         '\n[repos."owner/slow"]\n'
         'implementer_timeout_seconds = 10800\n'
         'fixer_timeout_seconds = 5400\n'
-        'review_timeout_seconds = 2400\n'
+        'review_timeout_seconds = 4800\n'
         'engine_stall_seconds = 2700\n'
         'engine_stall_startup_grace_seconds = 0\n'
         'max_iterations = 2\n'
@@ -6611,7 +6610,7 @@ def test_resolve_config_tuning_layers_like_every_other_key(
         slow.loop_heartbeat_seconds, slow.loop_quiescent_stop_after,
         slow.transient_cooldown_seconds,
         slow.transient_cooldown_reset_buffer_seconds,
-    ) == (10800, 5400, 2400, 2700, 0, 2, 120, 240, 3600, 6, 900, 0)
+    ) == (10800, 5400, 4800, 2700, 0, 2, 120, 240, 3600, 6, 900, 0)
     assert other.implementer_timeout_seconds == 7200
     assert other.fixer_timeout_seconds == 3600
     assert other.max_iterations == 8
@@ -6908,7 +6907,7 @@ def test_resolve_config_separates_the_errors_a_tick_reads_once(
 
     config = pipeline.resolve_config("owner/name")
 
-    assert len(config.errors) == 6
+    assert len(config.errors) == 7
     assert set(config.tuning_errors) < set(config.errors)
     assert [e for e in config.errors if e not in config.tuning_errors] == [
         e for e in config.errors if "permission_mode" in e

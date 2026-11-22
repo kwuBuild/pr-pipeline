@@ -131,7 +131,9 @@ def test_run_tick_body_routes_issue_and_linked_pr_targets_by_stage() -> None:
         "review_effort": "",
         "trusted_author": "",
         "max_in_flight": 3,
-        "timeout_seconds": 1200,
+        "timeout_seconds": 3600,
+        "stall_seconds": 1800,
+        "stall_startup_grace_seconds": 300,
         "only": None,
     }
     assert di.call_args.kwargs["target"] == ("issue", 462)
@@ -4214,12 +4216,13 @@ def test_fixer_dispatch_records_its_deadline_and_stall_limits(
     ) == stall
 
 
-@pytest.mark.parametrize("tuning, deadline", [
-    ({}, 1200),
-    ({"timeout_seconds": 2400}, 2400),
+@pytest.mark.parametrize("tuning, deadline, stall", [
+    ({}, 3600, (1800, 300)),
+    ({"timeout_seconds": 2400, "stall_seconds": 900,
+      "stall_startup_grace_seconds": 60}, 2400, (900, 60)),
 ])
-def test_reviewer_dispatch_records_its_deadline(
-    tmp_path: Path, tuning: dict[str, int], deadline: int,
+def test_reviewer_dispatch_records_its_deadline_and_stall_limits(
+    tmp_path: Path, tuning: dict[str, int], deadline: int, stall: tuple[int, int],
 ) -> None:
     """The reviewer marker carries the configured review deadline."""
     import pipeline
@@ -4246,9 +4249,9 @@ def test_reviewer_dispatch_records_its_deadline(
         mock.patch("tick.gh_text", side_effect=["main", "abc123"]),
         mock.patch("tick.gh_json", side_effect=metadata),
         mock.patch("tick.pipeline.touches_review_policy", return_value=False),
-        mock.patch("tick._publish_marker_or_revert", return_value=True),
+        mock.patch("tick._publish_marker_or_revert", return_value=True) as publish,
         mock.patch("tick.relabel"),
-        mock.patch("subprocess.Popen", return_value=mock.MagicMock(pid=12345)),
+        mock.patch("subprocess.Popen", return_value=mock.MagicMock(pid=12345)) as popen,
     ):
         tick._dispatch_one_reviewer(
             pr_number=42, pre_label=pipeline.LABEL_IMPLEMENTED, **tuning,
@@ -4256,7 +4259,13 @@ def test_reviewer_dispatch_records_its_deadline(
 
     marker = json.loads((wt_root / "pr-42" / "dispatch.json").read_text())
     assert marker["deadline"] == 5000.0 + deadline
-    assert "stall_seconds" not in marker
+    for record in (marker, publish.call_args.kwargs["published_marker"]):
+        assert (record["stall_seconds"], record["stall_startup_grace_seconds"]) == stall
+    command = popen.call_args.args[0]
+    assert command[command.index("--heartbeat") + 1] == tick._heartbeat_path(str(wt_root / "pr-42"))
+    assert command.index("--heartbeat") < command.index("--")
+    assert command[command.index("--stall-seconds") + 1] == str(stall[0])
+    assert command[command.index("--stall-startup-grace-seconds") + 1] == str(stall[1])
 
 
 def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(

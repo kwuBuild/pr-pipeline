@@ -159,13 +159,13 @@ max_in_flight = 3
 # the deadline of an engine already running. Minimum 60.
 implementer_timeout_seconds = 3600
 fixer_timeout_seconds = 3600
-review_timeout_seconds = 1200
+review_timeout_seconds = 3600
 
-# Implementer/fixer stall detection, in seconds. An engine with no output for
+# Implementer/fixer/reviewer stall detection, in seconds. An engine with no output for
 # engine_stall_seconds is reported as stalled (reported only: nothing is killed
 # or relabelled). It must be greater than 600 — the longest silence a healthy
-# engine produces, one Claude Code Bash call at its cap — and less than both the
-# implementer and the fixer deadline. engine_stall_startup_grace_seconds is
+# engine produces, one Claude Code Bash call at its cap — and less than the
+# implementer, fixer and reviewer deadlines. engine_stall_startup_grace_seconds is
 # added before the engine's first output event (minimum 0). Both are recorded
 # in the dispatch marker with the deadline.
 engine_stall_seconds = 1800
