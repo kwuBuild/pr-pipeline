@@ -73,6 +73,11 @@ def identity(value: object) -> int | None:
     return value if type(value) is int and 0 < value <= 2**63 - 1 else None
 
 
+def count(value: object) -> int | None:
+    """Keep absent or malformed observations unknown, including booleans."""
+    return value if type(value) is int and 0 <= value <= 2**63 - 1 else None
+
+
 def timestamp(value: object) -> str:
     numeric = number(value)
     return dt.datetime.fromtimestamp(numeric, dt.timezone.utc).isoformat(timespec="seconds") if numeric is not None else "unknown"
@@ -146,6 +151,17 @@ def normalize(entry: object, event_id: str, repo: str) -> dict[str, Any] | None:
     elif kind in {"review_handoff", "revision_handoff"}:
         data = {"label": clean(details.get("label")), "outcome": clean(details.get("outcome")) or None,
                 "head_sha": clean(details.get("head_sha")) or None}
+        if kind == "review_handoff":
+            data.update(rounds=count(details.get("rounds")),
+                        max_iterations=count(details.get("max_iterations")))
+            findings = details.get("finding_counts")
+            severities = ("blocker", "major", "minor")
+            data["finding_counts"] = (
+                {severity: findings[severity] for severity in severities}
+                if isinstance(findings, dict)
+                and all(count(findings.get(severity)) is not None for severity in severities)
+                else None
+            )
         message = f"{'review' if kind == 'review_handoff' else 'revision'} handoff confirmed: {data['label']}"
     elif kind in {"retry", "cooldown"}:
         data = {"domain": clean(details.get("domain")) or None,
@@ -166,6 +182,9 @@ def normalize(entry: object, event_id: str, repo: str) -> dict[str, Any] | None:
     elif kind == "terminal":
         # The reader sets the reason from the same tick's escalation decision.
         data = {"label": clean(details.get("label")), "reason": None}
+        if data["label"] == "ai:max-iterations":
+            data.update(rounds=count(details.get("rounds")),
+                        max_iterations=count(details.get("max_iterations")))
         message = f"terminal label: {data['label']}"
     elif kind == "attention":
         data = {"reason": clean(entry.get("reason")), "source_action": action}

@@ -120,6 +120,29 @@ def test_events_covers_operator_events_with_nullable_usage(consumer, action, det
         assert event["details"]["duration_ms"] is None
 
 
+@pytest.mark.parametrize("observations", [
+    {},
+    {"rounds": None, "max_iterations": None, "finding_counts": None},
+    {"rounds": True, "max_iterations": -1, "finding_counts": {"blocker": 0}},
+    {"rounds": 1.5, "max_iterations": "5", "finding_counts": {"blocker": False, "major": 0, "minor": 0}},
+])
+def test_events_old_or_invalid_review_observations_remain_unknown(consumer, observations):
+    repo, _ = consumer
+    append(repo, "tick-001.jsonl",
+           row("review_handoff", stage="review", number=27,
+               details={"label": "ai:changes-requested", **observations}),
+           row("notify_terminal_label", stage="fix", number=27,
+               details={"entity": "pr", "label": "ai:max-iterations", **observations}))
+    result = run_events(consumer, "--json", "pr:27")
+    assert result.returncode == 0, result.stderr
+    handoff, terminal = [json.loads(line) for line in result.stdout.splitlines()]
+    for event in (handoff, terminal):
+        assert event["schema_version"] == 1
+        assert event["details"]["rounds"] is None
+        assert event["details"]["max_iterations"] is None
+    assert handoff["details"]["finding_counts"] is None
+
+
 @pytest.mark.parametrize("deadline, expected", [(1200, 1200), (None, None), ("soon", None)])
 def test_events_stall_reports_time_to_deadline(consumer, deadline, expected):
     repo, _ = consumer

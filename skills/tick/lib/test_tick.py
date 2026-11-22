@@ -8905,6 +8905,7 @@ def test_converge_pipeline_labels_notifies_when_retry_finds_terminal_target() ->
     assert converged is True
     notify.assert_called_once_with(
         "pr", 42, "ai:ready-for-human", None, "harvest", "review",
+        rounds=None, max_iterations=None,
     )
 
 
@@ -12952,6 +12953,7 @@ def test_harvest_one_reviewer_promotes_and_posts_comment(
             "base_drift": False,
             "head_drift": False,
             "rounds": 1,
+            "rounds_after": 2, "max_iterations": 5,
             "verdict": "ready_for_human",
         }
         with mock.patch("tick.git") as git_mock:
@@ -12989,6 +12991,7 @@ def test_harvest_one_reviewer_promotes_and_posts_comment(
     converge_mock.assert_called_once_with(
         "pr", 42, "ai:ready-for-human",
         tick_log=tick_log, phase="harvest", stage="review",
+        rounds=2, max_iterations=5,
     )
 
     observation_call = next(
@@ -13047,6 +13050,7 @@ def test_harvest_one_reviewer_requests_changes(
             "base_drift": False,
             "head_drift": False,
             "rounds": 1,
+            "rounds_after": 2, "max_iterations": 5,
             "verdict": "changes_requested",
         }
         with mock.patch("tick.git") as git_mock:
@@ -13066,6 +13070,7 @@ def test_harvest_one_reviewer_requests_changes(
     converge_mock.assert_called_once_with(
         "pr", 7, "ai:changes-requested",
         tick_log=None, phase="harvest", stage="review",
+        rounds=2, max_iterations=5,
     )
     cleanup_mock.assert_called_once()
 
@@ -13110,6 +13115,7 @@ def test_harvest_one_reviewer_discards_on_base_drift(
             "base_drift": True,
             "head_drift": False,
             "rounds": 0,
+            "rounds_after": 0, "max_iterations": 5,
             "verdict": "ready_for_human",
         }
         with mock.patch("tick.git") as git_mock:
@@ -13137,6 +13143,7 @@ def test_harvest_one_reviewer_discards_on_base_drift(
     converge_mock.assert_called_once_with(
         "pr", 3, "ai:implemented",
         tick_log=None, phase="harvest", stage="review",
+        rounds=0, max_iterations=5,
     )
     cleanup_mock.assert_called_once()
 
@@ -13204,6 +13211,7 @@ def test_harvest_one_reviewer_discards_on_base_retarget(
     converge_mock.assert_called_once_with(
         "pr", 9, "ai:implemented",
         tick_log=None, phase="harvest", stage="review",
+        rounds=0, max_iterations=5,
     )
     cleanup_mock.assert_called_once_with(str(wt_dir))
 
@@ -13303,6 +13311,7 @@ def test_harvest_one_reviewer_posts_fresh_comment_when_same_shas_new_base_ref(
     converge_mock.assert_called_once_with(
         "pr", 17, "ai:changes-requested",
         tick_log=None, phase="harvest", stage="review",
+        rounds=2, max_iterations=5,
     )
 
 

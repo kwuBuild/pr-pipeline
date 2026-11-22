@@ -83,12 +83,12 @@ number. An invalid or missing identity follows the malformed-record warning path
 | `launch` | Controller launched a stage engine. | `model`, `effort` |
 | `result` | Engine result/usage observation; not confirmation of an external transition. | `reported_cost`, `duration_ms`, `usage_status`, `proposed_action`, `input_tokens`, `cached_input_tokens`, `output_tokens` |
 | `pr_handoff` | PR creation or rediscovery, PR label handoff, and issue custody convergence succeeded. | `issue_number`, `pr_number`, `created` |
-| `review_handoff` | Review comment publication, if required, and label convergence succeeded. An outcome can also discard a stale review. | `label`, `outcome`, `head_sha` |
+| `review_handoff` | Review comment publication, if required, and label convergence succeeded. An outcome can also discard a stale review. | `label`, `outcome`, `head_sha`, `rounds`, `max_iterations`, `finding_counts` |
 | `revision_handoff` | Revision publication and re-review label convergence succeeded. This includes a validated no-change result. | `label`, `outcome`, `head_sha` |
 | `retry` | Transient failure was requeued and its cooldown recorded. | `domain`, `failure_class`, `cooldown_until` |
 | `cooldown` | Dispatch was skipped for an active provider cooldown. | `domain`, `failure_class`, `cooldown_until` |
 | `stalled` | The existing stall reporter detected a live engine with no recent output. | `progress_age_seconds`, `seconds_to_deadline` |
-| `terminal` | A terminal workflow label landed. For `ai:needs-human-decision`, `reason` is the escalation reason that the same tick log recorded before the label landed, or `null`. An `escalate` or `kill_escalate` decision is never emitted on its own: it is logged before its action runs and can be cancelled. | `label`, `reason` |
+| `terminal` | A terminal workflow label landed. For `ai:needs-human-decision`, `reason` is the escalation reason that the same tick log recorded before the label landed, or `null`. An `escalate` or `kill_escalate` decision is never emitted on its own: it is logged before its action runs and can be cancelled. | `label`, `reason`; for `ai:max-iterations`: also `rounds`, `max_iterations` |
 | `attention` | An action failed, its outcome is unconfirmed, or custody was retained: engine termination failed (`kill_failed`), an escalation comment is held for retry (`escalation_comment_retry`), a marker cannot prove engine death (`corrupt_marker_escalate`), or a terminal label could not be read or edited, or its verification found a mismatched label set (`terminal_label_failed`). A successful edit followed by an unreadable confirmation is `label_convergence_unverified`; only targets `ai:ready-for-human`, `ai:needs-human-decision`, and `ai:max-iterations` are emitted. Its reason includes the target label and its message says "terminal label not confirmed": the remote label may already have changed. An unchanged episode (item, stage, dispatch, source action, reason) is emitted once. A `launch`, a confirmed handoff, or a `terminal` event for the item ends its episodes, so a later failure is emitted again. Episodes are derived from retained history, so a restarted or newly marked reader reaches the same result. | `reason`, `source_action` |
 | `stopped` | The native loop stopped: full-queue quiescence (`loop_quiescent_stop`), a terminal target (`loop_target_stop`), or a settled or exhausted `--only` list (`loop_only_stop`). | `reason`, `source_action` |
 | `startup_failure` | Startup could not proceed with the target, configuration, labels, or required tools. | `reason`, `source_action` |
@@ -97,6 +97,25 @@ number. An invalid or missing identity follows the malformed-record warning path
 Reviewer launch model/effort are joined from a matching retained
 `model_resolved` record when absent on the launch record. Model resolution alone
 does not produce a launch event.
+
+Review `rounds` is the accounted count **after the confirmed handoff**, from the
+same trusted comment history and approved-input reservations used for admission.
+A replayed publication does not add a round. A discarded stale review leaves the
+count unchanged. `max_iterations` is the configured cap at that decision. Approval
+at the cap still promotes; changes requested at the cap stop the fix loop.
+Every successful round-limit transition emits a `terminal` event with these
+counts, including fixer admission and answered-hold release. A failed transition
+does not emit a success event.
+
+`finding_counts` is either `null` or an object with nonnegative integer fields
+`blocker`, `major`, and `minor`. Counts come only from a validated review
+result; an empty validated findings array produces three zeros. Missing or invalid
+findings produce `null`, not an empty-review claim. A discarded review can still
+carry validated counts, but they describe the discarded result, not the current
+head. Finding text is never included. Missing or malformed retained count fields
+project as `null`; the reader does not reconstruct them from comments or assume
+zero. These fields extend `schema_version: 1`; older retained records remain
+readable with unknown observations.
 
 An `engine_result_summary` with proposed action `create_pr` can precede a failed
 GitHub request. Only the later `pr_handoff` record reports confirmation and
