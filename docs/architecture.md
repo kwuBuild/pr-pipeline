@@ -1010,8 +1010,10 @@ remains open (see *Future evolution*).
 
 **Atomic launch/completion ownership.** The dispatch flow runs
 the reviewer engine through `engine_wrapper.py`, which provides four guarantees:
-(1) ownership before spawn — the wrapper creates a dedicated process group
-(`os.setpgrp`), then writes its PID + `start_time` + PGID + `dispatch_id` to the
+(1) ownership before spawn — the wrapper leads a dedicated process group
+(dispatch starts it with `start_new_session=True`; it calls `os.setpgrp` only
+when it does not already lead its group, because Linux rejects that call from a
+session leader), then writes its PID + `start_time` + PGID + `dispatch_id` to the
 marker before the engine starts, where `start_time` is the OS-reported process
 start time (same source the verifier reads) and PGID equals the wrapper's PID
 (group leader); (2) signal forwarding — a SIGTERM handler terminates the engine
@@ -1324,8 +1326,9 @@ there.
    then fails and it terminates its engine (see the failure branch below), so the
    spend is real but bounded. Closing that window needs compare-and-swap
    acquisition, which is out of scope here and deserves its own measurement.
-2. The engine wrapper (`engine_wrapper.py`) creates a dedicated process group
-   (`os.setpgrp`), then replaces the lease with a full ownership marker carrying
+2. The engine wrapper (`engine_wrapper.py`) leads a dedicated process group
+   (`start_new_session=True` at dispatch; `os.setpgrp` only when not already the
+   leader), then replaces the lease with a full ownership marker carrying
    `pid` + `start_time` (OS-reported) + `pgid` (= wrapper PID, since it is the group
    leader) + `dispatch_id` before spawning codex. The child inherits the process group.
 3. The wrapper validates exit status and the dispatch-pinned report protocol,

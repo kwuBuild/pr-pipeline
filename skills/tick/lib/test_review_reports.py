@@ -517,7 +517,10 @@ def seed_wrapper(root, env, report, protocol):
     subprocess.run([env["LOOP_TEST_GIT"], "worktree", "add", "--detach", str(worktree), "HEAD"],
                    cwd=root, check=True, capture_output=True)
     payload = report if isinstance(report, bytes) else json.dumps(report).encode()
-    engine = "import sys; from pathlib import Path; Path(sys.argv[sys.argv.index('-o')+1]).write_bytes(" + repr(payload) + ")"
+    # A file, not `python -c`: Linux caps one argv string at 128 KiB, and the
+    # oversized report alone exceeds it.
+    engine = root.parent / "seed-engine.py"
+    engine.write_text("import sys; from pathlib import Path; Path(sys.argv[sys.argv.index('-o')+1]).write_bytes(" + repr(payload) + ")")
     cmd = [sys.executable, str(Path(__file__).parents[1] / "engine_wrapper.py"), "run",
            "--dispatch-id", "report-fixture", "--marker-path", str(worktree / "dispatch.json"),
            "--result-path", str(worktree / "review.json"), "--envelope-path", str(worktree / "completion.json"),
@@ -527,7 +530,7 @@ def seed_wrapper(root, env, report, protocol):
            "--pre-label", "ai:implemented"]
     if protocol is not None:
         cmd += ["--report-protocol-version", str(protocol)]
-    result = subprocess.run([*cmd, "--", sys.executable, "-c", engine], cwd=worktree,
+    result = subprocess.run([*cmd, "--", sys.executable, str(engine)], cwd=worktree,
                             env=env, capture_output=True, text=True, timeout=20)
     assert result.returncode == 0, result.stderr
     return worktree
