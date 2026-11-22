@@ -572,6 +572,31 @@ def test_status_displays_requests_and_evidence_without_claiming_compliance(tmp_p
     assert "no observation; use unknown" in result.stdout
 
 
+@pytest.mark.parametrize('present', [False, True])
+def test_status_separates_loop_record_from_tick_log_evidence(tmp_path, tick_module, live_engine, present):
+    repo = install_status_script(tmp_path)
+    root = repo / ".claude/worktrees"
+    path = root / ".tick-state/loop.json"
+    if present:
+        pid, start = live_engine
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "schema_version": 1, "invocation_id": "status-test", "pid": pid,
+            "process_start_time": start, "recorded_at": time.time(),
+            "host": tick_module.platform.node(),
+            "scope": {"mode": "target", "targets": ["#117"]},
+        }))
+    before = {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    result = run_status(repo)
+    assert result.returncode == 0, result.stderr
+    assert "LOOP PROCESS: " + ("running" if present else "unavailable") in result.stdout
+    assert "record_present=" + ("true" if present else "false") in result.stdout
+    assert "DISPATCH SCOPE:" in result.stdout
+    assert "LAST TICK AUDIT LOG" in result.stdout
+    after = {str(p): p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    assert after == before
+
+
 # --- Helpers ---
 
 

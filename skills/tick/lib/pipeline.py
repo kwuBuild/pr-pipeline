@@ -5944,9 +5944,10 @@ def _clock(ts: float) -> str:
 def dispatch_scope_report(log_dir: str, *, now: float) -> str:
     """Describe the newest tick's dispatch scope and how current that evidence is.
 
-    The dashboard cannot see the loop process, so this reads only retained
-    tick logs. The newest log holding a tick (a ``tick_complete`` summary, a
-    ``tick_scope_requested`` record, or a resolved scope record) names the
+    This reads only retained tick logs. The separate loop-process classifier
+    reports local identity evidence. The newest log holding a tick (a
+    ``tick_complete`` summary, a ``tick_scope_requested`` record, or a resolved
+    scope record) names the
     scope: an ``--only`` list with its expanded items, an unreadable list, a
     positional target, or the full queue. A list or target that was requested
     but never resolved (startup, target resolution, or harvest failed first)

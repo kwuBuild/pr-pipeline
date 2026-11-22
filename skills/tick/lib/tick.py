@@ -13138,8 +13138,9 @@ def main(
         Process exit code: 0 = full tick completed, 1 = reconcile failed
         (dispatch gated), 2 = reconcile succeeded but authoritative in-flight
         label read failed (dispatch gated, retryable), 3 = startup probe
-        failed (required binary missing), 4 = unhandled exception, 5 = another
-        tick already holds the mutex, 6 = the target has no
+        failed (required binary missing), 4 = unhandled exception or loop
+        record startup failure, 5 = another tick already holds the mutex,
+        6 = the target has no
         ``[repos."owner/name"]`` section (run setup; ``--loop`` logs a skip).
     """
     # Resolve repo root. The main checkout, never the linked worktree the
@@ -13826,6 +13827,157 @@ def _compute_post_dispatch_state(
     return in_flight_count, has_queue, held_items
 
 
+def _loop_record_path(wt_root: str | None = None) -> str:
+    return os.path.join(WT_ROOT if wt_root is None else wt_root, ".tick-state", "loop.json")
+
+
+def _valid_loop_record(record: object) -> bool:
+    """Validate version 1 before any PID reaches the process APIs."""
+    if not isinstance(record, dict):
+        return False
+    if type(record.get("schema_version")) is not int or record["schema_version"] != 1:
+        return False
+    pid = record.get("pid")
+    if type(pid) is not int or not 0 < pid <= 2**31 - 1:
+        return False
+    for key in ("process_start_time", "recorded_at"):
+        value = record.get(key)
+        if type(value) not in (int, float) or not 0 < value < math.inf:
+            return False
+    if any(not isinstance(record.get(key), str) or not record[key].strip()
+           for key in ("host", "invocation_id")):
+        return False
+    scope = record.get("scope")
+    if not isinstance(scope, dict):
+        return False
+    mode, targets = scope.get("mode"), scope.get("targets")
+    if mode not in ("full", "target", "only") or not isinstance(targets, list):
+        return False
+    if any(not isinstance(item, str) or not re.fullmatch(r"(?:#|pr:)[1-9][0-9]*", item)
+           for item in targets):
+        return False
+    return (mode == "full" and not targets
+            or mode == "target" and len(targets) == 1
+            or mode == "only" and bool(targets) and len(set(targets)) == len(targets))
+
+
+def classify_loop_process(wt_root: str | None = None) -> dict[str, object]:
+    """Return a versioned, read-only observation of the recorded local loop.
+
+    Missing evidence is unavailable, never proof of death. This takes no tick
+    lock and never repairs records. The signal-zero existence probe delivers
+    no signal. See ``skills/status/LOOP-STATUS.md`` for the JSON contract.
+    """
+    path = _loop_record_path(wt_root)
+    health = {"record": "missing", "process": "not_checked"}
+    result: dict[str, object] = {
+        "schema_version": 1, "observed_at": time.time(), "state": "unavailable",
+        "record_present": None, "source_health": health,
+        "reason": "record_missing", "record": None,
+    }
+    try:
+        Path(path).stat()
+        result["record_present"] = True
+    except FileNotFoundError:
+        result["record_present"] = False
+    except OSError:
+        pass
+    try:
+        with open(path, encoding="utf-8") as handle:
+            record = json.load(handle)
+    except FileNotFoundError:
+        result["record_present"] = False
+        return result
+    except (ValueError, UnicodeError):
+        result.update(record_present=True, reason="record_malformed")
+        health["record"] = "malformed"
+        return result
+    except OSError:
+        result["reason"] = "record_unreadable"
+        health["record"] = "unreadable"
+        return result
+    result["record_present"] = True
+    if not _valid_loop_record(record):
+        result["reason"] = "record_malformed"
+        health["record"] = "malformed"
+        return result
+    health["record"] = "readable"
+    result["record"] = record
+    result["state"] = "unknown"
+    if record["host"] != platform.node():
+        result["reason"] = "host_mismatch"
+        health["process"] = "foreign_host"
+        return result
+    start_time = process_control.get_process_start_time(record["pid"])
+    if start_time is not None:
+        if start_time == record["process_start_time"]:
+            result.update(state="running", reason="identity_verified")
+            health["process"] = "verified"
+        else:
+            result.update(state="not_running", reason="identity_mismatch")
+            health["process"] = "mismatch"
+        return result
+    try:
+        alive = process_control.pid_is_alive(record["pid"])
+    except OSError:
+        alive = True  # A failed existence probe is not proof of death.
+    if not alive:
+        result.update(state="not_running", reason="process_dead")
+        health["process"] = "dead"
+    else:
+        result["reason"] = "identity_unreadable"
+        health["process"] = "unreadable"
+    return result
+
+
+def _publish_loop_record(
+    parsed_target: tuple[str, int] | None,
+    only: tuple[tuple[str, int], ...] | None,
+) -> dict[str, object]:
+    """Publish only while TickLock and the loop's stop handlers are held."""
+    pid = os.getpid()
+    start_time = process_control.get_process_start_time(pid)
+    if start_time is None:
+        raise RuntimeError("cannot read loop process identity")
+    scope = {"mode": "full", "targets": []}
+    if parsed_target is not None:
+        scope = {"mode": "target", "targets": [_only_token(parsed_target)]}
+    elif only is not None:
+        scope = {"mode": "only", "targets": [_only_token(item) for item in only]}
+    record = {
+        "schema_version": 1, "invocation_id": str(uuid.uuid4()), "pid": pid,
+        "process_start_time": start_time, "recorded_at": time.time(),
+        "host": platform.node(), "scope": scope,
+    }
+    path = _loop_record_path()
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pipeline.atomic_write(path, json.dumps(record) + "\n")
+    return record
+
+
+def _remove_loop_record(record: dict[str, object]) -> None:
+    """Remove this invocation's unchanged record before TickLock release."""
+    path = _loop_record_path()
+    try:
+        with open(path, encoding="utf-8") as handle:
+            current = json.load(handle)
+        if current == record:
+            os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, UnicodeError) as exc:
+        print(f"tick: loop record cleanup unavailable: {exc}", file=sys.stderr)
+
+
+def _cmd_loop_status(argv: list[str]) -> int:
+    """Print one JSON observation without entering tick startup or locking."""
+    if argv and (len(argv) != 2 or argv[0] != "--wt-root"):
+        print("usage: tick.py loop-status [--wt-root PATH]", file=sys.stderr)
+        return 2
+    print(json.dumps(classify_loop_process(argv[1] if argv else None)))
+    return 0
+
+
 def _run_loop_locked(
     parsed_target: tuple[str, int] | None,
     impl_engine: str,
@@ -13865,15 +14017,22 @@ def _run_loop_locked(
         stop_event.set()
         wake_event.set()
 
-    signal.signal(signal.SIGINT, request_stop)
-    signal.signal(signal.SIGTERM, request_stop)
     # After startup, only full scheduled waits advance the quiet streak.
     # There is no second in-memory streak or post-summary state observation.
     after_heartbeat = True
     last_rc = 0
-    watcher = _start_wake_watcher(stop_event, wake_event)
+    watcher = None
+    record = None
 
     try:
+        try:
+            signal.signal(signal.SIGINT, request_stop)
+            signal.signal(signal.SIGTERM, request_stop)
+            record = _publish_loop_record(parsed_target, only)
+            watcher = _start_wake_watcher(stop_event, wake_event)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"tick: loop startup failed: {exc}", file=sys.stderr)
+            return TICK_CRASH_EXIT_CODE
         while not stop_event.is_set():
             # Clear before the tick so a nudge arriving during it is preserved
             # for the next wait instead of being consumed by this iteration.
@@ -13922,11 +14081,13 @@ def _run_loop_locked(
             # the next quiet observation. Nudges must not advance the streak.
             after_heartbeat = timer_expired
     finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
         stop_event.set()
         if watcher is not None:
             watcher.join(timeout=WAKE_WATCH_POLL_SECONDS)
+        if record is not None:
+            _remove_loop_record(record)
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
 
     return last_rc
 
@@ -15863,6 +16024,8 @@ if __name__ == "__main__":  # pragma: no cover
     # pipeline (the status dashboard calls it on every render).
     if sys.argv[1:2] == ["engine-progress"]:
         raise SystemExit(_cmd_engine_progress(sys.argv[2:]))
+    if sys.argv[1:2] == ["loop-status"]:
+        raise SystemExit(_cmd_loop_status(sys.argv[2:]))
     cli_args = parse_cli_args(sys.argv[1:])
     raise SystemExit(
         main(
