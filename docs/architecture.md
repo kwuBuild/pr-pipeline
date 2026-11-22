@@ -34,7 +34,8 @@ implementer and reviewer agents. Each handoff requires the developer to:
 - Developer only reviews PRs that reach `ai:ready-for-human`
 - Drive ticks on a state-aware cadence: poll fast while engines are
   in-flight, back off when idle, and stop at quiescence
-- Use cross-model review (Claude implements, Codex reviews) for independence
+- Keep author and reviewer sessions separate. The default Claude/Codex routes
+  use different model families; optional Codex writing does not guarantee this.
 
 ## Non-Goals
 
@@ -77,7 +78,7 @@ Each tick runs two fast phases. Engines run *between* ticks, not during them.
 └──────────────────────────────────────────────────┘
             │                          │
   ┌─────────▼──────────┐    ┌─────────▼──────────┐
-  │ claude -p           │    │ codex exec         │
+  │ claude / codex      │    │ codex exec         │
   │ (implement/fix)     │    │ (review)           │
   │ cwd: worktree       │    │ -C worktree        │
   │ → result.json       │    │ → review.json      │
@@ -87,6 +88,18 @@ Each tick runs two fast phases. Engines run *between* ticks, not during them.
 This design keeps each tick under 30 seconds regardless of concurrent PR
 count. Engines run as detached background processes writing results to files.
 The next tick harvests those results.
+
+Write-stage routing belongs to `tick._launch_write_engine`. Claude keeps its
+existing adapter; Codex uses `codex_write_wrapper.py` to normalize JSONL only
+after child exit. Both retain the same process-group custody, worktrees,
+report validators, and controller publication. A writable engine's completion
+file cannot override a live process group. The reviewer keeps its separate
+scrubbed environment and completion-envelope contract.
+
+Installed skills remain one library. Codex writers receive non-destructive
+links inside their worktree and prompts bound to the canonical installed path.
+See the [operator contract](../skills/tick/README.md#optional-codex-write-stages)
+for the permission policy and required adoption evidence.
 
 ### Loop and cadence
 
@@ -1259,7 +1272,7 @@ not prove a marker carries the fields recovery acts on. Before any liveness chec
 cleanup, revert, or label transition, the marker is validated by *type, enumeration, and
 identity* (`valid_marker`): it must carry the full provenance set (`engine`, `stage`,
 `pr_number`, `deadline`, `base_ref`, `base_sha`, `head_sha`, `pre_label`) with no unknown
-fields, a known stage-appropriate engine (`codex` for review, `claude` or `claude-ds`
+fields, a known stage-appropriate engine (`codex` for review; `claude`, `claude-ds`, or `codex`
 for implement/fix), a known `stage` matching the directory's PR/stage, a finite
 `deadline`, a `pre_label` that is one of the real pre-dispatch labels
 (`ai:implemented`/`ai:revised`, never an arbitrary or terminal label a revert would
@@ -1626,8 +1639,8 @@ permissions, never proof that repository checks ran.
 (`docs/working/pr-guidelines.md`), the state machine, custody, and the cadence
 are pipeline concerns and are identical for every target.
 
-**Models are operator configuration.** The implementer runs Claude via
-`claude -p` and can be routed to another provider by setting
+**Models are operator configuration.** Writers run the selected Claude or
+Codex adapter. The Claude route can use another provider through
 `ANTHROPIC_BASE_URL` in the dispatch env. The reviewer's model is pinned
 explicitly in the dispatch argv, because `--ignore-user-config` discards the
 operator's `config.toml` defaults.
@@ -1703,6 +1716,7 @@ skills/
       pipeline.py               # pure decision logic + argparse CLI (imported by tick.py)
       process_control.py        # bounded TERM/KILL rollback helper
       claude_stream_wrapper.py  # stream-json reader + progress heartbeat
+      codex_write_wrapper.py    # native JSONL normalization + progress heartbeat
       reviewer_observability.py # bounded, sanitized reviewer stderr capture
       prompts/                  # implementer / reviewer / fixer templates
       README.md                 # CLI reference + pinned Codex version

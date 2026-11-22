@@ -180,16 +180,18 @@ max_iterations = 5
 # --impl-effort, --fix-effort, --review-model, --review-effort) override these
 # for one run. A malformed value is a startup error naming the key.
 
-# Implementer engine: "claude" or "claude-ds". /pr-pipeline:setup writes the
-# route defaults (impl_engine and impl_model) and separate probe metadata
+# Implementer engine: "claude", "claude-ds", or opt-in "codex".
+# /pr-pipeline:setup writes the route defaults (impl_engine and impl_model)
+# and separate probe metadata
 # (probed_impl_engine and probed_model) into the repository's own section.
 # Editing a default or passing a flag does not rewrite that evidence: the tick
 # reports at startup when the route it runs differs. See README "Deadlines,
 # stall limits, routing and cadence" for the metadata contract.
 impl_engine = "claude"
 
-# Implementer --impl-model. Blank: claude resolves the operator's own default, and
-# claude-ds uses deepseek-v4-pro[1m].
+# Implementer --impl-model. Blank: claude resolves the operator's own default,
+# codex resolves its own configured default, and claude-ds uses
+# deepseek-v4-pro[1m].
 impl_model = ""
 # Compatibility aliases model/effort are normalized within each layer.
 # Do not set conflicting aliases in one table; equivalent strings are accepted.
@@ -204,7 +206,12 @@ fix_model = ""
 # Implementer and fixer effort (CLAUDE_CODE_EFFORT_LEVEL): low, medium, high,
 # xhigh or max. Blank impl_effort sets nothing on claude, so the inherited
 # environment and settings apply, and runs claude-ds at max. Blank fix_effort
-# inherits impl_effort on any fixer engine.
+# inherits impl_effort within the Claude family or within Codex. Crossing that
+# boundary uses the destination default. Codex accepts low/medium/high/xhigh
+# through model_reasoning_effort; max is rejected. Claude permission_mode,
+# engine_settings and verify_tools are not Codex permission grants. Codex uses
+# --approve-for-me (workspace-write plus automatic approval review). See the
+# README's "Optional Codex write stages" before adoption.
 impl_effort = ""
 fix_effort = ""
 

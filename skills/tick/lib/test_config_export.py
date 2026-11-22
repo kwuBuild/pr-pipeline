@@ -257,6 +257,8 @@ engine_stall_startup_grace_seconds=12
     ('fix_engine=""\nfix_model=""\nfix_effort=""', {"engine": "claude-ds", "model": "implement-model", "effort": "high", "cooldown_domain": "claude-ds"}),
     ('fix_engine="claude"', {"engine": "claude", "model": "", "effort": "high", "cooldown_domain": "claude"}),
     ('fix_engine="claude"\nfix_model="fix-model"\nfix_effort="low"', {"engine": "claude", "model": "fix-model", "effort": "low", "cooldown_domain": "claude"}),
+    ('fix_engine="codex"', {"engine": "codex", "model": "", "effort": "", "cooldown_domain": "codex"}),
+    ('fix_engine="codex"\nfix_model="codex-model"\nfix_effort="xhigh"', {"engine": "codex", "model": "codex-model", "effort": "xhigh", "cooldown_domain": "codex"}),
 ])
 def test_config_uses_resolver_fixer_inheritance(export_install, fix_keys, expected):
     case = export_install

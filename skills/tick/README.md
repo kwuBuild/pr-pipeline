@@ -364,12 +364,12 @@ activity. Each one can be set in `[defaults]` and overridden in
 | `engine_stall_seconds` | seconds | 1800 | integer > 600 and less than all three engine deadlines | all three stage dispatchers, recorded in the marker for stall detection |
 | `engine_stall_startup_grace_seconds` | seconds | 300 | integer ≥ 0 | all three stage dispatchers, recorded in the marker |
 | `max_iterations` | review/fix rounds | 5 | integer ≥ 1 | reviewer harvest: the round that reaches it gets `ai:max-iterations` |
-| `impl_engine` | — | `"claude"` | `"claude"` or `"claude-ds"` | implementer launch |
+| `impl_engine` | — | `"claude"` | `"claude"`, `"claude-ds"`, or `"codex"` | implementer launch |
 | `impl_model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
-| `fix_engine` | — | `""` | blank (the implementer's engine), `"claude"`, or `"claude-ds"` | fixer launch |
+| `fix_engine` | — | `""` | blank (the implementer's engine), `"claude"`, `"claude-ds"`, or `"codex"` | fixer launch |
 | `fix_model` | — | `""` | blank, or a model id | fixer `--model`; blank inherits `impl_model` only while the fixer runs on the implementer's engine |
-| `impl_effort` | — | `""` | blank, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | implementer `CLAUDE_CODE_EFFORT_LEVEL`; blank sets nothing on claude (the inherited environment and settings apply) and means `max` on claude-ds |
-| `fix_effort` | — | `""` | blank, or a level allowed for `impl_effort` | fixer `CLAUDE_CODE_EFFORT_LEVEL`; blank inherits `impl_effort` on any fixer engine |
+| `impl_effort` | — | `""` | blank, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` (`max` is Claude only) | engine-native effort (`CLAUDE_CODE_EFFORT_LEVEL` or Codex `model_reasoning_effort`); blank sets nothing on claude (the inherited environment and settings apply) and means `max` on claude-ds |
+| `fix_effort` | — | `""` | blank, or a level allowed for `impl_effort` on the fixer engine | engine-native effort; blank inherits `impl_effort` within the Claude family or within Codex |
 | `review_model` | — | `""` | blank (codex config, then `gpt-5.5`), or a model id | reviewer `--model` |
 | `review_effort` | — | `""` | blank (codex config, then `high`), or a bare token | reviewer `model_reasoning_effort` |
 | `loop_short_poll_seconds` | seconds | 270 | integer ≥ 60, not 300 | wake while work is queued, at capacity, or state is unknown |
@@ -429,6 +429,18 @@ These two metadata keys apply only to that repository; they do not inherit
 from `[defaults]` or CLI flags. Edit routing defaults as needed, and refresh
 probe metadata only by rerunning setup. Both metadata keys must be present
 and valid together; a partial or malformed record stops startup with exit 3.
+
+Setup writes `impl_model` as requested, not as it resolved. It writes
+`impl_effort`, `fix_engine`, `fix_model` and `fix_effort` as requested, but
+only when the request differs from what the configuration already resolves
+to; an unchanged key keeps its layer, so setup does not pin a `[defaults]`
+value into the repository section. The probe record keeps both
+`requested_routes` (configuration and flags, before fixer inheritance) and
+`routes` (the effective stage routes it measured). A blank fixer key therefore
+stays an inheritance rule after setup, so a later `--impl-model`,
+`--impl-effort` or `--impl-engine` override still reaches the fixer; an
+explicit fixer key stays pinned. `write-config` refuses a record whose request does not resolve to the
+measured routes, including a record without `requested_routes`; rerun the probe.
 
 When a config edit or flag selects a different implementer route, the tick
 prints `tick: implementer route … differs from the route /pr-pipeline:setup
@@ -756,8 +768,8 @@ a sleep into an early tick:
    apply. The artifact check is reviewer-only: a
    `completion.json` or `review.json` has landed, which the reviewer wrapper
    publishes by atomic rename after the engine exits. Implementers and fixers
-   run wrapperless and publish neither, and their engine holds a `Write` tool
-   with the worktree as its cwd — so for them one of those files is untrusted
+   do not use the review completion wrapper and publish neither. They can write
+   files in their worktree — so for them one of those files is untrusted
    input, not evidence, and is not read. The liveness check runs for every
    stage: both the marker's recorded PID and process group are no longer
    alive. Wrapper death alone is not
@@ -1047,8 +1059,8 @@ nor a wedged cap caused by a human holding an engine can go unexplained.
 ~/.claude/pr-pipeline/bin/pr-pipeline tick --fix-engine claude-ds --fix-model deepseek-v4-flash
 ```
 
-Controls whether the implementer uses `claude` (default) or `claude-ds`
-(DeepSeek via Claude wrapper). The fixer runs on the implementer's route unless
+Selects `claude` (default), `claude-ds` (DeepSeek via Claude), or opt-in `codex`.
+See [Optional Codex write stages](#optional-codex-write-stages) for its policy. The fixer runs on the implementer's route unless
 `fix_engine`/`--fix-engine` names its own engine; `fix_model`/`--fix-model`
 names its model. A blank fixer model inherits the implementer's model only while
 the fixer runs on the implementer's engine, because a model id names one
@@ -1088,12 +1100,13 @@ and additionally sets `ANTHROPIC_MODEL` for `claude-ds`.
 ```
 
 Sets the effort level that the implementer and the fixer receive as
-`CLAUDE_CODE_EFFORT_LEVEL` (config keys `impl_effort` and `fix_effort`). The allowed
-levels are `low`, `medium`, `high`, `xhigh` and `max`; any other value stops the
-tick at startup with an error that names the key. A blank `fix_effort` inherits
-`impl_effort` on any fixer engine, because effort levels are not specific to one
-provider (a model id is, which is why `fix_model` inherits only on the same
-engine).
+`CLAUDE_CODE_EFFORT_LEVEL` on Claude routes or `model_reasoning_effort` on
+Codex (config keys `impl_effort` and `fix_effort`). Claude accepts `low`,
+`medium`, `high`, `xhigh`, and `max`; Codex accepts the first four. Any other
+value stops the tick at startup with an error that names the key. A blank
+`fix_effort` inherits `impl_effort` within the Claude family or within Codex.
+Crossing that boundary uses the destination default. A model id is specific
+to one provider, which is why `fix_model` inherits only on the same engine.
 
 When the resolved effort is blank, `claude` gets no `CLAUDE_CODE_EFFORT_LEVEL`
 from the tick, so an exported value or the Claude settings apply as before.
@@ -1248,6 +1261,72 @@ When dispatching with `--impl-engine claude-ds`, set
 accepted as a value only when nothing exists at that path, while missing,
 directory, dangling-symlink, permission, and other path-read failures fail
 closed. `OPENAI_API_KEY` and `ANTHROPIC_API_KEY` are optional.
+
+### Optional Codex write stages
+
+Set `impl_engine = "codex"` or `fix_engine = "codex"` in the target's operator
+configuration, or pass the corresponding flags to `tick`. Claude remains the
+default. One-shot, native loop, positional targets, and `--only` use the same
+route resolver. A blank fixer engine inherits the implementer. A blank fixer
+model inherits only when both engines match. A blank fixer effort inherits
+within the Claude family or within Codex; crossing that boundary uses the
+destination default. Codex accepts `low`, `medium`, `high`, and `xhigh`; `max`
+is rejected. Blank Codex model/effort values leave resolution to Codex settings.
+
+The writer runs `codex exec --json --color never --approve-for-me`, with the
+prompt on stdin and the controller-created worktree as cwd. The permission
+preset selects workspace-write plus automatic approval review. Do not also
+pass `--sandbox`: CLI 0.171.0 rejects that combination. Protected Git metadata
+and authenticated command networking can require approval. The engine requests
+that approval through the configured reviewer. A denied required action must
+produce `NEEDS_HUMAN_DECISION`; neither the controller nor the engine changes
+the policy or selects a fallback provider.
+
+Claude's `permission_mode`, `engine_settings`, and `verify_tools` are not
+translated into Codex grants. The target's verification instructions remain
+mandatory. The writer inherits authentication and native configuration; the
+reviewer's scrubbed HOME and read-only settings are separate. No new project
+trust is persisted. Choose the CLI on PATH explicitly if a shell wrapper
+selects a different installation in the target checkout.
+
+Setup probes both effective stages. For example:
+
+```bash
+pr-pipeline setup probe owner/repo --impl-engine codex --model gpt-6-astra --effort high
+```
+
+The Codex probe uses the dispatch argv in disposable linked worktrees. It
+verifies a file, commits, and pushes to a local bare repository, with a detached
+HEAD for the fixer. Its report records CLI version, argv, routes, outcomes, and
+pushed heads. A passing local probe does **not** prove authenticated network
+push, target-specific rules, or the complete controller lifecycle. Before
+adoption, run a disposable issue through implementation, repository checks,
+commit/push, controller PR creation, rejection, Codex fixing, and separate
+re-review. Record unavailable or denied steps rather than calling them passed.
+The [2026-11-22 validation record](../../docs/working/codex-write-stage-validation.md)
+captures the measured CLI, policy, pushed heads, and complete native trial.
+
+`native_skills.prepare_writer` links the installed skill directories under
+`.agents/skills/pr-pipeline-<name>` in each worktree. It preserves existing
+catalog entries, refuses collisions and symlinked catalog parents, and rolls
+back only links it created if setup fails. Normal worktree cleanup owns link
+removal. Do not commit these links. Prompts name the canonical installed source
+so a same-named target skill cannot silently substitute its contents. Native
+skill discovery grants no permissions; loading telemetry does not prove
+compliance. Codex write telemetry currently reports skill use as unavailable.
+
+The Codex wrapper requires final agent text, a completed turn, and successful
+child exit. It emits the existing stage report plus Codex transport metadata;
+fixer reports retain their dispatch/head/review bindings. Harvest still waits
+for the whole process group to die and rejects a missing Codex transport on a
+Codex marker. Heartbeats are advisory. Quota failures use the Codex cooldown
+domain and existing stage retry limits; versioned fixer failures retain the
+existing escalation contract. Usage comes from Codex counters, not Claude
+counters. Existing Claude markers remain recoverable.
+
+The reviewer remains a separate read-only Codex session. Using Codex for both
+writing and review does not establish different model families. Author-led
+checks cannot advance a PR to independent approval.
 
 ### Engine permission modes
 
@@ -1422,8 +1501,8 @@ commands. If the engine cannot read required guidance or complete a required
 Phase A or Phase B step, the prompt requires `NEEDS_HUMAN_DECISION`. Denied
 commands must be recorded as `not run — <command> denied`; missing evidence
 cannot be replaced by an n/a claim. The harvest checks only the body's section
-structure. It neither validates the evidence nor adds a warning when the block
-is missing, including when it publishes a generated fallback body.
+structure and the presence of the required evidence labels. Missing evidence
+adds a visible notice; harvest does not validate the claims or approve the change.
 
 Claude already discovers namespaced skills from plugins. Dispatch loads the
 pipeline's installed plugin directly with `claude -p --plugin-dir <install>` and
@@ -1434,8 +1513,10 @@ source so a same-named task-branch skill does not satisfy the binding. No copied
 plugin or second namespace is created. Supporting files remain in the install.
 
 Required invocation or supporting-file access can still be denied by host policy;
-the engine must report `NEEDS_HUMAN_DECISION`. There is no silent document-read
-fallback. Verification commands retain their existing permission rules, and
+the engine must report `NEEDS_HUMAN_DECISION`. Claude has no silent document-read
+fallback. Codex uses its native name/path activation and file-reading workflow;
+see [Optional Codex write stages](#optional-codex-write-stages).
+Verification commands retain their existing permission rules, and
 skills do not grant publication or label authority.
 
 The Codex reviewer has an isolated home. Dispatch links `native_skills.REVIEW_SKILLS`
@@ -1679,8 +1760,8 @@ a known session/usage/quota-limit message. A valid success or
 mentions a limit.
 
 Transient results share an account-domain cooldown across implementer and fixer
-dispatch. `claude` and `claude-ds` use separate domains so a Claude subscription
-limit does not block DeepSeek-routed work. When the provider message includes a
+dispatch. `claude`, `claude-ds`, and `codex` use separate domains so a provider
+limit does not block the other write routes. When the provider message includes a
 reset wall-clock time, the cooldown ends `transient_cooldown_reset_buffer_seconds`
 (shipped: five minutes) after the next occurrence; otherwise it lasts
 `transient_cooldown_seconds` (shipped: one hour). Durable state lives in
@@ -1732,8 +1813,8 @@ guidance through native skill binding.
 
 #### Report transport
 
-The fixer returns its report through Claude Code structured output, not as its
-final chat message. The normal sequence is:
+Claude and Claude-DS fixers return their reports through Claude Code structured
+output. The normal sequence for those routes is:
 
 1. Dispatch builds one JSON Schema from the field sets in `lib/fixer_reports.py`
    (`fixer_reports.schema()`) and passes it as `claude -p --json-schema`. It pins
@@ -1748,15 +1829,19 @@ final chat message. The normal sequence is:
    message (`result`) has no effect. The report then passes the same field,
    binding, coverage and outcome checks as before; the schema does not replace them.
 
-Both fixer routes use this transport. A live probe with Claude Code 2.1.331
+Both Claude routes use this transport. A live probe with Claude Code 2.1.331
 returned a schema-valid `structured_output` on `claude` and on `claude-ds`
 (DeepSeek's Anthropic-compatible endpoint), in both cases under `dontAsk` with a
 narrow `--allowedTools` list. `claude-ds` therefore has no text-parse fallback.
 
 | Dispatch marker | Report source | Missing or non-object source |
 |---|---|---|
-| `report_transport="structured_output"` (new dispatches) | `result.json` `structured_output` | "Missing structured revision report …" human hold |
-| No `report_transport` (dispatched before this transport) | The whole final message in `result`, parsed as JSON | "Missing or malformed JSON revision report …" human hold |
+| `report_transport="structured_output"` (new Claude dispatches) | `result.json` `structured_output` | "Missing structured revision report …" human hold |
+| No `report_transport` (Codex or older Claude dispatches) | The whole final message in `result`, parsed as JSON | "Missing or malformed JSON revision report …" human hold |
+
+Codex receives no Claude JSON-schema flag. Its prompt requires a final message
+containing only the JSON report, and its wrapper validates the terminal turn
+and child exit before harvest applies the same report and binding checks.
 
 The marker alone selects the parse; harvest never guesses from the result's
 content. A dispatch already running when this change deploys keeps the text

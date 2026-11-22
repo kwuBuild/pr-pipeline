@@ -81,9 +81,10 @@ def parse_result(result: object, version: object,
             or type(result.get("report_protocol_version")) is not int
             or result.get("report_protocol_version") != version):
         return None, "Fixer result protocol does not match dispatch."
+    exit_key = "engine_exit_status" if result.get("engine") == "codex" else "claude_exit_status"
     if (result.get("is_error") is not False
-            or type(result.get("claude_exit_status")) is not int
-            or result["claude_exit_status"] != 0):
+            or type(result.get(exit_key)) is not int or result[exit_key] != 0
+            or (result.get("engine") == "codex" and result.get("turn_completed") is not True)):
         return None, "Fixer engine did not complete successfully."
     if transport == STRUCTURED_TRANSPORT:
         report = result.get("structured_output")

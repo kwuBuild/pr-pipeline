@@ -10,9 +10,15 @@ You scope it. Agents ship it. You merge it.
 
 Build your own AI software factory on GitHub. pr-pipeline is a Claude Code
 plugin that turns each issue you hand it into a reviewed pull request. Claude
-Code writes the change. Codex reviews it. Claude Code answers the review, round
+Code writes the change by default. Codex reviews it. The selected writer answers the review, round
 after round, until the pull request is ready for you to merge. Every step happens on GitHub, where you can follow it and step in. A
 small Python pipeline carries the work between the agents, so you don't.
+
+Implementation and fixing can also opt into Codex. See the
+[Codex write-stage contract](skills/tick/README.md#optional-codex-write-stages)
+for permissions, setup probes, and adoption evidence. The reviewer always runs
+in a separate read-only session; different model families depend on the routes
+and models you select.
 
 <!-- Demo recording goes here: a short terminal capture of /pr-pipeline:tick
      and /pr-pipeline:status, or a screenshot of a PR's label history. -->
@@ -42,12 +48,12 @@ out of its rules.
 ![The ai: label state machine. An issue moves from ai:available to ai:implementing. The pipeline opens a pull request at ai:implemented. Codex reviews it. Approved pull requests go to ai:ready-for-human. Pull requests with findings loop through ai:changes-requested, ai:fixing, and ai:revised back to review.](docs/images/pipeline-state-machine.svg)
 
 - **The agents make the judgment calls.** Each implementer and fixer is a full
-  Claude Code session with your settings, plugins, and skills, in its own git
+  Claude Code or opt-in Codex session with native settings and skills, in its own git
   worktree with a fresh context. The agents decide what to change and how. A
   fixer can even push back on a finding with evidence, and the next review
   decides.
-- **No agent grades its own work.** Claude Code writes and Codex reviews. Codex
-  runs read-only: it can judge the code but not change it.
+- **No agent grades its own work.** A separate Codex reviewer runs read-only:
+  it can judge the code but not change it. Author self-review does not approve a PR.
 - **The pipe never forgets.** Each item's state is a GitHub label plus a small
   record on disk, not a conversation. A crash or `/clear` in your session
   loses no workflow state; the next run picks up where the last one stopped.
@@ -122,8 +128,8 @@ or changes that must deploy without a human review.
 
 **Know before you start:**
 
-- **Two providers.** You need a Codex CLI login as well as Claude Code. Codex
-  is the reviewer.
+- **Native CLI logins.** Codex is required for review. Claude Code authentication
+  is also required when a write stage uses a Claude route.
 - **Your machine.** It runs from a Claude Code session or a terminal that
   stays open while the loop runs. It is not a hosted service.
 - **One operator.** Only issues and pull requests that your GitHub login wrote
@@ -259,9 +265,9 @@ with the whole queue and your configured defaults, so pass the same target and
 flags again when you start the loop.
 
 Flags select the agents for one run: `--impl-engine` chooses the implementation
-engine (`claude`, or `claude-ds` for DeepSeek through Claude Code), `--impl-model`
-the implementer model, `--impl-effort` its effort, `--fix-engine` and
-`--fix-model` the fixer's own route, and
+engine (`claude`, `claude-ds` for DeepSeek through Claude Code, or opt-in
+`codex`), `--impl-model` the implementer model, `--impl-effort` its effort,
+`--fix-engine` and `--fix-model` the fixer's own route, and
 `--review-model` and `--review-effort` the Codex reviewer. Setup records the
 implementation route it tested for each repository, so you need no flags for
 it. Deadlines, the review limit, agent routes, and loop timing are settings in

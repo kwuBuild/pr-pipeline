@@ -43,12 +43,11 @@ finding set or cross-round carry-forward from prose.
 
 ## Revision workflow
 
-Before editing, invoke `{revision_hygiene_skill_invocation}` through the native
-Skill tool (installed source `{revision_hygiene_skill_doc}`). Also invoke
-`{definition_of_done_skill_invocation}` (installed source
+Before editing, {revision_hygiene_skill_invocation}
+(installed source `{revision_hygiene_skill_doc}`). Also
+{definition_of_done_skill_invocation} (installed source
 `{definition_of_done_skill_doc}`) and follow its applicable proof requirements.
-A same-named repository document or plain file read cannot replace native
-invocation. If required guidance or supporting files are missing or denied,
+{skill_loading_contract} If required guidance or supporting files are missing or denied,
 report NEEDS_HUMAN_DECISION in the outcome field below.
 
 Assess every finding against the current code and governing requirements.
@@ -102,11 +101,7 @@ agents. A fixer requests independent re-review; it never grants approval.
 
 ## Complete revision report
 
-Return the report through the structured output. The controller launched you
-with a JSON schema for this report, so Claude Code collects it as a separate
-structured object. Harvest reads only that object; your final chat message is
-not parsed, and prose around it has no effect. Copy these controller binding
-fields exactly:
+{report_transport_instructions} Copy these controller binding fields exactly:
 {report_binding}
 
 Add these required fields:
