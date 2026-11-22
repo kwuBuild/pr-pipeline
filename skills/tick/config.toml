@@ -176,34 +176,36 @@ max_iterations = 5
 
 # --- Engine routing ---
 #
-# Explicit CLI flags (--impl-engine, --model, --fix-engine, --fix-model,
-# --effort, --fix-effort, --review-model, --review-effort) override these for one run. A malformed
-# value is a startup error naming the key.
+# Explicit CLI flags (--impl-engine, --impl-model, --fix-engine, --fix-model,
+# --impl-effort, --fix-effort, --review-model, --review-effort) override these
+# for one run. A malformed value is a startup error naming the key.
 
 # Implementer engine: "claude" or "claude-ds". /pr-pipeline:setup writes the
-# route defaults (impl_engine and model) and separate probe metadata
+# route defaults (impl_engine and impl_model) and separate probe metadata
 # (probed_impl_engine and probed_model) into the repository's own section.
 # Editing a default or passing a flag does not rewrite that evidence: the tick
 # reports at startup when the route it runs differs. See README "Deadlines,
 # stall limits, routing and cadence" for the metadata contract.
 impl_engine = "claude"
 
-# Implementer --model. Blank: claude resolves the operator's own default, and
+# Implementer --impl-model. Blank: claude resolves the operator's own default, and
 # claude-ds uses deepseek-v4-pro[1m].
-model = ""
+impl_model = ""
+# Compatibility aliases model/effort are normalized within each layer.
+# Do not set conflicting aliases in one table; equivalent strings are accepted.
 
 # Fixer route. Blank fix_engine runs the fixer on the implementer's engine.
-# Blank fix_model inherits model while the fixer runs on the implementer's
+# Blank fix_model inherits impl_model while the fixer runs on the implementer's
 # engine, and otherwise uses the fixer engine's default: a model id names one
 # provider's model.
 fix_engine = ""
 fix_model = ""
 
 # Implementer and fixer effort (CLAUDE_CODE_EFFORT_LEVEL): low, medium, high,
-# xhigh or max. Blank effort sets nothing on claude, so the inherited
+# xhigh or max. Blank impl_effort sets nothing on claude, so the inherited
 # environment and settings apply, and runs claude-ds at max. Blank fix_effort
-# inherits effort on any fixer engine.
-effort = ""
+# inherits impl_effort on any fixer engine.
+impl_effort = ""
 fix_effort = ""
 
 # Codex reviewer model and reasoning effort. Blank reads the operator's codex

@@ -749,7 +749,7 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   the configuration and rerun the tick; do not discard retained review evidence.
 - Configuration errors: a malformed `base_ref`, `permission_mode`,
   `[operator] login`, `approved_reviewers`, `verify_tools`, `checklist_paths`, `[scan] repos`, engine
-  route (`impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`,
+  route (`impl_engine`, `impl_model`, `fix_engine`, `fix_model`, `impl_effort`,
   `fix_effort`, `review_model`, `review_effort`, or the matching flag), or any deadline, stall, round,
   cooldown or cadence key exits 3 with `startup_config_invalid` naming the key —
   none of them has a reading that is both conservative and the one the operator
@@ -762,7 +762,7 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   `$CLAUDE_CONFIG_DIR` are errors too. Grep the tick log for `startup_config_`
   when a setting looks ignored
 - Unprobed engine route: `startup_route_unprobed` means the implementer route
-  this tick ran (after config edits and any `--impl-engine`/`--model` flag)
+  this tick ran (after config edits and any `--impl-engine`/`--impl-model` flag)
   differs from setup's separate `probed_impl_engine`/`probed_model` evidence.
   The tick still runs. Whether `auto` permission mode works was measured on the
   recorded route only; rerun setup to probe the new one

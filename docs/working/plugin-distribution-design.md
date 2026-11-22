@@ -606,7 +606,7 @@ runtime rules. The design in brief:
 
 1. Resolve A's login via `gh api user --jq .login`, display it, ask A to confirm.
 2. Ask which repositories A wants to drive, and which engine route
-   (`--impl-engine`, `--model`) the tick will run.
+   (`--impl-engine`, `--impl-model`) the tick will run.
 3. Per repository: resolve the default branch; create the `ai:` label set
    (section 6); inspect for `pom.xml`, `build.gradle`, `package.json`,
    `pyproject.toml`, `Cargo.toml` through the GitHub API; **propose**

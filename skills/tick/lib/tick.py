@@ -15715,9 +15715,11 @@ class CliArgs(TypedDict):
 _VALUE_FLAGS = {
     "--only": "only",
     "--impl-engine": "impl_engine",
+    "--impl-model": "model",
     "--model": "model",
     "--fix-engine": "fix_engine",
     "--fix-model": "fix_model",
+    "--impl-effort": "effort",
     "--effort": "effort",
     "--fix-effort": "fix_effort",
     "--review-model": "review_model",
@@ -15753,12 +15755,23 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
     """
     values: dict[str, str] = dict.fromkeys(_VALUE_FLAGS.values(), "")
     seen_flags: set[str] = set()
+    alias_values: dict[str, str] = {}
     target: str | None = None
     loop = False
 
     def set_value(flag: str, value: str) -> None:
-        # Route flags keep their last-value behavior. A second --only list
-        # would silently replace the first priority statement, so refuse it.
+        # Repeating one spelling keeps its last-value behavior. Different
+        # spellings of an implementer setting must agree within this CLI layer.
+        counterparts = {
+            "--model": "--impl-model", "--impl-model": "--model",
+            "--effort": "--impl-effort", "--impl-effort": "--effort",
+        }
+        other = counterparts.get(flag)
+        if other in alias_values and alias_values[other].strip() != value.strip():
+            print(f"tick: conflicting {flag} and {other} aliases", file=sys.stderr)
+            raise SystemExit(1)
+        alias_values[flag] = value
+        # A second --only would silently replace the first priority statement.
         if flag == "--only" and flag in seen_flags:
             print(f"tick: {flag} given more than once", file=sys.stderr)
             raise SystemExit(1)

@@ -23,8 +23,8 @@ and finding references through the existing authenticated comment history.
 | Permission mode | `--permission-mode auto` (config/CLI can select `dontAsk`) | `--permission-mode auto` (config/CLI can select `dontAsk`) | `-s read-only` (sandbox) |
 | Pre-approved tools | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | None (read-only sandbox enforces) |
 | Model (default) | whatever `claude` resolves (no `--model` flag) | whatever `claude` resolves / `deepseek-v4-pro[1m]` (claude-ds) | operator's `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`), else `gpt-5.5` |
-| Engine and model override | `impl_engine`/`model` config keys; `--impl-engine`/`--model` flags | `fix_engine`/`fix_model` config keys; `--fix-engine`/`--fix-model` flags; blank inherits the implementer route (model only on the same engine) | `review_model` config key; `--review-model` flag |
-| Reasoning effort | `effort` config key or `--effort` → `CLAUDE_CODE_EFFORT_LEVEL`; blank: not set on claude, `max` on claude-ds | `fix_effort` config key or `--fix-effort`; blank inherits `effort` on any engine | `review_effort` config key or `--review-effort`, else operator's codex config, else `high` |
+| Engine and model override | `impl_engine`/`impl_model` config keys; `--impl-engine`/`--impl-model` flags | `fix_engine`/`fix_model` config keys; `--fix-engine`/`--fix-model` flags; blank inherits the implementer route (model only on the same engine) | `review_model` config key; `--review-model` flag |
+| Reasoning effort | `impl_effort` config key or `--impl-effort` → `CLAUDE_CODE_EFFORT_LEVEL`; blank: not set on claude, `max` on claude-ds | `fix_effort` config key or `--fix-effort`; blank inherits `impl_effort` on any engine | `review_effort` config key or `--review-effort`, else operator's codex config, else `high` |
 | Env isolation | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([`tick._dispatch_one_reviewer`][tick]) |
 | Prompt source | `lib/prompts/implementer.txt` | `lib/prompts/fixer.txt` | `lib/prompts/reviewer.txt` |
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
@@ -46,7 +46,7 @@ specifically — Claude Code's settings precedence puts a checked-in
 `.claude/settings.json` above `~/.claude/settings.json`, and the CLI flag above
 both. Neither project settings file in this repo sets `model`, so today the
 resolved model is the user default; if one ever does, it wins, and for the fixer
-(whose worktree is the PR head) that file is branch content. Pass `--model` when
+(whose worktree is the PR head) that file is branch content. Pass `--impl-model` when
 a run must be pinned independent of the branch.
 
 When `--impl-engine claude-ds` is active, the model resolves to
@@ -56,7 +56,7 @@ When `--impl-engine claude-ds` is active, the model resolves to
 model, routing Claude Code's internal model selection through the DeepSeek API
 gateway.
 
-The operator config key `model`, or the tick CLI's `--model <model>`
+The operator config key `impl_model`, or the tick CLI's `--impl-model <model>`
 ([`tick.main`][tick]), overrides the per-engine default for both the `--model`
 flag and `ANTHROPIC_MODEL`. `pipeline.effective_engine_model` owns the claude-ds
 default.
@@ -68,7 +68,7 @@ For claude-ds, `CLAUDE_CODE_EFFORT_LEVEL=max` is set ([`tick._resolve_engine`][t
 
 The fixer has its own route: `fix_engine` and `fix_model` (flags `--fix-engine`
 and `--fix-model`). A blank `fix_engine` runs the fixer on the implementer's
-engine. A blank `fix_model` inherits the implementer's `model` only while the
+engine. A blank `fix_model` inherits the implementer's `impl_model` only while the
 fixer runs on the implementer's engine, because a model id names one provider's
 model; on another engine it is that engine's default. `pipeline.resolve_config`
 resolves the route, `tick._run_tick_body` passes it to `dispatch_fixers`, and
@@ -763,7 +763,7 @@ reads them from the configuration its startup gate validated and passes that
 | `engine_stall_seconds`, `engine_stall_startup_grace_seconds` | implementer/fixer dispatch, which records them in the marker as `stall_seconds` and `stall_startup_grace_seconds`; `tick._engine_progress` reads them there for the tick, the `--loop` watcher, and the status dashboard |
 | `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)`; hold release and all fixer dispatch → `tick._fix_within_budget`, using the [shared round budget](../../skills/tick/README.md#comment-trust-and-incomplete-history) |
 | `transient_cooldown_seconds`, `transient_cooldown_reset_buffer_seconds` | implementer/fixer harvest → `transient_cooldown_until` |
-| `impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`, `fix_effort`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |
+| `impl_engine`, `impl_model`, `fix_engine`, `fix_model`, `impl_effort`, `fix_effort`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |
 | `loop_short_poll_seconds`, `loop_max_poll_seconds`, `loop_heartbeat_seconds`, `loop_quiescent_stop_after` | `pipeline.compute_next_wake` in the tick body, through `ResolvedConfig.cadence()`; `_run_loop_locked` consumes the returned `TickOutcome.cadence` unchanged |
 
 Dispatch still re-reads `verify_tools` and `engine_settings` before each launch
@@ -778,7 +778,7 @@ limits it was dispatched under.
 
 `probed_route` comes from the repository's `probed_impl_engine` and
 `probed_model` metadata. Setup writes it atomically with routing defaults;
-subsequent edits to `impl_engine` or `model` do not change the evidence. The tick
+subsequent edits to `impl_engine` or `impl_model` do not change the evidence. The tick
 logs `startup_route_unprobed` when its effective implementer route differs,
 and runs. See the [route metadata contract](../../skills/tick/README.md#deadlines-stall-limits-routing-and-cadence)
 for validation and older configurations.

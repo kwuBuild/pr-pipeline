@@ -259,8 +259,9 @@ with the whole queue and your configured defaults, so pass the same target and
 flags again when you start the loop.
 
 Flags select the agents for one run: `--impl-engine` chooses the implementation
-engine (`claude`, or `claude-ds` for DeepSeek through Claude Code), `--model`
-the Claude model, `--fix-engine` and `--fix-model` the fixer's own route, and
+engine (`claude`, or `claude-ds` for DeepSeek through Claude Code), `--impl-model`
+the implementer model, `--impl-effort` its effort, `--fix-engine` and
+`--fix-model` the fixer's own route, and
 `--review-model` and `--review-effort` the Codex reviewer. Setup records the
 implementation route it tested for each repository, so you need no flags for
 it. Deadlines, the review limit, agent routes, and loop timing are settings in

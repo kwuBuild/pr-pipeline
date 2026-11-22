@@ -474,7 +474,7 @@ def test_write_config_records_the_route_the_probe_measured(
     config = pipeline.resolve_config(REPO)
     assert config.errors == ()
     assert config.probed_route == route
-    assert (config.impl_engine, config.model) == route
+    assert (config.impl_engine, pipeline.effective_engine_model(config.impl_engine, config.model)) == route
 
 
 @pytest.mark.parametrize(("engine", "model"), [
@@ -516,7 +516,7 @@ def test_config_route_edit_preserves_probe_evidence_and_warns_at_startup(
     path = pipeline.operator_config_path()
     document = tomllib.loads(path.read_text())
     section = document["repos"][REPO]
-    section["impl_engine"], section["model"] = engine, model
+    section["impl_engine"], section["impl_model"] = engine, model
     path.write_text(setup_flow.dump_toml(document))
 
     for _ in range(2):
@@ -604,7 +604,7 @@ def test_write_config_keeps_everything_else_the_operator_wrote(doubles) -> None:
         "permission_mode": "auto",
         "engine_settings": "",
         "impl_engine": "claude",
-        "model": "",
+        "impl_model": "",
         "probed_impl_engine": "claude",
         "probed_model": "",
     }
@@ -926,6 +926,91 @@ def test_a_repository_set_up_from_scratch_passes_the_tick_startup_gates(
     assert after_setup.returncode == 0, after_setup.stderr
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_impl_settings_setup_roundtrip_keeps_fixer_inheritance(doubles, legacy):
+    path = pipeline.operator_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[defaults]\nimpl_model="defaults"\nimpl_effort="low"\n'
+                    '[repos."owner/widget"]\nmodel="old"\neffort="medium"\n'
+                    'fix_model=""\nfix_effort=""\n')
+    prefix = "" if legacy else "impl-"
+    result = run_setup_public("probe", REPO, f"--{prefix}model", "sonnet", f"--{prefix}effort", "high")
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in doubles["claude_log"].read_text().splitlines()]
+    assert all(call["env"]["CLAUDE_CODE_EFFORT_LEVEL"] == "high" for call in calls)
+    result = run_setup_public("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert result.returncode == 0, result.stderr
+    section = tomllib.loads(path.read_text())["repos"][REPO]
+    assert section["impl_model"] == "sonnet" and section["impl_effort"] == "high"
+    assert "model" not in section and "effort" not in section
+    assert section["fix_model"] == section["fix_effort"] == ""
+    config = pipeline.resolve_config(REPO, cli_overrides={"model": "opus", "effort": "max"})
+    assert config.errors == ()
+    assert (config.model, config.fix_model, config.effort, config.fix_effort) == ("opus", "opus", "max", "max")
+    result = run_setup_public("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["changed"] is False
+
+
+@pytest.mark.parametrize("key, first, second", [("model", "sonnet", "opus"), ("effort", "high", "low")])
+@pytest.mark.parametrize("conflict", [False, True])
+def test_impl_settings_setup_alias_conflicts_fail_before_probe(doubles, key, first, second, conflict):
+    result = run_setup_public("probe", REPO, f"--impl-{key}", first, f"--{key}", second if conflict else first)
+    if conflict:
+        assert result.returncode != 0 and "conflict" in result.stderr
+        assert not doubles["claude_log"].exists()
+    else:
+        assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.parametrize("legacy_record", [False, True])
+def test_impl_settings_setup_keeps_prior_effort_when_probe_did_not_choose_it(doubles, legacy_record):
+    path = pipeline.operator_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[repos."owner/widget"]\neffort="high"\nfix_model="opus"\nfix_effort="low"\n')
+    assert run_setup_public("probe", REPO, "--model", "sonnet").returncode == 0
+    if legacy_record:
+        record = setup_flow.probe_record_path(REPO)
+        data = json.loads(record.read_text())
+        data.pop("impl_model", None)
+        data.pop("impl_effort", None)
+        record.write_text(json.dumps(data))
+    result = run_setup_public("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert result.returncode == 0, result.stderr
+    section = tomllib.loads(path.read_text())["repos"][REPO]
+    assert section["impl_model"] == "sonnet" and section["impl_effort"] == "high"
+    config = pipeline.resolve_config(REPO)
+    assert config.errors == ()
+    assert (config.effort, config.fix_model, config.fix_effort) == ("high", "opus", "low")
+
+
+def test_impl_settings_setup_keeps_default_model_intent_separate_from_probe(doubles, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
+    result = run_setup_public("probe", REPO, "--impl-engine", "claude-ds")
+    assert result.returncode == 0, result.stderr
+    result = run_setup_public("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert result.returncode == 0, result.stderr
+    section = tomllib.loads(pipeline.operator_config_path().read_text())["repos"][REPO]
+    assert section["impl_model"] == ""
+    assert section["probed_model"] == pipeline.effective_engine_model("claude-ds", "")
+    assert "fix_model" not in section and "fix_effort" not in section
+
+
+def test_impl_settings_setup_rejects_conflicting_alias_before_later_repetition(doubles):
+    result = run_setup_public("probe", REPO, "--model", "sonnet", "--impl-model", "opus", "--model", "opus")
+    assert result.returncode != 0 and "conflict" in result.stderr
+    assert not doubles["claude_log"].exists()
+
+
+def test_impl_settings_setup_equivalent_whitespace_aliases_use_normalized_model(doubles):
+    result = run_setup_public("probe", REPO, "--impl-model", " sonnet ", "--model", "sonnet")
+    assert result.returncode == 0, result.stderr
+    calls = [json.loads(line) for line in doubles["claude_log"].read_text().splitlines()]
+    assert all(call["argv"][call["argv"].index("--model") + 1] == "sonnet" for call in calls)
+    result = run_setup_public("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert result.returncode == 0, result.stderr
+
+
 # --- Helpers ---
 
 
@@ -937,6 +1022,13 @@ def run_setup(*args: str, cwd: Path | None = None) -> subprocess.CompletedProces
     return subprocess.run(
         [sys.executable, str(SETUP_PY), *args],
         capture_output=True, text=True, timeout=120, cwd=cwd,
+    )
+
+
+def run_setup_public(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["bash", str(SETUP_PY.parents[1] / "setup.sh"), *args],
+        capture_output=True, text=True, timeout=120,
     )
 
 
@@ -1059,7 +1151,7 @@ with open(os.environ["FAKE_CLAUDE_LOG"], "a") as log:
     log.write(json.dumps({
         "argv": argv, "stdin_isatty": sys.stdin.isatty(), "cwd": os.getcwd(),
         "prompt": prompt,
-        "env": {k: os.environ.get(k) for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL")},
+        "env": {k: os.environ.get(k) for k in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CLAUDE_CODE_EFFORT_LEVEL")},
     }) + "\n")
 command = os.environ["FAKE_PROBE_COMMAND"]
 def emit(obj):
