@@ -235,6 +235,36 @@ Per-repository keys override `[defaults]`; lists replace wholesale, so
 The [resolver contract](../../docs/working/pr-pipeline-internals.md#7-operator-configuration-resolution)
 owns the complete precedence and validation rules.
 
+### Read-only configuration export
+
+Run from the target checkout or one of its linked worktrees:
+
+```bash
+~/.claude/pr-pipeline/bin/pr-pipeline tick config --json
+# From an explicit installation or development checkout:
+bash /absolute/path/to/pr-pipeline/skills/tick/tick.sh config --json
+```
+
+Both commands reach `tick.py config --json`. The command resolves the target
+from local Git remotes and calls the existing configuration resolver. It emits
+only operator login, implement/fix routes and their cooldown domains, and the
+documented limits. It takes no tick lock, writes no state or import caches,
+and starts no tick, loop or engine. Invalid configuration exits 3 with a
+structured error that identifies settings without rejected values or raw
+diagnostics. The [configuration export schema](../status/CONFIG.md) owns the
+fields, exit statuses, and consumer rules.
+
+The result describes **this standalone invocation**: the packaged floor,
+operator defaults, repository overrides and supported process environment,
+with no CLI route overrides. An existing loop can retain different route flags
+or a different `PIPELINE_TRUSTED_AUTHOR`. Consumers must not use this export
+alone to assert that loop's operator identity, author eligibility, or per-item
+cooldown domain. Those claims need a separately scoped tick-owned snapshot tied
+to the loop invocation. This command does not add that snapshot or remove the
+Phase 1 limitations in #120.
+
+### Configuration validation
+
 `approved_reviewers` lists GitHub logins, beside `[operator] login`, whose PR
 conversation comments and submitted reviews the fixer acts on. See
 [Comment trust and incomplete history](#comment-trust-and-incomplete-history).
