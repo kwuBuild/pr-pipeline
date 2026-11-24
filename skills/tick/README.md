@@ -1699,13 +1699,46 @@ and owner clarifications; there is no second context acquisition lifecycle.
 Both Claude and Claude-DS receive installed revision-hygiene and definition-of-done
 guidance through native skill binding.
 
-The fixer returns one JSON object as its final response. The stream adapter
-preserves that response in `result.json` and stamps the dispatch protocol version
-beside it. The report repeats the dispatch ID, pinned head, published head and
+#### Report transport
+
+The fixer returns its report through Claude Code structured output, not as its
+final chat message. The normal sequence is:
+
+1. Dispatch builds one JSON Schema from the field sets in `lib/fixer_reports.py`
+   (`fixer_reports.schema()`) and passes it as `claude -p --json-schema`. It pins
+   `report_transport="structured_output"` in the dispatch marker. Implementer and
+   reviewer launches do not change.
+2. Claude Code makes the model submit the report through its `StructuredOutput`
+   tool, validates it against the schema, and puts the object in the stream's
+   `result` event as `structured_output`.
+3. The stream adapter keeps that event, including `structured_output`, in
+   `result.json` and stamps the dispatch protocol version beside it.
+4. Harvest reads the report from `structured_output` only. Prose in the final
+   message (`result`) has no effect. The report then passes the same field,
+   binding, coverage and outcome checks as before; the schema does not replace them.
+
+Both fixer routes use this transport. A live probe with Claude Code 2.1.331
+returned a schema-valid `structured_output` on `claude` and on `claude-ds`
+(DeepSeek's Anthropic-compatible endpoint), in both cases under `dontAsk` with a
+narrow `--allowedTools` list. `claude-ds` therefore has no text-parse fallback.
+
+| Dispatch marker | Report source | Missing or non-object source |
+|---|---|---|
+| `report_transport="structured_output"` (new dispatches) | `result.json` `structured_output` | "Missing structured revision report …" human hold |
+| No `report_transport` (dispatched before this transport) | The whole final message in `result`, parsed as JSON | "Missing or malformed JSON revision report …" human hold |
+
+The marker alone selects the parse; harvest never guesses from the result's
+content. A dispatch already running when this change deploys keeps the text
+parse. A `report_transport` value on any marker other than a versioned fixer
+marker makes the marker invalid.
+
+#### Report contents
+
+The report repeats the dispatch ID, pinned head, published head and
 original review fingerprint. Its dedicated `outcome` field selects the result;
 completion tokens inside prose or code examples have no control authority.
-The response fields are defined in `lib/fixer_reports.py` and explained in the
-fixer prompt: revision summary, one assessment/disposition/evidence/change-or-reason
+The report fields are defined once in `lib/fixer_reports.py` (the same sets
+build the schema and the validator) and explained in the fixer prompt: revision summary, one assessment/disposition/evidence/change-or-reason
 per finding, verification and status, PR/documentation updates, remaining work,
 and optional Additional context. Prose can contain paragraphs, lists, code fences
 and subsections. Mechanical validation checks identity, coverage and completeness;

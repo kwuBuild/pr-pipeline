@@ -1391,7 +1391,8 @@ machine's dispatch markers. See
 Prompts are assembled by the tick from live data:
 
 The implementer prompt supplies an explicit completion sentinel. New fixer
-prompts supply a dedicated outcome field in the complete revision report.
+prompts supply a dedicated outcome field in the complete revision report,
+returned through `claude -p --json-schema` structured output.
 The reviewer supplies a typed verdict in `review.json`, pinned by
 `--output-schema` (see *Reviewer (Codex)*). Each stage's harvest validates its
 control field and the evidence required by that stage before publication.
@@ -1562,9 +1563,12 @@ collection because the evidence has already moved into archive custody.
 
 ### Sentinel tokens
 
-These are the logical verdicts the harvest acts on. The Claude engines
-(implementer, fixer) emit their token literally in `result.json` because they
-take a prompt that instructs them to. The reviewer is different: its verdict is
+These are the logical verdicts the harvest acts on. The implementer emits its
+token literally in `result.json` because its prompt instructs it to. A new fixer
+returns its outcome as the `outcome` field of a report pinned by
+`claude -p --json-schema`; harvest reads it from `structured_output` (see
+[Report transport](../skills/tick/README.md#report-transport)). Legacy fixer
+dispatches emit the token literally. The reviewer is different: its verdict is
 a **typed field in `review.json`**, pinned by `codex exec --output-schema` (see
 *Reviewer (Codex)*) — the harvest reads `verdict` directly, not a string in
 prose. The `ready_for_human`/`changes_requested` schema values map to the
@@ -1578,8 +1582,8 @@ compatibility, publication bounds, and stable finding handoff.
 | `IMPLEMENTATION_COMPLETE` | Implementer (literal in `result.json`) | Code committed and pushed |
 | `NO_BLOCKERS_READY_FOR_HUMAN` | Reviewer (`review.json` verdict `ready_for_human`) | Clean review, no findings |
 | `BLOCKERS_FOUND` | Reviewer (`review.json` verdict `changes_requested`) | Review found issues |
-| `FIXES_PUSHED_RECHECK_NEEDED` | Fixer (literal in `result.json`) | Revisions committed and pushed (claim — cross-checked against the live head at harvest) |
-| `NO_CHANGES_RECHECK_NEEDED` | Fixer (literal in `result.json`) | Every finding explicitly needs no change, with a reason; unchanged pinned head required; re-review requested |
+| `FIXES_PUSHED_RECHECK_NEEDED` | Fixer (report `outcome` in `structured_output`) | Revisions committed and pushed (claim — cross-checked against the live head at harvest) |
+| `NO_CHANGES_RECHECK_NEEDED` | Fixer (report `outcome` in `structured_output`) | Every finding explicitly needs no change, with a reason; unchanged pinned head required; re-review requested |
 | `NEEDS_HUMAN_DECISION` | Any | Scope/design question for the developer |
 
 When an available result has no valid outcome (no sentinel for a Claude engine;

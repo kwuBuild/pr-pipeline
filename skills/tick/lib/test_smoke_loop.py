@@ -466,9 +466,10 @@ with (root / "calls.jsonl").open("a") as log:
 while not (root / "engine-exit").exists():
     time.sleep(0.02)
 result = "Offline completion fixture\\nNEEDS_HUMAN_DECISION"
+event = {"type": "result", "is_error": False}
 if os.environ["LOOP_TEST_STAGE"] == "fix":
     marker = json.loads(Path("dispatch.json").read_text())
-    result = json.dumps({
+    report = {
         "report_protocol_version": marker["report_protocol_version"],
         "dispatch_id": marker["dispatch_id"], "pinned_head": marker["head_sha"],
         "published_head": marker["head_sha"], "review_sha256": marker["review_sha256"],
@@ -480,9 +481,12 @@ if os.environ["LOOP_TEST_STAGE"] == "fix":
                      for ref in marker["review_handoff"]["finding_refs"]],
         "verification": "No checks run by this fixture.", "verification_status": "unavailable",
         "verification_waiver": "", "documentation": "No documentation changed.",
-        "remaining_work": "Owner decision required."})
-print(json.dumps({"type": "result", "is_error": False,
-                  "result": result}), flush=True)
+        "remaining_work": "Owner decision required."}
+    result = json.dumps(report)
+    if "--json-schema" in sys.argv:
+        event["structured_output"] = report
+event["result"] = result
+print(json.dumps(event), flush=True)
 '''
 
 GH_SHIM = '''

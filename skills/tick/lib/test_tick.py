@@ -14378,7 +14378,7 @@ def test_harvest_one_fixer_rechecks_and_relabels(
         dispatch_id="d-12",
         review_sha256="",
         approved_input_sha256="",
-        report_protocol_version=None, review_handoff=None,
+        report_protocol_version=None, review_handoff=None, report_transport=None,
     )
     converge_mock.assert_called_once_with(
         "pr", 12, "ai:revised",

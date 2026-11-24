@@ -3499,7 +3499,7 @@ def parse_implementation_result(obj: object) -> str | None:
     return _parse_result_sentinel(obj, _IMPLEMENTATION_SENTINELS)
 
 
-def parse_fix_result(obj: object) -> str | None:
+def parse_fix_result(obj: object, *, report_transport: object = None) -> str | None:
     """Extract the fixer sentinel from a ``claude -p --output-format json`` result.
 
     The fixer's ``result.json`` uses ``FIXES_PUSHED_RECHECK_NEEDED`` (code
@@ -3510,13 +3510,15 @@ def parse_fix_result(obj: object) -> str | None:
 
     Args:
         obj: The parsed ``result.json`` contents (any JSON value).
+        report_transport: The dispatch marker's ``report_transport``; selects
+            the structured-output parse for a versioned result.
 
     Returns:
         The sentinel string, or ``None`` if ``obj`` is not a valid result or
         contains no recognised sentinel.
     """
     if isinstance(obj, dict) and "report_protocol_version" in obj:
-        report, _ = fixer_reports.parse_result(obj, obj["report_protocol_version"])
+        report, _ = fixer_reports.parse_result(obj, obj["report_protocol_version"], report_transport)
         return report["outcome"] if report else None
     return _parse_result_sentinel(obj, _FIXER_SENTINELS)
 
@@ -3543,8 +3545,10 @@ def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_v
         outcome = parse_implementation_result(result_obj)
     elif stage == "fix":
         if report_protocol_version is not None:
-            report, problem = fixer_reports.parse_result(result_obj, report_protocol_version)
             marker = fix_marker or {}
+            report, problem = fixer_reports.parse_result(
+                result_obj, report_protocol_version, marker.get("report_transport"),
+            )
             if report and not problem:
                 problem = fixer_reports.binding_problem(
                     report, dispatch_id=marker.get("dispatch_id", ""),
@@ -4417,6 +4421,7 @@ def decide_fix_harvest(
     verification_unconfigured: bool = False,
     report_protocol_version: int | None = None,
     review_handoff: object = None,
+    report_transport: str | None = None,
 ) -> dict[str, object]:
     """Decide the outcome of a finished fixer engine.
 
@@ -4490,7 +4495,7 @@ def decide_fix_harvest(
             dispatch_id=dispatch_id, pinned_head=pinned_head, current_head=current_head,
             review_sha256=review_sha256, review_handoff=review_handoff,
             verification_unconfigured=verification_unconfigured, body_revision=body_revision,
-            approved_input_sha256=approved_input_sha256,
+            approved_input_sha256=approved_input_sha256, report_transport=report_transport,
         )
     sentinel = parse_fix_result(result_obj)
     report = _sanitize_engine_report(
@@ -4577,8 +4582,9 @@ def _decide_fixer_report(
     *, result_obj: object, report_protocol_version: object, dispatch_id: str,
     pinned_head: str, current_head: str, review_sha256: str, review_handoff: object,
     verification_unconfigured: bool, body_revision: str, approved_input_sha256: str,
+    report_transport: str | None = None,
 ) -> dict[str, object]:
-    report, problem = fixer_reports.parse_result(result_obj, report_protocol_version)
+    report, problem = fixer_reports.parse_result(result_obj, report_protocol_version, report_transport)
     if report:
         problem = fixer_reports.binding_problem(
             report, dispatch_id=dispatch_id, pinned_head=pinned_head,
@@ -4696,7 +4702,7 @@ _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
      "fix_round", "review_sha256", "verification_unconfigured",
      "permission_mode", "verify_tools", "stall_seconds",
      "stall_startup_grace_seconds", "report_protocol_version", "review_handoff",
-     "approved_input_sha256"}
+     "approved_input_sha256", "report_transport"}
 )
 
 # The stall limits an engine was dispatched under, with the minimum
@@ -4941,6 +4947,13 @@ def valid_marker(
                 or obj["report_protocol_version"] != version):
             return False
         if stage == "fix" and "review_handoff" not in obj:
+            return False
+
+    # Only a versioned fixer dispatch may pin the structured-output transport.
+    # Harvest selects the report parse from this field, never from the result.
+    if "report_transport" in obj:
+        if (stage != "fix" or "report_protocol_version" not in obj
+                or obj["report_transport"] != fixer_reports.STRUCTURED_TRANSPORT):
             return False
 
     if "review_handoff" in obj:
@@ -5435,6 +5448,7 @@ def harvest_fix(
     verification_unconfigured: bool = False,
     report_protocol_version: int | None = None,
     review_handoff: object = None,
+    report_transport: str | None = None,
 ) -> HarvestResult:
     """Decide the outcome of a finished fixer engine.
 
@@ -5452,6 +5466,10 @@ def harvest_fix(
         review_sha256: Original review fingerprint pinned at fixer dispatch.
         verification_unconfigured: Whether dispatch pinned empty verification
             grants; successful completion then requires an explicit waiver.
+        report_transport: The dispatch marker's ``report_transport``.
+            ``fixer_reports.STRUCTURED_TRANSPORT`` reads the report from the
+            result's ``structured_output``; ``None`` keeps the final-message
+            text parse for dispatches launched before the schema transport.
 
     Returns:
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
@@ -5472,6 +5490,7 @@ def harvest_fix(
         dispatch_id=dispatch_id,
         review_sha256=review_sha256,
         approved_input_sha256=approved_input_sha256,
+        report_transport=report_transport,
     )
     return decision  # type: ignore[return-value]
 
@@ -5733,6 +5752,7 @@ def _cmd_harvest_fix(args: argparse.Namespace) -> int:
         report_protocol_version=args.report_protocol_version,
         review_handoff=_load_json(args.review_handoff, None) if args.review_handoff else None,
         verification_unconfigured=args.verification_unconfigured,
+        report_transport=args.report_transport,
     )
     print(json.dumps(decision))
     return 0
@@ -6260,6 +6280,10 @@ def main(argv: list[str] | None = None) -> int:
     p_harvest_fix.add_argument("--result", required=True, help="Path to result.json")
     p_harvest_fix.add_argument("--dispatch-id", default="", help="Fixer dispatch identity")
     p_harvest_fix.add_argument("--report-protocol-version", type=int)
+    p_harvest_fix.add_argument(
+        "--report-transport", choices=[fixer_reports.STRUCTURED_TRANSPORT],
+        help="Dispatch-pinned report transport; omit for the final-message text parse",
+    )
     p_harvest_fix.add_argument("--review-handoff", help="Path to the dispatch-pinned review_handoff JSON")
     p_harvest_fix.add_argument("--verification-unconfigured", action="store_true")
     p_harvest_fix.add_argument(

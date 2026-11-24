@@ -77,6 +77,89 @@ def test_invalid_new_report_holds_without_retry_or_legacy_fallback(original, rev
     assert result["validation_reason"]
 
 
+def test_schema_is_built_from_the_report_field_sets():
+    schema = pipeline.fixer_reports.schema()
+    assert set(schema["properties"]) == pipeline.fixer_reports.REQUIRED | {"additional_context"}
+    assert set(schema["required"]) == pipeline.fixer_reports.REQUIRED
+    assert schema["additionalProperties"] is False
+    finding = schema["properties"]["findings"]["items"]
+    assert set(finding["properties"]) == set(finding["required"]) == pipeline.fixer_reports.FINDING_FIELDS
+    assert schema["properties"]["report_protocol_version"]["const"] == pipeline.fixer_reports.VERSION
+
+
+def test_structured_report_is_harvested_despite_prose_in_final_message(original, revision):
+    raw = "The PR body replacement is written, which is the last step before the report.\n" + json.dumps(revision)
+    result = harvest_revision(original, revision, raw=raw, structured=revision,
+                              report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    assert result["label"] == pipeline.LABEL_REVISED
+    assert result["action"] == "recheck"
+    assert revision["revision_summary"] in result["comment_body"]
+
+
+@pytest.mark.parametrize("structured", [None, "text", ["list"]])
+def test_structured_dispatch_without_structured_object_names_missing_report(original, revision, structured):
+    result = harvest_revision(original, revision, structured=structured, omit_structured=structured is None,
+                              report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    assert result["label"] == pipeline.LABEL_NEEDS_HUMAN
+    assert result["validation_reason"] == pipeline.fixer_reports.MISSING_STRUCTURED_REPORT
+    assert "structured" in result["validation_reason"]
+
+
+def test_structured_report_keeps_specific_semantic_and_binding_reasons(original, revision):
+    revision["findings"].pop()
+    result = harvest_revision(original, revision, structured=revision,
+                              report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    assert result["validation_reason"] == "Missing or unknown originating finding references."
+    revision["outcome"] = "DONE"
+    result = harvest_revision(original, revision, structured=revision,
+                              report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    assert result["validation_reason"] == "Unknown revision outcome."
+
+
+def test_inflight_text_dispatch_ignores_structured_output(original, revision):
+    # A dispatch launched before the schema transport keeps its text parse,
+    # whatever the result carries: the marker, not the content, decides.
+    raw = "Prose first.\n" + json.dumps(revision)
+    result = harvest_revision(original, revision, raw=raw, structured=revision)
+    assert result["label"] == pipeline.LABEL_NEEDS_HUMAN
+    assert "Missing or malformed JSON revision report" in result["validation_reason"]
+    assert harvest_revision(original, revision)["label"] == pipeline.LABEL_REVISED
+
+
+def test_held_fixer_outcome_reads_structured_report_for_structured_marker(original, revision):
+    marker = dict(dispatch_id="fix-run", head_sha="a" * 40,
+                  review_sha256=pipeline.review_reports.digest(original),
+                  review_handoff=pipeline.review_reports.handoff(original),
+                  report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    result = {"report_protocol_version": 2, "is_error": False, "claude_exit_status": 0,
+              "result": "Prose first.\n" + json.dumps(revision), "structured_output": revision}
+    assert pipeline.held_completion_outcome("fix", result, report_protocol_version=2,
+                                             fix_marker=marker) == pipeline.SENTINEL_FIXES_PUSHED
+    del result["structured_output"]
+    assert pipeline.held_completion_outcome("fix", result, report_protocol_version=2,
+                                             fix_marker=marker) == pipeline.OUTCOME_UNRECOGNIZED
+
+
+@pytest.mark.parametrize("change", ["none", "value", "stage", "unversioned"])
+def test_marker_accepts_report_transport_only_for_versioned_fixer(original, change):
+    marker = dict(engine="claude", stage="fix", pr_number=7, deadline=9999999999,
+                  base_ref="main", base_sha="b" * 40, head_sha="a" * 40,
+                  pre_label=pipeline.LABEL_CHANGES_REQUESTED, dispatch_id="fix-run", state="launching",
+                  report_protocol_version=2, review_sha256=pipeline.review_reports.digest(original),
+                  review_handoff=pipeline.review_reports.handoff(original),
+                  report_transport=pipeline.fixer_reports.STRUCTURED_TRANSPORT)
+    if change == "value":
+        marker["report_transport"] = "text"
+    elif change == "stage":
+        marker.update(stage="implement")
+        for key in ("report_protocol_version", "review_sha256", "review_handoff"):
+            del marker[key]
+    elif change == "unversioned":
+        for key in ("report_protocol_version", "review_handoff"):
+            del marker[key]
+    assert pipeline.valid_marker(marker) is (change == "none")
+
+
 @pytest.mark.parametrize("partial_push", [False, True])
 def test_unresolved_report_is_valid_reporting_and_publishes_complete_explanation(original, revision, partial_push):
     revision["outcome"] = pipeline.SENTINEL_NEEDS_HUMAN_DECISION
@@ -178,7 +261,7 @@ def test_resultless_new_fixer_with_unproved_tree_death_cannot_requeue_code(tmp_p
     assert (tmp_path / "dispatch.json").exists()
 
 
-@pytest.mark.parametrize("case", ["no-change", "unresolved", "unavailable", "bare", "missing", "duplicate", "unknown", "oversize", "head-mismatch", "legacy", "empty", "absent", "invalid-utf8", "quota"])
+@pytest.mark.parametrize("case", ["no-change", "unresolved", "unavailable", "bare", "missing", "duplicate", "unknown", "oversize", "head-mismatch", "legacy", "empty", "absent", "invalid-utf8", "quota", "prose", "structured-missing", "inflight"])
 def test_real_fixer_outcomes_retain_complete_evidence_without_code_reruns(report_repo, original, report, case):
     root, env = report_repo
     prepare_fixer(root, env, original, case=case)
@@ -188,12 +271,27 @@ def test_real_fixer_outcomes_retain_complete_evidence_without_code_reruns(report
     wait_for_artifact(worktree / "result.json")
     if case == "legacy":
         marker = json.loads((worktree / "dispatch.json").read_text())
-        del marker["report_protocol_version"]
+        del marker["report_protocol_version"], marker["report_transport"]
         (worktree / "dispatch.json").write_text(json.dumps(marker))
         result = json.loads((worktree / "result.json").read_text())
         result.pop("report_protocol_version", None)
         result["result"] = pipeline.SENTINEL_FIXES_PUSHED
         (worktree / "result.json").write_text(json.dumps(result))
+    elif case == "inflight":
+        # A dispatch launched before the schema transport: its marker has no
+        # report_transport and its result holds the report as the final message.
+        marker = json.loads((worktree / "dispatch.json").read_text())
+        del marker["report_transport"]
+        (worktree / "dispatch.json").write_text(json.dumps(marker))
+        result = json.loads((worktree / "result.json").read_text())
+        result["result"] = json.dumps(result.pop("structured_output"))
+        (worktree / "result.json").write_text(json.dumps(result))
+    elif case == "prose":
+        # The real stream wrapper kept the result event's structured_output,
+        # and the final message holds prose that the text parse rejects.
+        result = json.loads((worktree / "result.json").read_text())
+        assert result["result"].startswith("The PR body replacement is written")
+        assert result["structured_output"]["outcome"] == pipeline.SENTINEL_FIXES_PUSHED
     elif case == "empty":
         (worktree / "result.json").write_bytes(b"")
     elif case == "absent":
@@ -204,14 +302,14 @@ def test_real_fixer_outcomes_retain_complete_evidence_without_code_reruns(report
     run_report_tick(root, env)
     published = json.loads((root / "reports.json").read_text())
     assert len(published) == 2
-    if case in {"no-change", "legacy"}:
+    if case in {"no-change", "legacy", "prose", "inflight"}:
         assert "re-review requested" in published[-1]
         if case == "legacy":
             assert "Legacy" in published[-1]
         else:
             assert "complete evidence " * 300 in published[-1]
             assert "```sh\npytest -k retry\n```" in published[-1]
-            assert "<!-- pr-pipeline:no-change " in published[-1]
+            assert ("<!-- pr-pipeline:no-change " in published[-1]) is (case == "no-change")
         wait_for_artifact(worktree / "completion.json")
         run_report_tick(root, env)
     else:
@@ -224,6 +322,9 @@ def test_real_fixer_outcomes_retain_complete_evidence_without_code_reruns(report
             assert not archived.exists() and manifest["source_present"] is False
         else:
             assert archived.read_bytes() == source
+        if case == "structured-missing":
+            assert manifest["validation_reason"] == pipeline.fixer_reports.MISSING_STRUCTURED_REPORT
+            assert pipeline.fixer_reports.MISSING_STRUCTURED_REPORT in published[-1]
         if case in {"unresolved", "unavailable"}:
             assert not manifest["validation_reason"]
             assert "complete evidence " * 300 in published[-1]
@@ -262,9 +363,7 @@ def test_real_publication_failures_retry_without_losing_source_or_repeating_code
         marker["verification_unconfigured"] = True
         (worktree / "dispatch.json").write_text(json.dumps(marker))
         result = json.loads(source)
-        report = json.loads(result["result"])
-        report["verification_waiver"] = pipeline.VERIFICATION_WAIVER
-        result["result"] = json.dumps(report)
+        result["structured_output"]["verification_waiver"] = pipeline.VERIFICATION_WAIVER
         (worktree / "result.json").write_text(json.dumps(result))
         source = (worktree / "result.json").read_bytes()
     run_report_tick(root, env)
@@ -366,6 +465,10 @@ def test_real_fixer_launch_pins_protocol_through_adapter_and_reviewer_handoff(re
     marker = json.loads((worktree / "dispatch.json").read_text())
     result = json.loads((worktree / "result.json").read_text())
     assert marker["report_protocol_version"] == result["report_protocol_version"] == 2
+    assert marker["report_transport"] == pipeline.fixer_reports.STRUCTURED_TRANSPORT
+    fixer_argv = json.loads((root / "fixer-argv.json").read_text())
+    assert json.loads(fixer_argv[fixer_argv.index("--json-schema") + 1]) == pipeline.fixer_reports.schema()
+    assert result["structured_output"]["dispatch_id"] == marker["dispatch_id"]
     assert marker["engine"] == engine
     assert marker["review_handoff"] == pipeline.review_reports.handoff(original)
     assert "pr-pipeline:definition-of-done" in (worktree / "prompt.txt").read_text()
@@ -405,10 +508,14 @@ def revision_for(snapshot, **values):
     }
 
 
-def harvest_revision(original, revision, *, raw=None, engine_exit=0, **values):
+def harvest_revision(original, revision, *, raw=None, engine_exit=0, structured=None,
+                     omit_structured=False, **values):
+    event = {"type": "result", "is_error": False, "claude_exit_status": engine_exit,
+             "report_protocol_version": 2, "result": json.dumps(revision) if raw is None else raw}
+    if structured is not None and not omit_structured:
+        event["structured_output"] = structured
     return pipeline.harvest_fix(
-        result=json.dumps({"type": "result", "is_error": False, "claude_exit_status": engine_exit,
-                           "report_protocol_version": 2, "result": json.dumps(revision) if raw is None else raw}),
+        result=json.dumps(event),
         pinned_head="a" * 40, dispatch_id="fix-run", review_sha256=pipeline.review_reports.digest(original),
         report_protocol_version=2, review_handoff=pipeline.review_reports.handoff(original),
         **{"current_head": "b" * 40, **values},
@@ -447,6 +554,8 @@ result = None'''))
 from pathlib import Path
 root = Path(os.environ["LOOP_TEST_ROOT"])
 prompt = sys.stdin.read()
+schema_bound = "--json-schema" in sys.argv
+(root / "fixer-argv.json").write_text(json.dumps(sys.argv[1:]))
 (root / "fixer-launches").write_text(str(int((root / "fixer-launches").read_text()) + 1) if (root / "fixer-launches").exists() else "1")
 marker = json.loads(Path("dispatch.json").read_text())
 report = {template!r}
@@ -481,6 +590,17 @@ elif case == "oversize":
     report["additional_context"] = "界" * 21000
 raw = "FIXES_PUSHED_RECHECK_NEEDED" if case == "bare" else json.dumps(report)
 event = {{"type": "result", "subtype": "success", "is_error": False, "result": raw}}
+if schema_bound and case not in ("bare", "structured-missing"):
+    # The shape a live `claude -p --output-format stream-json --json-schema`
+    # run emits: prose text, a StructuredOutput tool call, then a result
+    # event carrying the validated object in structured_output.
+    prose = "The PR body replacement is written, which is the last step before the report."
+    print(json.dumps({{"type": "assistant", "message": {{"content": [
+        {{"type": "text", "text": prose}},
+        {{"type": "tool_use", "id": "toolu_report", "name": "StructuredOutput", "input": report}}]}}}}))
+    event["structured_output"] = report
+    if case == "prose":
+        event["result"] = prose + "\\n" + raw
 if case == "quota":
     event.update(is_error=True, api_error_status=429, result="quota exceeded")
 print(json.dumps(event))
