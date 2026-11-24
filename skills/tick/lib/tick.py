@@ -15,6 +15,11 @@ from __future__ import annotations
 
 import sys
 
+# A config export must leave the install untouched too, including import caches.
+_IS_CONFIG_COMMAND = __name__ == "__main__" and sys.argv[1:2] == ["config"]
+if _IS_CONFIG_COMMAND:
+    sys.dont_write_bytecode = True
+
 # Must precede `import tomllib` below, which is where a too-old interpreter
 # actually breaks. `ModuleNotFoundError: tomllib` reads as a broken install and
 # sends an operator to reinstall, but the cause is almost always PATH
@@ -248,7 +253,8 @@ MIN_CODEX_VERSION = "codex-cli 0.142.5"
 # The login remains fixed through the tick and its following loop observation;
 # a config edit is adopted at the next successful startup, never mid-tick.
 # Imports and read-only CLI helpers do not require a configured Git remote.
-_IMPORT_CONFIG = pipeline.resolve_config()
+# The config command resolves once inside its sanitized error boundary instead.
+_IMPORT_CONFIG = None if _IS_CONFIG_COMMAND else pipeline.resolve_config()
 # The shipped tuning, for direct callers of the tick body that pass no
 # validated configuration. A tick never runs on it: _run_single_tick_locked
 # always passes the configuration its startup gate validated.
@@ -258,7 +264,7 @@ _SHIPPED_CONFIG = pipeline.ResolvedConfig(
 )
 TRUSTED_HEAD_REPO = ""
 TARGET_REMOTE = ""
-TRUSTED_REVIEW_AUTHOR = _IMPORT_CONFIG.login
+TRUSTED_REVIEW_AUTHOR = _IMPORT_CONFIG.login if _IMPORT_CONFIG is not None else ""
 _PR_BODY_SOURCE_FILE = ".pr-body.md"
 _PR_CREATE_BODY_FILE = ".pr-create-body.md"
 # The fixer's optional replacement PR body, and the two-line envelope that binds
@@ -14489,6 +14495,69 @@ def engine_progress_report(wt_root: str) -> list[tuple[str, str]]:
     return sorted(rows)
 
 
+def _cmd_config(argv: list[str]) -> int:
+    """Export this invocation's allowlisted configuration without starting a tick."""
+    report: dict[str, object] = {
+        "schema_version": 1,
+        "target": None,
+        "observed_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "context": {
+            "kind": "standalone_default_invocation",
+            "description": "Packaged, operator-default and repository configuration "
+            "with this process's supported environment inputs; no CLI route overrides. "
+            "This is not an existing loop's applied configuration.",
+        },
+    }
+
+    def fail(code: str, message: str, settings: list[str], status: int = 3) -> int:
+        report["error"] = {"code": code, "message": message, "settings": settings}
+        print(json.dumps(report))
+        return status
+
+    if argv != ["--json"]:
+        return fail("invalid_arguments", "Usage: tick.py config --json", [], 2)
+    try:
+        target = resolve_target()
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return fail(
+            "target_resolution_failed", "Cannot resolve a unique local GitHub target.",
+            ["target"],
+        )
+    report["target"] = {"repo": target.repo, "remote": target.remote}
+    config_error = "Configuration could not be resolved; check the named settings."
+    try:
+        config = pipeline.resolve_config(target.repo)
+    except (ValueError, OSError, RecursionError):
+        # Keep unexpected file/parse failures secret-safe too. No exception
+        # text is suitable for this public surface.
+        return fail("invalid_configuration", config_error, ["configuration"])
+    if config.errors:
+        return fail(
+            "invalid_configuration", config_error,
+            pipeline.config_error_settings(config, target.repo),
+        )
+    values: dict[str, object] = {
+        "operator_login": config.login,
+        "routes": {
+            stage: {"engine": engine, "model": model, "effort": effort,
+                    "cooldown_domain": _engine_quota_domain(engine)}
+            for stage, engine, model, effort in (
+                ("implement", config.impl_engine, config.model, config.effort),
+                ("fix", config.fix_engine, config.fix_model, config.fix_effort),
+            )
+        },
+    }
+    for key in (
+        "max_in_flight", "max_iterations", "implementer_timeout_seconds",
+        "fixer_timeout_seconds", "review_timeout_seconds", "engine_stall_seconds",
+        "engine_stall_startup_grace_seconds",
+    ):
+        values[key] = getattr(config, key)
+    report["config"] = values
+    print(json.dumps(report))
+    return 0
+
+
 def _cmd_engine_progress(argv: list[str]) -> int:
     """Print one ``name<TAB>label`` line per dispatch marker.
 
@@ -15858,9 +15927,10 @@ def parse_cli_args(argv: list[str]) -> CliArgs:
 
 
 if __name__ == "__main__":  # pragma: no cover
-    # Read-only reporting subcommand, dispatched before the tick CLI: it takes
-    # no lock, makes no state transition, and is safe to run against a live
-    # pipeline (the status dashboard calls it on every render).
+    # Read-only reporting runs before the tick CLI, without a lock or state
+    # transition. The status dashboard calls engine-progress on every render.
+    if _IS_CONFIG_COMMAND:
+        raise SystemExit(_cmd_config(sys.argv[2:]))
     if sys.argv[1:2] == ["engine-progress"]:
         raise SystemExit(_cmd_engine_progress(sys.argv[2:]))
     cli_args = parse_cli_args(sys.argv[1:])

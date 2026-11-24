@@ -3063,6 +3063,56 @@ def resolve_config(
     )
 
 
+def config_error_settings(config: ResolvedConfig, repo: str) -> list[str]:
+    """Return safe setting identifiers for a public configuration error.
+
+    Resolver diagnostics can contain credentials, paths, repository keys and
+    rejected values. Match only their known prefixes and return constant key
+    names. Unknown diagnostics become ``configuration``; never forward their
+    text or infer a setting from the rejected value. This is presentation only:
+    :func:`resolve_config` remains the sole validator and precedence owner.
+    """
+    settings: set[str] = set()
+    prefixes = (
+        "the packaged floor [defaults] ", "[defaults] ",
+        f'[repos."{repo}"] ', "the command line ", "[operator] ",
+    )
+    known_keys = (*_CONFIG_KEYS, *_CONFIG_PROBE_KEYS, "login")
+    for problem in config.errors:
+        setting = "configuration"
+        for prefix in prefixes:
+            if problem.startswith(prefix):
+                setting = next(
+                    (key for key in known_keys
+                     if problem[len(prefix):].startswith(f"{key}:")),
+                    "configuration",
+                )
+                break
+        else:
+            for name in (_OPERATOR_CONFIG_ENV, _CLAUDE_CONFIG_DIR_ENV):
+                if problem.startswith(f"${name}:"):
+                    setting = name
+            for name in ("defaults", "operator", "repos", "scan"):
+                if problem.startswith((f"[{name}]:", f"packaged config.toml [{name}]:")):
+                    setting = name
+            if problem.startswith('[repos."'):
+                setting = "repos"
+            elif problem.startswith("[scan] repos:"):
+                setting = "scan.repos"
+            elif problem.startswith("packaged config.toml:"):
+                setting = "packaged_config"
+            elif problem.startswith("engine_stall_seconds ("):
+                setting = "engine_stall_seconds"
+                bound = re.match(
+                    r"engine_stall_seconds \([0-9]+\) must be less than "
+                    r"(implementer_timeout_seconds|fixer_timeout_seconds) ", problem,
+                )
+                if bound:
+                    settings.add(bound[1])
+        settings.add(setting)
+    return sorted(settings)
+
+
 def _resolve_probed_route(
     section: Mapping[str, object], repo: str,
 ) -> tuple[tuple[str, str] | None, list[str]]:

@@ -63,6 +63,11 @@ while true; do clear; bash /absolute/path/to/install/skills/status/status.sh; sl
 The repo comes from the main checkout's Git remote through the same
 `skills/tick/resolve-target.sh` helper the tick uses. The dashboard reads no
 configuration and resolves the target before looking for Python.
+
+Tools that need configuration can use `tick.py config --json` through the
+[read-only configuration export](CONFIG.md). Its snapshot describes that
+command's invocation context. It does not establish an existing loop's applied
+identity, author eligibility, or per-item cooldown domain.
 Linked-worktree invocations share the main checkout's target and marker space.
 `PIPELINE_REPO=<owner/repo>` selects exactly one matching local remote; multiple
 remotes require this selection. A missing, ambiguous, or unsafe remote, or a
