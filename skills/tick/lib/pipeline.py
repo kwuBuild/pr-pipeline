@@ -218,8 +218,8 @@ LOOP_QUIESCENT_STOP_AFTER = 3
 # Stage deadlines recorded in each dispatch marker.
 IMPLEMENTER_TIMEOUT_SECONDS = 60 * 60
 FIXER_TIMEOUT_SECONDS = 60 * 60
-REVIEW_TIMEOUT_SECONDS = 20 * 60
-# Implementer/fixer stall detection; see tick.ENGINE_STALL_SECONDS for the
+REVIEW_TIMEOUT_SECONDS = 60 * 60
+# Engine stall detection; see tick.ENGINE_STALL_SECONDS for the
 # reasoning behind the shipped threshold.
 ENGINE_STALL_SECONDS = 30 * 60
 ENGINE_STALL_STARTUP_GRACE_SECONDS = 5 * 60
@@ -2280,9 +2280,9 @@ class ResolvedConfig:
         implementer_timeout_seconds: Implementer deadline from dispatch.
         fixer_timeout_seconds: Fixer deadline from dispatch.
         review_timeout_seconds: Reviewer deadline from dispatch.
-        engine_stall_seconds: Implementer/fixer output silence that reports
+        engine_stall_seconds: Engine output silence that reports
             a stall. Above :data:`MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS` and
-            below both deadlines, or an entry in :attr:`errors`.
+            below all three deadlines, or an entry in :attr:`errors`.
         engine_stall_startup_grace_seconds: Extra silence allowed before an
             engine's first output event.
         max_iterations: Review/fix rounds before ``ai:max-iterations``.
@@ -3210,10 +3210,10 @@ def _resolve_int(
 
 
 def _stall_bound_problems(ints: Mapping[str, int]) -> list[str]:
-    """Report a stall threshold that cannot sit below both engine deadlines.
+    """Report a stall threshold that cannot sit below all three engine deadlines.
 
     The lower bound, above :data:`MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS`, is
-    the key's own minimum. The upper bound spans two keys, so it is checked on
+    the key's own minimum. The upper bound spans deadline keys, so it is checked on
     the resolved values: a threshold at or past a deadline can never report a
     stall before the deadline kills the engine.
 
@@ -3227,7 +3227,7 @@ def _stall_bound_problems(ints: Mapping[str, int]) -> list[str]:
     return [
         f"engine_stall_seconds ({stall}) must be less than {key} "
         f"({ints[key]}), or a stall is never reported before the deadline"
-        for key in ("implementer_timeout_seconds", "fixer_timeout_seconds")
+        for key in ("implementer_timeout_seconds", "fixer_timeout_seconds", "review_timeout_seconds")
         if stall >= ints[key]
     ]
 
@@ -4681,7 +4681,7 @@ _ALLOWED_MARKER_KEYS = _REQUIRED_MARKER_FIELDS | frozenset(
      "approved_input_sha256"}
 )
 
-# The stall limits an implementer/fixer was dispatched under, with the minimum
+# The stall limits an engine was dispatched under, with the minimum
 # each must meet. Optional: markers written before the limits were configurable
 # omit them and are judged against the shipped defaults.
 _MARKER_STALL_LIMITS = {"stall_seconds": 1, "stall_startup_grace_seconds": 0}
@@ -4821,8 +4821,8 @@ def valid_marker(
     - ``review_sha256``, when present, is a lowercase SHA-256 fingerprint on a
       *fix* marker only, binding the originating review for coverage checks;
     - ``stall_seconds`` (at least 1) and ``stall_startup_grace_seconds`` (at
-      least 0), when present, are integers on an *implement* or *fix* marker
-      only — the stall limits that engine was dispatched under;
+      least 0), when present, are integers on any stage's marker — the stall
+      limits that engine was dispatched under;
     - ``pre_label`` is one of the real pre-dispatch labels (``ai:implemented`` /
       ``ai:revised``) — never an arbitrary or terminal label, which reconciliation
       would otherwise revert to;
@@ -4977,7 +4977,7 @@ def valid_marker(
         if key in obj:
             value = obj[key]
             if (
-                stage not in {"implement", "fix"}
+                stage not in {"implement", "fix", "review"}
                 or isinstance(value, bool)
                 or not isinstance(value, int)
                 or value < minimum

@@ -209,7 +209,7 @@ WAKE_REQUEST_PATH = os.path.join(WT_ROOT, ".tick-state", "wake-request")
 # cap. Fixed, not configurable; the resolver refuses a configured stall
 # threshold at or below it.
 MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS = pipeline.MAX_LEGITIMATE_ENGINE_SILENCE_SECONDS
-# Progress-stall threshold. An implementer/fixer that has emitted no engine
+# Progress-stall threshold. An engine that has emitted no engine
 # output for this long is wedged rather than working — a network call that
 # never returns, a permission wait, a silent retry loop. Set at 3x the bound
 # above rather than at it: a threshold equal to the longest legal tool call
@@ -1084,7 +1084,7 @@ def _heartbeat_path(wt_dir: str) -> str:
         wt_dir: The engine's worktree directory.
 
     Returns:
-        The absolute heartbeat file path, alongside ``result.json``.
+        The absolute heartbeat file path, alongside the stage's result file.
     """
     return os.path.abspath(
         os.path.join(wt_dir, claude_stream_wrapper.HEARTBEAT_FILENAME),
@@ -10105,6 +10105,8 @@ def dispatch_reviewers(
     trusted_author: str = "",
     max_in_flight: int = pipeline.DEFAULT_MAX_IN_FLIGHT,
     timeout_seconds: int = REVIEW_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
     *,
     only: Sequence[tuple[str, int]] | None = None,
 ) -> None:
@@ -10138,6 +10140,8 @@ def dispatch_reviewers(
         timeout_seconds: Reviewer deadline from dispatch. The tick passes the
             ``review_timeout_seconds`` its startup gate validated; the default
             serves direct callers.
+        stall_seconds: Advisory output-silence limit recorded in both marker forms.
+        stall_startup_grace_seconds: Extra silence allowed before first output.
         only: Resolved ``--only`` scope items, or ``None``. When set, each
             listed PR is read directly in list order and the label queue is
             not listed, so a listed PR beyond the bounded queue page is still
@@ -10291,6 +10295,8 @@ def dispatch_reviewers(
             review_effort=review_effort,
             trusted_author=trusted_author,
             timeout_seconds=timeout_seconds,
+            stall_seconds=stall_seconds,
+            stall_startup_grace_seconds=stall_startup_grace_seconds,
         )
 
         # Track this new engine in the in-flight set.
@@ -10374,6 +10380,8 @@ def _dispatch_one_reviewer(
     review_effort: str = "",
     trusted_author: str = "",
     timeout_seconds: int = REVIEW_TIMEOUT,
+    stall_seconds: int = ENGINE_STALL_SECONDS,
+    stall_startup_grace_seconds: int = ENGINE_STALL_STARTUP_GRACE_SECONDS,
 ) -> None:
     """Launch a single codex reviewer engine for one PR.
 
@@ -10398,6 +10406,8 @@ def _dispatch_one_reviewer(
             direct callers that are not running a tick.
         timeout_seconds: Seconds from dispatch to the deadline recorded in
             the marker, which reconciliation enforces.
+        stall_seconds: Advisory output-silence limit recorded in both marker forms.
+        stall_startup_grace_seconds: Extra silence allowed before first output.
     """
     trusted_author = trusted_author or TRUSTED_REVIEW_AUTHOR
     wt_dir = os.path.abspath(os.path.join(WT_ROOT, f"pr-{pr_number}"))
@@ -10640,6 +10650,8 @@ def _dispatch_one_reviewer(
         "pre_label": pre_label,
         "dispatch_id": dispatch_id,
         "state": "launching",
+        "stall_seconds": stall_seconds,
+        "stall_startup_grace_seconds": stall_startup_grace_seconds,
     }
     try:
         pipeline.atomic_write(
@@ -10744,6 +10756,9 @@ def _dispatch_one_reviewer(
         "--result-path", result_path,
         "--envelope-path", envelope_path,
         "--observation-path", observation_path,
+        "--heartbeat", _heartbeat_path(wt_dir),
+        "--stall-seconds", str(stall_seconds),
+        "--stall-startup-grace-seconds", str(stall_startup_grace_seconds),
         "--engine", "codex",
         "--stage", "review",
         "--pr-number", str(pr_number),
@@ -14368,12 +14383,8 @@ def _engine_progress(
 ) -> _EngineProgress | None:
     """Return the newest progress evidence for one dispatched engine.
 
-    Only implementers and fixers are considered. Their stream wrapper owns the
-    engine's stdout and bumps a heartbeat file as output events arrive, which
-    is what makes progress observable at all. The reviewer wrapper discards
-    engine output, so it has no equivalent signal — and its stall cost is
-    already bounded by the review deadline, so inventing a weaker
-    proxy for it is deliberately deferred rather than guessed at.
+    Each stage's stdout reader bumps a heartbeat as output events arrive. Review observations and completion validation remain
+    independent of this advisory mtime-only signal.
 
     Args:
         wt_dir: The engine's worktree directory.
@@ -14384,7 +14395,7 @@ def _engine_progress(
         applies to it — or ``None`` when this marker has no progress contract
         (wrong stage) or no usable clock at all.
     """
-    if marker.get("stage") not in ("implement", "fix"):
+    if marker.get("stage") not in ("implement", "fix", "review"):
         return None
     # The limits this engine was dispatched under. A marker written before
     # they were recorded was dispatched under the shipped defaults.
@@ -14446,11 +14457,12 @@ def _stalled_engine_identity(
 
     Returns:
         The identity-verification result when the engine classifies ``live``,
-        otherwise ``None``. ``result.json`` is the right result file for both
-        stages that have a progress contract; the reviewer never reaches here.
+        otherwise ``None``. Reviewers complete through ``review.json``; the
+        write stages use ``result.json``.
     """
     classify_state, identity, _alive = _classify_marker(
-        wt_dir, marker, result_file="result.json",
+        wt_dir, marker,
+        result_file="review.json" if marker.get("stage") == "review" else "result.json",
     )
     return identity if classify_state == "live" else None
 
@@ -14473,7 +14485,7 @@ def engine_progress_report(wt_root: str) -> list[tuple[str, str]]:
         ``(worktree_name, label)`` per marker, sorted by name. The label is
         ``STALLED-Nm`` for a proven-live engine past its silence threshold,
         ``quiet-Nm`` for any other readable progress clock, and ``-`` where
-        no progress contract exists (the reviewer stage, or a marker with no
+        no progress contract exists (an unknown stage or a marker with no
         usable clock).
     """
     rows: list[tuple[str, str]] = []
@@ -15569,6 +15581,8 @@ def _run_tick_body(
                 trusted_author=trusted_author,
                 max_in_flight=max_in_flight,
                 timeout_seconds=tuning.review_timeout_seconds,
+                stall_seconds=tuning.engine_stall_seconds,
+                stall_startup_grace_seconds=tuning.engine_stall_startup_grace_seconds,
                 only=dispatch_items,
             )
         if "implementer" not in guidance_blocked:

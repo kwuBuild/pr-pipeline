@@ -28,8 +28,8 @@ and finding references through the existing authenticated comment history.
 | Env isolation | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([`tick._dispatch_one_reviewer`][tick]) |
 | Prompt source | `lib/prompts/implementer.txt` | `lib/prompts/fixer.txt` | `lib/prompts/reviewer.txt` |
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
-| Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | none — JSONL is sanitized for observations, not a heartbeat; the review timeout bounds the run |
-| Timeout | `implementer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_implementer`][tick]) | `fixer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_fixer`][tick]) | `review_timeout_seconds`, 20 min shipped ([`tick._dispatch_one_reviewer`][tick]) |
+| Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped by the bounded JSONL reader (≤1 write/5s) |
+| Timeout | `implementer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_implementer`][tick]) | `fixer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_fixer`][tick]) | `review_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_reviewer`][tick]) |
 | Process group | `start_new_session=True` | `start_new_session=True` | `start_new_session=True` on the wrapper; it calls `os.setpgrp()` only when it does not already lead its group ([`engine_wrapper.run_engine`][engine_wrapper]) |
 
 ## 2. Model and reasoning effort
@@ -535,11 +535,18 @@ sanitized command references. Dispatch records requested names separately. The
 limits and historical meaning. No observation changes completion or custody.
 
 Progress heartbeats reuse that same owned stdout pipe. As each stream event is
-consumed the wrapper bumps the mtime of `heartbeat` beside `result.json` — the
+consumed the wrapper bumps the mtime of `heartbeat` beside `result.json`
+(`review.json` for reviewers) — the
 mtime is the whole payload, and writes are throttled to at most one per 5s. The
 bump happens before the line is parsed, since an unparseable line is still proof
 the engine is emitting. Every write failure is swallowed: the heartbeat is
 advisory diagnostics and must never influence whether a result reaches harvest.
+The reviewer uses `reviewer_observability.observe_event_stream`, with no second
+reader, and preserves sanitized observations and fallback draining. Reviewer
+dispatch passes the resolved stall settings to the wrapper so its ownership
+marker retains them. Startup requires `engine_stall_seconds` to stay below all
+three stage deadlines; each ships at 3600 seconds. An explicit shorter review
+deadline is preserved and an incompatible stall threshold rejects startup.
 The path is resolved absolute in `_heartbeat_path`, not at the launch sites:
 the wrapper runs with `cwd` set to the worktree, so a relative path would
 resolve a second time underneath it — and because heartbeat failures are
@@ -760,7 +767,7 @@ reads them from the configuration its startup gate validated and passes that
 |---|---|
 | `max_in_flight` | all three dispatchers and both cadence paths, from the same startup `ResolvedConfig` |
 | `implementer_timeout_seconds`, `fixer_timeout_seconds`, `review_timeout_seconds` | the dispatchers, which record the marker `deadline` that reconciliation enforces |
-| `engine_stall_seconds`, `engine_stall_startup_grace_seconds` | implementer/fixer dispatch, which records them in the marker as `stall_seconds` and `stall_startup_grace_seconds`; `tick._engine_progress` reads them there for the tick, the `--loop` watcher, and the status dashboard |
+| `engine_stall_seconds`, `engine_stall_startup_grace_seconds` | all three stage dispatchers, which record them in both lease and published markers as `stall_seconds` and `stall_startup_grace_seconds`; `tick._engine_progress` reads them there for the tick, the `--loop` watcher, and the status dashboard |
 | `max_iterations` | `harvest_reviewers` → `pipeline.harvest_review(threshold=…)`; hold release and all fixer dispatch → `tick._fix_within_budget`, using the [shared round budget](../../skills/tick/README.md#comment-trust-and-incomplete-history) |
 | `transient_cooldown_seconds`, `transient_cooldown_reset_buffer_seconds` | implementer/fixer harvest → `transient_cooldown_until` |
 | `impl_engine`, `model`, `fix_engine`, `fix_model`, `effort`, `fix_effort`, `review_model`, `review_effort` | the implementer, fixer, and reviewer dispatchers |

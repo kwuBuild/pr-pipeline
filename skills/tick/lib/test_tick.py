@@ -720,6 +720,7 @@ def test_engine_stall_clock_leaves_lead_time_before_every_deadline() -> None:
     )
     assert slowest_verdict < tick.IMPLEMENTER_TIMEOUT
     assert slowest_verdict < tick.FIXER_TIMEOUT
+    assert slowest_verdict < tick.REVIEW_TIMEOUT
 
 
 @pytest.mark.parametrize("heartbeat, recorded, threshold", [
@@ -1025,14 +1026,8 @@ def test_scan_stalled_engines_forgets_dispatches_that_no_longer_exist(
     assert stall_episode_ids(tick) == set()
 
 
-def test_scan_stalled_engines_skips_the_reviewer_stage(tmp_path: Path) -> None:
-    """The reviewer has no progress signal, so it gets no stall verdict.
-
-    Its wrapper discards engine output, so there is no heartbeat to read and
-    the dispatch-clock fallback would classify every long review as stalled.
-    Its stall cost is already bounded by the 20-minute review timeout; a weaker
-    proxy is deliberately deferred rather than invented here.
-    """
+def test_scan_stalled_engines_reports_reviewers_after_startup_grace(tmp_path: Path) -> None:
+    """A live reviewer with no first output stalls after the startup grace."""
     import tick  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -1044,10 +1039,12 @@ def test_scan_stalled_engines_skips_the_reviewer_stage(tmp_path: Path) -> None:
     )
 
     with mock.patch.object(tick, "WT_ROOT", str(wt_root)):
-        with mock.patch.object(tick, "_report_engine_stalled") as report:
-            assert tick._scan_stalled_engines() is False
+        with mock.patch.object(tick, "_report_engine_stalled") as report, \
+                mock.patch("process_control.get_process_start_time", return_value=start):
+            assert tick._scan_stalled_engines() is True
 
-    report.assert_not_called()
+    report.assert_called_once()
+    assert report.call_args.kwargs["source"] == "start_time"
 
 
 def test_scan_stalled_engines_ignores_a_marker_whose_pid_was_reused(
@@ -1234,10 +1231,10 @@ def test_engine_progress_report_withholds_the_stall_verdict_past_the_deadline(
     assert rows == [("issue-577", f"quiet-{int(quiet // 60)}m")]
 
 
-def test_engine_progress_report_gives_the_reviewer_stage_no_progress_contract(
+def test_engine_progress_report_reports_reviewer_startup_silence(
     tmp_path: Path,
 ) -> None:
-    """The reviewer wrapper discards engine output, so there is nothing to read."""
+    """A reviewer without a heartbeat uses its dispatch clock."""
     import tick  # type: ignore[import-untyped]
 
     wt_root = tmp_path / "worktrees"
@@ -1252,7 +1249,7 @@ def test_engine_progress_report_gives_the_reviewer_stage_no_progress_contract(
 
     rows = tick.engine_progress_report(str(wt_root))
 
-    assert rows == [("pr-577", "-")]
+    assert rows == [("pr-577", "quiet-40m")]
 
 
 def test_engine_progress_cli_prints_one_row_per_marker(tmp_path: Path) -> None:
@@ -20499,7 +20496,8 @@ def test_main_runs_every_stage_on_the_validated_configuration(
         assert kwargs["transient_cooldown_reset_buffer_seconds"] == 30
     reviewer = stages["dispatch_reviewers"].call_args.kwargs
     assert (reviewer["timeout_seconds"], reviewer["review_model"],
-            reviewer["review_effort"]) == (2400, "gpt-6", "xhigh")
+            reviewer["review_effort"], reviewer["stall_seconds"],
+            reviewer["stall_startup_grace_seconds"]) == (2400, "gpt-6", "xhigh", 900, 60)
     implementer = stages["dispatch_implementers"].call_args.kwargs
     assert (implementer["impl_engine"], implementer["model"],
             implementer["timeout_seconds"], implementer["stall_seconds"],

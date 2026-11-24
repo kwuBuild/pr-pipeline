@@ -9,6 +9,7 @@ from os import PathLike
 from pathlib import Path
 from typing import BinaryIO
 
+from claude_stream_wrapper import ProgressHeartbeat
 from engine_usage import codex_usage, valid_codex_usage
 
 _SKILL_NAME_PATTERN = r"[A-Za-z0-9._-]{1,128}"
@@ -157,22 +158,26 @@ def observe_event_stream(
     *,
     max_event_bytes: int = 256 * 1024,
     skill_home: Path | None = None,
+    heartbeat_path: str | None = None,
 ) -> dict[str, object]:
     """Drain a Codex JSONL stream while bounding memory per logical event.
 
     Args:
         stream: Binary stdout pipe from ``codex exec --json``.
         max_event_bytes: Maximum bytes parsed for one JSONL event.
+        heartbeat_path: Optional mtime-only output signal, independent of parsing.
 
     Returns:
         A sanitized observation payload. Oversized events are drained, counted,
         and omitted without preventing later events from being inspected.
     """
     builder = _ObservationBuilder(skill_home)
+    heartbeat = ProgressHeartbeat(heartbeat_path)
     while True:
         chunk = stream.readline(max_event_bytes + 1)
         if not chunk:
             break
+        heartbeat.beat()
         if len(chunk) <= max_event_bytes:
             builder.observe(chunk)
             continue
