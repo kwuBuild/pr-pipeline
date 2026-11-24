@@ -8,6 +8,7 @@ probe directory rather than being claimed in the model's reply.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import shutil
@@ -994,6 +995,59 @@ def test_impl_settings_setup_keeps_default_model_intent_separate_from_probe(doub
     assert section["impl_model"] == ""
     assert section["probed_model"] == pipeline.effective_engine_model("claude-ds", "")
     assert "fix_model" not in section and "fix_effort" not in section
+
+
+@pytest.mark.parametrize("legacy_record", [False, True])
+def test_impl_settings_setup_writes_dontask_after_early_inconclusive_default_model_probe(
+    doubles, monkeypatch, legacy_record,
+):
+    """A grant-covered probe records a blank model; dontAsk setup still writes it."""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
+    probe = run_setup_public("probe", REPO, "--impl-engine", "claude-ds", "--verify-tool", "git:*")
+    assert json.loads(probe.stdout)["outcome"] == setup_flow.INCONCLUSIVE, probe.stderr
+    assert not doubles["claude_log"].exists()
+    record = setup_flow.probe_record_path(REPO)
+    data = json.loads(record.read_text())
+    assert data["model"] == ""
+    if legacy_record:
+        data.pop("impl_model")
+        record.write_text(json.dumps(data))
+    write = ("write-config", REPO, "--login", "operator-a",
+             "--permission-mode", "dontAsk", "--verify-tool", "git:*")
+    result = run_setup_public(*write)
+    assert result.returncode == 0, result.stderr
+    section = tomllib.loads(pipeline.operator_config_path().read_text())["repos"][REPO]
+    assert (section["impl_engine"], section["impl_model"]) == ("claude-ds", "")
+    assert (section["probed_impl_engine"], section["probed_model"]) == ("claude-ds", "")
+    config = pipeline.resolve_config(REPO)
+    assert config.errors == ()
+    assert config.probed_route == ("claude-ds", "")
+    again = run_setup_public(*write)
+    assert again.returncode == 0, again.stderr
+    assert json.loads(again.stdout)["changed"] is False
+
+
+@pytest.mark.parametrize("engine, model, probed, accepted", [
+    ("claude-ds", "", ("claude-ds", ""), True),
+    ("claude-ds", pipeline.CLAUDE_DS_DEFAULT_MODEL, ("claude-ds", ""), True),
+    ("claude-ds", "", ("claude-ds", pipeline.CLAUDE_DS_DEFAULT_MODEL), True),
+    ("claude-ds", "other-model", ("claude-ds", ""), False),
+    ("claude", "", ("claude-ds", ""), False),
+    ("claude", "sonnet", ("claude", ""), False),
+])
+def test_impl_settings_setup_compares_effective_route_models(
+    doubles, engine, model, probed, accepted,
+):
+    """Routing defaults match the probe by the model each route runs, not spelling."""
+    config = dataclasses.replace(
+        pipeline.resolve_config(REPO), impl_engine=engine, model=model,
+        probed_route=probed, repo_configured=True, verify_tools=(),
+        permission_mode="auto", engine_settings="", errors=(),
+    )
+    errors = setup_flow._resolved_errors(config, REPO, (), "auto", "", probed)
+    assert (errors == []) is accepted, errors
+    tampered = dataclasses.replace(config, probed_route=(probed[0], "tampered"))
+    assert setup_flow._resolved_errors(tampered, REPO, (), "auto", "", probed)
 
 
 def test_impl_settings_setup_rejects_conflicting_alias_before_later_repetition(doubles):

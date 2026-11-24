@@ -691,10 +691,15 @@ def _resolved_errors(
 ) -> list[str]:
     """Return why a tick would refuse, or misread, this repository's settings."""
     errors = list(config.errors)
+    # The probe evidence must round-trip exactly as recorded. Routing defaults
+    # are compared by the model each route runs, as the tick's unprobed-route
+    # check does: an early inconclusive probe records a blank model, while
+    # legacy and canonical defaults may spell the engine default either way.
     effective_route = (
         config.impl_engine, pipeline.effective_engine_model(config.impl_engine, config.model),
     )
-    if config.probed_route != route or effective_route != route:
+    probed_effective = (route[0], pipeline.effective_engine_model(*route))
+    if config.probed_route != route or effective_route != probed_effective:
         errors.append("the probed engine route does not resolve as written")
     if not config.repo_configured:
         errors.append(f"the file does not configure {repo}")
