@@ -239,13 +239,15 @@ def _no_foreign_process_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     keeps the ``os.getpid()`` tests honest — they read a process that
     genuinely exists — while making every invented identifier deterministic.
 
-    All **three** reads have to be confined, not just the two probes.
+    All **four** reads have to be confined, not just the two probes.
     ``_classify_marker`` calls :func:`process_control.get_process_start_time`
     *first*, and its answer picks the branch: ``None`` yields identity
     ``unknown`` and falls through to the probes, while a real timestamp yields
     ``mismatched`` and the probes are never consulted at all. Guarding the
     probes alone would leave that fork decided by whichever PIDs the
-    developer's machine happens to be using.
+    developer's machine happens to be using. The loop classifier also reads
+    :func:`process_control.get_process_state`, so a foreign PID has no readable
+    state either.
 
     Like :func:`_no_github_mutation`, the guard sits at the boundary where real
     execution happens, so a test that patches the helper never reaches it and
@@ -275,6 +277,7 @@ def _no_foreign_process_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     real_pid_is_alive = process_control.pid_is_alive
     real_pgid_is_alive = process_control.pgid_is_alive
     real_start_time = process_control.get_process_start_time
+    real_process_state = process_control.get_process_state
 
     def guarded_pid_is_alive(pid: int) -> bool:
         return real_pid_is_alive(pid) if pid == self_pid else False
@@ -287,8 +290,14 @@ def _no_foreign_process_probes(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(process_control, "pid_is_alive", guarded_pid_is_alive)
     monkeypatch.setattr(process_control, "pgid_is_alive", guarded_pgid_is_alive)
+    def guarded_process_state(pid: int) -> str | None:
+        return real_process_state(pid) if pid == self_pid else None
+
     monkeypatch.setattr(
         process_control, "get_process_start_time", guarded_start_time,
+    )
+    monkeypatch.setattr(
+        process_control, "get_process_state", guarded_process_state,
     )
 
 

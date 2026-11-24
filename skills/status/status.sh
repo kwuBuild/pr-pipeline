@@ -7,14 +7,16 @@
 #
 # It makes no writes to pipeline state: it never edits labels, dispatches
 # engines, or touches markers. (The Python calls below invoke a resolved
-# interpreter directly and take no tick lock.) It only *reads* the two state
-# sources the pipeline
-# externalizes, so it cannot interfere with a running tick/loop:
+# interpreter directly and take no tick lock.) It only *reads* externalized
+# state, so it cannot interfere with a running tick/loop:
 #
 #   1. GitHub labels      = pipeline stage   (queue / reviewing / done)
 #   2. worktree markers   = live engine state (pid liveness, deadline, result)
+#   3. loop record        = verified local loop identity
+#   4. tick logs          = historical dispatch/cadence evidence
 #
 # Sections:
+#   LOOP PROCESS       — read-only classification of the recorded local loop.
 #   DISPATCH SCOPE     — the newest tick's scope (full queue, positional target,
 #                        or --only list with its expansion; requested but
 #                        unresolved after an early failure) and whether that
@@ -66,7 +68,7 @@ NOW=$(date +%s)
 PY="$(pr_pipeline_resolve_python || true)"
 if [[ -z "$PY" ]]; then
   pr_pipeline_python_requirement_error WARN
-  echo "      Engine progress, tick logs, and parked-item classification are unavailable." >&2
+  echo "      Loop process, engine progress, tick logs, and parked-item classification are unavailable." >&2
 fi
 
 # Progress verdicts, one `name<TAB>label` line per marker, from the same code
@@ -89,9 +91,24 @@ PROGRESS_VERDICTS=$("$PY" "$TICK_LIB/tick.py" engine-progress \
 echo "PR PIPELINE  ·  $(date '+%Y-%m-%d %H:%M:%S')  ·  repo $REPO"
 echo "================================================================"
 
+# --- LOOP PROCESS (local identity evidence) -------------------------------
+# Render the shared JSON classification; shell never derives loop liveness.
+if [[ -n "$PY" ]] && LOOP=$("$PY" -B "$TICK_LIB/tick.py" loop-status \
+    --wt-root "$WT_ROOT" 2>/dev/null) \
+    && LOOP_LINE=$(printf '%s' "$LOOP" | jq -er '
+      "LOOP PROCESS: \(.state) · record_present=\(.record_present) · \(.reason)" +
+      " · source=\(.source_health.record)/\(.source_health.process)" +
+      " · observed_at=\(.observed_at)" +
+      (if .record == null then "" else
+        " · pid=\(.record.pid) · scope=\(.record.scope.mode) \(.record.scope.targets | join(","))"
+       end)'); then
+  echo "$LOOP_LINE"
+else
+  echo "LOOP PROCESS: unavailable · record_present=null · classifier_unavailable"
+fi
+
 # --- DISPATCH SCOPE (tick-log evidence) ------------------------------------
-# The dashboard cannot see the loop process. The banner reports what the newest
-# tick log recorded and whether its advertised next wake has passed, so a
+# This separate banner reports what the newest tick log recorded and whether its advertised next wake has passed, so a
 # list-scoped loop that died reads STALE rather than as a live scope.
 PIPELINE="$SKILL_DIR/../tick/lib/pipeline.py"
 TICK_LOG_DIR="$ROOT/.claude/worktrees/.tick-log"

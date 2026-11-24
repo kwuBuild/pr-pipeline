@@ -669,7 +669,9 @@ exits after the configured number of quiescent heartbeats.
 Every tick invocation, looped or one-shot, takes a non-blocking mutex at
 `.claude/worktrees/.tick.lock`. If another tick is running, the new invocation
 exits immediately with code `5`, writes `lock_held` to the tick log when
-possible, and does no harvest or dispatch work.
+possible, and does no harvest or dispatch work. Native loops also publish a
+[local process record](../status/LOOP-STATUS.md) while holding the mutex;
+one-shot ticks do not. Status reports that identity separately from tick logs.
 
 | State at end of tick | Next wake (shipped default) |
 |---|---|
@@ -2008,19 +2010,37 @@ while true; do clear; ~/.claude/pr-pipeline/bin/pr-pipeline status; sleep 5; don
 ```
 
 Read-only — safe to run alongside a live tick. It reads GitHub labels, worktree
-markers, and tick logs; it never writes, edits labels, or touches engines.
+markers, the native loop record, and tick logs; it never writes, edits labels,
+or touches engines.
+
+#### LOOP PROCESS
+
+Native `tick --loop` publishes `.claude/worktrees/.tick-state/loop.json` under
+`TickLock`, after installing stop handlers. It removes only its own unchanged
+record before unlocking. One-shot ticks write no loop record. A lock-refused
+invocation leaves it unchanged; SIGKILL can leave stale evidence.
+
+The dashboard calls the shared `tick.py loop-status` JSON classifier and shows
+`running`, `not_running`, `unknown`, or `unavailable` with `record_present` and
+source health. Missing records mean unavailable evidence, not proof of no loop.
+`not_running` describes the recorded identity, not completion or an exit cause.
+A matching start time with an exited-but-unreaped (zombie) process state is
+`not_running`. Unreadable process identity or state stays unknown unless
+existence evidence proves absence. See the authoritative [record and classifier contract](../status/LOOP-STATUS.md)
+for schema, failure handling, scope, and consumer rules. Stop commands remain
+deferred.
 
 #### DISPATCH SCOPE
 
-The first line under the header names the newest tick's dispatch scope and
+This separate banner names the newest tick's dispatch scope and
 how current that evidence is:
 
 ```
 DISPATCH SCOPE: --only #439,pr:468 (dispatch scope #439,pr:470,pr:468) · log evidence active: last tick 14:32:15, next due by 14:36:45
 ```
 
-The dashboard cannot see the loop process, so the banner reads only retained
-tick logs. The scope is `full queue`, `target #N (scope …)`,
+This banner reads only retained tick logs; `LOOP PROCESS` reports local
+process evidence separately. The scope is `full queue`, `target #N (scope …)`,
 `--only <list> (dispatch scope <expanded items>)`, or
 `--only <list> (scope UNREADABLE at last tick; no engine started)`.
 

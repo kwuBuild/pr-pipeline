@@ -2,8 +2,11 @@
 
 import json
 import signal
+import subprocess
 import sys
+import time
 from importlib.util import find_spec
+from unittest import mock
 
 import process_control
 import pytest
@@ -140,6 +143,74 @@ def test_get_start_time_returns_none_for_nonexistent_pid() -> None:
         assert process_control._linux_start_time(999999999) is None
     else:
         assert process_control._bsd_start_time(999999999) is None
+
+
+# --- get_process_state ---
+
+
+def test_get_process_state_reads_a_live_process() -> None:
+    state = process_control.get_process_state(process_control.os.getpid())
+    if state is None:
+        pytest.skip("ps blocked by sandbox — process state unreadable")
+    assert state[0] not in "ZXx"
+
+
+def test_get_process_state_reports_an_unreaped_child_as_zombie() -> None:
+    """A killed child keeps its PID and start time until the parent reaps it.
+
+    The suite guard confines the public helper to the pytest process, so this
+    reads the child through the platform reader that the helper dispatches to.
+    """
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        proc.kill()
+        deadline = time.monotonic() + 10
+        state = None
+        while time.monotonic() < deadline:  # poll() would reap the zombie.
+            state = platform_state_reader()(proc.pid)
+            if state and state.startswith("Z"):
+                break
+            time.sleep(0.05)
+        assert state is not None and state.startswith("Z"), state
+    finally:
+        proc.wait(timeout=10)
+
+
+def test_get_process_state_returns_none_for_nonexistent_pid() -> None:
+    if sys.platform == "linux":
+        assert process_control._linux_process_state(999999999) is None
+    else:
+        assert process_control._bsd_process_state(999999999) is None
+
+
+@pytest.mark.parametrize(("stat", "expected"), [
+    ("42 (py thon) Z 1 42 42 0 -1", "Z"),
+    ("42 (a) b) S 1 42 42 0 -1", "S"),
+    ("42 (x) X 1", "X"),
+    ("garbage", None),
+    ("42 (x)", None),
+])
+def test_linux_process_state_parses_the_stat_state_field(stat, expected) -> None:
+    with mock.patch("builtins.open", mock.mock_open(read_data=stat)):
+        assert process_control._linux_process_state(42) == expected
+
+
+@pytest.mark.parametrize(("stdout", "code", "expected"), [
+    ("Z\n", 0, "Z"),
+    ("  Ss+ \n", 0, "Ss+"),
+    ("", 1, None),
+    ("   \n", 0, None),
+])
+def test_bsd_process_state_reads_ps_stat(stdout, code, expected) -> None:
+    result = subprocess.CompletedProcess([], code, stdout=stdout, stderr="")
+    with mock.patch.object(process_control.subprocess, "run", return_value=result) as run:
+        assert process_control._bsd_process_state(42) == expected
+    assert run.call_args.args[0] == ["ps", "-o", "stat=", "-p", "42"]
+
+
+def test_bsd_process_state_unreadable_when_ps_fails() -> None:
+    with mock.patch.object(process_control.subprocess, "run", side_effect=OSError):
+        assert process_control._bsd_process_state(42) is None
 
 
 def test_parse_lstart_macos_format() -> None:
@@ -364,3 +435,9 @@ class FakeClock:
     def sleep(self, seconds: float) -> None:
         """Advance fake time without blocking the test process."""
         self.now += seconds
+
+
+def platform_state_reader():
+    if sys.platform == "linux":
+        return process_control._linux_process_state
+    return process_control._bsd_process_state

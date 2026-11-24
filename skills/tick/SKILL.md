@@ -42,7 +42,7 @@ Labels are the source of truth; each tick runs HARVEST before DISPATCH. Usage an
 | 1 | Reconcile failed, target parse failed, or the CLI rejected the target/`--only` input; dispatch gated |
 | 2 | Reconcile OK; dispatch gated because the authoritative in-flight label read failed, the `--only` expansion could not be read, or an installed doc a stage requires is unreadable (`skill_unresolved` with `pr: null`; repair the install, no relabel needed) |
 | 3 | Startup rejected: missing tools/Python >= 3.11, invalid target/config, or missing/unreadable label vocabulary |
-| 4 | Unhandled exception; traceback written to tick log when possible; `--loop` returns without another tick |
+| 4 | Unhandled exception or loop record startup failure; diagnostics in stderr or the tick log; `--loop` returns without another tick |
 | 5 | Tick mutex already held by another invocation |
 | 6 | Target has no `[repos."owner/name"]` section: setup never ran for it; `--loop` logs `startup_repo_unconfigured` and returns |
 

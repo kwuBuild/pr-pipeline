@@ -28,9 +28,15 @@ It reads only the state sources the pipeline externalizes:
    with its expansion; a list or target that failed before resolving shows as
    requested but not resolved, and a log with no scope record shows
    `scope unknown`) and whether that evidence is `active`, `ended`, or
-   `STALE`. The dashboard cannot see the loop process; `STALE` means no tick
-   ran after the advertised next wake. See the `pr-pipeline:tick` README,
+   `STALE`. This is historical evidence; `STALE` means no tick ran after
+   the advertised next wake. See the `pr-pipeline:tick` README,
    "DISPATCH SCOPE".
+4. **Loop record** (`.claude/worktrees/.tick-state/loop.json`) — the native loop's
+   local identity. **LOOP PROCESS** uses the shared read-only classifier to show
+   `running`, `not_running`, `unknown`, or `unavailable`, with explicit record
+   presence and source health. A missing record does not prove no loop exists;
+   `not_running` only refutes the recorded identity and says nothing about work
+   completion. See the [record and classifier contract](LOOP-STATUS.md).
 
 ## Run
 
@@ -42,9 +48,11 @@ the absolute path of this pipeline's install — is where its *code* lives.
 bash ${CLAUDE_PLUGIN_ROOT}/skills/status/status.sh
 ```
 
-Liveness uses `kill -0 "$pid"`, so — like the tick — run it in the **same trust
+The engine row uses `kill -0 "$pid"`, so — like the tick — run it in the **same trust
 domain that launched the engines (sandbox off)**; a sandbox that blocks process
-introspection makes every live engine read as dead.
+introspection can make an engine row read as dead. The separate loop classifier
+keeps unreadable identity as `unknown` unless shared existence evidence proves
+absence.
 
 Continuous view in a separate terminal pane. These run in a shell that this
 skill's text never reaches, so paste the install path the command above resolved
