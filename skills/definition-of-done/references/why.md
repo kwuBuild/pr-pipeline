@@ -29,6 +29,14 @@ the story. This file is the evidence behind `SKILL.md`, not more rules.
   compared the two runs.
 - The verification commands are reported as the proof, and nobody named the
   condition that broke the change.
+- A report lists many passing tests but never maps the requested failure outcome
+  to an observed result. The tests stub persistence, so they cannot establish
+  recovery from a failed write in a fresh process.
+- A green result belongs to the revision before the final change, or its only
+  output disappeared with a temporary directory. The reviewer cannot inspect
+  what ran on the published code.
+- Each review round adds overlapping helper tests while the missing production
+  path remains untested. CI and review cost grow without closing the evidence gap.
 
 ## When You Are About to Release on Green
 
@@ -36,6 +44,9 @@ the story. This file is the evidence behind `SKILL.md`, not more rules.
 |---|---|
 | "Every verification command passes" | They show that nothing broke, not that anything new ran. Name the entry point that ran it. |
 | "The unit test covers it" | A unit test proves the function. The claim is about the path that calls the function. |
+| "I added more tests" | Name the distinct requirement or failure mode they protect and the observation that establishes it. |
+| "The report has every field" | Structure carries the evidence; it does not verify its truth, revision, or relevance. |
+| "Every probe must become a regression test" | Keep useful continuing protection. Other observations can remain inspectable evidence for this change. |
 | "It is the same code path" | The proof supplied its own paths, working directory, and mode. Production supplies different ones, and that gap holds the defect. |
 | "I will sweep the siblings if review asks" | The question from review is the failure that this prevents. The sweep is one search. |
 | "I will write the Phase A declaration now, from the diff" | It will agree with the diff, because you copied it from the diff. Restart from a real declaration, or record a waiver. There is no `Phase A: skipped` exit. |

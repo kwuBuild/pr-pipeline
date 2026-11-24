@@ -28,7 +28,9 @@ Explain the decisions and tradeoffs.
 Describe the components, their normal flow, and their impact.
 
 ## Test coverage
-Explain what the tests prove and their limits. Include required completion evidence.
+Connect acceptance criteria to observed results and evidence for the tested
+revision. Explain the distinct regression protection and limits. Include required
+completion evidence, reusing that block rather than duplicating it here.
 
 ## Test plan
 List exact verification commands and results, plus remaining manual checks.
