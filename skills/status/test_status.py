@@ -675,9 +675,9 @@ def dispatch_real_implementer_marker(
     """Emit one ``dispatch.json`` through ``tick.py``'s real dispatch path.
 
     Only the boundaries the dashboard does not depend on are stubbed: git
-    (no real worktree to create), the engine subprocess, and the label
-    write. Marker construction, deadline math, and the atomic write are
-    the production code.
+    (no real worktree to create), the engine subprocess and its start-time
+    read, and the label write. Marker construction, deadline math, and the
+    atomic write are the production code.
     """
     wt_root = repo / ".claude/worktrees"
     wt_dir = wt_root / f"issue-{issue_number}"
@@ -703,6 +703,9 @@ def dispatch_real_implementer_marker(
         mock.patch.object(tick.pipeline, "validate_target_context"),
         mock.patch.object(tick, "relabel"),
         mock.patch("subprocess.Popen", return_value=proc),
+        mock.patch.object(
+            tick.process_control, "get_process_start_time", return_value=None,
+        ),
     ):
         tick._dispatch_one_implementer(  # type: ignore[attr-defined]
             issue_number=issue_number,
