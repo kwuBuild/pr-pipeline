@@ -55,6 +55,11 @@ def test_launcher_preserves_linked_repository_identity(context_repo):
     assert issue_reads(repo) == ["other/contracts#7", "example/loop#7"]
     worktree = repo / ".claude/worktrees/pr-7"
     prompt = (worktree / "prompt.txt").read_text()
+    normalized = " ".join(prompt.split())
+    assert "append one focused commit for this revision round" in normalized
+    assert "Do not amend, squash, rebase, or otherwise rewrite published PR commits" in normalized
+    assert "without fabricating a commit or pushing" in normalized
+    assert "git push origin HEAD:refs/heads/" in prompt
     foreign = "### Issue other/contracts#7 — Foreign contract\n\nForeign requirement"
     local = "### Issue example/loop#7 — Local contract\n\nLocal requirement"
     assert foreign in prompt and local in prompt

@@ -7,12 +7,14 @@ Use this document when preparing a manual pull request in this repository.
 - `git fetch origin main` to get the latest base before any branch surgery
 - Confirm the branch diff against the base branch contains only the intended task changes
 - Confirm the branch history against the base branch contains only the intended task commit(s)
-- Squash all commits into one via `git rebase -i origin/main` (do not use
+- Prepare the initial commit under the [history policy](commit-guidelines.md#default-history-shape).
+  Use `git rebase -i origin/main` when consolidation is needed (do not use
   `git reset --soft origin/main` — soft-reset moves HEAD without applying
   the new base's changes to the working tree, so files that changed on
   main since the branch diverged end up as unintended reverts in the
   squashed commit)
-- Force-push with `--force-with-lease` after squashing or rebasing
+- If the initial branch was already pushed, rewrite only an authorized branch
+  and use `--force-with-lease=<ref>:<expected-head>` after rebasing
 - Run the relevant tests before opening the PR
 - After creating the PR, update workflow labels per the [Workflow labels](#workflow-labels) section below: remove `ai:implementing` from the issue and add `ai:implemented` to the PR
 - When posting a PR review or revision comment via `gh pr comment --body-file`:
@@ -21,7 +23,12 @@ Use this document when preparing a manual pull request in this repository.
   gitignored and inside the sandbox write allowlist. Clean up the temp file after
   the comment is posted.
 
-The PR should reflect the repo's one-commit-per-task rule unless the user explicitly asked for stacked or bisectable history.
+## Revising and merging
+
+Follow the [history policy](commit-guidelines.md#default-history-shape) for
+revision commits and the owner's final squash merge. Each review round assesses
+the complete current PR under the [review scope](reviewer-report-contract.md#review-scope),
+with the previous findings and fixer report as supporting context.
 
 ## PR body template
 
@@ -219,7 +226,8 @@ The review output MUST be posted to the PR as a comment, and the PR MUST move to
 Workflow:
 1. Identify the target PR. If not given, use `gh pr view --json number` on the current branch.
 2. Find the diff. Typical starting point: `gh pr diff <number>`, or `git diff $(gh pr view <number> --json baseRefName -q .baseRefName)...HEAD` if checked out. The reviewing agent may read files, check git history, or investigate however it sees fit.
-3. Conduct the review. Approach, depth, and focus are up to the reviewing agent.
+3. Conduct the review under the [full-PR scope](reviewer-report-contract.md#review-scope).
+   Choose the investigation and checks needed to assess that scope.
 4. Pick the terminal label based on verdict:
    - Blocker/major findings or open questions requiring code changes → `ai:changes-requested`
    - No blockers/majors → `ai:ready-for-human`
@@ -336,7 +344,7 @@ An issue being actively implemented MUST carry `ai:implementing`. The label tran
 | `ai:implemented` | PR opened, awaiting review | Reviewer looks at it |
 | `ai:changes-requested` | Review found issues | Author pushes fixes |
 | `ai:revised` | Fixes pushed, awaiting re-review | Reviewer looks again |
-| `ai:ready-for-human` | Passed AI review | Human merges |
+| `ai:ready-for-human` | Passed AI review | Owner follows the [squash-merge policy](commit-guidelines.md#default-history-shape) |
 
 ### Pipeline automation states (pr-pipeline:tick)
 

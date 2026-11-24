@@ -4,11 +4,24 @@ Commit hygiene in this repo is a hard requirement.
 
 ## Default History Shape
 
-- Create exactly one commit per task before opening a PR
-- Before opening a PR, make sure the branch contains only the commit(s) for that task relative to the base branch
-- If the branch includes unrelated or older task commits, rebase or squash them away before raising the PR
-- Only create multiple commits when the user explicitly asks for stacked or bisectable history
-- If a workflow or skill would produce a different commit structure, ask whether that tradeoff is acceptable before proceeding
+Keep revisions inspectable during review and put one commit per PR on `main`.
+
+1. Before opening a PR, prepare one clean implementation commit containing only
+   the intended task changes relative to the fetched base. Remove unrelated or
+   older task commits before publication.
+2. After the PR opens, append one focused commit for each revision round that
+   changes files. This applies to manual authors and pipeline fixers. Preserve
+   published commits so the owner and reviewer can inspect each revision.
+   Do not amend, squash, or rebase published commits to fold in review fixes.
+3. A revision that needs no changes creates no commit and makes no push. Report
+   the assessment and verification instead.
+4. The owner uses **Squash and merge** after review and required checks. The
+   resulting commit on `main` represents the whole PR, including its revisions.
+   The pipeline does not merge the PR or squash its published history.
+
+An explicit owner request can select a different history shape. A dispatched
+fixer still follows its pinned push authority; a different history requirement
+does not grant it permission to rewrite the remote branch.
 
 ## Commit Subject Format
 
@@ -50,7 +63,7 @@ message to a file in `tmp/` at the project root (gitignored) and using
 
 ## Required Validation
 
-Before opening a PR, creating a final commit, or asking the owner to merge:
+Before publishing an implementation or revision commit, or asking the owner to merge:
 
 1. Inspect the branch commit subjects:
    ```bash
@@ -63,8 +76,10 @@ Before opening a PR, creating a final commit, or asking the owner to merge:
    ```
 4. Confirm each task commit includes a `What:` and `Why:` body.
 
-If any subject or body does not match, fix it before proceeding. For a
-one-commit task, amend the local commit.
+Correct an unpublished commit before pushing it. Do not amend published
+commits to repair their messages; identify the discrepancy for the owner. The
+owner should check the final squash commit's subject and body against these
+same rules and describe the complete PR, not only the last fixer change.
 
 ## Examples
 
