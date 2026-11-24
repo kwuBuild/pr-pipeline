@@ -3665,6 +3665,9 @@ def test_implementer_dispatch_uses_bounded_unattended_flags(
     assert "HEAD:" not in allowed
     assert engine_cmd[engine_cmd.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in engine_cmd
+    # Only the fixer returns a schema-bound report; the implementer keeps
+    # its sentinel protocol.
+    assert "--json-schema" not in engine_cmd
     # No --model: an unset override leaves model selection to the operator's
     # own claude config rather than pinning one here.
     assert "--model" not in engine_cmd
@@ -4098,6 +4101,10 @@ def test_fixer_dispatch_uses_bounded_unattended_flags(
     assert "Bash(git push origin HEAD)" not in allowed
     assert engine_cmd[engine_cmd.index("--output-format") + 1] == "stream-json"
     assert "--verbose" in engine_cmd
+    # The fixer report travels through Claude Code's structured output, bound
+    # to the one schema fixer_reports owns.
+    import fixer_reports
+    assert json.loads(engine_cmd[engine_cmd.index("--json-schema") + 1]) == fixer_reports.schema()
 
     kwargs = popen.call_args[1]
     assert getattr(kwargs["stdin"], "name", "").endswith("prompt.txt")
@@ -4312,8 +4319,8 @@ def test_dispatch_one_fixer_prompt_requires_green_verification_before_sentinel(
         assert tool not in prompt.replace(str(tmp_path), "<fixture>")
     assert "every required verification command passes, and the push succeeds" in normalized
     assert "NEEDS_HUMAN_DECISION" in prompt
-    assert "one JSON object" in normalized
-    assert "bare sentinel" in prompt or "no surrounding fence or sentinel" in normalized
+    assert "Return the report through the structured output" in normalized
+    assert "your final chat message is not parsed" in normalized
 
 
 def test_dispatch_one_fixer_prompt_binds_revision_hygiene_before_editing(

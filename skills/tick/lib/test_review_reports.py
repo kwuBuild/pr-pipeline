@@ -371,8 +371,10 @@ report = {"report_protocol_version": 2, "dispatch_id": marker["dispatch_id"],
                        for ref in snapshot["finding_refs"]],
           "verification": "Probe passed.", "verification_status": "passed", "verification_waiver": "",
           "documentation": "No updates needed.", "remaining_work": "Independent review."}
-print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
-                  "result": json.dumps(report)}))
+event = {"type": "result", "subtype": "success", "is_error": False, "result": json.dumps(report)}
+if "--json-schema" in sys.argv:
+    event["structured_output"] = report
+print(json.dumps(event))
 ''')
     worktree = seed_wrapper(root, env, report, 2)
     run_report_tick(root, env)

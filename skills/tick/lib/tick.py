@@ -1093,6 +1093,7 @@ def claude_engine_argv(
     model: str = "",
     settings: str = "",
     skill_plugin: str = "",
+    json_schema: str = "",
 ) -> list[str]:
     """Return the headless Claude argv every implementer and fixer runs.
 
@@ -1114,6 +1115,9 @@ def claude_engine_argv(
         model: ``--model`` value; empty omits the flag.
         settings: ``--settings`` value (the resolved ``engine_settings``);
             empty omits the flag.
+        json_schema: ``--json-schema`` value; empty omits the flag. Only the
+            fixer passes one (``fixer_reports.schema()``): Claude Code then
+            returns the report in the result's ``structured_output``.
 
     Returns:
         The argv, without the stream wrapper dispatch places in front of it.
@@ -1131,6 +1135,8 @@ def claude_engine_argv(
         argv += ["--settings", settings]
     if skill_plugin:
         argv += ["--plugin-dir", skill_plugin]
+    if json_schema:
+        argv += ["--json-schema", json_schema]
     return argv
 
 
@@ -1148,6 +1154,7 @@ def _launch_claude_engine(
     engine_settings: str = "",
     skills: Sequence[str] = (),
     fix_report_protocol_version: int | None = None,
+    json_schema: str = "",
 ) -> subprocess.Popen[bytes] | None:
     """Launch headless ``claude -p`` with narrow pre-approved tool grants.
 
@@ -1183,6 +1190,8 @@ def _launch_claude_engine(
             the bounded ``--allowedTools`` allowlist still resolves first.
         engine_settings: The target's resolved ``engine_settings``, passed as
             ``--settings``; empty (the default) omits the flag.
+        json_schema: The fixer report schema, passed as ``--json-schema``;
+            empty (the default) omits the flag.
 
     Returns:
         The Popen handle, or ``None`` when target validation, prompt/result
@@ -1226,6 +1235,7 @@ def _launch_claude_engine(
         model=model,
         settings=engine_settings,
         skill_plugin=skill_plugin,
+        json_schema=json_schema,
     )
     prompt_fh = result_fh = stderr_fh = None
     try:
@@ -9023,6 +9033,7 @@ def _harvest_one_fixer(
             approved_input_sha256=marker.get("approved_input_sha256", ""),
             report_protocol_version=marker.get("report_protocol_version"),
             review_handoff=marker.get("review_handoff"),
+            report_transport=marker.get("report_transport"),
         )
     except Exception:
         # Cap persistent parse errors to avoid infinite retries.
@@ -12554,6 +12565,10 @@ def _dispatch_one_fixer(
     if approved_input_sha256:
         lease_marker["approved_input_sha256"] = approved_input_sha256
     lease_marker["report_protocol_version"] = pipeline.fixer_reports.VERSION
+    # Both Claude routes (claude and claude-ds) return the report through
+    # --json-schema. Harvest reads this pinned field, not the result, to choose
+    # the structured_output parse; older markers keep the text parse.
+    lease_marker["report_transport"] = pipeline.fixer_reports.STRUCTURED_TRANSPORT
     try:
         pipeline.atomic_write(
             os.path.join(wt_dir, "dispatch.json"),
@@ -12652,6 +12667,7 @@ def _dispatch_one_fixer(
         engine_settings=config.engine_settings,
         skills=FIXER_SKILLS,
         fix_report_protocol_version=pipeline.fixer_reports.VERSION,
+        json_schema=json.dumps(pipeline.fixer_reports.schema(), separators=(",", ":")),
     )
     if proc is None:
         cleanup_scratch(wt_dir)

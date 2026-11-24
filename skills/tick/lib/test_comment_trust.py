@@ -766,7 +766,7 @@ def test_cli_approved_reply_cannot_exceed_configured_round_cap(comment_cli, labe
         wait_for_artifact(marker_path.with_name("result.json"))
         marker_path.with_name("result.json").write_text(json.dumps({
             "type": "result", "is_error": False, "claude_exit_status": 0,
-            "report_protocol_version": 2, "result": json.dumps(report)}))
+            "report_protocol_version": 2, "result": json.dumps(report), "structured_output": report}))
         run_comment_tick(root, env)
         data = json.loads(state.read_text())
         assert data["pr_labels"] == [pipeline.LABEL_NEEDS_HUMAN]

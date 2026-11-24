@@ -706,9 +706,15 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   failure logs its cause as a dispatch `skip` and retains the pickup label for
   retry. See the [governing-context contract](README.md#governing-context-the-fixer-is-handed)
   for source selection, pagination, attribution and excerpt budgets
-- New fixer reports: inspect `report_protocol_version`, `review_handoff`, and
-  `review_sha256` in the marker, then `result.json`, `fix-rendered.md` and
-  `fix-manifest.json` in scratch or `.harvest-evidence/`. The manifest records
+- New fixer reports: inspect `report_protocol_version`, `report_transport`,
+  `review_handoff`, and `review_sha256` in the marker, then `result.json`,
+  `fix-rendered.md` and `fix-manifest.json` in scratch or `.harvest-evidence/`.
+  With `report_transport="structured_output"` the report is `result.json`'s
+  `structured_output`; prose in `result` is ignored. "Missing structured revision
+  report" means that object is absent or not an object (check `is_error`,
+  `subtype` and `stderr.log`). "Missing or malformed JSON revision report" occurs
+  only for a marker without `report_transport`, whose final message must be the
+  JSON report. See [report transport](README.md#report-transport). The manifest records
   complete source/rendered digests and validation reason. A malformed or
   oversized report takes a human hold; do not rerun code merely to repair prose.
   See [complete fixer reports](README.md#complete-fixer-reports) for limits,

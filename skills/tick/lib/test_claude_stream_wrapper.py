@@ -328,6 +328,44 @@ def test_main_publishes_one_harvest_compatible_result(capfd, monkeypatch) -> Non
     assert published["claude_exit_status"] == 0
 
 
+@pytest.mark.parametrize("reentered", [False, True])
+def test_main_keeps_structured_output_from_a_schema_bound_stream(capfd, monkeypatch, reentered) -> None:
+    """``result.json`` carries the result event's ``structured_output`` unchanged.
+
+    The events follow a live ``claude -p --output-format stream-json --verbose
+    --json-schema`` run (Claude Code 2.1.331): prose text, a ``StructuredOutput``
+    tool call, its tool result, then a ``result`` event whose
+    ``structured_output`` holds the schema-valid object. A session re-entered
+    by a task notification keeps the terminal event's object.
+    """
+    report = {"outcome": "A", "note": "Reporting outcome A as requested."}
+    events = [
+        {"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "I'm reporting outcome A as you asked, with a short note."}]}},
+        {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "StructuredOutput", "input": report,
+             "caller": {"type": "direct"}}]}},
+        {"type": "user", "message": {"content": [
+            {"tool_use_id": "toolu_1", "type": "tool_result",
+             "content": "Structured output provided successfully"}]}},
+        {"type": "result", "subtype": "success", "is_error": False,
+         "result": json.dumps(report), "structured_output": report, "num_turns": 2},
+    ]
+    if reentered:
+        events.insert(0, {"type": "result", "subtype": "success", "is_error": False,
+                          "result": "segment", "num_turns": 1})
+    script = "print(" + repr("\n".join(json.dumps(e) for e in events)) + ")"
+
+    with open(os.devnull) as stdin:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        exit_status = main(["--fix-report-protocol-version", "2", "--", sys.executable, "-c", script])
+
+    assert exit_status == 0
+    published = json.loads(capfd.readouterr().out)
+    assert published["structured_output"] == report
+    assert published["report_protocol_version"] == 2
+
+
 @pytest.mark.parametrize("engine_tail", [[], ["--", "engine-argument"]])
 def test_main_preserves_legacy_heartbeat_arguments_without_separator(tmp_path, capfd, monkeypatch, engine_tail):
     heartbeat = tmp_path / "heartbeat"

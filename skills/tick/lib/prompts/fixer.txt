@@ -93,8 +93,11 @@ agents. A fixer requests independent re-review; it never grants approval.
 
 ## Complete revision report
 
-Your final response must be one JSON object, with no surrounding fence or
-sentinel outside it. Copy these controller binding fields exactly:
+Return the report through the structured output. The controller launched you
+with a JSON schema for this report, so Claude Code collects it as a separate
+structured object. Harvest reads only that object; your final chat message is
+not parsed, and prose around it has no effect. Copy these controller binding
+fields exactly:
 {report_binding}
 
 Add these required fields:
