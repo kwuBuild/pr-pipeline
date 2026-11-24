@@ -973,6 +973,13 @@ def test_cli_reviewer_harvest_counts_local_approved_reservations(comment_cli, si
                        for call in calls)
     assert data["pr_labels"] == [expected], data["pr_labels"]
     assert (wt / "dispatch.json").exists() is (not silent_count)
+    records = [json.loads(line) for path in (wt.parent / ".tick-log").glob("*.jsonl")
+               for line in path.read_text().splitlines()]
+    handoff, = [entry for entry in records if entry["action"] == "review_handoff"]
+    # The published approved source and its local receipt are one prior round.
+    assert handoff["details"]["rounds"] == silent_count + 2
+    assert handoff["details"]["max_iterations"] == 3
+    assert handoff["details"]["finding_counts"] == {"blocker": 0, "major": 1, "minor": 0}
 
 
 @pytest.mark.parametrize("receipts", [[], ["id:silent-1", "id:silent-2"], {"invalid": True}])

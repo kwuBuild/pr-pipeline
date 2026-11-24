@@ -1950,6 +1950,9 @@ def decide_review_harvest(
         ``label`` (the label to set), ``sentinel``, ``verdict`` (validated, may
         be ``None``), ``base_retarget`` (bool), ``base_drift`` (bool),
         ``head_drift`` (bool), ``rounds`` (prior recorded rounds),
+        ``rounds_after`` (accounted rounds after the proposed handoff),
+        ``max_iterations`` (configured cap), ``finding_counts`` (validated
+        counts by severity, or ``None`` when validation is unavailable),
         ``post_comment`` (bool), and ``comment_body`` (str, empty when not
         posting).
     """
@@ -1958,6 +1961,15 @@ def decide_review_harvest(
         approved_input_reservations=approved_input_reservations,
     )
     verdict = validate_review(review_obj, report_protocol_version=report_protocol_version)
+    observations = {
+        "rounds_after": rounds,
+        "max_iterations": threshold,
+        "finding_counts": (
+            {severity: sum(finding["severity"] == severity for finding in review_obj["findings"])
+             for severity in ("blocker", "major", "minor")}
+            if verdict is not None else None
+        ),
+    }
 
     # A retargeted PR invalidates the review outright: the diff was anchored
     # to the old base, and the SHA drift checks below cannot see the change —
@@ -1972,6 +1984,7 @@ def decide_review_harvest(
     )
     if base_retarget:
         return {
+            **observations,
             "action": "discard",
             "label": pre_label,
             "sentinel": SENTINEL_BLOCKERS,
@@ -1988,6 +2001,7 @@ def decide_review_harvest(
     head_drift = head_advanced(pinned_head, current_head)
     if base_drift or head_drift:
         return {
+            **observations,
             "action": "discard",
             "label": pre_label,
             "sentinel": SENTINEL_BLOCKERS,
@@ -2033,6 +2047,7 @@ def decide_review_harvest(
     if (verdict is None or verdict == "needs_human_decision" or validation_reason
             or (verdict == VERDICT_CHANGES and not blocking)):
         return {
+            **observations,
             "action": "escalate",
             "label": LABEL_NEEDS_HUMAN,
             "sentinel": SENTINEL_BLOCKERS,
@@ -2073,6 +2088,7 @@ def decide_review_harvest(
     if not review_reports.within_limit(comment_body):
         reason = "Complete rendered report exceeds 60,000 characters or UTF-8 bytes."
         return {
+            **observations,
             "action": "escalate", "label": LABEL_NEEDS_HUMAN,
             "sentinel": SENTINEL_BLOCKERS, "verdict": verdict,
             "base_retarget": False, "base_drift": False, "head_drift": False,
@@ -2108,6 +2124,8 @@ def decide_review_harvest(
         label, sentinel = LABEL_CHANGES_REQUESTED, SENTINEL_BLOCKERS
 
     return {
+        **observations,
+        "rounds_after": rounds_after,
         "action": action,
         "label": label,
         "sentinel": sentinel,

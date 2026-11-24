@@ -1557,18 +1557,24 @@ def _notify_terminal_label(
     tick_log: "TickLog | None",
     phase: str,
     stage: str,
+    *,
+    rounds: int | None = None,
+    max_iterations: int | None = None,
 ) -> None:
     """Emit best-effort operator signals for terminal label transitions."""
     reason = f"{entity} #{number} reached terminal label {label}"
     print(f"tick: {reason}", file=sys.stderr)
     if tick_log is not None:
+        details = {"entity": entity, "label": label}
+        if label == pipeline.LABEL_MAX_ITERATIONS:
+            details.update(rounds=rounds, max_iterations=max_iterations)
         tick_log.log(
             pr=number,
             phase=phase,
             stage=stage,
             action="notify_terminal_label",
             reason=reason,
-            details={"entity": entity, "label": label},
+            details=details,
         )
     _emit_operator_notification(
         title="PR pipeline terminal label",
@@ -1841,6 +1847,8 @@ def _converge_pipeline_labels(
     tick_log: "TickLog | None",
     phase: str,
     stage: str,
+    rounds: int | None = None,
+    max_iterations: int | None = None,
 ) -> bool:
     """Converge all remote pipeline labels to one target, or none.
 
@@ -1915,6 +1923,7 @@ def _converge_pipeline_labels(
         if target_label in _TERMINAL_LABELS:
             _notify_terminal_label(
                 entity, number, target_label, tick_log, phase, stage,
+                rounds=rounds, max_iterations=max_iterations,
             )
         return True
 
@@ -1974,6 +1983,7 @@ def _converge_pipeline_labels(
     if target_label in _TERMINAL_LABELS:
         _notify_terminal_label(
             entity, number, target_label, tick_log, phase, stage,
+            rounds=rounds, max_iterations=max_iterations,
         )
     return True
 
@@ -6833,6 +6843,8 @@ def _harvest_one_reviewer(
         if not _converge_pipeline_labels(
             "pr", n, harvest_label,
             tick_log=tick_log, phase="harvest", stage=_REVIEWER_CONFIG.stage,
+            rounds=harvest_result.get("rounds_after"),
+            max_iterations=harvest_result.get("max_iterations"),
         ):
             skip_cleanup = True
         else:
@@ -6857,7 +6869,10 @@ def _harvest_one_reviewer(
             reason="review outcome handed off after publication and label convergence",
             engine=str(marker.get("engine", "codex")), dispatch_id=dispatch_id,
             details={"label": harvest_label, "outcome": harvest_result.get("action"),
-                     "head_sha": current_head},
+                     "head_sha": current_head,
+                     "rounds": harvest_result.get("rounds_after"),
+                     "max_iterations": harvest_result.get("max_iterations"),
+                     "finding_counts": harvest_result.get("finding_counts")},
         )
     if archive_dir and not _finalize_harvest_archive(
         wt_dir, archive_dir, number=n, stage="review", phase="harvest",
@@ -11732,6 +11747,10 @@ def _fix_within_budget(
         if not pipeline.at_max_iterations(rounds, max_iterations):
             return True
         relabel("pr", number, pre_label, pipeline.LABEL_MAX_ITERATIONS)
+        _notify_terminal_label(
+            "pr", number, pipeline.LABEL_MAX_ITERATIONS, tick_log, "dispatch", "fix",
+            rounds=rounds, max_iterations=max_iterations,
+        )
         reason = f"fixer input reached round cap ({rounds}/{max_iterations})"
     except (ValueError, subprocess.CalledProcessError) as exc:
         reason = f"fixer admission refused: {exc} — retained for retry"

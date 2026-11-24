@@ -2656,7 +2656,7 @@ a failed lookup or malformed response leaves the label unchanged either way.
 | "What did the reviewer find?" | Worktree → `review.json` |
 | "Why did the reviewer reject?" | Worktree → `review.json` → `.verdict` field |
 | "Which reviewer skill files were observed?" | Tick log → `reviewer_skill_observation` (`observed_skills`) |
-| "How many fix iterations has this PR gone through?" | Dashboard (iteration in label) or `gh pr view` |
+| "How many review rounds has this PR used?" | `pr-pipeline events --json pr:N` → `review_handoff.details.rounds` and `.max_iterations`; also present on `ai:max-iterations` terminal events. See the [event fields](../status/EVENTS.md#events-and-confirmation). |
 | "Did a dispatch fail to launch?" | Tick log → `select(.action|startswith("skip_"))` |
 | "Is the pipeline currently quiescent?" | Dashboard → IN-FLIGHT ENGINES shows `(none)`, state shows all terminal labels |
 
