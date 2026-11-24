@@ -1994,8 +1994,9 @@ The dashboard calls the shared `tick.py loop-status` JSON classifier and shows
 `running`, `not_running`, `unknown`, or `unavailable` with `record_present` and
 source health. Missing records mean unavailable evidence, not proof of no loop.
 `not_running` describes the recorded identity, not completion or an exit cause.
-Unreadable process identity stays unknown unless existence evidence proves
-absence. See the authoritative [record and classifier contract](../status/LOOP-STATUS.md)
+A matching start time with an exited-but-unreaped (zombie) process state is
+`not_running`. Unreadable process identity or state stays unknown unless
+existence evidence proves absence. See the authoritative [record and classifier contract](../status/LOOP-STATUS.md)
 for schema, failure handling, scope, and consumer rules. Stop commands remain
 deferred.
 

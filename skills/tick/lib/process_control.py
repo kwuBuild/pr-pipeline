@@ -74,6 +74,59 @@ def _linux_start_time(pid: int) -> float | None:
         return None
 
 
+def get_process_state(pid: int) -> str | None:
+    """Return the OS scheduler state code of a process, or None.
+
+    Uses ``ps -o stat=`` on macOS/BSD and the state field of
+    ``/proc/<pid>/stat`` on Linux. A code that starts with ``Z`` (or ``X`` on
+    Linux) names a process that has exited but still holds its PID and start
+    time because its parent has not reaped it. Returns ``None`` if the process
+    does not exist or the state cannot be read; ``None`` is not proof of death.
+
+    Args:
+        pid: Positive process identifier.
+
+    Returns:
+        The platform's state code, such as ``"S"``, ``"R+"`` or ``"Z"``, or ``None``.
+    """
+    if sys.platform == "linux":
+        return _linux_process_state(pid)
+    return _bsd_process_state(pid)
+
+
+def process_state_is_exited(state: str) -> bool:
+    """Return whether a :func:`get_process_state` code names an exited process."""
+    return state[:1] in ("Z", "X", "x")
+
+
+def _bsd_process_state(pid: int) -> str | None:
+    """Read the process state via ``ps -o stat=`` (macOS/BSD)."""
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    state = result.stdout.strip()
+    if result.returncode != 0 or not state:
+        return None
+    return state
+
+
+def _linux_process_state(pid: int) -> str | None:
+    """Read the state field (field 3) from ``/proc/<pid>/stat`` (Linux)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            stat = f.read()
+    except OSError:
+        return None
+    # The comm field may contain spaces and parentheses; the state follows
+    # the last closing parenthesis.
+    fields = stat[stat.rfind(")") + 1:].split() if ")" in stat else []
+    return fields[0] if fields else None
+
+
 def _parse_lstart(lstart: str) -> float | None:
     """Parse the ``ps -o lstart=`` output into epoch seconds.
 

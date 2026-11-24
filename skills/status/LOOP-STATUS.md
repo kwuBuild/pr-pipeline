@@ -62,6 +62,15 @@ root. Bad CLI arguments exit 2. The classifier acquires no lock, writes no
 pipeline state, performs no GitHub calls, and never sends a signal. When start
 time is unavailable, the shared `pid_is_alive` signal-zero probe checks
 existence without delivering a signal. Permission failure cannot prove death.
+
+A matching start time alone does not prove that the process runs. A killed
+process whose parent has not yet reaped it is a zombie: it keeps its PID and
+start time, and it answers the existence probe, but it cannot run ticks. The
+classifier therefore also reads the OS process state through
+`process_control.get_process_state` (`ps -o stat=` on macOS/BSD, the state
+field of `/proc/<pid>/stat` on Linux). It reads the state before the start
+time. A PID cannot be reused while its process or zombie exists, so a later
+matching start time shows that the state belongs to the recorded process.
 Status and future Mission Control consumers must use this classifier rather
 than infer liveness from logs, the lock file, or a PID alone.
 
@@ -76,15 +85,17 @@ unrecognized versions as unavailable evidence.
 | No record at the observed path | `unavailable` | false | `record_missing` |
 | Record cannot be read | `unavailable` | true if presence was observed, otherwise null | `record_unreadable` |
 | Invalid JSON, invalid fields, or unsupported record version | `unavailable` | true | `record_malformed` |
-| Readable local record, matching process start identity | `running` | true | `identity_verified` |
+| Readable local record, matching process start identity, live process state | `running` | true | `identity_verified` |
+| Readable local record, matching process start identity, exited but unreaped (state `Z`, or `X` on Linux) | `not_running` | true | `process_zombie` |
 | Readable local record, different process start identity (PID reuse) | `not_running` | true | `identity_mismatch` |
-| Start identity unavailable and existence probe proves absence | `not_running` | true | `process_dead` |
+| Start identity or process state unavailable and existence probe proves absence | `not_running` | true | `process_dead` |
 | Process identity unreadable and absence not proved | `unknown` | true | `identity_unreadable` |
+| Matching start identity, process state unreadable, and absence not proved | `unknown` | true | `process_state_unreadable` |
 | Record names a different host | `unknown` | true | `host_mismatch` |
 
 `source_health.record` is `missing`, `unreadable`, `malformed`, or `readable`.
 `source_health.process` is `not_checked`, `verified`, `mismatch`, `dead`,
-`unreadable`, or `foreign_host`. Source health describes evidence quality;
+`zombie`, `unreadable`, or `foreign_host`. Source health describes evidence quality;
 `state` describes what that evidence supports. Presence and process reads can
 race with publication, cleanup, or exit, so the result is an observation at
 `observed_at`, not a promise of continuing liveness.

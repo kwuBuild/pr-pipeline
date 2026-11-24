@@ -597,6 +597,38 @@ def test_status_separates_loop_record_from_tick_log_evidence(tmp_path, tick_modu
     assert after == before
 
 
+def test_status_reports_a_killed_unreaped_loop_as_not_running(tmp_path, tick_module):
+    """A zombie keeps its PID and start time, but it cannot run ticks."""
+    process_control = tick_module.process_control
+    repo = install_status_script(tmp_path)
+    path = repo / ".claude/worktrees/.tick-state/loop.json"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    try:
+        start = process_control.get_process_start_time(proc.pid)
+        assert start is not None, "cannot read the child's start time"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({
+            "schema_version": 1, "invocation_id": "zombie-test", "pid": proc.pid,
+            "process_start_time": start, "recorded_at": time.time(),
+            "host": tick_module.platform.node(),
+            "scope": {"mode": "full", "targets": []},
+        }))
+        before = path.read_bytes()
+        proc.kill()
+        deadline = time.monotonic() + 10  # Popen.poll() would reap the zombie.
+        while not (process_control.get_process_state(proc.pid) or "").startswith("Z"):
+            assert time.monotonic() < deadline, "killed child never became a zombie"
+            time.sleep(0.05)
+        result = run_status(repo)
+        assert result.returncode == 0, result.stderr
+        assert "LOOP PROCESS: not_running · record_present=true · process_zombie" in result.stdout
+        assert "source=readable/zombie" in result.stdout
+        assert path.read_bytes() == before
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
 # --- Helpers ---
 
 

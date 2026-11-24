@@ -6,6 +6,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from unittest import mock
 
@@ -30,15 +31,25 @@ def record():
     }
 
 
-@pytest.mark.parametrize(('start', 'alive', 'state', 'reason'), [
-    (100.0, True, 'running', 'identity_verified'),
-    (101.0, True, 'not_running', 'identity_mismatch'),
-    (None, False, 'not_running', 'process_dead'),
-    (None, True, 'unknown', 'identity_unreadable'),
+@pytest.mark.parametrize(('start', 'proc_state', 'alive', 'state', 'reason'), [
+    (100.0, 'S', True, 'running', 'identity_verified'),
+    (100.0, 'R+', True, 'running', 'identity_verified'),
+    (101.0, 'S', True, 'not_running', 'identity_mismatch'),
+    (None, None, False, 'not_running', 'process_dead'),
+    (None, None, True, 'unknown', 'identity_unreadable'),
+    # A killed child that its parent has not reaped keeps its PID and start time.
+    (100.0, 'Z', True, 'not_running', 'process_zombie'),
+    (100.0, 'Z+', True, 'not_running', 'process_zombie'),
+    (100.0, 'X', True, 'not_running', 'process_zombie'),
+    # Verified identity without readable state is not proof of either outcome.
+    (100.0, None, True, 'unknown', 'process_state_unreadable'),
+    # The process can exit between the state and identity reads.
+    (100.0, None, False, 'not_running', 'process_dead'),
 ])
-def test_classifier_identity_evidence(record_path, record, start, alive, state, reason):
+def test_classifier_identity_evidence(record_path, record, start, proc_state, alive, state, reason):
     record_path.write_text(json.dumps(record))
     with mock.patch.object(tick.process_control, 'get_process_start_time', return_value=start), \
+         mock.patch.object(tick.process_control, 'get_process_state', return_value=proc_state), \
          mock.patch.object(tick.process_control, 'pid_is_alive', return_value=alive):
         result = tick.classify_loop_process(str(record_path.parents[1]))
     assert result['schema_version'] == 1
@@ -176,6 +187,12 @@ def test_real_sigkill_retains_dead_record_and_next_loop_replaces_it(loop_repo):
                 assert read_cli(repo, env)['state'] == 'running'
                 prior = record['invocation_id']
                 proc.kill()
+                # Defer reaping: the killed loop stays a zombie with its PID and start time.
+                assert wait_without_reaping(lambda: zombie(proc.pid)), 'killed loop never became a zombie'
+                unreaped = read_cli(repo, env)
+                assert (unreaped['state'], unreaped['reason']) == ('not_running', 'process_zombie')
+                assert unreaped['source_health'] == {'record': 'readable', 'process': 'zombie'}
+                assert json.loads(path.read_text()) == record
                 proc.wait(timeout=10)
                 assert path.exists()
                 assert read_cli(repo, env)['state'] == 'not_running'
@@ -295,6 +312,21 @@ def test_real_startup_refusal_removes_loop_record(loop_repo):
 
 
 # --- Helpers ---
+
+
+def wait_without_reaping(predicate, timeout=10.0):
+    # Popen.poll/wait would reap the child and erase the state under test.
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def zombie(pid):
+    probe = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True)
+    return probe.stdout.strip().startswith('Z')
 
 
 def read_cli(repo, env):

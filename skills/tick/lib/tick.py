@@ -13908,14 +13908,23 @@ def classify_loop_process(wt_root: str | None = None) -> dict[str, object]:
         result["reason"] = "host_mismatch"
         health["process"] = "foreign_host"
         return result
+    # Read the state before the identity. A PID cannot be reused while its
+    # process (or zombie) exists, so a later matching start time shows that
+    # this state belongs to the recorded process.
+    proc_state = process_control.get_process_state(record["pid"])
     start_time = process_control.get_process_start_time(record["pid"])
-    if start_time is not None:
-        if start_time == record["process_start_time"]:
+    if start_time is not None and start_time != record["process_start_time"]:
+        result.update(state="not_running", reason="identity_mismatch")
+        health["process"] = "mismatch"
+        return result
+    if start_time is not None and proc_state is not None:
+        if process_control.process_state_is_exited(proc_state):
+            # Killed but unreaped: the PID and start time survive the exit.
+            result.update(state="not_running", reason="process_zombie")
+            health["process"] = "zombie"
+        else:
             result.update(state="running", reason="identity_verified")
             health["process"] = "verified"
-        else:
-            result.update(state="not_running", reason="identity_mismatch")
-            health["process"] = "mismatch"
         return result
     try:
         alive = process_control.pid_is_alive(record["pid"])
@@ -13925,7 +13934,8 @@ def classify_loop_process(wt_root: str | None = None) -> dict[str, object]:
         result.update(state="not_running", reason="process_dead")
         health["process"] = "dead"
     else:
-        result["reason"] = "identity_unreadable"
+        result["reason"] = ("identity_unreadable" if start_time is None
+                            else "process_state_unreadable")
         health["process"] = "unreadable"
     return result
 
