@@ -169,6 +169,7 @@ def run_probe(
     model: str,
     verify_tools: Sequence[str],
     engine_settings: str = "",
+    effort: str | None = None,
 ) -> dict[str, object]:
     """Measure whether ``auto`` approves an ungranted command on this route.
 
@@ -179,8 +180,10 @@ def run_probe(
     Args:
         repo: ``owner/name`` the result is for.
         impl_engine: ``"claude"`` or ``"claude-ds"``, as passed to the tick.
-        model: The ``--model`` the tick will pass; empty for the operator's
+        model: The requested ``--impl-model``; empty for the operator's
             default (``deepseek-v4-pro[1m]`` for claude-ds, as at dispatch).
+        effort: Explicit implementer effort, or None to preserve configuration
+            intent when setup writes the record. Only an explicit value is persisted.
         verify_tools: The verification grants proposed for the repository.
         engine_settings: The ``engine_settings`` proposed for the repository,
             passed as ``--settings`` exactly as dispatch will pass it.
@@ -193,11 +196,14 @@ def run_probe(
         "repo": repo,
         "impl_engine": impl_engine,
         "model": model,
+        "impl_model": model,
         "verify_tools": list(verify_tools),
         "engine_settings": engine_settings,
         "allowed_tools": allowed,
         "probe_command": PROBE_COMMAND,
     }
+    if effort is not None:
+        report["impl_effort"] = effort
     granting = allowlist_grants(PROBE_COMMAND, allowed)
     if granting is not None:
         return {**report, "outcome": INCONCLUSIVE, "detail": (
@@ -207,7 +213,9 @@ def run_probe(
     model = pipeline.effective_engine_model(impl_engine, model)
     report["model"] = model
     try:
-        engine_bin, extra_env = tick._resolve_engine(impl_engine, model=model)
+        engine_bin, extra_env = tick._resolve_engine(
+            impl_engine, model=model, effort=effort or "",
+        )
     except RuntimeError as exc:
         return {**report, "outcome": INCONCLUSIVE,
                 "detail": f"the route cannot launch: {exc}"}
@@ -491,10 +499,11 @@ def plan_config(
     - ``dontAsk`` needs verification grants, because without them an engine
       is stranded mid-run.
 
-    The probed route (``impl_engine`` and ``model``, as the probe launched
-    it) supplies the repository's routing defaults and separate
-    ``probed_impl_engine`` / ``probed_model`` evidence. The tick reports a
-    different route even after those routing defaults are edited.
+    The requested route supplies canonical repository routing defaults;
+    the measured route supplies separate ``probed_impl_engine`` /
+    ``probed_model`` evidence. Legacy records contain only the measured model.
+    Unspecified effort and fixer settings keep their existing inheritance.
+    The tick reports a different route even after those defaults are edited.
 
     Returns:
         ``(path, existing, merged, route)``: the documents, equal when nothing
@@ -567,14 +576,25 @@ def plan_config(
     section = repos.setdefault(section_key, {})
     if not isinstance(section, dict):
         raise SetupRefused(f'{path}: [repos."{section_key}"] must be a table')
+    normalized, alias_errors = pipeline.normalize_impl_aliases(
+        section, f'[repos."{section_key}"]',
+    )
+    if alias_errors:
+        raise SetupRefused("; ".join(alias_errors))
+    section.clear()
+    section.update(normalized)
     section["verify_tools"] = list(verify_tools)
     section["permission_mode"] = permission_mode
     # Written even when blank: a missing key would inherit a nonblank
     # [defaults] value, not the "no --settings flag" the probe measured.
     section["engine_settings"] = engine_settings
-    # The route the probe measured. Both keys always, for the same reason: a
-    # missing model would inherit [defaults] and run a route nobody probed.
-    section["impl_engine"], section["model"] = probed_engine, probed_model
+    # Preserve intent separately from the effective model the probe measured.
+    # Old records contain only the measured model; retain their old meaning.
+    # An omitted effort does not overwrite an existing setting or pin defaults.
+    section["impl_engine"] = probed_engine
+    section["impl_model"] = record.get("impl_model", probed_model)
+    if "impl_effort" in record:
+        section["impl_effort"] = record["impl_effort"]
     section["probed_impl_engine"] = probed_engine
     section["probed_model"] = probed_model
     if base_ref is not None:
@@ -671,7 +691,15 @@ def _resolved_errors(
 ) -> list[str]:
     """Return why a tick would refuse, or misread, this repository's settings."""
     errors = list(config.errors)
-    if config.probed_route != route or (config.impl_engine, config.model) != route:
+    # The probe evidence must round-trip exactly as recorded. Routing defaults
+    # are compared by the model each route runs, as the tick's unprobed-route
+    # check does: an early inconclusive probe records a blank model, while
+    # legacy and canonical defaults may spell the engine default either way.
+    effective_route = (
+        config.impl_engine, pipeline.effective_engine_model(config.impl_engine, config.model),
+    )
+    probed_effective = (route[0], pipeline.effective_engine_model(*route))
+    if config.probed_route != route or effective_route != probed_effective:
         errors.append("the probed engine route does not resolve as written")
     if not config.repo_configured:
         errors.append(f"the file does not configure {repo}")
@@ -920,6 +948,23 @@ def install_deny_rules(path: Path) -> list[str]:
 # --- CLI ---
 
 
+class ImplementerSetting(argparse.Action):
+    """Reject conflicting CLI aliases at the first conflicting occurrence."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        other = (
+            self.dest.removeprefix("impl_") if self.dest.startswith("impl_")
+            else f"impl_{self.dest}"
+        )
+        previous = getattr(namespace, other, None)
+        if previous is not None and previous.strip() != values.strip():
+            parser.error(
+                f"conflicting --{self.dest.replace('_', '-')} and "
+                f"--{other.replace('_', '-')} aliases"
+            )
+        setattr(namespace, self.dest, values)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
     commands = parser.add_subparsers(dest="command", required=True)
@@ -931,7 +976,14 @@ def main(argv: list[str] | None = None) -> int:
     probe = commands.add_parser("probe", help="measure auto on the engine route")
     probe.add_argument("repo")
     probe.add_argument("--impl-engine", default="claude", choices=("claude", "claude-ds"))
-    probe.add_argument("--model", default="")
+    probe.add_argument("--impl-model", action=ImplementerSetting, type=str.strip)
+    probe.add_argument("--model", action=ImplementerSetting, type=str.strip,
+                       help="compatibility alias for --impl-model")
+    probe.add_argument("--impl-effort", action=ImplementerSetting, type=str.strip,
+                       choices=pipeline.ENGINE_EFFORT_LEVELS)
+    probe.add_argument("--effort", action=ImplementerSetting, type=str.strip,
+                       choices=pipeline.ENGINE_EFFORT_LEVELS,
+                       help="compatibility alias for --impl-effort")
     probe.add_argument("--verify-tool", action="append", default=[])
     probe.add_argument("--engine-settings", default="")
     write = commands.add_parser("write-config", help="record one repository")
@@ -945,6 +997,9 @@ def main(argv: list[str] | None = None) -> int:
     deny = commands.add_parser("deny-rules", help="show or install deny rules")
     deny.add_argument("--install", action="store_true")
     args = parser.parse_args(argv)
+    if args.command == "probe":
+        args.model = args.impl_model if args.impl_model is not None else (args.model or "")
+        args.effort = args.impl_effort if args.impl_effort is not None else args.effort
 
     try:
         return _dispatch(args)
@@ -982,7 +1037,7 @@ def _dispatch(args: argparse.Namespace) -> int:
         record = probe_record_path(args.repo)
         tools = _checked_tools(args.verify_tool)
         report = run_probe(args.repo, impl_engine=args.impl_engine,
-                           model=args.model, verify_tools=tools,
+                           model=args.model, effort=args.effort, verify_tools=tools,
                            engine_settings=_checked_settings(args.engine_settings))
         report["recorded_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         record.parent.mkdir(parents=True, exist_ok=True)

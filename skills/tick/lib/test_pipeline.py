@@ -6568,8 +6568,8 @@ def test_resolve_config_tuning_defaults_are_todays_values(
         shipped = floor["defaults"]
         assert isinstance(shipped, dict)
         assert set(pipeline._INT_SETTINGS) | {
-            "impl_engine", "model", "fix_engine", "fix_model",
-            "review_model", "review_effort", "effort", "fix_effort",
+            "impl_engine", "impl_model", "fix_engine", "fix_model",
+            "review_model", "review_effort", "impl_effort", "fix_effort",
         } <= set(shipped), "the shipped floor must state every default"
 
 

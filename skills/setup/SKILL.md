@@ -42,9 +42,12 @@ not work around it.
    they name another login, use theirs.
 3. **Repositories and route.** Ask which repositories to drive, as
    `owner/name`. Ask which engine route the tick will run: `--impl-engine`
-   (`claude` or `claude-ds`) and `--model` (blank for the operator's default).
+   (`claude` or `claude-ds`) and `--impl-model` (blank for the operator's default).
+   Offer `--impl-effort` only when the operator wants an effort override.
    The probe measures that route, and `write-config` records it as the
-   repository's `impl_engine` and `model`, so the tick runs it without flags.
+   repository's `impl_engine` and `impl_model`, so the tick runs it without flags.
+   It preserves blank model intent and existing or inherited effort when no
+   effort flag is given. Fixer settings remain explicit or inherited as before.
    It also writes separate `probed_impl_engine` and `probed_model` evidence.
    A config edit or flag selecting another route reports `startup_route_unprobed`;
    rerun setup to measure that route. See the [route metadata contract](../tick/README.md#deadlines-stall-limits-routing-and-cadence).
@@ -72,7 +75,7 @@ not work around it.
       tick run outside the session sandbox, so a sandboxed probe would measure a
       different environment. Tell the operator it makes two short model calls.
       ```bash
-      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude-ds] [--model <model>] [--verify-tool '<grant>' ...] [--engine-settings '<json-or-absolute-path>']
+      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude-ds] [--impl-model <model>] [--impl-effort <level>] [--verify-tool '<grant>' ...] [--engine-settings '<json-or-absolute-path>']
       ```
       `--engine-settings` is the `engine_settings` value that dispatch passes
       to engines as `--settings`. Omit it unless the operator chooses it in
@@ -89,7 +92,7 @@ not work around it.
         acceptable; the tick then marks its PRs "Verification unconfigured".
       - `auto_failed`, `unmeasurable`, or `inconclusive`: the route did not
         pass. Show `detail` and let the operator choose one of two outcomes:
-        1. Change the engine route (`--impl-engine`/`--model`) and probe
+        1. Change the engine route (`--impl-engine`/`--impl-model`) and probe
            again.
         2. Record `--permission-mode dontAsk` with named verification grants.
            If the list is empty, the operator must name the target's
@@ -111,7 +114,8 @@ not work around it.
       ```bash
       bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh write-config <owner/name> --login <login> --permission-mode <auto|dontAsk> [--verify-tool '<grant>' ...] [--engine-settings '<value>'] [--base-ref <branch>] --dry-run
       ```
-      Show `diff`. The rewrite keeps every value but normalises formatting
+      Show `diff`. The rewrite uses canonical implementer keys in this repository section,
+      preserves other settings, normalises formatting
       and drops comments. The previous file is kept as `config.toml.bak`. On
       the operator's approval, rerun without `--dry-run`. `changed: false`
       means the file already says this. `write-config` refuses a combination

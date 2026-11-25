@@ -69,6 +69,117 @@ def loop_repo(tmp_path):
     return repo, env
 
 
+@pytest.mark.parametrize("stage, mode, legacy, explicit, override, cross_engine", [
+    ("implement", "queue", False, False, True, False),
+    ("implement", "target", True, False, True, False),
+    ("implement", "target", False, False, False, False),
+    ("fix", "target", False, False, True, False),
+    ("fix", "loop", True, False, True, False),
+    ("fix", "target", False, True, True, False),
+    ("fix", "target", False, False, False, False),
+    ("fix", "target", False, False, False, True),
+])
+def test_impl_settings_public_launcher_emits_inherited_or_explicit_route(
+    loop_repo, stage, mode, legacy, explicit, override, cross_engine,
+):
+    repo, env = loop_repo
+    env["LOOP_TEST_STAGE"] = stage
+    kind = "issue" if stage == "implement" else "pr"
+    (repo / "label").write_text("ai:available" if stage == "implement" else "ai:changes-requested")
+    config = Path(env["PR_PIPELINE_CONFIG"])
+    with config.open("a") as f:
+        f.write('impl_model="sonnet"\nimpl_effort="low"\nfix_model=""\nfix_effort=""\n')
+    if stage == "fix" and mode == "target" and not cross_engine:
+        # Exercise setup persistence before the later per-run override. The
+        # saved record uses the legacy schema, which upgrades must still read.
+        records = config.parent / "setup-probes/example"
+        records.mkdir(parents=True)
+        (records / "loop.json").write_text(json.dumps({
+            "repo": "example/loop", "impl_engine": "claude", "model": "sonnet",
+            "outcome": "pass", "verify_tools": ["python -m pytest:*"],
+        }))
+        setup = Path(__file__).parents[2] / "setup/setup.sh"
+        result = subprocess.run(
+            ["bash", str(setup), "write-config", "example/loop", "--login", "test-owner",
+             "--permission-mode", "auto", "--verify-tool", "python -m pytest:*"],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+    prefix = "" if legacy else "impl-"
+    flags = [f"--{prefix}model", "opus", f"--{prefix}effort", "high"] if override else []
+    if cross_engine:
+        flags += ["--fix-engine", "claude-ds"]
+        env["DEEPSEEK_API_KEY"] = "fixture-key"
+    if explicit:
+        flags += ["--fix-model", "haiku", "--fix-effort", "max"]
+    if mode != "queue":
+        flags += ["#7" if stage == "implement" else "pr:7"]
+    if mode == "loop":
+        flags += ["--loop"]
+    launcher = Path(__file__).parents[1] / "pr-pipeline.sh"
+    env["PR_PIPELINE_HOME"] = str(Path(__file__).resolve().parents[3])
+    stderr = repo / "route.stderr"
+    proc = None
+    engine_pid = None
+    marker = repo / ".claude/worktrees" / f"{kind}-7" / "dispatch.json"
+    try:
+        with stderr.open("w") as err:
+            proc = subprocess.Popen(["bash", str(launcher), "tick", *flags], cwd=repo, env=env,
+                                    stdout=err, stderr=err, start_new_session=True)
+            deadline = time.monotonic() + 60
+            while not ((repo / "engine-route.json").exists() and marker.exists()):
+                assert proc.poll() in (None, 0), stderr.read_text()
+                assert time.monotonic() < deadline, stderr.read_text()
+                time.sleep(0.05)
+            route = json.loads((repo / "engine-route.json").read_text())
+            engine_pid = json.loads(marker.read_text())["pid"]
+            argv = route["argv"]
+            expected_model = "haiku" if explicit else "opus" if override else "sonnet"
+            if cross_engine:
+                expected_model = pipeline.effective_engine_model("claude-ds", "")
+            assert argv[argv.index("--model") + 1] == expected_model
+            assert route["effort"] == ("max" if explicit else "high" if override else "low")
+            assert Path(route["cwd"]) == marker.parent
+            assert (marker.parent / ".git").is_file()
+            if mode != "loop":
+                assert proc.wait(timeout=30) == 0, stderr.read_text()
+    finally:
+        # The local fixture exits cooperatively; wait for its wrapper to reap
+        # it before stopping the controller, rather than signalling a stale PID.
+        (repo / "engine-exit").touch()
+        if engine_pid is None and marker.exists():
+            engine_pid = json.loads(marker.read_text()).get("pid")
+        if engine_pid is not None:
+            deadline = time.monotonic() + 10
+            result = marker.parent / "result.json"
+            while time.monotonic() < deadline and not (result.exists() and result.stat().st_size):
+                time.sleep(0.05)
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.wait(timeout=5)
+
+
+@pytest.mark.parametrize("cli", [False, True])
+def test_impl_settings_conflicts_refuse_public_tick_before_launch(loop_repo, cli):
+    repo, env = loop_repo
+    env["LOOP_TEST_STAGE"] = "implement"
+    (repo / "label").write_text("ai:available")
+    flags = ["--impl-model", "sonnet", "--model", "opus"] if cli else []
+    if not cli:
+        with Path(env["PR_PIPELINE_CONFIG"]).open("a") as f:
+            f.write('impl_model="sonnet"\nmodel="opus"\n')
+    result = subprocess.run(["bash", str(Path(__file__).parents[1] / "tick.sh"), *flags],
+                            cwd=repo, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and "conflict" in result.stderr
+    assert not (repo / "engine-started").exists()
+    assert not (repo / ".claude/worktrees/issue-7/dispatch.json").exists()
+    assert (repo / "label").read_text() == "ai:available"
+
+
 @pytest.mark.parametrize("stage", ["implement", "fix"])
 def test_real_loop_wakes_after_child_exit_before_emitted_cadence(loop_repo, stage):
     repo, env = loop_repo
@@ -504,6 +615,9 @@ from pathlib import Path
 root = Path(os.environ["LOOP_TEST_ROOT"])
 with (root / "calls.jsonl").open("a") as log:
     log.write(json.dumps(["claude", *sys.argv[1:]]) + "\\n")
+(root / "engine-route.json").write_text(json.dumps({
+    "argv": sys.argv[1:], "effort": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"), "cwd": os.getcwd(),
+}))
 (root / "engine-started").touch()
 while not (root / "engine-exit").exists():
     time.sleep(0.02)

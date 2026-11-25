@@ -2156,6 +2156,8 @@ _CONFIG_KEYS = (
     "engine_settings",
     "max_in_flight",
     "impl_engine",
+    "impl_model",
+    "impl_effort",
     "model",
     "fix_engine",
     "fix_model",
@@ -2305,7 +2307,8 @@ class ResolvedConfig:
             engine's first output event.
         max_iterations: Review/fix rounds before ``ai:max-iterations``.
         impl_engine: The implementer engine, one of :data:`ENGINE_ROUTES`.
-        model: The implementer ``--model``; ``""`` is the engine default.
+        model: Resolved ``impl_model`` (legacy internal field name);
+            ``""`` is the engine default.
         fix_engine: The fixer engine; a blank key inherits ``impl_engine``.
         fix_model: The fixer ``--model``. A blank key inherits ``model`` when
             the fixer runs on the implementer's engine, and is the engine
@@ -2314,7 +2317,8 @@ class ResolvedConfig:
             codex config, then the pinned fallback.
         review_effort: The reviewer reasoning effort, resolved like
             ``review_model``.
-        effort: The implementer effort, one of :data:`ENGINE_EFFORT_LEVELS`;
+        effort: Resolved ``impl_effort`` (legacy internal field name), one of
+            :data:`ENGINE_EFFORT_LEVELS`;
             ``""`` is no override (``claude-ds`` then runs at ``max``).
         fix_effort: The fixer effort. A blank key inherits ``effort`` on any
             fixer engine: effort levels belong to no single provider.
@@ -3250,6 +3254,32 @@ def _stall_bound_problems(ints: Mapping[str, int]) -> list[str]:
     ]
 
 
+def normalize_impl_aliases(
+    table: Mapping[str, object], label: str,
+) -> tuple[dict[str, object], list[str]]:
+    """Normalize implementer aliases in one layer, before selecting precedence.
+
+    Equal strings after whitespace trimming are equivalent. Conflicts are
+    errors even when another layer would override them. Callers must refuse
+    errors before launch or persistence.
+    """
+    normalized = dict(table)
+    problems: list[str] = []
+    for legacy in ("model", "effort"):
+        canonical = f"impl_{legacy}"
+        if legacy not in normalized:
+            continue
+        old = normalized.pop(legacy)
+        if canonical in normalized:
+            new = normalized[canonical]
+            if not (isinstance(old, str) and isinstance(new, str)
+                    and old.strip() == new.strip()):
+                problems.append(f"{label}: conflicting {canonical} and {legacy} aliases")
+        else:
+            normalized[canonical] = old
+    return normalized, problems
+
+
 def _resolve_routes(
     layers: Sequence[tuple[str, Mapping[str, object]]],
 ) -> tuple[dict[str, str], list[str]]:
@@ -3273,11 +3303,16 @@ def _resolve_routes(
         :class:`ResolvedConfig` route field.
     """
     problems: list[str] = []
+    normalized_layers = []
+    for label, table in layers:
+        normalized, alias_problems = normalize_impl_aliases(table, label)
+        normalized_layers.append((label, normalized))
+        problems.extend(alias_problems)
 
     def resolve(key: str, default: str, valid: Callable[[str], bool],
                 blank_means: str = "") -> str:
         value, problem = _resolve_string(
-            _pick(layers, key), key, default, valid, blank_means=blank_means,
+            _pick(normalized_layers, key), key, default, valid, blank_means=blank_means,
         )
         if problem:
             problems.append(problem)
@@ -3290,7 +3325,7 @@ def _resolve_routes(
         return ENGINE_MODEL_RE.fullmatch(value) is not None
 
     impl_engine = resolve("impl_engine", ENGINE_ROUTES[0], is_engine)
-    model = resolve("model", "", is_model, "the engine's default model")
+    model = resolve("impl_model", "", is_model, "the engine's default model")
     fix_engine = resolve(
         "fix_engine", "", is_engine, "the implementer's engine",
     ) or impl_engine
@@ -3309,7 +3344,7 @@ def _resolve_routes(
     def is_effort(value: str) -> bool:
         return value in ENGINE_EFFORT_LEVELS
 
-    effort = resolve("effort", "", is_effort, "the engine's default effort")
+    effort = resolve("impl_effort", "", is_effort, "the engine's default effort")
     fix_effort = resolve(
         "fix_effort", "", is_effort, "the implementer's effort",
     ) or effort

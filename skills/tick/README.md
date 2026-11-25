@@ -365,11 +365,11 @@ activity. Each one can be set in `[defaults]` and overridden in
 | `engine_stall_startup_grace_seconds` | seconds | 300 | integer ≥ 0 | all three stage dispatchers, recorded in the marker |
 | `max_iterations` | review/fix rounds | 5 | integer ≥ 1 | reviewer harvest: the round that reaches it gets `ai:max-iterations` |
 | `impl_engine` | — | `"claude"` | `"claude"` or `"claude-ds"` | implementer launch |
-| `model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
+| `impl_model` | — | `""` | blank, or a model id not starting with `-` | implementer `--model` (`ANTHROPIC_MODEL` for claude-ds) |
 | `fix_engine` | — | `""` | blank (the implementer's engine), `"claude"`, or `"claude-ds"` | fixer launch |
-| `fix_model` | — | `""` | blank, or a model id | fixer `--model`; blank inherits `model` only while the fixer runs on the implementer's engine |
-| `effort` | — | `""` | blank, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | implementer `CLAUDE_CODE_EFFORT_LEVEL`; blank sets nothing on claude (the inherited environment and settings apply) and means `max` on claude-ds |
-| `fix_effort` | — | `""` | blank, or a level allowed for `effort` | fixer `CLAUDE_CODE_EFFORT_LEVEL`; blank inherits `effort` on any fixer engine |
+| `fix_model` | — | `""` | blank, or a model id | fixer `--model`; blank inherits `impl_model` only while the fixer runs on the implementer's engine |
+| `impl_effort` | — | `""` | blank, `"low"`, `"medium"`, `"high"`, `"xhigh"`, or `"max"` | implementer `CLAUDE_CODE_EFFORT_LEVEL`; blank sets nothing on claude (the inherited environment and settings apply) and means `max` on claude-ds |
+| `fix_effort` | — | `""` | blank, or a level allowed for `impl_effort` | fixer `CLAUDE_CODE_EFFORT_LEVEL`; blank inherits `impl_effort` on any fixer engine |
 | `review_model` | — | `""` | blank (codex config, then `gpt-5.5`), or a model id | reviewer `--model` |
 | `review_effort` | — | `""` | blank (codex config, then `high`), or a bare token | reviewer `model_reasoning_effort` |
 | `loop_short_poll_seconds` | seconds | 270 | integer ≥ 60, not 300 | wake while work is queued, at capacity, or state is unknown |
@@ -381,10 +381,19 @@ activity. Each one can be set in `[defaults]` and overridden in
 
 Precedence is the same as for every key: explicit CLI flags, then
 `[repos."owner/name"]`, then `[defaults]`, then the packaged floor. Only the
-route keys have flags: `--impl-engine`, `--model`, `--fix-engine`,
-`--fix-model`, `--effort`, `--fix-effort`, `--review-model`, and
+route keys have flags: `--impl-engine`, `--impl-model`, `--fix-engine`,
+`--fix-model`, `--impl-effort`, `--fix-effort`, `--review-model`, and
 `--review-effort`. A typed flag is
 validated like a config value.
+
+`model` and `effort` remain compatibility aliases for `impl_model` and
+`impl_effort`. Each layer normalizes aliases before precedence is applied:
+for example, a repository's legacy `model` overrides a canonical `impl_model`
+in `[defaults]`. Within one table, both names must contain equal strings after
+whitespace trimming; conflicting aliases stop startup even if a higher layer
+would override them. The CLI accepts `--model` and `--effort` with the same
+rule: mixed spellings must agree. Repeating one spelling keeps its last value.
+These rules apply to both tick and setup probe flags.
 
 Integer keys accept integers only. A boolean, float, or string, a value below
 the minimum, a wake of exactly 300 seconds (the prompt-cache TTL cliff, which
@@ -406,9 +415,16 @@ deadline and stall limits are recorded in its `dispatch.json` at dispatch:
 reconciliation, the stall watcher, and the status dashboard read them from
 there, so a later edit does not move them for an engine already running.
 
-`/pr-pipeline:setup` sets `impl_engine` and `model` in the repository's section,
+`/pr-pipeline:setup` sets `impl_engine` and `impl_model` in the repository's section,
 so the tick runs the measured route without flags. In the same atomic config
 write, it records separate `probed_impl_engine` and `probed_model` evidence.
+Setup keeps the requested model separate from the measured model: a blank
+`impl_model` stays blank, while `probed_model` records the effective model.
+An explicit setup `--impl-effort` is recorded as `impl_effort`; omission keeps
+the existing setting or its inheritance. Setup does not resolve and pin fixer
+settings. Old probe records remain readable; their recorded `model` retains
+its prior meaning. Setup writes canonical names in the selected repository
+section and preserves other sections.
 These two metadata keys apply only to that repository; they do not inherit
 from `[defaults]` or CLI flags. Edit routing defaults as needed, and refresh
 probe metadata only by rerunning setup. Both metadata keys must be present
@@ -1044,13 +1060,13 @@ writes the probed implementer route there. A flag overrides the configuration
 for one run, and the tick reports at startup when that run's implementer route
 differs from the probed one (see [Configuration](#deadlines-stall-limits-routing-and-cadence)).
 
-### Model override (`--model`)
+### Model override (`--impl-model`)
 
 ```bash
-~/.claude/pr-pipeline/bin/pr-pipeline tick --model claude-sonnet-4-6
+~/.claude/pr-pipeline/bin/pr-pipeline tick --impl-model claude-sonnet-4-6
 ```
 
-Sets the implementer model (config key `model`), which the fixer inherits as
+Sets the implementer model (config key `impl_model`), which the fixer inherits as
 described above. When the resolved value is blank, the
 `claude` engine gets **no `--model` flag at all**, so the CLI resolves the model
 through its own settings precedence — upgrade your default and the pipeline
@@ -1062,20 +1078,20 @@ it when a run must be pinned regardless of branch content. `claude-ds` still
 defaults to `deepseek-v4-pro[1m]`, because the DeepSeek endpoint cannot resolve
 Anthropic model aliases and so has no operator default to inherit.
 
-When given, `--model` overrides the `--model` CLI flag for the `claude` engine
+When given, `--impl-model` supplies the native `--model` CLI flag for the `claude` engine
 and additionally sets `ANTHROPIC_MODEL` for `claude-ds`.
 
-### Implementer and fixer effort (`--effort`, `--fix-effort`)
+### Implementer and fixer effort (`--impl-effort`, `--fix-effort`)
 
 ```bash
-~/.claude/pr-pipeline/bin/pr-pipeline tick --effort high --fix-effort medium
+~/.claude/pr-pipeline/bin/pr-pipeline tick --impl-effort high --fix-effort medium
 ```
 
 Sets the effort level that the implementer and the fixer receive as
-`CLAUDE_CODE_EFFORT_LEVEL` (config keys `effort` and `fix_effort`). The allowed
+`CLAUDE_CODE_EFFORT_LEVEL` (config keys `impl_effort` and `fix_effort`). The allowed
 levels are `low`, `medium`, `high`, `xhigh` and `max`; any other value stops the
 tick at startup with an error that names the key. A blank `fix_effort` inherits
-`effort` on any fixer engine, because effort levels are not specific to one
+`impl_effort` on any fixer engine, because effort levels are not specific to one
 provider (a model id is, which is why `fix_model` inherits only on the same
 engine).
 
@@ -1311,7 +1327,7 @@ the value to the repository section even when blank, so a nonblank
 Accepting `--permission-mode auto` proves nothing, and neither does a run that
 merely starts: `auto` depends on the provider, model, and account, and a
 classifier denial is not an approval. Setup therefore measures the route the
-tick will use (`impl_engine`, `model`) for each repository, and `write-config`
+tick will use (`impl_engine`, `impl_model`) for each repository, and `write-config`
 records routing defaults and separate probe evidence in the repository's
 section (see [the route metadata contract](#deadlines-stall-limits-routing-and-cadence)):
 

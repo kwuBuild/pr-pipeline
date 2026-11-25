@@ -1659,7 +1659,7 @@ def test_shipped_floor_carries_no_operator_owned_table() -> None:
 
 
 def test_shipped_floor_declares_every_per_target_setting() -> None:
-    """Every per-target key the runtime reads must appear in the floor.
+    """Every canonical per-target setting must appear in the floor.
 
     The floor is what a fresh install runs on and what the file documents to an
     adopter. A key the resolver reads but the floor omits is a setting an
@@ -1671,7 +1671,11 @@ def test_shipped_floor_declares_every_per_target_setting() -> None:
     with open(POLICY_CONFIG, "rb") as fh:
         config = tomllib.load(fh)
 
-    missing = set(pipeline._CONFIG_KEYS) - set(config.get("defaults", {}))
+    # Compatibility aliases are documented, but only canonical names should
+    # carry defaults: two editable spellings would invite same-layer conflicts.
+    canonical = set(pipeline._CONFIG_KEYS) - {"model", "effort"}
+    missing = canonical - set(config.get("defaults", {}))
+    assert not {"model", "effort"} & set(config["defaults"])
 
     assert not missing, (
         f"the packaged floor omits per-target settings the resolver reads: "
