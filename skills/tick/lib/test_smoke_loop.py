@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 import pipeline
+import process_control
 import pytest
 
 
@@ -142,6 +143,47 @@ def test_real_loop_wakes_after_child_exit_before_emitted_cadence(loop_repo, stag
                 proc.wait(timeout=5)
         # A failing baseline still has its live fixture engine. Its separate
         # process group must not outlive the test's temporary repository.
+        if engine_pid is None and marker_path.exists():
+            engine_pid = json.loads(marker_path.read_text()).get("pid")
+        if engine_pid:
+            try:
+                os.killpg(engine_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+
+@pytest.mark.parametrize("stage", ["implement", "fix"])
+def test_real_launch_records_the_os_start_time_identity_reads(loop_repo, stage):
+    # macOS reports start time in whole seconds. A wall-clock stamp taken after
+    # spawn can sit more than the 1s tolerance away and read as PID reuse.
+    repo, env = loop_repo
+    env["LOOP_TEST_STAGE"] = stage
+    kind = "issue" if stage == "implement" else "pr"
+    (repo / "label").write_text(
+        "ai:available" if stage == "implement" else "ai:changes-requested"
+    )
+    marker_path = repo / ".claude" / "worktrees" / f"{kind}-7" / "dispatch.json"
+    engine_pid = None
+    try:
+        dispatch = subprocess.run(
+            ["bash", str(Path(__file__).parents[1] / "tick.sh"),
+             "#7" if kind == "issue" else "pr:7"],
+            cwd=repo, env=env, text=True, capture_output=True, timeout=90,
+        )
+        assert dispatch.returncode == 0, dispatch.stderr
+        marker = json.loads(marker_path.read_text())
+        engine_pid = marker["pid"]
+        # Read the live engine the way the tick does, from a separate process:
+        # this suite's guard hides other processes' start times in-process.
+        live_start = json.loads(subprocess.run(
+            [sys.executable, process_control.__file__, "get-start-time",
+             "--pid", str(engine_pid)],
+            capture_output=True, text=True, check=True, timeout=30,
+        ).stdout)["start_time"]
+        if live_start is None:
+            pytest.skip("process start time is unreadable on this host")
+        assert marker["start_time"] == live_start
+    finally:
         if engine_pid is None and marker_path.exists():
             engine_pid = json.loads(marker_path.read_text()).get("pid")
         if engine_pid:

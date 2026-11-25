@@ -3420,6 +3420,27 @@ def _nonempty_file(path: str) -> bool:
         return False
 
 
+def _engine_start_time(pid: int) -> float:
+    """Return the start time to record in a published engine marker.
+
+    Identity verification compares the recorded value with
+    :func:`process_control.get_process_start_time`, so record that same OS
+    value. macOS ``ps -o lstart=`` reports whole seconds: a wall-clock stamp
+    taken after spawn sits up to one second plus the launch delay later, and
+    on a slow host that exceeds the 1s tolerance. The live engine then reads
+    as PID reuse, so the tick stops counting it and can harvest it as gone.
+
+    Args:
+        pid: The spawned engine's process identifier.
+
+    Returns:
+        The OS-reported start time, or the current wall-clock time when the
+        OS value is unreadable.
+    """
+    start = process_control.get_process_start_time(pid)
+    return time.time() if start is None else start
+
+
 def _is_positive_marker_pid(marker: Mapping[str, object]) -> bool:
     """Return whether a marker names a process at all.
 
@@ -10865,7 +10886,7 @@ def _dispatch_one_reviewer(
     published_marker = dict(lease_marker)
     published_marker.pop("state", None)
     published_marker["pid"] = proc.pid
-    published_marker["start_time"] = time.time()
+    published_marker["start_time"] = _engine_start_time(proc.pid)
     published_marker["pgid"] = proc.pid
 
     marker_ok = _publish_marker_or_revert(
@@ -11596,7 +11617,7 @@ def _dispatch_one_implementer(
     published_marker = dict(lease_marker)
     published_marker.pop("state", None)
     published_marker["pid"] = proc.pid
-    published_marker["start_time"] = time.time()
+    published_marker["start_time"] = _engine_start_time(proc.pid)
     published_marker["pgid"] = proc.pid
 
     marker_ok = _publish_marker_or_revert(
@@ -12730,7 +12751,7 @@ def _dispatch_one_fixer(
     published_marker = dict(lease_marker)
     published_marker.pop("state", None)
     published_marker["pid"] = proc.pid
-    published_marker["start_time"] = time.time()
+    published_marker["start_time"] = _engine_start_time(proc.pid)
     published_marker["pgid"] = proc.pid
 
     marker_ok = _publish_marker_or_revert(
