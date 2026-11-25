@@ -5,6 +5,23 @@ The reviewer supplies the report. The controller validates its structure, pins
 its identity, publishes it, and passes it to the next fixer and reviewer.
 Structural validity does not prove review quality or sufficient business judgment.
 
+## Review scope
+
+Every review round assesses the complete current PR against its pinned diff base
+and head, including the original implementation and all accumulated revisions.
+Inspect the affected callers and contracts as needed to judge the task. Previous
+findings and the fixer report guide follow-up but do not restrict the review to
+those findings, the latest commit, or the fixer's changed files. Report newly
+discovered blocker or major findings within the task contract as well as any
+unresolved original findings.
+
+A revision-only diff helps explain what the fixer changed. It does not replace
+the full PR diff. State the scope actually examined and any material gaps in the
+report. Reuse applicable verification evidence with its tested revision and
+limits; full-PR review does not require rerunning every successful check.
+The controller supplies the full diff range and discussion context, but its
+structural report checks do not enforce review depth.
+
 ## Report content
 
 New dispatches use `report_protocol_version: 2` and the installed

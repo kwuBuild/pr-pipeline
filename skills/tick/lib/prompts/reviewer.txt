@@ -60,7 +60,17 @@ Review exactly the checked-out PR head:
 - Diff base SHA (merge-base of base and head): {base_sha}
 - Head SHA: {head_sha}
 
-Use the pinned SHAs above for the diff contract (diff base..head covers only this PR's own commits). Return only JSON that conforms to the provided review output schema.
+Review the full PR on every round, including re-review after a fixer run.
+Use `git diff {base_sha} {head_sha}` to inspect the complete current change
+against the pinned diff base. Assess the original implementation, all accumulated
+revisions, and affected callers and contracts. The originating findings and
+fixer report guide follow-up; do not limit the review to the latest fixer commit
+or the files and findings named in that report. Report new blocker or major
+findings anywhere within the PR's task contract, as well as unresolved original
+findings. A previous-head-to-current-head diff can explain the latest revision,
+but cannot replace the full PR diff. Describe the scope actually examined and
+any material gaps in your report. Return only JSON that conforms to the provided
+review output schema.
 
 Use report_protocol_version 2. Explain the verdict and task contract in reasoning
 and scope. Distinguish files inspected from checks executed. In verification,

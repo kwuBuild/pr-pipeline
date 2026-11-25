@@ -152,8 +152,11 @@ def test_full_text_survives_large_context_and_quoted_tokens(github):
 
 
 
-@pytest.mark.parametrize('stage', ['review', 'fix'])
-def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tmp_path, monkeypatch, github, stage):
+@pytest.mark.parametrize('stage,pre_label', [
+    ('review', 'ai:implemented'), ('review', 'ai:revised'),
+    ('fix', 'ai:changes-requested'),
+])
+def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tmp_path, monkeypatch, github, stage, pre_label):
     import tick
     import pipeline
     from unittest import mock
@@ -178,7 +181,7 @@ def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tm
     popen = mock.Mock(return_value=mock.Mock(pid=12345))
     monkeypatch.setattr(tick.subprocess, 'Popen', popen)
     if stage == 'review':
-        tick._dispatch_one_reviewer(pr_number=42, pre_label='ai:implemented')
+        tick._dispatch_one_reviewer(pr_number=42, pre_label=pre_label)
     else:
         tick._dispatch_one_fixer(pr_number=42)
     popen.assert_called_once()
@@ -201,6 +204,11 @@ def test_dispatch_supplies_complete_files_and_keeps_selected_review_authority(tm
         assert marker['review_handoff'] == pipeline.review_reports.handoff(selected)
         assert selected in prompt
     else:
+        normalized = ' '.join(prompt.split())
+        assert 'Review the full PR on every round' in normalized
+        assert f"git diff {marker['base_sha']} {marker['head_sha']}" in prompt
+        assert 'do not limit the review to the latest fixer commit' in normalized
+        assert 'new blocker or major findings' in normalized
         assert '-s' in popen.call_args.args[0]
         assert 'read-only' in popen.call_args.args[0]
         assert 'GH_TOKEN' not in popen.call_args.kwargs['env']

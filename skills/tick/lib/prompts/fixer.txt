@@ -68,10 +68,19 @@ the repository's own verification commands: its tests, linter and type checker
 in the order and exact invocations prescribed by `CLAUDE.md`/`AGENTS.md` and
 the documents they reference, until every required command passes. Green commands are
 necessary but not sufficient: verify the story surface and sibling paths too.
+For a changed outcome, append one focused commit for this revision round after
+verification. Follow the target repository's commit-message conventions. Keep
+the dispatched head and all published PR commits as ancestors of your revision.
+Do not amend, squash, rebase, or otherwise rewrite published PR commits. Final
+merge and any squash of published history belong to the owner. If the target's
+history requirements cannot be satisfied by appending a revision, report
+NEEDS_HUMAN_DECISION and explain the conflict.
+
 Commit, then push using only:
 `git push {target_remote} HEAD:refs/heads/{head_ref}`
 The worktree has a detached HEAD. Do not force-push or overwrite an advanced
-remote head to repair report formatting. If every finding needs no change,
+remote head. If the normal push is rejected, report NEEDS_HUMAN_DECISION with
+the failure and any work already published. If every finding needs no change,
 verify the existing behavior without fabricating a commit or pushing.
 
 The controller can publish an optional PR body replacement. When the current

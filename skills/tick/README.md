@@ -1367,6 +1367,21 @@ Applying `--approve-for-me` would permit workspace writes and approval-based
 escalation, changing that review boundary. No live Codex approval probe or
 provider-capability claim is implied by the CLI inspection.
 
+### Revision commits and review scope
+
+The [fixer prompt](lib/prompts/fixer.txt) requests one focused appended commit
+for a changed revision round and preserves published history. A no-change
+response needs no commit or push. The owner controls the final merge and any
+squash, according to the target repository's policy; target history requirements
+do not widen the fixer's normal-push authority.
+
+The [reviewer prompt](lib/prompts/reviewer.txt) requires the complete current PR
+diff on every round, including re-review. The original findings and fixer report
+guide follow-up without restricting new findings. Dispatch supplies the pinned
+diff base, current head, and complete discussion context. These are engine
+instructions: report validation does not prove review depth or enforce the
+number of commits a fixer creates.
+
 ### Prompt-bound skills (`skill_unresolved`)
 
 The fixer binds `review-response-hygiene` and `definition-of-done` through the
