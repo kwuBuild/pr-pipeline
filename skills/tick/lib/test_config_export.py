@@ -105,10 +105,13 @@ max_in_flight=7
 @pytest.mark.parametrize("body,settings", [
     ('[operator]\nlogin="sk-secret /"', ["login"]),
     ('[defaults]\nimpl_engine="sk-secret /"', ["impl_engine"]),
-    ('[defaults]\nmodel="sk-secret /"', ["model"]),
+    ('[defaults]\nimpl_model="sk-secret /"', ["impl_model"]),
+    # Legacy aliases normalize before validation, so errors name the canonical key.
+    ('[defaults]\nmodel="sk-secret /"', ["impl_model"]),
     ('[defaults]\nfix_engine="sk-secret /"', ["fix_engine"]),
     ('[defaults]\nfix_model="sk-secret /"', ["fix_model"]),
-    ('[defaults]\neffort="sk-secret /"', ["effort"]),
+    ('[defaults]\nimpl_effort="sk-secret /"', ["impl_effort"]),
+    ('[defaults]\neffort="sk-secret /"', ["impl_effort"]),
     ('[defaults]\nfix_effort="sk-secret /"', ["fix_effort"]),
     ('[defaults]\nengine_settings="sk-secret /"', ["engine_settings"]),
     ('[defaults]\nverify_tools=["Bash(sk-secret /)"]', ["verify_tools"]),

@@ -11,6 +11,8 @@ import time
 
 import pytest
 
+from test_review_reports import wait_for_engine_result
+
 
 @pytest.fixture
 def offline_tick(tmp_path):
@@ -272,7 +274,7 @@ def test_cli_blocked_dispatch_still_harvests_finished_work(offline_tick, tmp_pat
     first = run_installed_tick(install, root, env, ["#7"])
     assert first.returncode == 0, first.stdout + first.stderr
     wt = root / ".claude" / "worktrees" / "issue-7"
-    wait_until(lambda: (wt / "result.json").exists() and (wt / "result.json").stat().st_size)
+    wait_for_engine_result(wt)
     doc.unlink()
 
     result = run_installed_tick(install, root, env, ["#7"])

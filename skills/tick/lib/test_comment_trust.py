@@ -762,8 +762,8 @@ def test_cli_approved_reply_cannot_exceed_configured_round_cap(comment_cli, labe
         report = revision_for(marker["review_handoff"], dispatch_id=marker["dispatch_id"],
                               pinned_head=marker["head_sha"], published_head=marker["head_sha"],
                               outcome=pipeline.SENTINEL_NEEDS_HUMAN_DECISION)
-        from test_review_reports import wait_for_artifact
-        wait_for_artifact(marker_path.with_name("result.json"))
+        from test_review_reports import wait_for_engine_result
+        wait_for_engine_result(marker_path.parent)
         marker_path.with_name("result.json").write_text(json.dumps({
             "type": "result", "is_error": False, "claude_exit_status": 0,
             "report_protocol_version": 2, "result": json.dumps(report), "structured_output": report}))

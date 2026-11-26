@@ -380,7 +380,7 @@ print(json.dumps(event))
     run_report_tick(root, env)
     body = json.loads((root / "reports.json").read_text())[0]
     snapshot = json.loads((worktree / "dispatch.json").read_text())["review_handoff"]
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     run_report_tick(root, env)
     wait_for_artifact(root / "reviewer-argv.json")
     argv = json.loads((root / "reviewer-argv.json").read_text())
@@ -494,6 +494,33 @@ def wait_for_artifact(path):
             return
         time.sleep(0.02)
     pytest.fail(f"engine did not produce {path.name}")
+
+
+def wait_for_engine_result(worktree):
+    """Wait until the wrapperless engine has exited with a non-empty result.
+
+    The engine's stdout is redirected to ``result.json``, so a non-empty file
+    can still be mid-write. Like the tick, treat it as complete only after the
+    marker's PID has exited.
+    """
+    result = worktree / "result.json"
+    pid = json.loads((worktree / "dispatch.json").read_text())["pid"]
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if result.exists() and result.stat().st_size and not pid_running(pid):
+            return
+        time.sleep(0.02)
+    pytest.fail(f"engine {pid} did not exit with a non-empty {result.name}")
+
+
+def pid_running(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def install_reviewer_shim(root, env, report):
