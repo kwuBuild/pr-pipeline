@@ -15,7 +15,7 @@ import pytest
 from test_smoke_loop import loop_repo  # noqa: F401
 from test_review_reports import (  # noqa: F401
     comment, install_reviewer_shim, report, report_repo, run_report_tick,
-    wait_for_artifact,
+    wait_for_artifact, wait_for_engine_result,
 )
 
 
@@ -268,7 +268,7 @@ def test_real_fixer_outcomes_retain_complete_evidence_without_code_reruns(report
     install_reviewer_shim(root, env, dict(report, verdict="ready_for_human", findings=[]))
     run_report_tick(root, env)
     worktree = root / ".claude/worktrees/pr-7"
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     if case == "legacy":
         marker = json.loads((worktree / "dispatch.json").read_text())
         del marker["report_protocol_version"], marker["report_transport"]
@@ -345,7 +345,7 @@ def test_real_publication_failures_retry_without_losing_source_or_repeating_code
     install_reviewer_shim(root, env, dict(report, verdict="ready_for_human", findings=[]))
     run_report_tick(root, env)
     worktree = root / ".claude/worktrees/pr-7"
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     source = (worktree / "result.json").read_bytes()
     (root / ".claude/worktrees/7-attempts").write_text("1")
     if fault == "archive":
@@ -395,7 +395,7 @@ def test_archive_move_failure_keeps_retry_counter_and_original_worktree(report_r
     install_reviewer_shim(root, env, dict(report, verdict="ready_for_human", findings=[]))
     run_report_tick(root, env)
     worktree = root / ".claude/worktrees/pr-7"
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     fail = root / "fail-comment"
     fail.touch()
     run_report_tick(root, env)
@@ -431,7 +431,7 @@ def test_late_authority_change_prevents_stale_fixer_publication(report_repo, ori
     prepare_fixer(root, env, original)
     run_report_tick(root, env)
     worktree = root / ".claude/worktrees/pr-7"
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     (root / f"late-{change}").touch()
     run_report_tick(root, env)
     assert (worktree / "dispatch.json").exists()
@@ -461,7 +461,7 @@ def test_real_fixer_launch_pins_protocol_through_adapter_and_reviewer_handoff(re
     install_reviewer_shim(root, env, followup)
     run_report_tick(root, env)
     worktree = root / ".claude/worktrees/pr-7"
-    wait_for_artifact(worktree / "result.json")
+    wait_for_engine_result(worktree)
     marker = json.loads((worktree / "dispatch.json").read_text())
     result = json.loads((worktree / "result.json").read_text())
     assert marker["report_protocol_version"] == result["report_protocol_version"] == 2
