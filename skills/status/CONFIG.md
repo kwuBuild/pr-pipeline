@@ -48,11 +48,12 @@ newline; standard error is empty. Version 1 has exactly these top-level fields:
 
 Routes are the resolver's resolved values. A blank fixer engine inherits the
 implementer engine. A blank fixer model inherits the implementer model only
-when the engines match. Blank fixer effort inherits implementer effort across
-engines. An empty resolved model or effort means no override; this export
+when the engines match. Blank fixer effort inherits within the Claude family
+or within Codex; crossing that boundary uses the destination default.
+An empty resolved model or effort means no override; this export
 does not query a provider's model defaults or convert engine-specific effort
 defaults into applied settings. `cooldown_domain` uses the tick's shared domain
-mapping (`claude` or `claude-ds`). It is a route domain, not evidence that a
+mapping (`claude`, `claude-ds`, or `codex`). It is a route domain, not evidence that a
 cooldown is active or applies to a particular item.
 
 The fixed context description is:

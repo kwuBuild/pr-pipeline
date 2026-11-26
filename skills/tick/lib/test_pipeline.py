@@ -6746,7 +6746,7 @@ def test_resolve_config_fixer_route_inherits_only_a_usable_model(
 
 @pytest.mark.parametrize("key, value", [
     ("impl_engine", '""'),
-    ("impl_engine", '"codex"'),
+    ("impl_engine", '"unknown"'),
     ("impl_engine", "true"),
     ("fix_engine", '"claude-dss"'),
     ("model", '"-p"'),
@@ -6874,7 +6874,7 @@ def test_resolve_config_reports_the_route_recorded_for_the_repository(
 @pytest.mark.parametrize("metadata, key", [
     ('probed_impl_engine = "claude"\n', "probed_model"),
     ('probed_model = "sonnet"\n', "probed_impl_engine"),
-    ('probed_impl_engine = "codex"\nprobed_model = "sonnet"\n', "probed_impl_engine"),
+    ('probed_impl_engine = "unknown"\nprobed_model = "sonnet"\n', "probed_impl_engine"),
     ('probed_impl_engine = "claude"\nprobed_model = true\n', "probed_model"),
     ('probed_impl_engine = "claude"\nprobed_model = "-p"\n', "probed_model"),
 ])

@@ -24,49 +24,7 @@ import pytest
 
 @pytest.fixture
 def loop_repo(tmp_path):
-    repo = tmp_path / "consumer"
-    repo.mkdir()
-    git = shutil.which("git")
-    assert git
-    for args in (
-        ["init", "-b", "main"],
-        ["config", "user.email", "fixture@example.invalid"],
-        ["config", "user.name", "Fixture"],
-        ["commit", "--allow-empty", "-m", "fixture"],
-        ["remote", "add", "origin", "https://github.com/example/loop.git"],
-        ["update-ref", "refs/remotes/origin/main", "HEAD"],
-        ["update-ref", "refs/remotes/origin/fix", "HEAD"],
-    ):
-        subprocess.run([git, *args], cwd=repo, check=True, capture_output=True)
-    sha = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    for name, source in (("gh", GH_SHIM), ("git", GIT_SHIM), ("claude", ENGINE_SHIM),
-                         ("codex", VERSION_SHIM), ("osascript", "")):
-        executable = bin_dir / name
-        executable.write_text(f"#!{sys.executable}\n" + source)
-        executable.chmod(0o755)
-    home = tmp_path / "home"
-    home.mkdir()
-    config = home / "operator.toml"
-    config.write_text(
-        '[operator]\nlogin="test-owner"\n[repos."example/loop"]\n'
-        'base_ref="main"\nverify_tools=["python -m pytest:*"]\n'
-    )
-    # Explicit environment keeps credentials and operator overrides out of the
-    # fixture. Every executable that could contact a service is a local shim.
-    env = {
-        "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(home),
-        "PR_PIPELINE_CONFIG": str(config), "PIPELINE_REPO": "example/loop",
-        "LOOP_TEST_ROOT": str(repo), "LOOP_TEST_GIT": git, "LOOP_TEST_SHA": sha,
-        "LOOP_TEST_LABELS": json.dumps(sorted(pipeline.WORKFLOW_LABELS)),
-        "LOOP_TEST_REVIEW_MARKER": pipeline.REVIEW_MARKER,
-        "LOOP_TEST_REVIEW_BODY": pipeline.render_review_comment(
-            verdict="changes_requested", base_sha=sha, head_sha=sha,
-            findings=[{"severity": "major", "file": "app.py:1", "summary": "Fix fixture"}],
-        ),
-    }
-    return repo, env
+    return make_loop_repo(tmp_path)
 
 
 @pytest.mark.parametrize("stage, mode, legacy, explicit, override, cross_engine", [
@@ -181,9 +139,16 @@ def test_impl_settings_conflicts_refuse_public_tick_before_launch(loop_repo, cli
 
 
 @pytest.mark.parametrize("stage", ["implement", "fix"])
-def test_real_loop_wakes_after_child_exit_before_emitted_cadence(loop_repo, stage):
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_real_loop_wakes_after_child_exit_before_emitted_cadence(loop_repo, stage, engine):
     repo, env = loop_repo
     env["LOOP_TEST_STAGE"] = stage
+    env["LOOP_TEST_ENGINE"] = engine
+    if engine == "codex":
+        codex = Path(env["PATH"].split(os.pathsep)[0]) / "codex"
+        codex.write_text(f"#!{sys.executable}\n" + ENGINE_SHIM)
+        with Path(env["PR_PIPELINE_CONFIG"]).open("a") as config:
+            config.write('impl_engine="codex"\n')
     kind = "issue" if stage == "implement" else "pr"
     (repo / "label").write_text(
         "ai:available" if stage == "implement" else "ai:changes-requested"
@@ -223,7 +188,7 @@ def test_real_loop_wakes_after_child_exit_before_emitted_cadence(loop_repo, stag
             unexpected = repo / "unexpected"
             assert not unexpected.exists(), unexpected.read_text()
             calls = [json.loads(line) for line in (repo / "calls.jsonl").read_text().splitlines()]
-            assert sum(call[0] == "claude" for call in calls) == 1
+            assert sum(call[0] == engine for call in calls) == 1
             assert any(
                 call[:3] == ["gh", kind, "edit"] and "ai:needs-human-decision" in call
                 for call in calls
@@ -542,6 +507,53 @@ def test_real_queue_nudge_does_not_satisfy_one_heartbeat_limit(loop_repo):
 # --- Helpers ---
 
 
+def make_loop_repo(tmp_path):
+    """Return a consumer checkout and an explicit shim-only environment."""
+    repo = tmp_path / "consumer"
+    repo.mkdir()
+    git = shutil.which("git")
+    assert git
+    for args in (
+        ["init", "-b", "main"],
+        ["config", "user.email", "fixture@example.invalid"],
+        ["config", "user.name", "Fixture"],
+        ["commit", "--allow-empty", "-m", "fixture"],
+        ["remote", "add", "origin", "https://github.com/example/loop.git"],
+        ["update-ref", "refs/remotes/origin/main", "HEAD"],
+        ["update-ref", "refs/remotes/origin/fix", "HEAD"],
+    ):
+        subprocess.run([git, *args], cwd=repo, check=True, capture_output=True)
+    sha = subprocess.check_output([git, "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for name, source in (("gh", GH_SHIM), ("git", GIT_SHIM), ("claude", ENGINE_SHIM),
+                         ("codex", VERSION_SHIM), ("osascript", "")):
+        executable = bin_dir / name
+        executable.write_text(f"#!{sys.executable}\n" + source)
+        executable.chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    config = home / "operator.toml"
+    config.write_text(
+        '[operator]\nlogin="test-owner"\n[repos."example/loop"]\n'
+        'base_ref="main"\nverify_tools=["python -m pytest:*"]\n'
+    )
+    # Explicit environment keeps credentials and operator overrides out of the
+    # fixture. Every executable that could contact a service is a local shim.
+    env = {
+        "PATH": f"{bin_dir}:{os.environ['PATH']}", "HOME": str(home),
+        "PR_PIPELINE_CONFIG": str(config), "PIPELINE_REPO": "example/loop",
+        "LOOP_TEST_ROOT": str(repo), "LOOP_TEST_GIT": git, "LOOP_TEST_SHA": sha,
+        "LOOP_TEST_LABELS": json.dumps(sorted(pipeline.WORKFLOW_LABELS)),
+        "LOOP_TEST_REVIEW_MARKER": pipeline.REVIEW_MARKER,
+        "LOOP_TEST_REVIEW_BODY": pipeline.render_review_comment(
+            verdict="changes_requested", base_sha=sha, head_sha=sha,
+            findings=[{"severity": "major", "file": "app.py:1", "summary": "Fix fixture"}],
+        ),
+    }
+    return repo, env
+
+
 def run_until_reported_stop(repo, env, args):
     """Allow slow CLI startup, then require prompt exit after the cadence line."""
     stderr = repo / "stop.stderr"
@@ -612,13 +624,18 @@ print("codex-cli 0.142.5")
 ENGINE_SHIM = '''
 import json, os, sys, time
 from pathlib import Path
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.171.0")
+    raise SystemExit(0)
 root = Path(os.environ["LOOP_TEST_ROOT"])
+engine = os.environ.get("LOOP_TEST_ENGINE", "claude")
 with (root / "calls.jsonl").open("a") as log:
-    log.write(json.dumps(["claude", *sys.argv[1:]]) + "\\n")
+    log.write(json.dumps([engine, *sys.argv[1:]]) + "\\n")
 (root / "engine-route.json").write_text(json.dumps({
     "argv": sys.argv[1:], "effort": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"), "cwd": os.getcwd(),
 }))
 (root / "engine-started").touch()
+(root / "engine-effort").write_text(os.environ.get("CLAUDE_CODE_EFFORT_LEVEL", ""))
 while not (root / "engine-exit").exists():
     time.sleep(0.02)
 result = "Offline completion fixture\\nNEEDS_HUMAN_DECISION"
@@ -642,7 +659,11 @@ if os.environ["LOOP_TEST_STAGE"] == "fix":
     if "--json-schema" in sys.argv:
         event["structured_output"] = report
 event["result"] = result
-print(json.dumps(event), flush=True)
+if engine == "codex":
+    print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": result}}), flush=True)
+    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 12, "output_tokens": 5}}), flush=True)
+else:
+    print(json.dumps(event), flush=True)
 '''
 
 GH_SHIM = '''

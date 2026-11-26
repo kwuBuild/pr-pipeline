@@ -45,6 +45,15 @@ def test_full_mixed_report_preserves_markdown_and_all_finding_references(origina
             assert finding[field] in result["comment_body"]
 
 
+@pytest.mark.parametrize("exit_status,completed,valid", [(0, True, True), (1, True, False), (0, False, False), (True, True, False)])
+def test_codex_transport_preserves_versioned_revision_validation(revision, exit_status, completed, valid):
+    payload = {"engine": "codex", "engine_exit_status": exit_status, "turn_completed": completed,
+               "is_error": False, "report_protocol_version": 2, "result": json.dumps(revision)}
+    parsed, problem = pipeline.fixer_reports.parse_result(payload, 2)
+    assert (parsed == revision) == valid
+    assert bool(problem) != valid
+
+
 @pytest.mark.parametrize("defect", ["missing", "duplicate", "unknown", "bare", "version", "dispatch", "head", "review", "waiver", "error", "duplicate-key"])
 def test_invalid_new_report_holds_without_retry_or_legacy_fallback(original, revision, defect):
     extra = {}

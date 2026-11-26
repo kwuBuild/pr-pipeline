@@ -32,6 +32,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -40,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tick" / "lib"))
 import labels  # noqa: E402
 import pipeline  # noqa: E402
 import tick  # noqa: E402
+import codex_write_wrapper  # noqa: E402
 
 # --- The route probe ---
 
@@ -115,8 +117,11 @@ def probe_argv(
     allowed_tools: str,
     model: str,
     engine_settings: str = "",
+    *, effort: str = "",
 ) -> list[str]:
     """Return the probe's argv: dispatch's own, with nothing added."""
+    if engine_bin == "codex":
+        return codex_write_wrapper.engine_argv(model=model, effort=effort)
     return tick.claude_engine_argv(
         engine_bin,
         permission_mode=permission_mode,
@@ -170,6 +175,7 @@ def run_probe(
     verify_tools: Sequence[str],
     engine_settings: str = "",
     effort: str | None = None,
+    stage: str = "implement",
 ) -> dict[str, object]:
     """Measure whether ``auto`` approves an ungranted command on this route.
 
@@ -179,11 +185,13 @@ def run_probe(
 
     Args:
         repo: ``owner/name`` the result is for.
-        impl_engine: ``"claude"`` or ``"claude-ds"``, as passed to the tick.
+        impl_engine: One of :data:`pipeline.ENGINE_ROUTES`, as passed to the tick.
+            ``"codex"`` runs the native Codex write probe instead.
         model: The requested ``--impl-model``; empty for the operator's
             default (``deepseek-v4-pro[1m]`` for claude-ds, as at dispatch).
         effort: Explicit implementer effort, or None to preserve configuration
             intent when setup writes the record. Only an explicit value is persisted.
+        stage: ``"implement"`` or ``"fix"``; selects the Codex probe's worktree shape.
         verify_tools: The verification grants proposed for the repository.
         engine_settings: The ``engine_settings`` proposed for the repository,
             passed as ``--settings`` exactly as dispatch will pass it.
@@ -191,6 +199,9 @@ def run_probe(
     Returns:
         A JSON-serialisable report with ``outcome`` and ``detail``.
     """
+    if impl_engine == "codex":
+        return _codex_probe(repo, model=model, effort=effort or "", stage=stage,
+                            verify_tools=verify_tools, engine_settings=engine_settings)
     allowed = probe_allowed_tools(verify_tools)
     report: dict[str, object] = {
         "repo": repo,
@@ -267,6 +278,135 @@ def run_probe(
     else:
         detail = f"auto never ran the command: {_run_summary(auto)}"
     return {**report, "outcome": AUTO_FAILED, "detail": detail}
+
+
+def run_route_probes(repo: str, *, routes: Mapping[str, str], verify_tools: Sequence[str],
+                     engine_settings: str = "") -> dict[str, object]:
+    """Probe both effective stages, including a detached Codex fixer probe.
+
+    ``routes`` holds the requested write-stage keys, where a blank fixer key is
+    an inheritance rule. The record keeps that request as ``requested_routes``
+    beside the effective ``routes`` it measured, so ``write-config`` persists
+    the rule rather than pinning today's resolved fixer route.
+    """
+    requested = {key: routes.get(key, "") for key in pipeline.WRITE_ROUTE_KEYS}
+    resolved = effective_routes(requested)
+    reports: dict[str, dict[str, object]] = {}
+    previous = None
+    for stage, engine_key, model_key, effort_key in (
+        ("implement", "impl_engine", "model", "effort"),
+        ("fix", "fix_engine", "fix_model", "fix_effort"),
+    ):
+        route = (resolved[engine_key], resolved[model_key], resolved[effort_key])
+        if route == previous and route[0] != "codex":
+            reports[stage] = dict(reports["implement"], stage=stage)
+        else:
+            reports[stage] = run_probe(repo, impl_engine=route[0], model=route[1], effort=route[2],
+                stage=stage, verify_tools=verify_tools, engine_settings=engine_settings)
+        previous = route
+    # The first stage that did not pass names the outcome, so an inconclusive
+    # or unmeasurable stage keeps its own remedy instead of reading auto_failed.
+    failed = [r["outcome"] for r in reports.values() if r["outcome"] != PASS]
+    record = {**reports["implement"], "requested_routes": requested, "routes": resolved, "stages": reports,
+              "outcome": failed[0] if failed else PASS}
+    # Implementer intent comes from the request, not the measured stage report:
+    # the stage report holds the effective model and effort the probe ran.
+    record.pop("impl_effort", None)
+    record["impl_model"] = requested["impl_model"]
+    return record
+
+
+def effective_routes(requested: Mapping[str, object]) -> dict[str, str]:
+    """Resolve requested write-stage routes to the effective routes a probe runs.
+
+    Raises:
+        SetupRefused: When the request names an unusable route.
+    """
+    resolved, problems = pipeline._resolve_routes([("probe", requested)])
+    if problems:
+        raise SetupRefused("; ".join(problems))
+    for engine_key, model_key in (("impl_engine", "model"), ("fix_engine", "fix_model")):
+        resolved[model_key] = pipeline.effective_engine_model(resolved[engine_key], resolved[model_key])
+    return resolved
+
+
+def _codex_probe(repo: str, *, model: str, effort: str, stage: str,
+                 verify_tools: Sequence[str], engine_settings: str) -> dict[str, object]:
+    """Prove local worktree verification, commit and push under dispatch policy.
+
+    Local push exercises protected Git metadata, not network authentication.
+    Adoption still needs the production-controller trial on the real target.
+    """
+    env = tick._engine_env()
+    argv = codex_write_wrapper.engine_argv(model=model, effort=effort)
+    report = {"repo": repo, "impl_engine": "codex", "model": model, "effort": effort,
+              "stage": stage, "verify_tools": list(verify_tools), "engine_settings": engine_settings,
+              "engine_version": _engine_version("codex", env), "argv": argv,
+              "permission_policy": "workspace-write with --approve-for-me",
+              "authenticated_push_proven": False, "outcome": AUTO_FAILED,
+              "detail": "Local probe failed; no adoption proof."}
+    with tempfile.TemporaryDirectory(prefix="pr-pipeline-codex-probe-") as directory:
+        root = Path(directory).resolve()
+        checkout, worktree, remote = root / "checkout", root / "worktree", root / "remote.git"
+        def git(*args, cwd=None):
+            return subprocess.check_output(["git", *args], cwd=cwd, env=env, stderr=subprocess.PIPE, text=True).strip()
+        git("init", "--bare", str(remote))
+        git("init", "-b", "main", str(checkout))
+        git("config", "user.name", "Pipeline probe", cwd=checkout)
+        git("config", "user.email", "probe@example.invalid", cwd=checkout)
+        git("commit", "--allow-empty", "-m", "probe baseline", cwd=checkout)
+        git("remote", "add", "origin", str(remote), cwd=checkout)
+        git("push", "origin", "HEAD", cwd=checkout)
+        before = git("rev-parse", "HEAD", cwd=checkout)
+        git("worktree", "add", *(["--detach"] if stage == "fix" else ["-b", "probe"]), str(worktree), "HEAD", cwd=checkout)
+        proof = uuid.uuid4().hex
+        script = worktree / "probe.sh"
+        script.write_text(
+            "set -eu\n" + f"printf '%s\\n' '{proof}' > verified.txt\n"
+            + f"test \"$(cat verified.txt)\" = '{proof}'\n"
+            + "git add verified.txt\ngit commit -m 'Verify native write permissions'\n"
+            + ("git push origin HEAD:refs/heads/probe\n" if stage == "fix" else "git push origin HEAD\n")
+            + f"printf '%s\\n' 'PROBE_VERIFIED_{proof}'\n"
+        )
+        prompt = ("Permission probe in a disposable Git worktree. Run exactly `sh probe.sh`. "
+                  "The script verifies a file, commits it and pushes only to a local disposable bare repository. "
+                  "Protected Git metadata requires approval: request approval through the configured automatic "
+                  "reviewer before executing, or after a sandbox filesystem refusal. "
+                  "Return the output. If the approval reviewer denies the request, stop and report that denial. "
+                  "Do not alter the script or change the sandbox/approval policy.")
+        proc = subprocess.Popen(argv, cwd=worktree, env=env, stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        try:
+            stdout, stderr = proc.communicate(prompt.encode(), timeout=PROBE_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate()
+            report["timed_out"] = True
+        stream = stdout.decode(errors="replace")
+        result = codex_write_wrapper.collect_stream(stream.splitlines(), tick.claude_stream_wrapper.ProgressHeartbeat(None))
+        report["detail"] = "Local probe did not prove the required actions: " + str(result["result"])[-2000:]
+        executed = False
+        for line in stream.splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            item = event.get("item") if isinstance(event, dict) else None
+            if (isinstance(event, dict) and event.get("type") == "item.completed" and isinstance(item, dict)
+                    and item.get("type") == "command_execution" and item.get("exit_code") == 0
+                    and "sh probe.sh" in str(item.get("command"))
+                    and f"PROBE_VERIFIED_{proof}" in str(item.get("aggregated_output"))):
+                executed = True
+        try:
+            pushed = git("--git-dir", str(remote), "rev-parse", "refs/heads/probe")
+            verified = git("--git-dir", str(remote), "show", "refs/heads/probe:verified.txt") == proof
+        except subprocess.CalledProcessError:
+            pushed, verified = "", False
+        report.update(returncode=proc.returncode, executed=executed, pushed_head=pushed,
+                      stderr_tail=stderr.decode(errors="replace")[-1000:])
+        if proc.returncode == 0 and not result["is_error"] and executed and verified and pushed != before:
+            report.update(outcome=PASS, detail="Local worktree verification, commit and push passed; authenticated network push and controller lifecycle remain unproved.")
+    return report
 
 
 def _engine_version(engine_bin: str, env: Mapping[str, str]) -> str:
@@ -542,6 +682,14 @@ def plan_config(
             f"the recorded probe for {repo} names no engine route; rerun the probe"
         )
     outcome = record.get("outcome")
+    measured_routes = record.get("routes", {})
+    if isinstance(measured_routes, dict):
+        measured_stages = record.get("stages", {})
+        for stage, engine in (("implement", probed_engine),
+                              ("fix", measured_routes.get("fix_engine", probed_engine))):
+            stage_report = measured_stages.get(stage, {}) if isinstance(measured_stages, dict) else {}
+            if engine == "codex" and (not isinstance(stage_report, dict) or stage_report.get("outcome") != PASS):
+                raise SetupRefused(f"Codex {stage} requires its own passing probe; dontAsk is a Claude-only remedy")
     if not verify_tools and outcome != PASS:
         raise SetupRefused(
             f"the route did not pass the probe ({outcome}): an empty "
@@ -597,6 +745,28 @@ def plan_config(
         section["impl_effort"] = record["impl_effort"]
     section["probed_impl_engine"] = probed_engine
     section["probed_model"] = probed_model
+    if "routes" in record:
+        # Persist the request, not the measurement: a blank fixer key keeps
+        # following the implementer route a later run resolves (#127). The
+        # request must still resolve to exactly the routes the probe measured.
+        routes, requested = record["routes"], record.get("requested_routes")
+        if (not isinstance(routes, dict) or not isinstance(requested, dict)
+                or set(requested) != set(pipeline.WRITE_ROUTE_KEYS)
+                or not all(isinstance(value, str) for value in requested.values())):
+            raise SetupRefused("the probe record has no valid requested stage routes; rerun the probe")
+        resolved = effective_routes(requested)
+        if any(resolved[field] != routes.get(field) for field in pipeline.ROUTE_FIELDS.values()):
+            raise SetupRefused("the requested stage routes do not resolve to the measured routes; rerun the probe")
+        if (resolved["impl_engine"], resolved["model"]) != (probed_engine, probed_model):
+            raise SetupRefused("recorded impl_engine/model route mismatch; rerun the probe")
+        section["impl_model"] = requested["impl_model"]
+        # Write a key only when the request differs from what the config
+        # already resolves to, so an unspecified setting keeps its layer
+        # (a [defaults] value is not pinned into this section).
+        current = dict(pipeline.resolve_config(repo).requested_routes)
+        for key in ("impl_effort", "fix_engine", "fix_model", "fix_effort"):
+            if requested[key] != current.get(key, ""):
+                section[key] = requested[key]
     if base_ref is not None:
         section["base_ref"] = base_ref
     return str(path), existing, merged, (probed_engine, probed_model)
@@ -970,12 +1140,12 @@ def main(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("login", help="report the authenticated GitHub login")
     prereqs = commands.add_parser("prereqs", help="report missing host tools")
-    prereqs.add_argument("--impl-engine", default="claude", choices=("claude", "claude-ds"))
+    prereqs.add_argument("--impl-engine", default="claude", choices=pipeline.ENGINE_ROUTES)
     for name in ("inspect", "labels"):
         commands.add_parser(name).add_argument("repo")
     probe = commands.add_parser("probe", help="measure auto on the engine route")
     probe.add_argument("repo")
-    probe.add_argument("--impl-engine", default="claude", choices=("claude", "claude-ds"))
+    probe.add_argument("--impl-engine", choices=pipeline.ENGINE_ROUTES)
     probe.add_argument("--impl-model", action=ImplementerSetting, type=str.strip)
     probe.add_argument("--model", action=ImplementerSetting, type=str.strip,
                        help="compatibility alias for --impl-model")
@@ -984,6 +1154,9 @@ def main(argv: list[str] | None = None) -> int:
     probe.add_argument("--effort", action=ImplementerSetting, type=str.strip,
                        choices=pipeline.ENGINE_EFFORT_LEVELS,
                        help="compatibility alias for --impl-effort")
+    probe.add_argument("--fix-engine", choices=("", *pipeline.ENGINE_ROUTES))
+    probe.add_argument("--fix-model", type=str.strip)
+    probe.add_argument("--fix-effort", type=str.strip)
     probe.add_argument("--verify-tool", action="append", default=[])
     probe.add_argument("--engine-settings", default="")
     write = commands.add_parser("write-config", help="record one repository")
@@ -998,8 +1171,11 @@ def main(argv: list[str] | None = None) -> int:
     deny.add_argument("--install", action="store_true")
     args = parser.parse_args(argv)
     if args.command == "probe":
-        args.model = args.impl_model if args.impl_model is not None else (args.model or "")
-        args.effort = args.impl_effort if args.impl_effort is not None else args.effort
+        # None means "not given": the probe then resolves the configured value.
+        if args.impl_model is None:
+            args.impl_model = args.model
+        if args.impl_effort is None:
+            args.impl_effort = args.effort
 
     try:
         return _dispatch(args)
@@ -1036,9 +1212,13 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "probe":
         record = probe_record_path(args.repo)
         tools = _checked_tools(args.verify_tool)
-        report = run_probe(args.repo, impl_engine=args.impl_engine,
-                           model=args.model, effort=args.effort, verify_tools=tools,
-                           engine_settings=_checked_settings(args.engine_settings))
+        overrides = {key: getattr(args, key) for key in pipeline.WRITE_ROUTE_KEYS
+                     if getattr(args, key) is not None}
+        config = pipeline.resolve_config(args.repo, cli_overrides=overrides)
+        if config.tuning_errors:
+            raise SetupRefused("; ".join(config.tuning_errors))
+        report = run_route_probes(args.repo, routes=dict(config.requested_routes),
+            verify_tools=tools, engine_settings=_checked_settings(args.engine_settings))
         report["recorded_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         record.parent.mkdir(parents=True, exist_ok=True)
         pipeline.atomic_write(str(record), json.dumps(report, indent=2) + "\n")

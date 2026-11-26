@@ -11,9 +11,11 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from pathlib import Path
 
@@ -63,6 +65,154 @@ def doubles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Path]:
     monkeypatch.setenv("FAKE_PROBE_COMMAND", setup_flow.PROBE_COMMAND)
     set_route(monkeypatch, dontAsk="deny", auto="run")
     return {"state": state, "gh_log": gh_log, "claude_log": claude_log, "bin": bin_dir}
+
+
+@pytest.mark.parametrize("stage", ["implement", "fix"])
+@pytest.mark.parametrize("denied", [False, True])
+def test_codex_probe_exercises_verification_commit_and_push(tmp_path, monkeypatch, stage, denied):
+    binary = tmp_path / "codex"
+    binary.write_text(f"#!{sys.executable}\n" + '''import json, subprocess, sys
+if sys.argv[1:] == ["--version"]:
+    print("codex-cli 0.171.0")
+    raise SystemExit(0)
+assert "--approve-for-me" in sys.argv and "--sandbox" not in sys.argv
+assert "--permission-mode" not in sys.argv
+prompt = sys.stdin.read()
+assert "request approval" in prompt
+''' + ('''print(json.dumps({"type": "turn.failed", "error": {"message": "permission denied"}}))
+raise SystemExit(1)
+''' if denied else '''p = subprocess.run(["sh", "probe.sh"], capture_output=True, text=True)
+print(json.dumps({"type": "item.completed", "item": {"type": "command_execution", "command": "sh probe.sh", "exit_code": p.returncode, "aggregated_output": p.stdout + p.stderr}}))
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "probe finished"}}))
+print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1}}))
+raise SystemExit(p.returncode)
+'''))
+    binary.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
+    report = setup_flow.run_probe("owner/repo", impl_engine="codex", model="gpt-5.5",
+        effort="high", stage=stage, verify_tools=[])
+    assert (report["outcome"] == setup_flow.PASS) != denied
+    assert report["engine_version"] == "codex-cli 0.171.0"
+    assert report["stage"] == stage
+    assert report["authenticated_push_proven"] is False
+    if denied:
+        assert "permission denied" in report["detail"]
+
+
+def test_codex_probe_uses_dispatch_policy_and_records_both_effective_routes(monkeypatch):
+    import setup_flow
+    import codex_write_wrapper
+
+    seen = []
+    def run(repo, **kwargs):
+        seen.append(kwargs)
+        return {"outcome": setup_flow.PASS, "detail": "fixture", **kwargs}
+    monkeypatch.setattr(setup_flow, "run_probe", run)
+    report = setup_flow.run_route_probes("owner/repo", routes={
+        "impl_engine": "codex", "impl_model": "gpt-5.5", "impl_effort": "xhigh",
+        "fix_engine": "claude", "fix_model": "sonnet", "fix_effort": "high",
+    }, verify_tools=[], engine_settings="")
+    assert report["outcome"] == setup_flow.PASS
+    assert [(r["impl_engine"], r["model"], r["stage"]) for r in seen] == [
+        ("codex", "gpt-5.5", "implement"), ("claude", "sonnet", "fix")]
+    assert setup_flow.probe_argv("codex", "auto", "ignored", "gpt-5.5", effort="xhigh") == codex_write_wrapper.engine_argv(model="gpt-5.5", effort="xhigh")
+
+
+def test_codex_route_probe_cannot_pass_after_a_denied_fixer(monkeypatch):
+    import setup_flow
+
+    monkeypatch.setattr(setup_flow, "run_probe", lambda repo, **kwargs: {
+        "outcome": setup_flow.PASS if kwargs["stage"] == "implement" else setup_flow.AUTO_FAILED,
+        "detail": "permission denied",
+    })
+    report = setup_flow.run_route_probes("owner/repo", routes={"impl_engine": "codex"},
+        verify_tools=[], engine_settings="")
+    assert report["outcome"] != setup_flow.PASS
+
+
+def test_setup_cli_resolves_both_routes_and_retains_effort(monkeypatch, tmp_path):
+    config = tmp_path / "operator.toml"
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(config))
+    captured = []
+    def probes(repo, **kwargs):
+        captured.append(kwargs)
+        return {"outcome": setup_flow.PASS}
+    monkeypatch.setattr(setup_flow, "run_route_probes", probes)
+    assert setup_flow.main(["probe", "owner/repo", "--impl-engine", "codex", "--model", "gpt-5.5",
+        "--effort", "xhigh", "--fix-engine", "claude", "--fix-model", "sonnet", "--fix-effort", "high"]) == 0
+    assert captured[0]["routes"] == {"impl_engine": "codex", "impl_model": "gpt-5.5", "impl_effort": "xhigh",
+        "fix_engine": "claude", "fix_model": "sonnet", "fix_effort": "high"}
+
+
+def test_setup_writes_exact_measured_stage_routes(monkeypatch, tmp_path):
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "operator.toml"))
+    routes = {"impl_engine": "codex", "model": "gpt-5.5", "effort": "xhigh",
+              "fix_engine": "claude", "fix_model": "sonnet", "fix_effort": "high",
+              "review_model": "", "review_effort": ""}
+    requested = {"impl_engine": "codex", "impl_model": "gpt-5.5", "impl_effort": "xhigh",
+                 "fix_engine": "claude", "fix_model": "sonnet", "fix_effort": "high"}
+    monkeypatch.setattr(setup_flow, "_read_probe_record", lambda repo: {
+        "impl_engine": "codex", "model": "gpt-5.5", "verify_tools": [],
+        "outcome": setup_flow.PASS, "routes": routes, "requested_routes": requested,
+        "stages": {s: {"outcome": setup_flow.PASS} for s in ("implement", "fix")},
+    })
+    _, _, merged, _ = setup_flow.plan_config("owner/repo", login="owner", verify_tools=[],
+        permission_mode="auto", base_ref="main")
+    assert {k: merged["repos"]["owner/repo"].get(k) for k in requested} == requested
+
+
+@pytest.mark.parametrize("requested", [
+    None,
+    {"impl_engine": "codex", "impl_model": "gpt-5.5", "impl_effort": "xhigh",
+     "fix_engine": "", "fix_model": "", "fix_effort": ""},
+], ids=["missing-request", "request-resolves-elsewhere"])
+def test_setup_refuses_a_record_whose_request_does_not_match_the_measurement(
+    monkeypatch, tmp_path, requested,
+):
+    """Persisting a request needs evidence that it resolves to the probed routes."""
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "operator.toml"))
+    routes = {"impl_engine": "codex", "model": "gpt-5.5", "effort": "xhigh",
+              "fix_engine": "claude", "fix_model": "sonnet", "fix_effort": "high"}
+    record = {"impl_engine": "codex", "model": "gpt-5.5", "verify_tools": [],
+              "outcome": setup_flow.PASS, "routes": routes,
+              "stages": {s: {"outcome": setup_flow.PASS} for s in ("implement", "fix")}}
+    if requested is not None:
+        record["requested_routes"] = requested
+    monkeypatch.setattr(setup_flow, "_read_probe_record", lambda repo: record)
+    with pytest.raises(setup_flow.SetupRefused, match="rerun the probe"):
+        setup_flow.plan_config("owner/repo", login="owner", verify_tools=[],
+            permission_mode="auto", base_ref="main")
+
+
+def test_setup_probe_uses_existing_effective_routes_when_flags_are_absent(monkeypatch, tmp_path):
+    config = tmp_path / "operator.toml"
+    config.write_text('[repos."owner/repo"]\nimpl_engine="codex"\nmodel="gpt-5.5"\n'
+                      'effort="high"\nfix_engine="claude"\nfix_model="sonnet"\n')
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(config))
+    captured = []
+    def probes(repo, **kwargs):
+        captured.append(kwargs["routes"])
+        return {"outcome": setup_flow.PASS}
+    monkeypatch.setattr(setup_flow, "run_route_probes", probes)
+    assert setup_flow.main(["probe", "owner/repo"]) == 0
+    assert captured[0]["impl_engine"] == "codex"
+    assert captured[0]["fix_engine"] == "claude"
+    assert captured[0]["fix_model"] == "sonnet"
+
+
+@pytest.mark.parametrize("codex_stage", ["implement", "fix"])
+def test_dontask_cannot_bypass_a_failed_codex_stage_probe(monkeypatch, tmp_path, codex_stage):
+    monkeypatch.setenv("PR_PIPELINE_CONFIG", str(tmp_path / "operator.toml"))
+    routes = {"impl_engine": "codex" if codex_stage == "implement" else "claude",
+              "fix_engine": "codex", "model": ""}
+    monkeypatch.setattr(setup_flow, "_read_probe_record", lambda repo: {
+        **routes, "verify_tools": ["sh ./check.sh"], "outcome": setup_flow.AUTO_FAILED,
+        "routes": routes, "stages": {s: {"outcome": setup_flow.AUTO_FAILED if s == codex_stage else setup_flow.PASS}
+                                      for s in ("implement", "fix")},
+    })
+    with pytest.raises(setup_flow.SetupRefused, match="Codex"):
+        setup_flow.plan_config("owner/repo", login="owner", verify_tools=["sh ./check.sh"],
+            permission_mode="dontAsk", base_ref="main")
 
 
 # --- The probe command is not a grant ---
@@ -543,12 +693,79 @@ def test_config_route_edit_preserves_probe_evidence_and_warns_at_startup(
     assert pipeline.resolve_config(REPO).probed_route == (engine, model)
 
 
+@pytest.mark.parametrize(("configured", "tick_flags", "expected"), [
+    pytest.param('fix_engine=""\nfix_model=""\nfix_effort=""\n', ("--model", "opus"),
+                 ("claude", "--model", "opus"), id="inherited-model"),
+    pytest.param('effort="high"\n', ("--effort", "low"),
+                 ("claude", "effort", "low"), id="inherited-effort"),
+    pytest.param("", ("--impl-engine", "codex", "--model", "gpt-5.5"),
+                 ("codex", "--model", "gpt-5.5"), id="inherited-engine"),
+    pytest.param('fix_engine="claude"\nfix_model="sonnet"\n', ("--model", "opus"),
+                 ("claude", "--model", "sonnet"), id="explicit-fixer-control"),
+])
+def test_setup_preserves_fixer_inheritance_through_actual_dispatch(
+    doubles, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    configured: str, tick_flags: tuple[str, ...], expected: tuple[str, str, str],
+) -> None:
+    """A blank fixer key stays a rule after setup, not a pin of today's route.
+
+    Real setup.sh probe and write-config run against an existing section, then
+    the written route drives a real tick.sh fixer dispatch with an override.
+    """
+    import test_smoke_loop
+
+    config = pipeline.operator_config_path()
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[operator]\nlogin = "operator-a"\n'
+                      f'[repos."{REPO}"]\nimpl_engine="claude"\nmodel="sonnet"\n{configured}')
+    setup_sh = SETUP_PY.parents[1] / "setup.sh"
+    for args in (("probe", REPO, "--impl-engine", "claude", "--model", "sonnet"),
+                 ("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")):
+        done = subprocess.run(["bash", str(setup_sh), *args], capture_output=True,
+                              text=True, timeout=120)
+        assert done.returncode == 0, done.stderr
+    section = tomllib.loads(config.read_text())["repos"][REPO]
+    for key in ("fix_engine", "fix_model", "fix_effort"):
+        written = re.search(rf'^{key}="([^"]*)"$', configured, re.MULTILINE)
+        assert section.get(key, "") == (written.group(1) if written else "")
+
+    (tmp_path / "dispatch").mkdir()
+    target, env = test_smoke_loop.make_loop_repo(tmp_path / "dispatch")
+    env["LOOP_TEST_STAGE"] = "fix"
+    # Each binary names itself in calls.jsonl, so the log shows which ran.
+    codex = Path(env["PATH"].split(os.pathsep)[0]) / "codex"
+    codex.write_text(f"#!{sys.executable}\nimport os\nos.environ['LOOP_TEST_ENGINE'] = 'codex'\n"
+                     + test_smoke_loop.ENGINE_SHIM)
+    with Path(env["PR_PIPELINE_CONFIG"]).open("a") as target_config:
+        for key in ("impl_engine", "model", "effort", "fix_engine", "fix_model", "fix_effort"):
+            if key in section:
+                target_config.write(f"{key}={json.dumps(section[key])}\n")
+    (target / "label").write_text("ai:changes-requested")
+    (target / "engine-exit").touch()
+    launched = subprocess.run(
+        ["bash", str(TICK_PY.parents[1] / "tick.sh"), "pr:7", *tick_flags],
+        cwd=target, env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert launched.returncode == 0, launched.stderr
+    deadline = time.monotonic() + 30
+    while not (target / "engine-started").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    calls = [json.loads(line) for line in (target / "calls.jsonl").read_text().splitlines()]
+    launches = [call for call in calls if call[0] in ("claude", "codex")]
+    assert [call[0] for call in launches] == [expected[0]]
+    if expected[1] == "effort":
+        assert (target / "engine-effort").read_text() == expected[2]
+    else:
+        argv = launches[0]
+        assert argv[argv.index(expected[1]) + 1] == expected[2]
+
+
 def test_write_config_refuses_a_probe_record_with_an_unusable_route(doubles) -> None:
     """A probe record naming no supported route cannot become configuration."""
     assert run_setup("probe", REPO).returncode == 0
     record = setup_flow.probe_record_path(REPO)
     evidence = json.loads(record.read_text())
-    evidence["impl_engine"] = "codex"
+    evidence["impl_engine"] = "unknown"
     record.write_text(json.dumps(evidence))
 
     result = run_setup("write-config", REPO, "--login", "operator-a",
@@ -997,20 +1214,50 @@ def test_impl_settings_setup_keeps_default_model_intent_separate_from_probe(doub
     assert "fix_model" not in section and "fix_effort" not in section
 
 
+def test_route_probe_setup_writes_only_changed_effort_and_fixer_keys(doubles):
+    """Setup does not pin [defaults] route values into the repository section."""
+    path = pipeline.operator_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('[defaults]\nimpl_effort="low"\nfix_engine="claude"\nfix_model="sonnet"\n')
+    write = ("write-config", REPO, "--login", "operator-a", "--permission-mode", "auto")
+    assert run_setup_public("probe", REPO).returncode == 0
+    assert run_setup_public(*write).returncode == 0
+    section = tomllib.loads(path.read_text())["repos"][REPO]
+    assert not {"impl_effort", "fix_engine", "fix_model", "fix_effort"} & set(section)
+
+    assert run_setup_public("probe", REPO, "--fix-model", "opus").returncode == 0
+    result = run_setup_public(*write)
+    assert result.returncode == 0, result.stderr
+    section = tomllib.loads(path.read_text())["repos"][REPO]
+    assert section["fix_model"] == "opus"
+    assert not {"impl_effort", "fix_engine", "fix_effort"} & set(section)
+    config = pipeline.resolve_config(REPO)
+    assert (config.effort, config.fix_engine, config.fix_model) == ("low", "claude", "opus")
+
+
 @pytest.mark.parametrize("legacy_record", [False, True])
 def test_impl_settings_setup_writes_dontask_after_early_inconclusive_default_model_probe(
     doubles, monkeypatch, legacy_record,
 ):
-    """A grant-covered probe records a blank model; dontAsk setup still writes it."""
+    """An early inconclusive default-model probe still lets dontAsk setup write.
+
+    A stage-route probe records the effective model it would run. A record
+    from before stage routes carries a blank model and no ``impl_model``;
+    write-config compares effective models, so it accepts both.
+    """
     monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-key")
     probe = run_setup_public("probe", REPO, "--impl-engine", "claude-ds", "--verify-tool", "git:*")
     assert json.loads(probe.stdout)["outcome"] == setup_flow.INCONCLUSIVE, probe.stderr
     assert not doubles["claude_log"].exists()
     record = setup_flow.probe_record_path(REPO)
     data = json.loads(record.read_text())
-    assert data["model"] == ""
+    probed_model = pipeline.effective_engine_model("claude-ds", "")
+    assert data["model"] == probed_model
+    assert data["impl_model"] == ""
     if legacy_record:
-        data.pop("impl_model")
+        for key in ("impl_model", "routes", "requested_routes", "stages"):
+            data.pop(key)
+        data["model"] = probed_model = ""
         record.write_text(json.dumps(data))
     write = ("write-config", REPO, "--login", "operator-a",
              "--permission-mode", "dontAsk", "--verify-tool", "git:*")
@@ -1018,10 +1265,10 @@ def test_impl_settings_setup_writes_dontask_after_early_inconclusive_default_mod
     assert result.returncode == 0, result.stderr
     section = tomllib.loads(pipeline.operator_config_path().read_text())["repos"][REPO]
     assert (section["impl_engine"], section["impl_model"]) == ("claude-ds", "")
-    assert (section["probed_impl_engine"], section["probed_model"]) == ("claude-ds", "")
+    assert (section["probed_impl_engine"], section["probed_model"]) == ("claude-ds", probed_model)
     config = pipeline.resolve_config(REPO)
     assert config.errors == ()
-    assert config.probed_route == ("claude-ds", "")
+    assert config.probed_route == ("claude-ds", probed_model)
     again = run_setup_public(*write)
     assert again.returncode == 0, again.stderr
     assert json.loads(again.stdout)["changed"] is False

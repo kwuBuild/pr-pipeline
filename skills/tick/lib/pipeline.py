@@ -235,7 +235,8 @@ TRANSIENT_COOLDOWN_RESET_BUFFER_SECONDS = 5 * 60
 # Implementer/fixer engines a route may name. ``claude-ds`` is ``claude``
 # routed to DeepSeek; it has no operator default model to inherit, so a blank
 # model means this pin (see :func:`effective_engine_model`).
-ENGINE_ROUTES = ("claude", "claude-ds")
+ENGINE_ROUTES = ("claude", "claude-ds", "codex")
+CODEX_EFFORT_LEVELS = ("low", "medium", "high", "xhigh")
 CLAUDE_DS_DEFAULT_MODEL = "deepseek-v4-pro[1m]"
 
 # A model id is its own argv element, so quoting cannot leak into an expression
@@ -263,12 +264,12 @@ def effective_engine_model(engine: str, model: str) -> str:
     """Return the model an implementer/fixer dispatch runs on this route.
 
     Args:
-        engine: ``"claude"`` or ``"claude-ds"``.
+        engine: A route in :data:`ENGINE_ROUTES`.
         model: The configured model; blank means the engine's default.
 
     Returns:
-        ``model`` when set. Blank stays blank for ``claude``, whose CLI then
-        resolves the operator's own default, and is
+        ``model`` when set. Blank stays blank for ``claude`` and ``codex``;
+        their CLIs resolve the operator's own default. A blank model is
         :data:`CLAUDE_DS_DEFAULT_MODEL` for ``claude-ds``.
     """
     if not model and engine == "claude-ds":
@@ -2317,11 +2318,16 @@ class ResolvedConfig:
             codex config, then the pinned fallback.
         review_effort: The reviewer reasoning effort, resolved like
             ``review_model``.
-        effort: Resolved ``impl_effort`` (legacy internal field name), one of
-            :data:`ENGINE_EFFORT_LEVELS`;
+        effort: Resolved ``impl_effort`` (legacy internal field name),
+            validated for the selected engine;
             ``""`` is no override (``claude-ds`` then runs at ``max``).
-        fix_effort: The fixer effort. A blank key inherits ``effort`` on any
-            fixer engine: effort levels belong to no single provider.
+        fix_effort: The fixer effort. A blank key inherits ``effort`` within
+            the Claude family or within Codex. Crossing uses the destination default.
+        requested_routes: The write-stage route keys as configured, before
+            fixer inheritance: ``(key, value)`` pairs for
+            :data:`WRITE_ROUTE_KEYS`. A blank fixer value stays blank, so a
+            writer of configuration (setup) keeps it an inheritance rule rather
+            than pinning the route it resolves to today.
         probed_route: The repository's ``(probed_impl_engine, probed_model)``
             setup evidence, independent of routing defaults and CLI flags.
             ``None`` for older setups without evidence or invalid metadata
@@ -2369,6 +2375,7 @@ class ResolvedConfig:
     review_effort: str = ""
     effort: str = ""
     fix_effort: str = ""
+    requested_routes: tuple[tuple[str, str], ...] = ()
     probed_route: tuple[str, str] | None = None
     loop_short_poll_seconds: int = LOOP_SHORT_POLL_SECONDS
     loop_max_poll_seconds: int = LOOP_MAX_POLL_SECONDS
@@ -3032,6 +3039,7 @@ def resolve_config(
     tuning_errors.extend(_stall_bound_problems(ints))
     routes, route_problems = _resolve_routes(layers)
     tuning_errors.extend(route_problems)
+    requested_routes = requested_write_routes(layers, routes)
     probed_route, probe_problems = _resolve_probed_route(repo_section, repo)
     tuning_errors.extend(probe_problems)
     errors.extend(tuning_errors)
@@ -3067,6 +3075,7 @@ def resolve_config(
         review_effort=routes["review_effort"],
         effort=routes["effort"],
         fix_effort=routes["fix_effort"],
+        requested_routes=tuple(requested_routes.items()),
         probed_route=probed_route,
         login=login,
         allow_touching=allow_touching,
@@ -3280,6 +3289,41 @@ def normalize_impl_aliases(
     return normalized, problems
 
 
+WRITE_ROUTE_KEYS = ("impl_engine", "impl_model", "impl_effort", "fix_engine", "fix_model", "fix_effort")
+# The ResolvedConfig route field each write-stage config key resolves to. The
+# implementer fields keep their legacy names (``model``, ``effort``).
+ROUTE_FIELDS = {"impl_engine": "impl_engine", "impl_model": "model", "impl_effort": "effort",
+                "fix_engine": "fix_engine", "fix_model": "fix_model", "fix_effort": "fix_effort"}
+_INHERITING_ROUTE_KEYS = ("fix_engine", "fix_model", "fix_effort")
+
+
+def requested_write_routes(
+    layers: Sequence[tuple[str, Mapping[str, object]]], routes: Mapping[str, str],
+) -> dict[str, str]:
+    """Return the write-stage route keys as configured, before inheritance.
+
+    Implementer keys have no inheritance, so their resolved value is the
+    request. A fixer key keeps the declared value, and an absent or blank one
+    stays ``""``: blank is a continuing rule that follows the implementer route
+    resolved on each run, not a request for today's implementer route.
+
+    Args:
+        layers: ``(label, table)`` pairs, lowest precedence first.
+        routes: The result of :func:`_resolve_routes` for the same layers.
+
+    Returns:
+        A value for every key in :data:`WRITE_ROUTE_KEYS`. Meaningful only when
+        the route resolution reported no problems.
+    """
+    requested = {key: routes[ROUTE_FIELDS[key]] for key in WRITE_ROUTE_KEYS
+                 if key not in _INHERITING_ROUTE_KEYS}
+    for key in _INHERITING_ROUTE_KEYS:
+        picked = _pick(layers, key)
+        value = picked[1] if picked is not None else ""
+        requested[key] = value.strip() if isinstance(value, str) else ""
+    return {key: requested[key] for key in WRITE_ROUTE_KEYS}
+
+
 def _resolve_routes(
     layers: Sequence[tuple[str, Mapping[str, object]]],
 ) -> tuple[dict[str, str], list[str]]:
@@ -3292,8 +3336,8 @@ def _resolve_routes(
     A blank fixer key inherits the implementer's. The fixer model inherits only
     while the fixer runs on the implementer's engine: a model id names one
     provider's model, and handing it to another provider fails at launch.
-    The fixer effort inherits on any engine: effort levels are not
-    provider-specific.
+    Effort inherits between Claude routes, or within Codex. Crossing the
+    Codex/Claude boundary uses the destination engine's default effort.
 
     Args:
         layers: ``(label, table)`` pairs, lowest precedence first.
@@ -3341,13 +3385,15 @@ def _resolve_routes(
         "the operator's codex effort",
     )
 
-    def is_effort(value: str) -> bool:
-        return value in ENGINE_EFFORT_LEVELS
+    def valid_effort(engine: str, value: str) -> bool:
+        return value in (CODEX_EFFORT_LEVELS if engine == "codex" else ENGINE_EFFORT_LEVELS)
 
-    effort = resolve("impl_effort", "", is_effort, "the engine's default effort")
+    effort = resolve("impl_effort", "", lambda v: valid_effort(impl_engine, v), "the engine's default effort")
     fix_effort = resolve(
-        "fix_effort", "", is_effort, "the implementer's effort",
-    ) or effort
+        "fix_effort", "", lambda v: valid_effort(fix_engine, v), "the compatible implementer's effort",
+    )
+    if not fix_effort and (fix_engine == "codex") == (impl_engine == "codex"):
+        fix_effort = effort
     return {
         "impl_engine": impl_engine,
         "model": model,
@@ -3502,6 +3548,11 @@ def _parse_result_sentinel(obj: object, sentinels: tuple[str, ...]) -> str | Non
     """
     if not isinstance(obj, dict):
         return None
+    if obj.get("engine") == "codex" and (
+        obj.get("is_error") is not False or obj.get("turn_completed") is not True
+        or type(obj.get("engine_exit_status")) is not int or obj["engine_exit_status"] != 0
+    ):
+        return None
     result_text = obj.get("result")
     if not isinstance(result_text, str):
         return None
@@ -3558,7 +3609,7 @@ def parse_fix_result(obj: object, *, report_transport: object = None) -> str | N
     return _parse_result_sentinel(obj, _FIXER_SENTINELS)
 
 
-def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_version: int | None = None,
+def held_completion_outcome(stage: str, result_obj: object, *, engine: str = "", report_protocol_version: int | None = None,
                             fix_marker: dict | None = None) -> str:
     """Return the validated engine outcome completed under a human hold.
 
@@ -3574,6 +3625,8 @@ def held_completion_outcome(stage: str, result_obj: object, *, report_protocol_v
     Raises:
         ValueError: If ``stage`` is not a known pipeline stage.
     """
+    if stage != "review" and not valid_write_transport(result_obj, engine):
+        return OUTCOME_UNRECOGNIZED
     if stage == "review":
         outcome = validate_review(result_obj, report_protocol_version=report_protocol_version)
     elif stage == "implement":
@@ -4754,8 +4807,8 @@ _VALID_STAGES = frozenset({"review", "implement", "fix"})
 # string.
 _VALID_ENGINES_BY_STAGE: dict[str, frozenset[str]] = {
     "review": frozenset({"codex"}),
-    "implement": frozenset({"claude", "claude-ds"}),
-    "fix": frozenset({"claude", "claude-ds"}),
+    "implement": frozenset(ENGINE_ROUTES),
+    "fix": frozenset(ENGINE_ROUTES),
 }
 
 # The only lease ``state`` a pre-spawn marker may carry. Any other value (a corrupt
@@ -4862,8 +4915,8 @@ def valid_marker(
       carries every required provenance field (``engine``, ``stage``, ``pr_number``,
       ``deadline``, ``base_ref``, ``base_sha``, ``head_sha``, ``pre_label``,
       ``dispatch_id``);
-    - ``engine`` is valid for its stage (``codex`` for review, ``claude`` or
-      ``claude-ds`` for implement/fix);
+    - ``engine`` is valid for its stage (``codex`` for review; ``claude``,
+      ``claude-ds``, or ``codex`` for implement/fix);
     - ``dispatch_id`` is a non-empty string (links the marker to its completion envelope);
     - ``stage`` is a known pipeline stage, and equals ``expected_stage`` when given
       (a ``fix`` marker must not drive a ``review`` reconciliation);
@@ -5444,11 +5497,22 @@ def validate_marker(
     return valid_marker(dispatch, expected_pr=pr, expected_stage=stage)
 
 
+def valid_write_transport(result: object, engine: str) -> bool:
+    """A dispatch-pinned Codex route cannot fall back to legacy Claude output."""
+    if engine != "codex":
+        return True
+    return (isinstance(result, dict) and result.get("engine") == "codex"
+            and type(result.get("engine_exit_status")) is int
+            and type(result.get("is_error")) is bool
+            and type(result.get("turn_completed")) is bool)
+
+
 def harvest_implementation(
     *,
     result: str,
     pre_label: str = LABEL_AVAILABLE,
     verification_unconfigured: bool = False,
+    engine: str = "",
 ) -> HarvestResult:
     """Decide the outcome of a finished implementer engine.
 
@@ -5462,6 +5526,8 @@ def harvest_implementation(
         A HarvestResult with ``action``, ``label``, and ``sentinel`` keys.
     """
     result_obj = _load_json_string(result, None)
+    if not valid_write_transport(result_obj, engine):
+        result_obj = None
     decision = decide_implementation_harvest(
         result_obj=result_obj,
         verification_unconfigured=verification_unconfigured,
@@ -5484,6 +5550,7 @@ def harvest_fix(
     report_protocol_version: int | None = None,
     review_handoff: object = None,
     report_transport: str | None = None,
+    engine: str = "",
 ) -> HarvestResult:
     """Decide the outcome of a finished fixer engine.
 
@@ -5512,6 +5579,8 @@ def harvest_fix(
     try:
         result_obj = review_reports.loads(result)
     except (ValueError, TypeError, RecursionError):
+        result_obj = None
+    if not valid_write_transport(result_obj, engine):
         result_obj = None
     decision = decide_fix_harvest(
         result_obj=result_obj,

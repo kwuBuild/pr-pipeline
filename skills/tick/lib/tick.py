@@ -69,6 +69,7 @@ import discussion_context
 import engine_usage
 import labels
 import native_skills
+import codex_write_wrapper
 import pipeline
 import process_control
 import reviewer_observability
@@ -651,6 +652,8 @@ def _resolve_engine(
         ``(binary, extra_env)`` — the binary name and any additional env
         vars to merge into the Popen env.
     """
+    if impl_engine == "codex":
+        return "codex", {}
     if impl_engine != "claude-ds":
         return (
             impl_engine,
@@ -1144,6 +1147,65 @@ def claude_engine_argv(
     if json_schema:
         argv += ["--json-schema", json_schema]
     return argv
+
+
+def _launch_write_engine(*, engine_bin: str, effort: str = "", **kwargs) -> subprocess.Popen[bytes] | None:
+    """Select native transport without sharing engine-specific CLI settings."""
+    if engine_bin != "codex":
+        return _launch_claude_engine(engine_bin=engine_bin, **kwargs)
+    return _launch_codex_engine(effort=effort, **kwargs)
+
+
+def _launch_codex_engine(
+    *, prompt: str, wt_dir: str, result_path: str, env: dict[str, str],
+    push_permission: str, model: str = "", effort: str = "",
+    permission_mode: str = "auto", verify_tools: tuple[str, ...] | None = None,
+    engine_settings: str = "", skills: Sequence[str] = (),
+    fix_report_protocol_version: int | None = None,
+) -> subprocess.Popen[bytes] | None:
+    """Launch a writer with inherited auth and Codex's automatic approval review.
+
+    Claude permission_mode, verify_tools and engine_settings are deliberately
+    not translated into Codex flags. The shared prompt carries the exact push
+    destination and required checks; Codex policy decides whether each command
+    may execute. Denial must be reported, never retried with broader policy.
+    """
+    handles = []
+    try:
+        pipeline.validate_target_context(
+            pipeline.ResolvedTarget(TRUSTED_HEAD_REPO, TARGET_REMOTE), cwd=wt_dir, env=env,
+        )
+        paths = native_skills.prepare_writer(
+            install_root=pipeline.INSTALL_SKILLS_ROOT, worktree=Path(wt_dir), skills=skills,
+        )
+        prompt += ("\n\nController-owned native skill links (do not commit or replace):\n"
+                   + "\n".join(f"- {name}: {path}" for name, path in paths.items())
+                   + "\nUse the exact installed source named above even if the target has a same-named skill. "
+                   "Skill discovery is not compliance evidence. Request approval through the configured "
+                   "automatic reviewer for protected Git metadata and authenticated networking when needed. "
+                   "If the reviewer denies a required action, report NEEDS_HUMAN_DECISION and the denied "
+                   "command; do not change the sandbox/approval policy.\n")
+        Path(wt_dir, "prompt.txt").write_text(prompt)
+        for path, mode in ((Path(wt_dir, "prompt.txt"), "rb"),
+                           (Path(result_path), "wb"), (Path(wt_dir, "stderr.log"), "wb")):
+            handles.append(path.open(mode))
+        proc = subprocess.Popen(
+            [sys.executable, str(Path(__file__).with_name("codex_write_wrapper.py")),
+             "--heartbeat", _heartbeat_path(wt_dir),
+             *(["--fix-report-protocol-version", str(fix_report_protocol_version)]
+               if fix_report_protocol_version is not None else []),
+             "--", *codex_write_wrapper.engine_argv(model=model, effort=effort)],
+            stdin=handles[0], stdout=handles[1], stderr=handles[2], cwd=wt_dir,
+            start_new_session=True, env=env,
+        )
+        _track_engine_child(proc)
+        return proc
+    except (OSError, ValueError) as exc:
+        print(f"tick: refusing Codex write launch: {exc}", file=sys.stderr)
+        return None
+    finally:
+        for handle in handles:
+            handle.close()
 
 
 def _launch_claude_engine(
@@ -2229,7 +2291,9 @@ def _engine_result_summary(
         "harvest_action": harvest_action,
         "harvest_label": harvest_label,
         "sentinel": harvest_result.get("sentinel"),
-        "usage": engine_usage.claude_usage(result_obj),
+        "usage": (engine_usage.codex_usage(result_obj.get("usage"), partial=result_obj.get("is_error") is not False)
+                  if isinstance(result_obj, dict) and result_obj.get("engine") == "codex"
+                  else engine_usage.claude_usage(result_obj)),
         "reported_models": engine_usage.claude_models(result_obj),
     }
     if not isinstance(result_obj, dict):
@@ -2959,7 +3023,7 @@ def transient_cooldown_until(
 
 def _engine_quota_domain(engine: str) -> str:
     """Return the account-level quota domain shared across engine stages."""
-    if engine not in {"claude", "claude-ds"}:
+    if engine not in pipeline.ENGINE_ROUTES:
         raise ValueError(f"unsupported engine quota domain: {engine!r}")
     return engine
 
@@ -3009,7 +3073,7 @@ class EngineCooldowns:
             until: Epoch time after which dispatch may resume.
             reason: Bounded classification reason for operator diagnostics.
         """
-        if domain not in {"claude", "claude-ds"} or not math.isfinite(until):
+        if domain not in pipeline.ENGINE_ROUTES or not math.isfinite(until):
             raise ValueError("cooldown domain and deadline must be valid")
         if not isinstance(reason, str) or not reason:
             raise ValueError("cooldown reason must be a non-empty string")
@@ -3970,7 +4034,7 @@ def _held_result_outcome(
         result_obj = None
     version = None
     marker = None
-    if config.stage in {"review", "fix"}:
+    if config.stage in {"review", "fix", "implement"}:
         try:
             marker = json.loads(Path(wt_dir, "dispatch.json").read_text())
             version = marker.get("report_protocol_version")
@@ -3980,6 +4044,7 @@ def _held_result_outcome(
             return pipeline.OUTCOME_UNRECOGNIZED
     return pipeline.held_completion_outcome(
         config.stage, result_obj, report_protocol_version=version, fix_marker=marker,
+        engine=marker.get("engine", "") if isinstance(marker, dict) else "",
     )
 
 
@@ -7919,6 +7984,7 @@ def _harvest_one_implementer(
 
     try:
         harvest_result = pipeline.harvest_implementation(
+            engine=engine,
             verification_unconfigured=verification_unconfigured,
             result=result_raw,
             pre_label=pre_label,
@@ -9064,6 +9130,7 @@ def _harvest_one_fixer(
 
     try:
         harvest_result = pipeline.harvest_fix(
+            engine=engine,
             verification_unconfigured=verification_unconfigured,
             result=result_raw,
             pre_label=pre_label,
@@ -11549,7 +11616,7 @@ def _dispatch_one_implementer(
         "branch_name": branch_name,
         "pr_body_source_file": _PR_BODY_SOURCE_FILE,
         "definition_of_done_skill_doc": skill_doc_path(DEFINITION_OF_DONE_SKILL),
-        "definition_of_done_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{DEFINITION_OF_DONE_SKILL}",
+        "definition_of_done_skill_invocation": native_skills.writer_invocation(impl_engine, DEFINITION_OF_DONE_SKILL, pipeline.INSTALL_SKILLS_ROOT),
     })
 
     result_path = os.path.join(wt_dir, "result.json")
@@ -11582,8 +11649,9 @@ def _dispatch_one_implementer(
         )
         return
 
-    proc = _launch_claude_engine(
+    proc = _launch_write_engine(
         engine_bin=engine_bin,
+        effort=effort,
         prompt=prompt,
         wt_dir=wt_dir,
         result_path=result_path,
@@ -11597,6 +11665,13 @@ def _dispatch_one_implementer(
     )
     if proc is None:
         # Launch failed — clean up and leave label unchanged.
+        if impl_engine == "codex":
+            _escalate_dispatch_setup_failure(
+                entity="issue", number=issue_number, pre_label=pipeline.LABEL_AVAILABLE,
+                stage="implement", reason="Codex launch setup failed; inspect target validation and installed skill catalog",
+                engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
+            )
+            return
         cleanup_scratch(wt_dir)
         if tick_log:
             tick_log.log(
@@ -11685,7 +11760,8 @@ def _dispatch_one_implementer(
             # The effort the tick handed the engine; None means it set none.
             details={
                 "model": model or None,
-                "effort": engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+                "effort": (effort or None) if impl_engine == "codex" else engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+                **({"permission_policy": "workspace-write with --approve-for-me"} if impl_engine == "codex" else {}),
             },
         )
 
@@ -12628,8 +12704,9 @@ def _dispatch_one_fixer(
     lease_marker["report_protocol_version"] = pipeline.fixer_reports.VERSION
     # Both Claude routes (claude and claude-ds) return the report through
     # --json-schema. Harvest reads this pinned field, not the result, to choose
-    # the structured_output parse; older markers keep the text parse.
-    lease_marker["report_transport"] = pipeline.fixer_reports.STRUCTURED_TRANSPORT
+    # the structured_output parse; Codex and older markers keep the text parse.
+    if impl_engine != "codex":
+        lease_marker["report_transport"] = pipeline.fixer_reports.STRUCTURED_TRANSPORT
     try:
         pipeline.atomic_write(
             os.path.join(wt_dir, "dispatch.json"),
@@ -12671,15 +12748,25 @@ def _dispatch_one_fixer(
         "finding_references": json.dumps(review_handoff, ensure_ascii=False),
         "head_ref": head_ref,
         "revision_hygiene_skill_doc": skill_doc_path(REVISION_HYGIENE_SKILL),
-        "revision_hygiene_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{REVISION_HYGIENE_SKILL}",
+        "revision_hygiene_skill_invocation": native_skills.writer_invocation(impl_engine, REVISION_HYGIENE_SKILL, pipeline.INSTALL_SKILLS_ROOT),
+        "skill_loading_contract": native_skills.writer_loading_contract(impl_engine),
         "summary_budget": pipeline.fixer_reports.AUTHOR_ALLOWANCE,
+        "report_transport_instructions": (
+            "Return the report through the structured output. The controller launched you "
+            "with a JSON schema for this report, so Claude Code collects it as a separate "
+            "structured object. Harvest reads only that object; your final chat message is "
+            "not parsed, and prose around it has no effect."
+            if lease_marker.get("report_transport") == pipeline.fixer_reports.STRUCTURED_TRANSPORT
+            else "Your final message must contain only the JSON report, without surrounding "
+            "prose or Markdown fences. Harvest parses that entire message as JSON."
+        ),
         "report_binding": json.dumps({
             "report_protocol_version": pipeline.fixer_reports.VERSION,
             "dispatch_id": dispatch_id, "pinned_head": head_sha,
             "review_sha256": lease_marker["review_sha256"],
         }),
         "definition_of_done_skill_doc": skill_doc_path(DEFINITION_OF_DONE_SKILL),
-        "definition_of_done_skill_invocation": f"{native_skills.CLAUDE_NAMESPACE}:{DEFINITION_OF_DONE_SKILL}",
+        "definition_of_done_skill_invocation": native_skills.writer_invocation(impl_engine, DEFINITION_OF_DONE_SKILL, pipeline.INSTALL_SKILLS_ROOT),
         "pr_body_revision_file": _PR_BODY_REVISION_FILE,
         # The whole stamp line, not its prefix: the engine copies a literal it
         # was given rather than composing one from a dispatch id it would have
@@ -12715,8 +12802,9 @@ def _dispatch_one_fixer(
         return
 
     result_path = os.path.join(wt_dir, "result.json")
-    proc = _launch_claude_engine(
+    proc = _launch_write_engine(
         engine_bin=engine_bin,
+        effort=effort,
         prompt=prompt,
         wt_dir=wt_dir,
         result_path=result_path,
@@ -12728,9 +12816,17 @@ def _dispatch_one_fixer(
         engine_settings=config.engine_settings,
         skills=FIXER_SKILLS,
         fix_report_protocol_version=pipeline.fixer_reports.VERSION,
-        json_schema=json.dumps(pipeline.fixer_reports.schema(), separators=(",", ":")),
+        **({"json_schema": json.dumps(pipeline.fixer_reports.schema(), separators=(",", ":"))}
+           if impl_engine != "codex" else {}),
     )
     if proc is None:
+        if impl_engine == "codex":
+            _escalate_dispatch_setup_failure(
+                entity="pr", number=pr_number, pre_label=pipeline.LABEL_CHANGES_REQUESTED,
+                stage="fix", reason="Codex launch setup failed; inspect target validation and installed skill catalog",
+                engine=impl_engine, tick_log=tick_log, cleanup_dir=wt_dir,
+            )
+            return
         cleanup_scratch(wt_dir)
         if tick_log:
             tick_log.log(
@@ -12816,7 +12912,8 @@ def _dispatch_one_fixer(
             details={
                 "head_sha": head_sha[:8],
                 "model": model or None,
-                "effort": engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+                "effort": (effort or None) if impl_engine == "codex" else engine_extra_env.get("CLAUDE_CODE_EFFORT_LEVEL"),
+                **({"permission_policy": "workspace-write with --approve-for-me"} if impl_engine == "codex" else {}),
             },
         )
 

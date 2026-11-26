@@ -42,8 +42,9 @@ not work around it.
    they name another login, use theirs.
 3. **Repositories and route.** Ask which repositories to drive, as
    `owner/name`. Ask which engine route the tick will run: `--impl-engine`
-   (`claude` or `claude-ds`) and `--impl-model` (blank for the operator's default).
-   Offer `--impl-effort` only when the operator wants an effort override.
+   (`claude`, `claude-ds`, or opt-in `codex`) and `--impl-model` (blank for the
+   operator's default). Offer `--impl-effort` only when the operator wants an
+   effort override.
    The probe measures that route, and `write-config` records it as the
    repository's `impl_engine` and `impl_model`, so the tick runs it without flags.
    It preserves blank model intent and existing or inherited effort when no
@@ -73,16 +74,20 @@ not work around it.
    4. Probe the route with exactly the confirmed grants. Run it with Bash
       `dangerouslyDisableSandbox: true`, like the tick: engines launched by the
       tick run outside the session sandbox, so a sandboxed probe would measure a
-      different environment. Tell the operator it makes two short model calls.
+      different environment. Tell the operator it makes paid model calls: two
+      per distinct Claude route, or one per Codex write stage.
       ```bash
-      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude-ds] [--impl-model <model>] [--impl-effort <level>] [--verify-tool '<grant>' ...] [--engine-settings '<json-or-absolute-path>']
+      bash ${CLAUDE_PLUGIN_ROOT}/skills/setup/setup.sh probe <owner/name> [--impl-engine claude|claude-ds|codex] [--impl-model <model>] [--impl-effort <level>] [--fix-engine <engine>] [--fix-model <model>] [--fix-effort <level>] [--verify-tool '<grant>' ...] [--engine-settings '<json-or-absolute-path>']
       ```
       `--engine-settings` is the `engine_settings` value that dispatch passes
-      to engines as `--settings`. Omit it unless the operator chooses it in
+      to Claude engines as `--settings`. Omit it unless the operator chooses it in
       step 5. Pass the same value to `write-config`. A path must name a
       readable file that holds a JSON object; setup and each dispatch refuse
       any other file.
-      The probe asks a headless engine, launched as dispatch launches one, to
+      Codex stages follow the [native probe contract](../tick/README.md#optional-codex-write-stages):
+      verify, commit and push in linked worktrees with the dispatch permission
+      preset. Both stages must pass; `dontAsk` cannot remedy a failed Codex probe.
+      The Claude probe asks a headless engine, launched as dispatch launches one, to
       run `git init` in a throwaway directory. That command is in no grant.
       The first run uses `dontAsk`, a negative control that must be denied.
       The second uses `auto`, which must run the command and return its
@@ -94,7 +99,7 @@ not work around it.
         pass. Show `detail` and let the operator choose one of two outcomes:
         1. Change the engine route (`--impl-engine`/`--impl-model`) and probe
            again.
-        2. Record `--permission-mode dontAsk` with named verification grants.
+        2. For a failed Claude route, record `--permission-mode dontAsk` with named verification grants.
            If the list is empty, the operator must name the target's
            verification commands, then probe again with them.
 
@@ -145,3 +150,18 @@ labels and leave the config unchanged (`changed: false`). The probe still runs
 and records fresh evidence. When a tick finds a target with no
 `[repos."owner/name"]` section, it exits 6 and names this skill. See
 [unconfigured targets](../tick/README.md#unconfigured-targets).
+
+## Optional Codex routes
+
+Probe the effective implementer and fixer routes, including `--impl-effort`,
+`--fix-engine`, `--fix-model`, and `--fix-effort` when selected. Setup records
+both stage results. It writes an effort or fixer key only when the request
+differs from the current configuration, so a blank fixer key still inherits
+the implementer route; see the
+[route metadata contract](../tick/README.md#deadlines-stall-limits-routing-and-cadence).
+Codex uses its own fixed
+`--approve-for-me` preset; Claude grants, settings, negative control, and
+`dontAsk` remedies do not apply to it. A failed Codex probe blocks adoption;
+do not substitute a Claude permission mode. See the authoritative
+[Codex write-stage contract](../tick/README.md#optional-codex-write-stages)
+for local-probe limits and the required production-controller trial.

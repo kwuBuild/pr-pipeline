@@ -19,18 +19,24 @@ and finding references through the existing authenticated comment history.
 
 | Property | Implementer | Fixer | Reviewer |
 |---|---|---|---|
-| Binary | `claude -p` | `claude -p` | `codex exec` (via `engine_wrapper.py`) |
+| Binary | `claude -p` or opt-in `codex exec` | `claude -p` or opt-in `codex exec` | `codex exec` (via `engine_wrapper.py`) |
 | Permission mode | `--permission-mode auto` (config/CLI can select `dontAsk`) | `--permission-mode auto` (config/CLI can select `dontAsk`) | `-s read-only` (sandbox) |
 | Pre-approved tools | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | `--allowedTools` ([`tick._engine_allowed_tools`][tick]); auto may approve more | None (read-only sandbox enforces) |
 | Model (default) | whatever `claude` resolves (no `--model` flag) | whatever `claude` resolves / `deepseek-v4-pro[1m]` (claude-ds) | operator's `$CODEX_HOME/config.toml` (else `~/.codex/config.toml`), else `gpt-5.5` |
 | Engine and model override | `impl_engine`/`impl_model` config keys; `--impl-engine`/`--impl-model` flags | `fix_engine`/`fix_model` config keys; `--fix-engine`/`--fix-model` flags; blank inherits the implementer route (model only on the same engine) | `review_model` config key; `--review-model` flag |
-| Reasoning effort | `impl_effort` config key or `--impl-effort` → `CLAUDE_CODE_EFFORT_LEVEL`; blank: not set on claude, `max` on claude-ds | `fix_effort` config key or `--fix-effort`; blank inherits `impl_effort` on any engine | `review_effort` config key or `--review-effort`, else operator's codex config, else `high` |
+| Reasoning effort | `impl_effort` config key or `--impl-effort` → `CLAUDE_CODE_EFFORT_LEVEL` (Codex: `model_reasoning_effort`); blank: not set on claude, `max` on claude-ds | `fix_effort` config key or `--fix-effort`; blank inherits `impl_effort` within the Claude family or within Codex | `review_effort` config key or `--review-effort`, else operator's codex config, else `high` |
 | Env isolation | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | Full parent env via `_engine_env()` ([`tick._engine_env`][tick]) | scrub-dir with `HOME`/`CODEX_HOME` redirect ([`tick._dispatch_one_reviewer`][tick]) |
 | Prompt source | `lib/prompts/implementer.txt` | `lib/prompts/fixer.txt` | `lib/prompts/reviewer.txt` |
 | Output capture | stdout → `result.json` | stdout → `result.json` | final output → atomic `review.json`; JSONL stdout → bounded sanitizer |
 | Progress heartbeat | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped per output event (≤1 write/5s) | `heartbeat` mtime, bumped by the bounded JSONL reader (≤1 write/5s) |
 | Timeout | `implementer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_implementer`][tick]) | `fixer_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_fixer`][tick]) | `review_timeout_seconds`, 60 min shipped ([`tick._dispatch_one_reviewer`][tick]) |
 | Process group | `start_new_session=True` | `start_new_session=True` | `start_new_session=True` on the wrapper; it calls `os.setpgrp()` only when it does not already lead its group ([`engine_wrapper.run_engine`][engine_wrapper]) |
+
+The Claude-specific permission, tool, model, and effort rows describe the default routes.
+Codex writers use `tick._launch_write_engine` → `tick._launch_codex_engine` →
+`codex_write_wrapper.py`; their authoritative policy, skill lifecycle, and
+transport are documented in [Optional Codex write stages](../../skills/tick/README.md#optional-codex-write-stages).
+Both adapters inherit `_engine_env()`. The reviewer remains isolated.
 
 ## 2. Model and reasoning effort
 
@@ -61,8 +67,11 @@ The operator config key `impl_model`, or the tick CLI's `--impl-model <model>`
 flag and `ANTHROPIC_MODEL`. `pipeline.effective_engine_model` owns the claude-ds
 default.
 
-Reasoning effort is not explicitly set. Claude Code uses its own default.
-For claude-ds, `CLAUDE_CODE_EFFORT_LEVEL=max` is set ([`tick._resolve_engine`][tick]).
+The resolved `impl_effort` sets `CLAUDE_CODE_EFFORT_LEVEL` on Claude routes. A blank
+value leaves Claude's default intact and selects `max` for claude-ds
+([`tick._resolve_engine`][tick]). Codex uses `model_reasoning_effort`; its model,
+effort, and inheritance rules are in the
+[Codex writer contract](../../skills/tick/README.md#optional-codex-write-stages).
 
 ### Fixer
 
@@ -72,8 +81,8 @@ engine. A blank `fix_model` inherits the implementer's `impl_model` only while t
 fixer runs on the implementer's engine, because a model id names one provider's
 model; on another engine it is that engine's default. `pipeline.resolve_config`
 resolves the route, `tick._run_tick_body` passes it to `dispatch_fixers`, and
-model resolution happens at [`tick._dispatch_one_fixer`][tick]. Uses
-`_launch_claude_engine` with the same `--model` handling and env construction.
+model resolution happens at [`tick._dispatch_one_fixer`][tick]. Both write stages
+use `_launch_write_engine` to select the native adapter and inherit `_engine_env()`.
 
 ### Reviewer
 
@@ -130,10 +139,12 @@ review's provenance survives a later edit to the operator config.
 The pipeline does not install or enforce an operator's pre-PR hooks. Hook
 behavior belongs to the engine host and the settings it loads:
 
-- **Implementer and fixer:** [`tick._launch_claude_engine`][tick] launches
+- **Claude implementer and fixer:** [`tick._launch_claude_engine`][tick] launches
   `claude -p` without `--bare`. Non-interactive mode alone does not disable
   Claude hooks; configured hooks can run. See the host's
   [programmatic-mode documentation](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode).
+- **Codex implementer and fixer:** `_launch_codex_engine` inherits native Codex
+  configuration. Claude hook configuration does not govern this adapter.
 - **Reviewer:** [`tick._dispatch_one_reviewer`][tick] launches Codex, which does
   not use Claude Code's hook configuration. Its own isolation is described in
   [Reviewer](#reviewer-1).
@@ -151,7 +162,7 @@ must hold independently of optional host hooks.
 Each engine runs with `cwd` set to an isolated git worktree:
 - Implementer: worktree at the configured implementation base on the selected remote
   ([`tick._dispatch_one_implementer`][tick])
-- Fixer: worktree at the PR's head branch
+- Fixer: worktree detached at the PR's pinned head SHA
   ([`tick._dispatch_one_fixer`][tick])
 - Reviewer: worktree at the PR's head SHA (detached)
   ([`tick._dispatch_one_reviewer`][tick])
@@ -170,9 +181,11 @@ compatibility with those routes and older clients; a qualifying ancestor
 [Claude's instruction-loading documentation](https://code.claude.com/docs/en/memory#agentsmd).
 These are host discovery rules, not extra reads performed by the pipeline.
 
-The implementer and fixer invoke the installed `pr-pipeline:definition-of-done`
+Claude implementers and fixers invoke the installed `pr-pipeline:definition-of-done`
 and `pr-pipeline:review-response-hygiene` skills. The launcher loads the existing
-plugin with `--plugin-dir` and preapproves the selected native call. The isolated
+plugin with `--plugin-dir` and preapproves the selected native call. Codex writers
+use native `AGENTS.md` discovery and the installed skill links described in the
+[Codex writer contract](../../skills/tick/README.md#optional-codex-write-stages). The isolated
 Codex reviewer receives optional installed skills through `HOME/.agents/skills`
 symlinks. See [stage bindings](../../skills/tick/README.md#prompt-bound-skills-skill_unresolved)
 for discovery, permissions, required guidance, and the Phase A/B obligations.
@@ -295,7 +308,11 @@ reviewer from auto-approving a PR that modifies the very rules used to evaluate 
 
 ### Implementer and fixer
 
-Permission model: `--permission-mode auto` + `--allowedTools` by default;
+The following grants describe Claude routes. Codex uses the separate
+[writer policy](../../skills/tick/README.md#optional-codex-write-stages), with the
+same controller-supplied push destination and completion obligations.
+
+Claude permission model: `--permission-mode auto` + `--allowedTools` by default;
 operator configuration or the CLI can select `dontAsk`
 ([`tick._engine_allowed_tools`][tick], [`tick._launch_claude_engine`][tick]).
 
@@ -744,11 +761,12 @@ ignore case. `--loop` exits on startup rejection or a `tick_crash` (exit 4) befo
 remote cadence.
 
 `pipeline.validate_target_context` invokes the helper's `--check-remote` mode
-without changing the supplied working directory. `_launch_claude_engine` runs
-it with the engine's cwd and environment before opening output files or starting
+without changing the supplied working directory. `_launch_claude_engine` and
+`_launch_codex_engine` run it with the engine's cwd and environment before opening output files or starting
 either an implementer or fixer. A conflicting effective fetch or push URL
-returns a launch failure, leaves the item on its pickup label, and reports the
-target error on stderr. `_harvest_one_reviewer` performs the same local check
+returns a launch failure and reports the target error on stderr. The Claude
+path leaves the pickup label; a Codex setup failure escalates for a human decision.
+`_harvest_one_reviewer` performs the same local check
 before its worktree fetch; a rejection logs `target_context_invalid` and retains
 the marker and result for retry. This closes routing differences caused by
 conditional includes and worktree configuration while preserving startup's

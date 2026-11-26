@@ -715,8 +715,8 @@ jq -c 'select(.phase=="dispatch" and .action=="skip")' .claude/worktrees/.tick-l
   `structured_output`; prose in `result` is ignored. "Missing structured revision
   report" means that object is absent or not an object (check `is_error`,
   `subtype` and `stderr.log`). "Missing or malformed JSON revision report" occurs
-  only for a marker without `report_transport`, whose final message must be the
-  JSON report. See [report transport](README.md#report-transport). The manifest records
+  only for a marker without `report_transport` (Codex or older Claude dispatches).
+  Its final message must be the JSON report. See [report transport](README.md#report-transport). The manifest records
   complete source/rendered digests and validation reason. A malformed or
   oversized report takes a human hold; do not rerun code merely to repair prose.
   See [complete fixer reports](README.md#complete-fixer-reports) for limits,
@@ -787,3 +787,20 @@ publication. A failed archive, post, or relabel retains the marker and source
 for retry. A missing or mismatched completion version is not accepted as legacy
 completion. See the [report contract](../../docs/working/reviewer-report-contract.md)
 for recovery ownership and compatibility.
+
+## Codex write-stage failures
+
+Inspect `stderr.log`, `result.json`, and the dispatch/harvest log before retrying.
+Confirm `codex --version` from the target environment; a Node wrapper can select
+a different architecture or installation there. Codex 0.171.0 supports the
+write adapter. Do not combine `--sandbox` with `--approve-for-me`. A sandbox
+filesystem refusal can require the normal automatic approval request; an
+approval-review denial must end the run with an explicit blocked outcome.
+Never bypass policy to make a probe pass.
+
+Missing native skill links, empty guidance, or catalog collisions require
+repair of the installation/target. Do not replace user-owned skill directories.
+A result file or heartbeat never overrides live process custody. Preserve
+markers and evidence after publication failure, then let the next tick retry.
+See [Optional Codex write stages](README.md#optional-codex-write-stages) for
+the policy and native acceptance requirements.

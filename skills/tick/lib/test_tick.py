@@ -10441,8 +10441,9 @@ def test_classify_marker_retains_custody_when_pid_probe_alive(
     assert not (wt_dir / "completion.json").exists()
 
 
+@pytest.mark.parametrize("engine", ["claude", "codex"])
 def test_live_wrapperless_engine_cannot_complete_from_matching_envelope(
-    tmp_path: Path,
+    tmp_path: Path, engine: str,
 ) -> None:
     """A wrapperless engine may not declare its own completion.
 
@@ -10486,7 +10487,7 @@ def test_live_wrapperless_engine_cannot_complete_from_matching_envelope(
     wt_dir = wt_root / "issue-99"
     wt_dir.mkdir(parents=True)
     marker: dict[str, object] = {
-        "engine": "claude",
+        "engine": engine,
         "stage": "implement",
         "pr_number": 99,
         "deadline": 9999999999.0,
@@ -11447,6 +11448,7 @@ def test_harvest_one_implementer_creates_pr_on_create_pr_action(
 
     # Verify pipeline.harvest_implementation was called with result content
     harvest_impl.assert_called_once_with(
+        engine="claude",
         verification_unconfigured=False,
         result='{"result": "IMPLEMENTATION_COMPLETE", "exit_status": 0}',
         pre_label="ai:available",
@@ -14369,6 +14371,7 @@ def test_harvest_one_fixer_rechecks_and_relabels(
                     )
 
     harvest_fix.assert_called_once_with(
+        engine="claude",
         verification_unconfigured=False,
         result='{"result": "FIXES_PUSHED_RECHECK_NEEDED", "exit_status": 0}',
         pre_label="ai:changes-requested",
@@ -20552,7 +20555,7 @@ def test_main_route_flags_override_the_configured_routes(
     ("engine_stall_seconds = 600\n", "engine_stall_seconds"),
     ("engine_stall_seconds = 4000\n", "engine_stall_seconds"),
     ("max_iterations = true\n", "max_iterations"),
-    ('impl_engine = "codex"\n', "impl_engine"),
+    ('impl_engine = "unknown"\n', "impl_engine"),
     ('fix_model = "-p"\n', "fix_model"),
     ('effort = "ultra"\n', "effort"),
     ('fix_effort = "--loop"\n', "fix_effort"),

@@ -19,6 +19,7 @@ from unittest import mock
 from conftest import legacy_review
 
 import pytest
+import pipeline
 
 from conftest import comment_pages
 
@@ -427,8 +428,9 @@ def test_dispatch_implementers_logs_skip_when_at_capacity() -> None:
 # --- _dispatch_one_implementer ---
 
 
+@pytest.mark.parametrize("engine", ["claude", "codex"])
 def test_dispatch_one_implementer_creates_worktree_and_launches(
-    tmp_path: Path,
+    tmp_path: Path, engine: str,
 ) -> None:
     """_dispatch_one_implementer creates worktree, writes marker, launches engine."""
     from tick import _dispatch_one_implementer  # type: ignore[import-untyped]
@@ -458,6 +460,7 @@ def test_dispatch_one_implementer_creates_worktree_and_launches(
                             issue_number=461,
                             issue_title="PWA icons",
                             tick_log=None,
+                            impl_engine=engine,
                         )
 
     # Must have created the worktree directory
@@ -468,7 +471,7 @@ def test_dispatch_one_implementer_creates_worktree_and_launches(
     marker_path = wt_dir / "dispatch.json"
     assert marker_path.is_file()
     marker = json.loads(marker_path.read_text())
-    assert marker["engine"] == "claude"
+    assert marker["engine"] == engine
     assert marker["stage"] == "implement"
     assert marker["pr_number"] == 461
     assert marker["pre_label"] == "ai:available"
@@ -480,6 +483,17 @@ def test_dispatch_one_implementer_creates_worktree_and_launches(
 
     # Must have launched the engine via Popen
     popen_mock.assert_called_once()
+    if engine == "codex":
+        argv = popen_mock.call_args.args[0]
+        assert "--approve-for-me" in argv
+        assert "--permission-mode" not in argv
+        assert "--allowedTools" not in argv
+        assert "codex_write_wrapper.py" in argv[1]
+        assert popen_mock.call_args.kwargs["cwd"] == str(wt_dir)
+        prompt = (wt_dir / "prompt.txt").read_text()
+        assert "$definition-of-done" in prompt
+        assert "native Skill tool" not in prompt
+        assert "git push origin HEAD" in prompt
 
     # Must have relabeled the issue
     relabel_mock.assert_called_once_with(
@@ -547,12 +561,31 @@ def test_dispatch_one_implementer_uses_claude_ds_engine(
     )
 
 
+def test_codex_skill_catalog_failure_escalates_without_starting_engine(tmp_path):
+    import tick
+
+    root = tmp_path / "repo"
+    root.mkdir()
+    with mock.patch("tick.WT_ROOT", str(tmp_path / "worktrees")), \
+         mock.patch("tick.git", return_value=str(root)), \
+         mock.patch("tick.pipeline.atomic_write", side_effect=lambda path, data: (
+             Path(path).parent.mkdir(parents=True, exist_ok=True) or Path(path).write_text(data))), \
+         mock.patch("tick.native_skills.prepare_writer", side_effect=ValueError("catalog collision")), \
+         mock.patch("tick._escalate_dispatch_setup_failure") as escalate, \
+         mock.patch("subprocess.Popen") as popen:
+        tick._dispatch_one_implementer(issue_number=461, issue_title="fixture", impl_engine="codex")
+    popen.assert_not_called()
+    assert escalate.call_args.kwargs["number"] == 461
+    assert "Codex" in escalate.call_args.kwargs["reason"]
+
+
 @pytest.mark.parametrize("engine, effort, env_effort, logged", [
     ("claude", "high", "high", "high"),
     # No override: the tick sets nothing and an exported value still reaches.
     ("claude", "", "low", None),
     ("claude-ds", "", "max", "max"),
     ("claude-ds", "medium", "medium", "medium"),
+    ("codex", "high", "low", "high"),
 ])
 def test_dispatch_one_implementer_sends_and_logs_the_effort(
     tmp_path: Path, engine: str, effort: str, env_effort: str,
@@ -1232,6 +1265,7 @@ def test_dispatch_one_fixer_terminates_on_relabel_failure(
     ("claude", "low", "low"),
     ("claude", "", None),
     ("claude-ds", "", "max"),
+    ("codex", "xhigh", "xhigh"),
 ])
 def test_dispatch_one_fixer_sends_and_logs_the_effort(
     tmp_path: Path, engine: str, effort: str, logged: str | None,
@@ -1267,7 +1301,9 @@ def test_dispatch_one_fixer_sends_and_logs_the_effort(
         )
 
     sent = popen.call_args[1]["env"].get("CLAUDE_CODE_EFFORT_LEVEL")
-    assert sent == logged
+    assert sent == (None if engine == "codex" else logged)
+    if engine == "codex":
+        assert f'model_reasoning_effort="{effort}"' in popen.call_args.args[0]
     launch = [c.kwargs for c in tick_log.log.call_args_list
               if c.kwargs.get("action") == "launch"]
     assert launch[-1]["details"]["effort"] == logged
@@ -1615,6 +1651,8 @@ def test_dispatch_one_fixer_fetches_review_comment_for_prompt(
         ("claude", "claude-opus-5", "claude-opus-5"),
         ("claude-ds", "", "deepseek-v4-pro[1m]"),
         ("claude-ds", "deepseek-v4-flash", "deepseek-v4-flash"),
+        ("codex", "", None),
+        ("codex", "gpt-5.5", "gpt-5.5"),
     ],
 )
 def test_dispatch_one_fixer_model_selection_matches_implementer(
@@ -1672,6 +1710,28 @@ def test_dispatch_one_fixer_model_selection_matches_implementer(
                                         )
 
     engine_cmd = popen.call_args[0][0]
+    marker = json.loads((wt_root / "pr-42/dispatch.json").read_text())
+    prompt = (wt_root / "pr-42/prompt.txt").read_text()
+    if impl_engine == "codex":
+        assert "report_transport" not in marker
+        assert "--json-schema" not in engine_cmd
+        assert "final message must contain only the JSON report" in prompt
+        assert "Claude Code collects it" not in prompt
+        assert "--approve-for-me" in engine_cmd
+        assert "--permission-mode" not in engine_cmd
+        assert "--settings" not in engine_cmd
+        assert "--fix-report-protocol-version" in engine_cmd
+        prompt = (wt_root / "pr-42/prompt.txt").read_text()
+        assert "$review-response-hygiene" in prompt
+        assert "$definition-of-done" in prompt
+        assert "native Skill tool" not in prompt
+        assert "plain file read cannot replace native" not in prompt
+        assert "no separate skill invocation tool" in prompt
+        assert "HEAD:refs/heads/fix-branch" in prompt
+    else:
+        assert marker["report_transport"] == pipeline.fixer_reports.STRUCTURED_TRANSPORT
+        assert "--json-schema" in engine_cmd
+        assert "Claude Code collects it" in prompt
     if expected is None:
         assert "--model" not in engine_cmd, (
             f"unset override must omit --model so the operator default "
